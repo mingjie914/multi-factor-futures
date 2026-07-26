@@ -210,6 +210,71 @@ class MySQLSource(DataSource):
     def _get_table_config(self, table_key: str) -> Optional[dict]:
         return self._table_map.get(table_key)
 
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        """Quote a configured MySQL identifier, including schema prefixes."""
+        if not identifier or "\x00" in identifier:
+            raise ValueError("invalid MySQL identifier")
+        return ".".join(
+            f"`{part.replace('`', '``')}`" for part in identifier.split(".")
+        )
+
+    def fetch_macro(
+        self,
+        fields: List[str],
+        start: Optional[Date] = None,
+        end: Optional[Date] = None,
+    ) -> pd.DataFrame:
+        """Read configured macro fields without proxying unavailable columns."""
+        requested = list(dict.fromkeys(str(field) for field in fields))
+        if not requested:
+            return pd.DataFrame()
+
+        cfg = self._get_table_config("macrodata")
+        if not cfg:
+            return pd.DataFrame(columns=requested, dtype=float)
+        column_map = cfg.get("columns", {})
+        missing = [field for field in requested if field not in column_map]
+        if missing:
+            raise ValueError(
+                "unconfigured macro fields: " + ", ".join(sorted(missing))
+            )
+        if "date" not in column_map:
+            raise ValueError("macrodata configuration requires a date column")
+
+        table_sql = self._quote_identifier(str(cfg["table_name"]))
+        date_sql = self._quote_identifier(str(column_map["date"]))
+        parsed_date = f"STR_TO_DATE(CAST({date_sql} AS CHAR), '%Y/%c/%e')"
+        selections = [f"{parsed_date} AS `observation_date`"]
+        selections.extend(
+            f"{self._quote_identifier(str(column_map[field]))} AS "
+            f"{self._quote_identifier(field)}"
+            for field in requested
+        )
+
+        where_clauses = [f"{parsed_date} IS NOT NULL"]
+        if start is not None:
+            start_text = pd.Timestamp(start).strftime("%Y-%m-%d")
+            where_clauses.append(f"{parsed_date} >= '{start_text}'")
+        if end is not None:
+            end_text = pd.Timestamp(end).strftime("%Y-%m-%d")
+            where_clauses.append(f"{parsed_date} <= '{end_text}'")
+        sql = (
+            f"SELECT {', '.join(selections)} FROM {table_sql} "
+            f"WHERE {' AND '.join(where_clauses)} ORDER BY `observation_date`"
+        )
+        frame = self._read_sql(sql)
+        if frame.empty:
+            return pd.DataFrame(columns=requested, dtype=float)
+
+        frame["observation_date"] = pd.to_datetime(
+            frame["observation_date"], errors="coerce"
+        )
+        frame = frame.dropna(subset=["observation_date"])
+        frame = frame.drop_duplicates("observation_date", keep="last")
+        frame = frame.set_index("observation_date").sort_index()
+        return frame.reindex(columns=requested).apply(pd.to_numeric, errors="coerce")
+
     def _build_query(
         self,
         table_cfg: dict,

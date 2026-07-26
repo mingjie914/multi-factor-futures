@@ -35,6 +35,7 @@ class DataManager(DataProvider):
         self._prefetch_signature = None
         self._prefetched_data: Dict[str, pd.DataFrame] = {}
         self._contract_pair_memory: Dict[tuple, Dict[str, pd.DataFrame]] = {}
+        self._macro_memory: Dict[tuple, pd.DataFrame] = {}
 
     @staticmethod
     def _request_signature(dates: DateIndex, universe: Universe) -> tuple:
@@ -238,6 +239,53 @@ class DataManager(DataProvider):
     def get_universe(self, date: Date) -> Universe:
         """获取可投资标的集合."""
         return self._source.fetch_index_constituents("all", date)
+
+    def get_macro(
+        self,
+        fields: List[str],
+        start: Optional[Date] = None,
+        end: Optional[Date] = None,
+    ) -> pd.DataFrame:
+        """获取按观察月份索引的宏观数据，并在进程内复用结果."""
+        requested = tuple(dict.fromkeys(str(field) for field in fields))
+        if not requested:
+            return pd.DataFrame()
+
+        start_ts = pd.Timestamp(start) if start is not None else None
+        end_ts = pd.Timestamp(end) if end is not None else None
+        memory_key = (requested, start_ts, end_ts)
+        cached = self._macro_memory.get(memory_key)
+        if cached is not None:
+            return cached.copy(deep=True)
+
+        if self._cache_only:
+            result = pd.DataFrame(columns=list(requested), dtype=float)
+            self._macro_memory[memory_key] = result
+            return result.copy(deep=True)
+
+        try:
+            result = self._source.fetch_macro(
+                list(requested), start=start_ts, end=end_ts
+            )
+        except Exception:
+            logger.exception(
+                "fetch_macro 失败: fields=%s [%s~%s]",
+                ",".join(requested),
+                start_ts,
+                end_ts,
+            )
+            result = pd.DataFrame(columns=list(requested), dtype=float)
+
+        if result is None or result.empty:
+            result = pd.DataFrame(columns=list(requested), dtype=float)
+        else:
+            result = result.copy()
+            result.index = pd.DatetimeIndex(result.index)
+            result = result.sort_index().reindex(columns=list(requested))
+            result = result.apply(pd.to_numeric, errors="coerce")
+
+        self._macro_memory[memory_key] = result
+        return result.copy(deep=True)
 
     def get_listing_dates(self, universe: Universe) -> pd.Series:
         """获取品种上市日期.

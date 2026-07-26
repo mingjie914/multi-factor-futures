@@ -6,6 +6,7 @@ import pytest
 
 from core.registry import _REGISTRIES
 from workflows.research import (
+    _passes_post_bonferroni_quality,
     _parse_requested_factors,
     _validate_requested_factors,
 )
@@ -21,6 +22,24 @@ def test_requested_factor_validation_rejects_unknown_names():
     assert _validate_requested_factors(["known"], {"known"}) == ["known"]
     with pytest.raises(ValueError, match="missing"):
         _validate_requested_factors(["known", "missing"], {"known"})
+
+
+def test_post_bonferroni_quality_uses_ic_and_direction_not_stock_ir_cutoff():
+    assert _passes_post_bonferroni_quality({
+        "best_ic": 0.036,
+        "best_ic_pos_ratio": 0.566,
+        "best_ir": 0.075,
+    })
+    assert not _passes_post_bonferroni_quality({
+        "best_ic": 0.019,
+        "best_ic_pos_ratio": 0.60,
+        "best_ir": 0.80,
+    })
+    assert _passes_post_bonferroni_quality({
+        "best_ic": -0.03,
+        "best_ic_pos_ratio": 0.45,
+        "best_ir": -0.06,
+    })
 
 
 def test_user_factor_discovery_is_sorted_and_duplicate_safe(tmp_path, monkeypatch):

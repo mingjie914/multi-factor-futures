@@ -1,0 +1,35 @@
+schema_version: 1
+
+# The runtime registry is the discovery pool. It is intentionally dynamic and
+# must never be interpreted as approval for portfolio or trading use.
+discovery_pool:
+  source: core.registry
+  membership: all_registered_factors
+  deployment_eligible: false
+
+historical_screened_pool:
+  - candidate_set_id: low_churn_adapters_12_2018_20260726
+    status: historical_candidate
+    stage: historical_full_sample
+    protocol_sha256: cca5746530e1b3e7e8b7be4348f63c355c2137255c4fd3561f116d301521c215
+    evidence_path: runs/factor_research/low_churn_adapters_12_2018_20260726
+    evaluation_start: '2018-01-01'
+    evaluation_end: '2026-07-24'
+    independent_oos: false
+    portfolio_eligible: false
+    deployment_eligible: false
+    next_allowed_step: correlation_dedup_then_new_locked_oos
+    diagnostics:
+      all_pass_dsr_95: false
+      pbo_cscv: 0.32857142857142857
+    factors:
+      - {name: low_churn_candle_pressure_120d_rank_weekly, holding_period: 5}
+      - {name: low_churn_candle_pressure_120d_rank_monthly, holding_period: 10}
+      - {name: low_churn_volume_weighted_clv_120d_rank_weekly, holding_period: 5}
+      - {name: low_churn_volume_weighted_clv_120d_rank_monthly, holding_period: 10}
+      - {name: low_churn_candle_pressure_120d_rank_biweekly, holding_period: 10}
+      - {name: low_churn_volume_weighted_clv_120d_rank_biweekly, holding_period: 20}
+
+oos_validated_pool: []
+portfolio_eligible_pool: []
+deployment_approved_pool: []

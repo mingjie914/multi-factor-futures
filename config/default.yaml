@@ -52,6 +52,26 @@ data:
         columns:
           day: TRADE_DAYS
           exchange: S_INFO_EXCHMARKET
+      macrodata:
+        table_name: macrodata
+        columns:
+          date: date
+          repo_7d: 银行间质押式回购加权利率7天月
+          repo_1y: 银行间质押式回购加权利率1年月
+          shibor_3m: SHIBOR3个月月
+          shibor_6m: SHIBOR6个月月
+          pmi: PMI
+          pmi_new_orders: PMI新订单
+          pmi_input_prices: PMI主要原材料购进价格
+          pmi_raw_inventory: PMI原材料库存
+          cpi_yoy: CPI当月同比
+          ppi_mom: PPI全部工业品环比
+          ppirm_nonferrous_yoy: PPIRM有色金属材料类当月同比
+          ppirm_agri_yoy: PPIRM农副产品类当月同比
+          taiwan_electronics: 台湾电子行业指数月
+          fai_secondary_yoy: 固定资产投资完成额第二产业累计同比
+          social_financing_yoy: 社融存量同比
+          leading_index: 宏观经济景气指数先行指数
     pool_size: 5
     query_timeout: 30
     connect_timeout: 5

@@ -136,6 +136,20 @@ class DataProvider(abc.ABC):
         """
         return {"near": pd.DataFrame(), "far": pd.DataFrame()}
 
+    def get_macro(
+        self,
+        fields: List[str],
+        start: Optional[Date] = None,
+        end: Optional[Date] = None,
+    ) -> pd.DataFrame:
+        """Retrieve macro observations indexed by their observation month.
+
+        Macro publication timing is factor-specific. Implementations return
+        the stored observations unchanged; factors must apply an explicit
+        publication lag before mapping them to trading dates.
+        """
+        return pd.DataFrame(columns=list(fields), dtype=float)
+
     def get_at_frequency(
         self,
         field: str,
@@ -252,6 +266,15 @@ class DataSource(abc.ABC):
             f"{self.__class__.__name__} 不支持 frequency={frequency!r}, "
             f"仅支持 daily. 请使用 DolphinDB 等支持分钟数据的源."
         )
+
+    def fetch_macro(
+        self,
+        fields: List[str],
+        start: Optional[Date] = None,
+        end: Optional[Date] = None,
+    ) -> pd.DataFrame:
+        """Fetch macro observations indexed by their observation month."""
+        return pd.DataFrame(columns=list(fields), dtype=float)
 
 
 # ---------------------------------------------------------------------------

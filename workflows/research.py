@@ -186,6 +186,29 @@ def _apply_global_bonferroni(
     return total_hypotheses, cutoff
 
 
+FORMAL_IC_THRESHOLD = 0.02
+FORMAL_IC_POS_THRESHOLD = 0.52
+
+
+def _passes_post_bonferroni_quality(result: dict) -> bool:
+    """Apply economic-size and directional gates after raw OLS/HAC testing.
+
+    HAC IC-IR remains a reported stability diagnostic. A fixed 0.50 cutoff is
+    not used because this framework samples a small futures cross-section
+    daily with overlapping forward returns, unlike the broad-equity monthly
+    IC convention from which that heuristic was inherited.
+    """
+    best_ic = float(result.get("best_ic", 0.0))
+    positive_ratio = float(result.get("best_ic_pos_ratio", 0.0))
+    directional_hit_rate = (
+        positive_ratio if best_ic >= 0.0 else 1.0 - positive_ratio
+    )
+    return bool(
+        abs(best_ic) >= FORMAL_IC_THRESHOLD
+        and directional_hit_rate >= FORMAL_IC_POS_THRESHOLD
+    )
+
+
 def _load_adaptivity_data(csv_path: str | None = None) -> dict:
     """加载因子适配性研究结果 (方案A: 最小集成).
 
@@ -324,7 +347,7 @@ def _run_screening(runner, all_factors, config_path, t_threshold, output_dir):
     for _, row in df.iterrows():
         if row["status"] != "OK":
             continue
-        mark = "✓" if abs(row["t_stat"]) >= t_threshold else " "
+        mark = "*" if abs(row["t_stat"]) >= t_threshold else " "
         if abs(row["t_stat"]) >= t_threshold:
             significant.append(row["factor"])
         print(
@@ -628,24 +651,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
     # 筛选显著因子 (业界标准筛选流程)
     # 门槛1: t值显著性 (Bonferroni校正后)
-    # 门槛2: IC+IR双门槛 (|IC|>0.02 且 IR>0.5)
-    # 门槛3: IC命中率 > 52%
-    IC_THRESHOLD = 0.02
-    IR_THRESHOLD = 0.50
-    IC_POS_THRESHOLD = 0.52
-
-    def _passes_ic_ir(r):
-        """IC+IR+命中率三重门槛 (命中率按主方向统计)."""
-        # 命中率按IC主方向统计: 正向因子看IC>0比例, 反向因子看IC<0比例
-        if r["best_ic"] >= 0:
-            pos_ok = r["best_ic_pos_ratio"] >= IC_POS_THRESHOLD
-        else:
-            pos_ok = (1.0 - r["best_ic_pos_ratio"]) >= IC_POS_THRESHOLD
-        return (
-            abs(r["best_ic"]) >= IC_THRESHOLD
-            and abs(r["best_ir"]) >= IR_THRESHOLD
-            and pos_ok
-        )
+    # 门槛2: |IC| >= 0.02 且主方向命中率 >= 52%。IR_NW 保留为诊断，
+    # 后续由分段稳定性、DSR/PBO 与冻结验证治理。
 
     # 第一阶段: 对每个预声明因子×持有期的原始单因子 OLS/HAC p 值
     # 执行全局 Bonferroni。Ridge 尚未参与，也不产生筛选 p 值。
@@ -657,9 +664,13 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
           f"参考正态阈值={bonferroni_t_threshold:.3f}")
 
     t_significant = [r for r in results if r["bonferroni_significant"]]
-    # 第二阶段: IC+IR双门槛筛选
-    significant = [r for r in t_significant if _passes_ic_ir(r)]
-    rejected_by_ir = [r for r in t_significant if not _passes_ic_ir(r)]
+    # 第二阶段: 经济量级与方向稳定性门槛
+    significant = [
+        r for r in t_significant if _passes_post_bonferroni_quality(r)
+    ]
+    rejected_by_quality = [
+        r for r in t_significant if not _passes_post_bonferroni_quality(r)
+    ]
     significant.sort(key=lambda x: abs(x["best_t"]), reverse=True)
     governance_cfg = getattr(runner.config, "factor_governance", None)
     governance_enabled = bool(
@@ -679,11 +690,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     corr_info = f"m={total_hypotheses}, raw OLS/HAC p≤{bonferroni_alpha:.3g}"
 
     print("\n" + "=" * 80)
-    print(f"OLS/IC 检验完成: Bonferroni 显著 {len(t_significant)} 个 → IC+IR双门槛后 {len(significant)} 个")
-    print(f"  门槛: OLS/HAC p≤{bonferroni_alpha:.3g}, |IC|≥{IC_THRESHOLD}, |IR|≥{IR_THRESHOLD}, IC命中率≥{IC_POS_THRESHOLD:.0%}")
+    print(f"OLS/IC 检验完成: Bonferroni 显著 {len(t_significant)} 个 → IC/命中率门槛后 {len(significant)} 个")
+    print(f"  门槛: OLS/HAC p≤{bonferroni_alpha:.3g}, |IC|≥{FORMAL_IC_THRESHOLD}, IC命中率≥{FORMAL_IC_POS_THRESHOLD:.0%}; IR_NW仅作诊断")
     print(f"  Bonferroni校正: {corr_info}")
-    if rejected_by_ir:
-        print(f"  IR门槛淘汰: {len(rejected_by_ir)} 个 (t显著但IC/IR/命中率不达标)")
+    if rejected_by_quality:
+        print(f"  经济质量门槛淘汰: {len(rejected_by_quality)} 个 (t显著但IC/命中率不达标)")
     print("=" * 80)
     print(f"\n按最优持有期分组:")
     for p in sorted(by_period.keys()):
@@ -830,7 +841,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         print(f"\n{'#':>3} {'因子名':<35} {'单调性':>6} {'多空':>7} {'月换手':>7} {'IC一致':>7} {'稳健':>4}")
         print("-" * 85)
         for i, r in enumerate(significant, 1):
-            robust_str = "✓" if r.get("passes_robustness") else "✗"
+            robust_str = "PASS" if r.get("passes_robustness") else "FAIL"
             print(f"{i:>3} {r['name']:<35} {r.get('layered_monotonicity',0):>6.3f} "
                   f"{r.get('layered_ls_return',0):>7.2%} {r.get('monthly_turnover',0):>7.2%} "
                   f"{r.get('ic_sign_consistency',0):>7.1%} {robust_str:>4}")
@@ -886,15 +897,16 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             ],
             "total_hypotheses": total_hypotheses,
             "bonferroni_alpha": bonferroni_alpha,
-            "ic_threshold": IC_THRESHOLD,
+            "ic_threshold": FORMAL_IC_THRESHOLD,
             # 周期架构信息 (新增字段, 向后兼容)
             "frequency": period_ctx.unit.value,
             "periods_mode": "explicit" if periods_override is not None else "window_match",
             "periods_override": periods_override,
             "periods_semantics": "周期数 (非天数); daily频率下1周期=1交易日",
             "bars_per_year": period_ctx.bars_per_year,
-            "ir_threshold": IR_THRESHOLD,
-            "ic_pos_threshold": IC_POS_THRESHOLD,
+            "ir_threshold": None,
+            "ir_role": "reported_diagnostic_and_downstream_stability_input",
+            "ic_pos_threshold": FORMAL_IC_POS_THRESHOLD,
             "mono_threshold": 0.5,
             "n_factors_total": len(all_factors),
             "n_factors_t_significant": len(t_significant),
