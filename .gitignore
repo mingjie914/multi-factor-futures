@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+/.pytest_cache/
+
+# Local data and caches
+/cache/
+/data_cache/
+*.parquet
+*.feather
+
+# Generated reports, signals, and study artifacts
+/reports/
+/signals_output/
+/runs/*
+!/runs/README.md
+!/runs/factor_research/
+/runs/factor_research/*
+!/runs/factor_research/holdout_ledger.jsonl
+/runs/pytest_*/
+/runs/codex_pytest_*/
+
+# Local credentials
+config/local.yaml
+config/secret.yaml
+.env
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+/_work/
+/.test_tmp/

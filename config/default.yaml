@@ -1,0 +1,293 @@
+# Research/backtest defaults. This file intentionally contains no approved factors.
+market: futures
+seed: 42
+
+data:
+  source: mysql_futures
+  cache:
+    enabled: true
+    only: false
+    path: ./cache
+    backend: parquet
+  mysql:
+    host: '${MYSQL_HOST}'
+    port: 3306
+    user: '${MYSQL_USER}'
+    password: '${MYSQL_PASSWORD}'
+    database: '${MYSQL_DATABASE:testmm}'
+    charset: utf8mb4
+    tables:
+      commodity_eod:
+        table_name: ccommodityfutureseodprices
+        columns:
+          date: TRADE_DT
+          ticker: S_INFO_WINDCODE
+          pre_settle: S_DQ_PRESETTLE
+          open: S_DQ_OPEN
+          high: S_DQ_HIGH
+          low: S_DQ_LOW
+          close: S_DQ_CLOSE
+          settle: S_DQ_SETTLE
+          volume: S_DQ_VOLUME
+          amount: S_DQ_AMOUNT
+          oi: S_DQ_OI
+          oi_change: S_DQ_OICHANGE
+      contract_mapping:
+        table_name: cfuturescontractmapping
+        columns:
+          ticker: S_INFO_WINDCODE
+          mapped_to: FS_MAPPING_WINDCODE
+          start_date: STARTDATE
+          end_date: ENDDATE
+      contract_description:
+        table_name: cfuturesdescription
+        columns:
+          ticker: S_INFO_WINDCODE
+          name: S_INFO_NAME
+          exchange: S_INFO_EXCHMARKET
+          list_date: S_INFO_LISTDATE
+          delist_date: S_INFO_DELISTDATE
+      calendar:
+        table_name: cfuturescalendar
+        columns:
+          day: TRADE_DAYS
+          exchange: S_INFO_EXCHMARKET
+    pool_size: 5
+    query_timeout: 30
+    connect_timeout: 5
+    failure_cooldown: 30
+    endpoints: []
+    fallbacks: []
+  ddb:
+    host: '${DDB_HOST}'
+    port: 8961
+    user: '${DDB_USER}'
+    password: '${DDB_PASSWORD}'
+    minute_db: dfs://kline_db
+    minute_table: kline_futures_1min
+    eod_db: dfs://wind_db
+    eod_table: CCommodityFuturesEODPrices
+    data_version: v1
+    dominant_lag_days: 1
+
+# 2017 is warm-up; formal historical studies evaluate from 2018.
+date_range:
+  start: '2017-01-01'
+  end: '2026-07-24'
+
+universe:
+  - RB
+  - HC
+  - I
+  - J
+  - JM
+  - FG
+  - SM
+  - SF
+  - CU
+  - AL
+  - SN
+  - NI
+  - ZN
+  - AU
+  - AG
+  - SC
+  - SA
+  - FU
+  - V
+  - TA
+  - RU
+  - MA
+  - EG
+  - EB
+  - PK
+  - A
+  - M
+  - Y
+  - P
+  - C
+  - CF
+  - SR
+  - OI
+  - RM
+  - JD
+  - AP
+  - LH
+  - EC
+  - IF
+  - IC
+  - IM
+  - IH
+  - T
+  - TL
+  - UR
+  - LC
+  - PS
+
+# Empty by design: only an audited study may propose factors.
+factors: []
+
+processing:
+  - type: winsorize
+    params: {method: mad, n_sigma: 3}
+  - type: standardize
+    params: {method: zscore, by_date: true}
+
+testing:
+  ic:
+    methods: [pearson, spearman]
+    decay_periods: [1, 3, 5, 10, 20, 40]
+    forward_period: 5
+  layered: {n_groups: 5, rebalance: monthly}
+  regression: {method: fama_macbeth, weighted: false}
+
+# Ridge is a post-screening estimator. Raw OLS/HAC and multiplicity control
+# are performed by the research workflow before a factor can reach this layer.
+alpha:
+  type: sector_grouped_ridge
+  params:
+    fit_intercept: true
+    min_samples_per_sector: 100
+    fallback_to_global: false
+    ridge_alphas: [0.01, 0.1, 1.0, 10.0]
+    ridge_cv_folds: 3
+
+risk:
+  type: barra_futures
+  style_factors: [carry, momentum, volatility, skewness, liquidity]
+  estimation_window: 252
+  covariance_estimator: shrinkage
+
+optimization:
+  type: mean_variance
+  risk_aversion: 2.0
+  cost_penalty: 0.5
+  dynamic_risk_limits:
+    enabled: true
+    asset_vol_budget: 0.025
+    sector_vol_budget: 0.06
+    hard_asset_cap: 1.0
+    gross_cap: 2.0
+    net_cap: 0.5
+    atr_window: 20
+    risk_window: 60
+    covariance_shrinkage: 0.30
+  constraints:
+    - {type: net_exposure, lower: -0.5, upper: 0.5}
+    - {type: leverage, limit: 3.0, vol_target: 0.2}
+    - {type: sector_exposure, limit: 0.3}
+
+costs:
+  type: simple_futures
+  commission_rate: 0.0002
+  slippage: 0.0
+  margin_rate: 0.12
+  annual_fee: 0.00105
+
+signals:
+  mode: trend_following
+  position_sizer: atr_based
+  position_sizer_params: {target_volatility: 0.15, atr_period: 20}
+  sl_tp_rules: []
+  batch: {entry_batches: 3, exit_batches: 2}
+  output: {format: csv, path: ./signals_output}
+
+asset_selection:
+  enabled: false
+  mode: hysteresis_top_n
+  top_n_per_side: 2
+  exit_buffer: 1
+  min_abs_forecast: 0.0
+  restrict_to_valid_sectors: false
+
+backtest:
+  initial_capital: 1.0
+  rebalance_freq: weekly
+  benchmark: csi300
+  plot: true
+  report_dir: ./reports
+  training_window: 504
+  retrain_freq: 10
+  holding_period: 5
+
+# Empty horizon templates are populated only from audited training artifacts.
+sub_portfolios:
+  - name: short_term
+    factors: []
+    rebalance_freq: weekly
+    holding_period: 5
+    retrain_freq: 5
+    training_window: 504
+    capital_weight: 0.34
+  - name: mid_term
+    factors: []
+    rebalance_freq: weekly
+    holding_period: 10
+    retrain_freq: 10
+    training_window: 504
+    capital_weight: 0.33
+  - name: long_term
+    factors: []
+    rebalance_freq: weekly
+    holding_period: 40
+    retrain_freq: 20
+    training_window: 504
+    capital_weight: 0.33
+
+meta_optimizer:
+  enabled: true
+  method: shrinkage_min_variance
+  reweight_freq: 20
+  min_weight: 0.01
+  max_weight: 0.60
+  target_volatility: 0.15
+  estimation_window: 252
+  covariance_shrinkage: 0.30
+  enforce_underlying_constraints: true
+  underlying_constraints: []
+  net_underlying_costs: true
+  underlying_dynamic_risk_limits:
+    enabled: true
+    asset_vol_budget: 0.03
+    sector_vol_budget: 0.075
+    hard_asset_cap: 1.0
+    gross_cap: 2.0
+    net_cap: 0.5
+    atr_window: 20
+    risk_window: 60
+    covariance_shrinkage: 0.30
+
+factor_synthesis: {enabled: false, confirm_map: []}
+research_artifacts: {enabled: false, path: '', required: false, strict_config_hash: true}
+factor_governance:
+  enabled: true
+  default_max_per_family: 20
+  family_caps:
+    trend: 20
+    carry: 12
+    risk_distribution: 15
+    liquidity_flow: 15
+    positioning_participation: 12
+    intraday: 12
+  explicit_family_map: {}
+horizon_ensemble:
+  enabled: false
+  neighbor_count: 1
+  max_log_distance: 0.80
+  use_valid_periods: false
+  retrain_freq_by_horizon: {}
+
+defensive_sleeve: {enabled: false, integration_mode: standalone}
+supertrend_sleeve:
+  enabled: true
+  integration_mode: shadow
+  capital_weight: 0.0
+  rebalance_freq: 5
+  rebalance_on_flip: false
+  target_volatility: 0.12
+  asset_vol_budget: 0.025
+  sector_vol_budget: 0.06
+  hard_asset_cap: 1.0
+  gross_cap: 2.0
+  net_cap: 0.5
+  turnover_cap: 0.5

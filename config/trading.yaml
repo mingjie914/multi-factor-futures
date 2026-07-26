@@ -1,0 +1,7 @@
+# End-of-day trading approval gate. Research outputs never enable this file.
+schema_version: 1
+enabled: false
+approval_status: disabled
+approved_study_id: ""
+protocol_sha256: ""
+deployment_package: ""
