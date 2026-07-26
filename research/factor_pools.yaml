@@ -8,11 +8,11 @@ discovery_pool:
   deployment_eligible: false
 
 historical_screened_pool:
-  - candidate_set_id: low_churn_adapters_12_2018_20260726
+  - candidate_set_id: low_churn_adapters_commit_2c5a8ea_2018_20260726
     status: historical_candidate
     stage: historical_full_sample
-    protocol_sha256: cca5746530e1b3e7e8b7be4348f63c355c2137255c4fd3561f116d301521c215
-    evidence_path: runs/factor_research/low_churn_adapters_12_2018_20260726
+    protocol_sha256: b7a6d67b74f939a6583ac7961984d017f363eef128040efee6885ab3a6bfd2a9
+    evidence_path: runs/factor_research/low_churn_adapters_commit_2c5a8ea_2018_20260726
     evaluation_start: '2018-01-01'
     evaluation_end: '2026-07-24'
     independent_oos: false
