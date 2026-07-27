@@ -91,6 +91,15 @@ def test_sqlite_catalog_and_immutable_snapshot_can_coexist(tmp_path):
         )
 
 
+def test_repository_can_freeze_candidate_selection_by_run(tmp_path):
+    repository, candidate = _repository_with_candidate(tmp_path)
+
+    assert repository.list_candidates(run_ids=("repo_test",)) == (
+        CandidateSpec.from_dict(candidate.to_dict()),
+    )
+    assert repository.list_candidates(run_ids=("missing_run",)) == ()
+
+
 def test_candidate_status_requires_evidence_and_cannot_move_backwards(tmp_path):
     repository, candidate = _repository_with_candidate(tmp_path)
     with pytest.raises(ValueError, match="requires audit evidence"):

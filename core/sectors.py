@@ -1,7 +1,9 @@
 """Canonical futures sector taxonomy shared by research and execution."""
 from __future__ import annotations
 
-from typing import Iterable
+import hashlib
+import json
+from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -34,6 +36,8 @@ SECTOR_MAP = {
     "EC": "other",
 }
 
+TAXONOMY_VERSION = "futures_taxonomy_20260728"
+
 SECTOR_NAMES = tuple(sorted(set(SECTOR_MAP.values())))
 
 ASSET_CLASS_BY_SECTOR = {
@@ -48,6 +52,38 @@ ASSET_CLASS_BY_SECTOR = {
 }
 
 ASSET_CLASS_NAMES = ("stock", "bond", "commodity")
+
+
+def taxonomy_sha256(sector_map: Mapping[str, str] = SECTOR_MAP) -> str:
+    payload = {
+        "version": TAXONOMY_VERSION,
+        "sector_map": dict(sorted((str(k), str(v)) for k, v in sector_map.items())),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def taxonomy_diff(
+    previous: Mapping[str, str],
+    current: Mapping[str, str] = SECTOR_MAP,
+) -> dict:
+    """Return an auditable change set; any change requires a P0 replay."""
+    instruments = sorted(set(map(str, previous)) | set(map(str, current)))
+    changes = [
+        {
+            "instrument": instrument,
+            "previous": previous.get(instrument),
+            "current": current.get(instrument),
+        }
+        for instrument in instruments
+        if previous.get(instrument) != current.get(instrument)
+    ]
+    return {
+        "taxonomy_version": TAXONOMY_VERSION,
+        "taxonomy_sha256": taxonomy_sha256(current),
+        "changes": changes,
+        "requires_full_p0_replay": bool(changes),
+    }
 
 
 def sector_for(instrument: str) -> str:

@@ -193,7 +193,7 @@ testing:
     methods: [pearson, spearman]
     decay_periods: [1, 3, 5, 10, 20, 40]
     forward_period: 5
-  layered: {n_groups: 5, rebalance: monthly}
+  layered: {n_groups: 3, rebalance: monthly}
   regression: {method: fama_macbeth, weighted: false}
 
 # Ridge is a post-screening estimator. Raw OLS/HAC and multiplicity control
@@ -249,6 +249,10 @@ costs:
   slippage: 0.0
   margin_rate: 0.12
   annual_fee: 0.00105
+  # Filled only from a versioned realized dominant-contract roll ledger.
+  annual_roll_cost: null
+  roll_cost_by_instrument: {}
+  roll_cost_source: ''
 
 signals:
   mode: trend_following
@@ -370,6 +374,46 @@ factor_governance:
     positioning_participation: 12
     intraday: 12
   explicit_family_map: {}
+
+# Formal discovery policy. Horizons and preprocessing variants are hypotheses
+# within an economic factor; Bonferroni/FWER is retained as a report label.
+validation_policy:
+  version: factor_validation_v2
+  discovery_method: hierarchical_fdr
+  discovery_q: 0.10
+  fwer_report_alpha: 0.05
+  min_abs_ic: 0.01
+  min_abs_t: 2.0
+  deployment_hit_rate: 0.52
+  deployment_oos_hit_rate: 0.50
+  oos_fold_sign_ratio: 0.60
+  annual_direction_ratio: 0.60
+  annual_effect_ratio: 0.65
+  minimum_calendar_years: 5
+  minimum_year_observations: 20
+  n_return_groups: 3
+  max_monthly_turnover: 0.50
+  cost_safety_margin: 1.50
+  single_instrument_min_trading_days: 750
+  single_instrument_bootstrap_samples: 399
+  observation_weight_cap: 0.50
+  require_predeclared_direction_for_promotion: true
+  expected_directions: {}
+  dual_track_families: [carry, trend, macro_trend]
+  family_horizons: {}
+  scorecard:
+    enabled: true
+    enforced: false
+    calibrated: false
+    calibration_source: ''
+    calibration_sha256: ''
+    weights:
+      annual_direction: 0.25
+      annual_effect: 0.25
+      hit_rate: 0.25
+      ir_stability: 0.25
+    ir_std_max: 0.30
+    threshold: 0.75
 horizon_ensemble:
   enabled: false
   neighbor_count: 1

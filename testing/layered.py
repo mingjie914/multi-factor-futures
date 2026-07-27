@@ -34,12 +34,16 @@ class LayeredResult(TestResult):
         }
 
     def summary(self) -> str:
-        # CR-026: Q1 = 最低因子值组 (Bottom), Q5 = 最高因子值组 (Top)
-        top = self.group_metrics.get("Q5", {}).get("annual_return", 0)
+        group_labels = sorted(
+            (name for name in self.group_metrics if name.startswith("Q")),
+            key=lambda name: int(name[1:]),
+        )
+        top_label = group_labels[-1] if group_labels else "Q1"
+        top = self.group_metrics.get(top_label, {}).get("annual_return", 0)
         bot = self.group_metrics.get("Q1", {}).get("annual_return", 0)
         ls = self.group_metrics.get("long_short", {}).get("annual_return", 0)
         return (
-            f"Top(Q5)={top:.2%} Bottom(Q1)={bot:.2%} "
+            f"Top({top_label})={top:.2%} Bottom(Q1)={bot:.2%} "
             f"L/S={ls:.2%} mono={self.monotonicity:.3f}"
         )
 
@@ -113,7 +117,11 @@ class LayeredBacktest(FactorTest):
         gs["long_short"] = ls
 
         # CR-026: 年化按非重叠调仓频率 (252/holding_period)
-        ann_factor = 252.0 / holding_period if holding_period > 0 else 252.0
+        periods_per_year = float(params.get("periods_per_year", 252.0))
+        ann_factor = (
+            periods_per_year / holding_period
+            if holding_period > 0 else periods_per_year
+        )
 
         # Per-group metrics
         def _metrics(s: pd.Series) -> dict:

@@ -25,6 +25,7 @@ _CATEGORY_TO_FAMILY = {
     "intraday_specs": "intraday",
     "cross_frequency": "intraday",
     "cross_commodity": "cross_commodity",
+    "macro_sensitivity": "macro_trend",
     "technicals": "technical_pattern",
     "pattern": "technical_pattern",
 }
@@ -49,6 +50,7 @@ def factor_family(factor_name: str, explicit_map: Mapping[str, str] | None = Non
     fallback_prefixes = (
         (("carry", "basis", "roll_yield", "term_structure"), "carry"),
         (("mom", "trend", "breakout", "sma_slope", "ema_gap"), "trend"),
+        (("macro_beta",), "macro_trend"),
         (("vol", "atr", "drawdown", "skew"), "risk_distribution"),
         (("volume", "oi_", "dollar_volume", "amihud"), "liquidity_flow"),
         (("intraday", "overnight", "tail_", "vwap"), "intraday"),

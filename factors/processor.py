@@ -45,6 +45,35 @@ class FactorProcessor:
     ) -> Dict[str, FactorMatrix]:
         return {name: self.process(f, context) for name, f in factors.items()}
 
+    def process_excluding(
+        self,
+        factor: FactorMatrix,
+        context: ProcessingContext,
+        excluded_steps: set[str],
+    ) -> FactorMatrix:
+        """Run the declared pipeline while omitting predeclared step types."""
+        result = factor.copy()
+        eligibility = None
+        if context.eligibility is not None:
+            eligibility = context.eligibility.reindex(
+                index=result.index, columns=result.columns, fill_value=False
+            )
+            result = result.where(eligibility)
+        for step in self._steps:
+            if str(getattr(step, "name", "")) in excluded_steps:
+                continue
+            try:
+                result = step.transform(result, context)
+            except Exception as exc:
+                if bool(getattr(step, "fail_closed", False)):
+                    raise
+                logging.getLogger(__name__).warning(
+                    "Processing step '%s' failed: %s", step.name, exc
+                )
+        if eligibility is not None:
+            result = result.where(eligibility)
+        return result
+
 
 def build_processing_steps(configs: List[dict]) -> List[ProcessingStep]:
     """从配置构建处理步骤."""

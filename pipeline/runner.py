@@ -112,6 +112,26 @@ class PipelineRunner:
                 decision_date=self.config.date_range.start,
                 expected_config_hash=expected_hash,
             )
+            from core.sectors import taxonomy_sha256
+            from research.validation import validation_policy_sha256
+
+            metadata = dict(bundle.manifest.get("metadata", {}) or {})
+            expected_governance = {
+                "validation_policy_sha256": validation_policy_sha256(
+                    self.config.validation_policy
+                ),
+                "taxonomy_sha256": taxonomy_sha256(),
+            }
+            mismatches = {
+                key: {"expected": value, "actual": metadata.get(key)}
+                for key, value in expected_governance.items()
+                if metadata.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "research artifact governance hash mismatch; full P0 replay "
+                    f"required: {mismatches}"
+                )
         except Exception:
             if required:
                 raise
@@ -1103,6 +1123,24 @@ class PipelineRunner:
 
         return sector_map
 
+    def _build_factor_weight_caps(self, sp_cfg) -> dict:
+        """Load observation-channel alpha-contribution caps from the bundle."""
+        if self._adaptivity_artifact_df is None:
+            return {}
+        frame = self._adaptivity_artifact_df
+        if frame.empty or not {"factor", "weight_cap"}.issubset(frame.columns):
+            return {}
+        allowed = set(sp_cfg.factors)
+        caps = {}
+        for _, row in frame.iterrows():
+            name = str(row.get("factor", ""))
+            if name not in allowed:
+                continue
+            cap = float(pd.to_numeric(row.get("weight_cap", 1.0), errors="coerce"))
+            if np.isfinite(cap) and 0.0 < cap <= 1.0:
+                caps[name] = cap
+        return caps
+
     def _sector_row_horizons(self, row) -> list[int]:
         from core.period import approved_horizon_ensemble
 
@@ -1171,6 +1209,7 @@ class PipelineRunner:
             (alpha_model, sector_factor_map) 元组
         """
         sector_factor_map = self._build_sector_factor_map(sp_cfg)
+        factor_weight_caps = self._build_factor_weight_caps(sp_cfg)
 
         if (
             sector_factor_map
@@ -1179,6 +1218,7 @@ class PipelineRunner:
             from alpha import ols  # noqa: F401
             sub_params = dict(alpha_params)
             sub_params["sector_factor_map"] = sector_factor_map
+            sub_params["factor_weight_caps"] = factor_weight_caps
             sub_alpha = create("return_model", alpha_cfg.type, **sub_params)
             total_factors = sum(len(v) for v in sector_factor_map.values())
             logger.info(

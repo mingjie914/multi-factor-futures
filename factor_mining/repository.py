@@ -169,17 +169,25 @@ class CandidateRepository:
         self,
         *,
         statuses: Sequence[str] | None = None,
+        run_ids: Sequence[str] | None = None,
         limit: int | None = None,
     ) -> tuple[CandidateSpec, ...]:
         query = "SELECT candidate_json FROM candidates"
         params: list[object] = []
+        clauses: list[str] = []
         if statuses:
             unknown = sorted(set(statuses) - ALLOWED_STATUSES)
             if unknown:
                 raise ValueError(f"unsupported statuses: {unknown}")
             placeholders = ",".join("?" for _ in statuses)
-            query += f" WHERE status IN ({placeholders})"
+            clauses.append(f"status IN ({placeholders})")
             params.extend(statuses)
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            clauses.append(f"run_id IN ({placeholders})")
+            params.extend(str(value) for value in run_ids)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY updated_at DESC, candidate_id"
         if limit is not None:
             if limit < 1:

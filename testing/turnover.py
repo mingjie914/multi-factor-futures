@@ -32,18 +32,30 @@ class TurnoverResult(TestResult):
         monthly_turnover: float,
         annual_turnover: float,
         turnover_series: pd.Series,
+        daily_turnover_series: pd.Series = None,
+        mean_absolute_weights: dict[str, float] = None,
+        threshold: float = 0.50,
     ):
         self.daily_turnover = daily_turnover
         self.monthly_turnover = monthly_turnover
         self.annual_turnover = annual_turnover
         self.turnover_series = turnover_series
+        self.daily_turnover_series = (
+            daily_turnover_series
+            if daily_turnover_series is not None
+            else turnover_series
+        )
+        self.mean_absolute_weights = dict(mean_absolute_weights or {})
+        self.threshold = float(threshold)
 
     def to_dict(self) -> dict:
         return {
             "daily_turnover": float(self.daily_turnover),
             "monthly_turnover": float(self.monthly_turnover),
             "annual_turnover": float(self.annual_turnover),
-            "passes_threshold": self.monthly_turnover < 0.50,
+            "passes_threshold": self.monthly_turnover < self.threshold,
+            "turnover_definition": "half_turnover_0.5_sum_abs_delta_weight",
+            "mean_absolute_weights": dict(self.mean_absolute_weights),
         }
 
     def summary(self) -> str:
@@ -65,8 +77,13 @@ class TurnoverTest(FactorTest):
 
     name = "turnover"
 
-    def __init__(self, annualization: int = 252):
-        self.annualization = annualization
+    def __init__(
+        self,
+        annualization: int = 252,
+        monthly_threshold: float = 0.50,
+    ):
+        self.annualization = int(annualization)
+        self.monthly_threshold = float(monthly_threshold)
 
     def run(
         self,
@@ -80,19 +97,46 @@ class TurnoverTest(FactorTest):
         centered = ranks.sub(ranks.mean(axis=1), axis=0)
         gross = centered.abs().sum(axis=1).replace(0.0, np.nan)
         target_weights = centered.div(gross, axis=0).fillna(0.0)
-        daily_series = (0.5 * target_weights.diff().abs().sum(axis=1)).iloc[1:]
-        daily_series = daily_series.replace([np.inf, -np.inf], np.nan).dropna()
+        rebalance_every = max(int(params.get("rebalance_every", 1)), 1)
+        decision_weights = target_weights.iloc[::rebalance_every]
+        turnover_series = (
+            0.5 * decision_weights.diff().abs().sum(axis=1)
+        ).iloc[1:]
+        turnover_series = turnover_series.replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
 
-        if len(daily_series) == 0:
-            return TurnoverResult(0.0, 0.0, 0.0, pd.Series(dtype=float))
+        if len(turnover_series) == 0:
+            return TurnoverResult(
+                0.0,
+                0.0,
+                0.0,
+                pd.Series(dtype=float),
+                threshold=self.monthly_threshold,
+            )
+
+        if isinstance(target_weights.index, pd.DatetimeIndex):
+            all_days = pd.DatetimeIndex(target_weights.index.normalize().unique())
+            daily_series = turnover_series.groupby(
+                turnover_series.index.normalize()
+            ).sum().reindex(all_days, fill_value=0.0)
+        else:
+            daily_series = turnover_series
 
         daily_turnover = float(daily_series.mean())
-        monthly_turnover = daily_turnover * 21  # 21交易日/月
+        monthly_turnover = daily_turnover * 21
         annual_turnover = daily_turnover * self.annualization
 
         return TurnoverResult(
             daily_turnover=daily_turnover,
             monthly_turnover=monthly_turnover,
             annual_turnover=annual_turnover,
-            turnover_series=daily_series,
+            turnover_series=turnover_series,
+            daily_turnover_series=daily_series,
+            mean_absolute_weights={
+                str(name): float(value)
+                for name, value in decision_weights.abs().mean(axis=0).items()
+                if np.isfinite(value) and value > 0.0
+            },
+            threshold=self.monthly_threshold,
         )

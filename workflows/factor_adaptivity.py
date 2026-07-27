@@ -66,7 +66,11 @@ from factors.specs.directional import *  # noqa: F401,F403
 from factors.specs.volume_stat import *  # noqa: F401,F403
 from core.config import load_config
 from core.period import PeriodContext
-from core.sectors import SECTOR_MAP
+from core.sectors import (
+    SECTOR_MAP,
+    TAXONOMY_VERSION,
+    taxonomy_sha256,
+)
 from data.manager import DataManager, FrequencyDataProvider
 from data.cache import Cache
 from factors.engine import FactorEngine
@@ -81,7 +85,7 @@ DEFAULT_PERIODS = [1, 3, 5, 10, 20, 40]
 OOS_SPLIT_RATIO = 0.6
 
 # 板块IC有效性门槛
-SECTOR_IC_THRESHOLD = 0.015      # 板块IC绝对值下限
+SECTOR_IC_THRESHOLD = 0.01       # 全市场统一经济量级底线
 SECTOR_T_THRESHOLD = 1.96        # 板块t值下限 (95%置信)
 SECTOR_HIT_RATE_THRESHOLD = 0.52 # IC命中率下限
 OOS_CONSISTENCY_THRESHOLD = 0.5  # 样本外IC方向一致比例下限
@@ -286,6 +290,8 @@ def _compute_ic_by_sector(
     sector_map: dict,
     min_stocks: int = 3,
     forward_period: int = 1,
+    single_min_trading_days: int = 750,
+    single_bootstrap_samples: int = 399,
 ) -> dict:
     """计算因子在各板块上的 IC.
 
@@ -301,7 +307,7 @@ def _compute_ic_by_sector(
     """
     common_dates = factor_mat.index.intersection(fwd_returns.index)
     common_cols = factor_mat.columns.intersection(fwd_returns.columns)
-    if len(common_cols) < 2 or len(common_dates) < 10:
+    if len(common_cols) < 1 or len(common_dates) < 10:
         return {}
 
     if factor_mat.index.equals(common_dates) and factor_mat.columns.equals(common_cols):
@@ -323,7 +329,17 @@ def _compute_ic_by_sector(
 
     results = {}
     for sector, positions in sector_positions.items():
-        if len(positions) < 2:
+        if len(positions) == 1:
+            single = _compute_single_instrument_ts_arrays(
+                np.ascontiguousarray(factor_values[:, positions[0]]),
+                np.ascontiguousarray(return_values[:, positions[0]]),
+                common_dates,
+                forward_period=forward_period,
+                min_trading_days=single_min_trading_days,
+                bootstrap_samples=single_bootstrap_samples,
+            )
+            if single:
+                results[sector] = single
             continue
         # DataFrame column selection historically yielded C-contiguous arrays.
         # Preserve that reduction order so near-constant rows retain identical
@@ -388,6 +404,120 @@ def _compute_ic_by_sector(
             "hit_rate": hit_rate,
         }
     return results
+
+
+def _compute_single_instrument_ts_arrays(
+    factor: np.ndarray,
+    returns: np.ndarray,
+    index: pd.Index,
+    *,
+    forward_period: int,
+    min_trading_days: int = 750,
+    bootstrap_samples: int = 399,
+) -> dict:
+    """Single-instrument predictive regression with HAC and wild score test.
+
+    The observation requirement is measured in unique trading dates, never in
+    intraday bars.  Insufficient histories are retained as observation-channel
+    hypotheses with p=1 so they remain visible in the same FDR family.
+    """
+    valid = np.isfinite(factor) & np.isfinite(returns)
+    x = np.asarray(factor[valid], dtype=float)
+    y = np.asarray(returns[valid], dtype=float)
+    valid_index = pd.DatetimeIndex(index[valid])
+    if len(x) < 20:
+        return {}
+
+    trading_dates = valid_index.normalize()
+    n_trading_days = int(trading_dates.nunique())
+    sufficient_history = n_trading_days >= int(min_trading_days)
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    x_centered = x - x_mean
+    y_centered = y - y_mean
+    denominator = float(np.dot(x_centered, x_centered))
+    if denominator <= np.finfo(float).eps:
+        return {}
+    beta = float(np.dot(x_centered, y_centered) / denominator)
+    residual = y_centered - beta * x_centered
+    score = x_centered * residual
+
+    max_lag = min(max(int(forward_period) - 1, 0), len(score) - 1)
+    long_run = float(np.dot(score, score))
+    for lag in range(1, max_lag + 1):
+        weight = 1.0 - lag / (max_lag + 1.0)
+        long_run += 2.0 * weight * float(np.dot(score[lag:], score[:-lag]))
+    variance = max(long_run, 0.0) / denominator**2
+    standard_error = float(np.sqrt(variance))
+    hac_t = beta / standard_error if standard_error > 0.0 else 0.0
+    hac_p = float(
+        2.0 * scipy_stats.t.sf(abs(hac_t), df=max(n_trading_days - 1, 1))
+    )
+
+    day_codes, _ = pd.factorize(trading_dates, sort=True)
+    # Wild cluster score test under H0: beta=0.  Using unrestricted OLS
+    # residual scores here would make their total mechanically zero.
+    null_score = x_centered * y_centered
+    day_scores = np.bincount(day_codes, weights=null_score)
+    cluster_scale = float(np.sqrt(np.dot(day_scores, day_scores)))
+    if sufficient_history and cluster_scale > 0.0 and bootstrap_samples > 0:
+        observed_score_t = float(day_scores.sum() / cluster_scale)
+        rng = np.random.default_rng(20260728)
+        extreme = 0
+        remaining = int(bootstrap_samples)
+        # Bound temporary memory for long histories and large bootstrap counts.
+        while remaining:
+            batch = min(remaining, 256)
+            signs = rng.integers(0, 2, size=(batch, len(day_scores)), dtype=np.int8)
+            signs = signs.astype(float) * 2.0 - 1.0
+            boot_t = signs @ day_scores / cluster_scale
+            extreme += int(
+                np.count_nonzero(np.abs(boot_t) >= abs(observed_score_t))
+            )
+            remaining -= batch
+        wild_p = float((extreme + 1) / (bootstrap_samples + 1))
+    else:
+        wild_p = 1.0
+    conservative_p = max(hac_p, wild_p)
+
+    x_std = float(x_centered.std(ddof=0))
+    y_std = float(y_centered.std(ddof=0))
+    predictive_corr = (
+        float(np.dot(x_centered, y_centered) / (len(x) * x_std * y_std))
+        if x_std > 0.0 and y_std > 0.0 else 0.0
+    )
+    oriented_product = pd.Series(
+        x_centered * y_centered / max(x_std * y_std, np.finfo(float).eps),
+        index=valid_index,
+        dtype=float,
+    )
+    return {
+        "ic_series": oriented_product,
+        "ic_mean": predictive_corr,
+        "ic_std": float(oriented_product.std(ddof=0)),
+        "ir": (
+            float(oriented_product.mean() / oriented_product.std(ddof=0))
+            if float(oriented_product.std(ddof=0)) > 0.0 else 0.0
+        ),
+        "t_stat": float(hac_t),
+        "ic_t_stat": float(hac_t),
+        "ols_beta": beta,
+        "ols_hac_t": float(hac_t),
+        "ols_p_value": float(conservative_p if sufficient_history else 1.0),
+        "hac_p_value": hac_p,
+        "wild_bootstrap_p_value": wild_p,
+        "ols_n": int(len(x)),
+        "n_obs": int(len(x)),
+        "n_trading_days": n_trading_days,
+        "minimum_trading_days": int(min_trading_days),
+        "sufficient_history": sufficient_history,
+        "observation_channel": not sufficient_history,
+        "inference_model": "single_instrument_ts_ols_hac_wild_score_bootstrap",
+        "test_type": "single_instrument_time_series",
+        "effect_metric": "predictive_correlation",
+        "p_value": float(conservative_p if sufficient_history else 1.0),
+        "hit_rate": float((oriented_product > 0.0).mean()),
+    }
 
 
 def _compute_pooled_ts_fixed_effects(
@@ -571,7 +701,10 @@ def _compute_oos_consistency(ic_series: pd.Series, oos_ratio: float = OOS_SPLIT_
     train_direction = 1 if train.mean() >= 0 else -1
     oos_ic = float(test.mean())
     oos_hit_rate = float((test * train_direction > 0).mean())
-    is_consistent = oos_hit_rate >= OOS_CONSISTENCY_THRESHOLD
+    is_consistent = bool(
+        oos_ic * train_direction > 0.0
+        and oos_hit_rate >= OOS_CONSISTENCY_THRESHOLD
+    )
     return {
         "oos_ic": oos_ic,
         "oos_hit_rate": oos_hit_rate,
@@ -688,6 +821,8 @@ def _analyze_factor_across_periods(
     fwd_returns_by_period: dict,
     periods: list,
     sector_map: dict,
+    single_min_trading_days: int = 750,
+    single_bootstrap_samples: int = 399,
 ) -> dict:
     """Evaluate one factor across horizons using read-only shared inputs."""
     result = {
@@ -709,6 +844,8 @@ def _analyze_factor_across_periods(
             sector_map,
             min_stocks=3,
             forward_period=period,
+            single_min_trading_days=single_min_trading_days,
+            single_bootstrap_samples=single_bootstrap_samples,
         )
         for sector, values in sector_ics.items():
             oos = _compute_oos_consistency(values["ic_series"])
@@ -726,6 +863,13 @@ def _analyze_factor_across_periods(
                     "test_type", "cross_section_fama_macbeth"
                 ),
                 "inference_model": values.get("inference_model", ""),
+                "observation_channel": bool(
+                    values.get("observation_channel", False)
+                ),
+                "sufficient_history": bool(
+                    values.get("sufficient_history", True)
+                ),
+                "n_trading_days": int(values.get("n_trading_days", 0)),
                 "passes_thresholds": (
                     _is_sector_valid(values) and oos["is_consistent"]
                 ),
@@ -758,9 +902,9 @@ def _apply_multiple_testing(
     alpha: float = 0.05,
 ) -> int:
     """Apply the predeclared multiple-testing gate to raw OLS/HAC p-values."""
-    from research.statistics import benjamini_hochberg, simes_p_value
+    from research.statistics import benjamini_hochberg
 
-    if method not in {"bonferroni", "global", "hierarchical"}:
+    if method not in {"bonferroni", "global", "hierarchical", "deployment"}:
         raise ValueError(f"unsupported FDR method: {method}")
 
     factor_entries = {}
@@ -774,7 +918,20 @@ def _apply_multiple_testing(
         factor_entries[name] = entries
         hypothesis_entries.extend(entries)
 
-    if method == "bonferroni":
+    if method == "deployment":
+        for entry in hypothesis_entries:
+            entry["q_value"] = 1.0
+            entry["fdr_significant"] = True
+            entry["multiplicity_role"] = "frozen_deployment_parameter_selection"
+            entry["is_valid"] = bool(entry["passes_thresholds"])
+        for name, result in all_results.items():
+            result["factor_p_value"] = min(
+                (float(entry.get("p_value", 1.0)) for entry in factor_entries[name]),
+                default=1.0,
+            )
+            result["factor_q_value"] = 1.0
+            result["factor_fdr_significant"] = bool(factor_entries[name])
+    elif method == "bonferroni":
         adjusted_alpha = alpha / max(len(hypothesis_entries), 1)
         for entry in hypothesis_entries:
             raw_p = float(entry.get("p_value", 1.0))
@@ -820,40 +977,35 @@ def _apply_multiple_testing(
                 entry["passes_thresholds"] and is_significant
             )
     else:
-        factor_names = list(all_results)
-        factor_p_values = []
-        local_decisions = {}
-        for name in factor_names:
-            entries = factor_entries[name]
-            p_values = [entry.get("p_value", 1.0) for entry in entries]
-            local_q, local_rejected = benjamini_hochberg(p_values, alpha=alpha)
-            local_decisions[name] = (local_q, local_rejected)
-            factor_p_values.append(simes_p_value(p_values))
+        from research.validation import apply_hierarchical_fdr
 
-        factor_q_values, factor_rejected = benjamini_hochberg(
-            factor_p_values, alpha=alpha
+        audit = apply_hierarchical_fdr(
+            factor_entries,
+            q=alpha,
+            fwer_alpha=0.05,
+            p_key="p_value",
         )
-        for index, name in enumerate(factor_names):
+        for name in all_results:
             result = all_results[name]
-            factor_q = float(factor_q_values[index])
-            factor_significant = bool(factor_rejected[index])
-            result["factor_p_value"] = float(factor_p_values[index])
-            result["factor_q_value"] = factor_q
-            result["factor_fdr_significant"] = factor_significant
-            local_q, local_rejected = local_decisions[name]
-            for entry, local_value, local_significant in zip(
-                factor_entries[name], local_q, local_rejected
-            ):
-                entry["local_q_value"] = float(local_value)
-                entry["factor_q_value"] = factor_q
-                entry["q_value"] = max(factor_q, float(local_value))
+            entries = factor_entries[name]
+            first = entries[0] if entries else {}
+            result["factor_p_value"] = float(first.get("factor_simes_p_value", 1.0))
+            result["factor_q_value"] = float(first.get("factor_q_value", 1.0))
+            result["factor_fdr_significant"] = bool(
+                first.get("factor_fdr_significant", False)
+            )
+            result["hierarchical_fdr_audit"] = audit
+            for entry in entries:
+                entry["q_value"] = max(
+                    float(entry.get("factor_q_value", 1.0)),
+                    float(entry.get("local_q_value", 1.0)),
+                )
                 entry["fdr_significant"] = bool(
-                    factor_significant and local_significant
+                    entry.get("hierarchical_fdr_significant", False)
                 )
                 entry["is_valid"] = bool(
                     entry["passes_thresholds"]
-                    and factor_significant
-                    and local_significant
+                    and entry["fdr_significant"]
                 )
 
     for result in all_results.values():
@@ -902,6 +1054,10 @@ def _select_approved_optima(result: dict) -> list[dict]:
             "n_obs": int(entry.get("n_obs", 0)),
             "valid_period_count": len(candidates),
             "valid_periods": "|".join(str(item[0]) for item in sorted(candidates)),
+            "observation_channel": bool(
+                entry.get("observation_channel", False)
+            ),
+            "n_trading_days": int(entry.get("n_trading_days", 0)),
         })
 
     result["sector_optima"] = sector_optima
@@ -920,13 +1076,63 @@ def _select_approved_optima(result: dict) -> list[dict]:
             "best_ir": best["best_ir"],
             "best_t": best["best_t"],
             "best_q": best["best_q"],
+            "observation_channel": bool(best["observation_channel"]),
         })
     else:
         result.update({
             "best_sector": "", "best_period": 0, "best_ic": 0.0,
             "best_ir": 0.0, "best_t": 0.0, "best_q": 1.0,
+            "observation_channel": False,
         })
     return sector_optima
+
+
+def load_discovery_contract(
+    path: str,
+    *,
+    expected_policy_sha256: str,
+    expected_taxonomy_sha256: str,
+) -> tuple[list[str], dict, dict]:
+    """Load the frozen discovery set used by deployment-only adaptivity."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    config = dict(payload.get("config", {}) or {})
+    if config.get("validation_policy_sha256") != expected_policy_sha256:
+        raise ValueError("discovery validation-policy hash mismatch; rerun P0")
+    if config.get("taxonomy_sha256") != expected_taxonomy_sha256:
+        raise ValueError("discovery taxonomy hash mismatch; rerun P0")
+    names = [str(name) for name in payload.get("final_factors", [])]
+    if not names or len(names) != len(set(names)):
+        raise ValueError("discovery contract has no unique final_factors")
+    name_set = set(names)
+    rows = {
+        str(row.get("name", "")): row
+        for row in payload.get("significant_factors", [])
+        if str(row.get("name", "")) in name_set
+    }
+    missing = sorted(name_set - set(rows))
+    if missing:
+        raise ValueError(f"discovery contract missing final-factor metadata: {missing}")
+    variants = {
+        name: str(rows[name].get("best_variant", "neutralized"))
+        for name in names
+    }
+    metadata = {
+        name: {
+            "observation_channel": bool(
+                rows[name].get("observation_channel", False)
+            ),
+            "observation_reasons": list(
+                rows[name].get("observation_reasons", [])
+            ),
+            "promotion_status": str(
+                rows[name].get("promotion_status", "observation")
+            ),
+            "weight_cap": float(rows[name].get("weight_cap", 1.0)),
+        }
+        for name in names
+    }
+    return names, variants, metadata
 
 
 def run_adaptivity_analysis(
@@ -943,8 +1149,11 @@ def run_adaptivity_analysis(
     workers: int = None,
     factor_workers: int = None,
     config=None,
-    fdr_method: str = "bonferroni",
-    fdr_alpha: float = 0.05,
+    runner=None,
+    preprocessing_variants: dict = None,
+    candidate_metadata: dict = None,
+    fdr_method: str = None,
+    fdr_alpha: float = None,
     frequency: str = "daily",
 ):
     """运行因子适配性分析.
@@ -994,12 +1203,21 @@ def run_adaptivity_analysis(
 
     from pipeline.runner import PipelineRunner
 
-    runner = (
+    runner = runner or (
         PipelineRunner(config=config)
         if config is not None
         else PipelineRunner(config_path)
     )
     config = runner.config
+    policy = config.validation_policy
+    from research.validation import validate_policy, validation_policy_sha256
+
+    validate_policy(policy)
+    fdr_method = fdr_method or "hierarchical"
+    fdr_alpha = (
+        float(policy.discovery_q) if fdr_alpha is None else float(fdr_alpha)
+    )
+    policy_hash = validation_policy_sha256(policy)
     base_data_mgr = runner.data_manager
     universe = pd.Index(config.universe) if config.universe else pd.Index([])
 
@@ -1098,7 +1316,7 @@ def run_adaptivity_analysis(
             _formula_inputs(data_mgr, calendar, valid_universe)
             ta_cn_inputs_ready = True
         engine = FactorEngine(data_mgr)
-        factor_batch = engine.compute_factors(
+        computed_batch = engine.compute_factors(
             batch_names,
             calendar,
             valid_universe,
@@ -1107,8 +1325,16 @@ def run_adaptivity_analysis(
             chunk_size=chunk_size,
         )
         factor_batch = runner.processor.process_batch(
-            factor_batch, processing_context
+            computed_batch, processing_context
         )
+        for name in batch_names:
+            if (
+                name in computed_batch
+                and (preprocessing_variants or {}).get(name) == "raw"
+            ):
+                factor_batch[name] = runner.processor.process_excluding(
+                    computed_batch[name], processing_context, {"neutralize"}
+                )
         available = [name for name in batch_names if name in factor_batch]
 
         def _evaluate(name):
@@ -1118,6 +1344,14 @@ def run_adaptivity_analysis(
                 analysis_returns,
                 periods,
                 SECTOR_MAP,
+                single_min_trading_days=policy.single_instrument_min_trading_days,
+                single_bootstrap_samples=policy.single_instrument_bootstrap_samples,
+            )
+            factor_result["preprocessing_variant"] = (
+                (preprocessing_variants or {}).get(name, "neutralized")
+            )
+            factor_result["candidate_metadata"] = dict(
+                (candidate_metadata or {}).get(name, {})
             )
             frame_hash = (
                 dataframe_sha256(analysis_factor)
@@ -1142,6 +1376,7 @@ def run_adaptivity_analysis(
                 pool.shutdown(wait=True)
 
         engine.clear_cache()
+        del computed_batch
         del factor_batch
         if is_ta_cn_batch:
             gc.collect()
@@ -1197,11 +1432,23 @@ def run_adaptivity_analysis(
             "factor_chunk_size": chunk_size,
             "fdr_method": fdr_method,
             "fdr_alpha": fdr_alpha,
+            "validation_policy_sha256": policy_hash,
+            "taxonomy_version": TAXONOMY_VERSION,
+            "taxonomy_sha256": taxonomy_sha256(),
+            "multiplicity_role": (
+                "deployment_parameter_selection"
+                if fdr_method == "deployment" else "factor_discovery"
+            ),
             "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
             "factor_preprocessing": [
                 "mad_winsorize_by_date",
+                "candidate_selected_sector_neutralization",
                 "zscore_standardize_by_date",
             ],
+            "preprocessing_variant_source": (
+                "frozen_discovery_contract"
+                if preprocessing_variants else "neutralized_default"
+            ),
             "selection_order": [
                 "predeclared_exposure_preprocessing",
                 "raw_ols_hac_p_values",
@@ -1237,6 +1484,7 @@ def run_adaptivity_analysis(
     sector_columns = [
         "factor", "sector", "best_period", "best_ic", "best_ir", "best_t",
         "best_q", "n_obs", "valid_period_count", "valid_periods",
+        "observation_channel", "n_trading_days",
     ]
     df_sector = pd.DataFrame(sector_rows, columns=sector_columns)
     if not df_sector.empty:
@@ -1255,8 +1503,33 @@ def run_adaptivity_analysis(
         # 最佳板块的IC衰减分析
         best_sec = res["best_sector"]
         decay_info = res.get("ic_decay_analysis", {}).get(best_sec, {})
+        candidate_observation = bool(
+            res.get("candidate_metadata", {}).get("observation_channel", False)
+        )
+        local_observation = bool(res.get("observation_channel", False))
+        observation_channel = candidate_observation or local_observation
+        candidate_cap = float(
+            res.get("candidate_metadata", {}).get("weight_cap", 1.0)
+        )
+        weight_cap = min(
+            candidate_cap,
+            float(policy.observation_weight_cap) if local_observation else 1.0,
+        )
         summary_rows.append({
             "factor": fname,
+            "preprocessing_variant": res.get(
+                "preprocessing_variant", "neutralized"
+            ),
+            "observation_channel": observation_channel,
+            "weight_cap": weight_cap,
+            "promotion_status": (
+                "observation" if observation_channel
+                else str(
+                    res.get("candidate_metadata", {}).get(
+                        "promotion_status", "wf_candidate"
+                    )
+                )
+            ),
             "best_sector": res["best_sector"],
             "best_period": res["best_period"],
             "best_ic": round(res["best_ic"], 4),
@@ -1285,6 +1558,12 @@ def run_adaptivity_analysis(
         "factor_adaptivity_summary": csv_path,
         "factor_sector_selection": sector_csv_path,
     }
+    discovery_path = os.path.join(output_dir, "ic_by_window_period.json")
+    if os.path.isfile(discovery_path):
+        artifact_files["factor_discovery"] = discovery_path
+    funnel_path = os.path.join(output_dir, "validation_funnel.json")
+    if os.path.isfile(funnel_path):
+        artifact_files["validation_funnel"] = funnel_path
     significant = [
         {
             "name": name,
@@ -1300,14 +1579,22 @@ def run_adaptivity_analysis(
         if not names:
             return {}
         recompute_engine = FactorEngine(data_mgr)
-        matrices = recompute_engine.compute_factors(
+        computed = recompute_engine.compute_factors(
             names,
             calendar,
             valid_universe,
             parallel=False,
             chunk_size=max(len(names), 1),
         )
-        matrices = runner.processor.process_batch(matrices, processing_context)
+        matrices = runner.processor.process_batch(computed, processing_context)
+        for name in names:
+            if (
+                name in computed
+                and (preprocessing_variants or {}).get(name) == "raw"
+            ):
+                matrices[name] = runner.processor.process_excluding(
+                    computed[name], processing_context, {"neutralize"}
+                )
         recompute_engine.clear_cache()
         return matrices
 
@@ -1362,6 +1649,8 @@ def run_adaptivity_analysis(
                 "frequency": period_ctx.unit.value,
                 "fdr_method": fdr_method,
                 "fdr_alpha": fdr_alpha,
+                "validation_policy_sha256": policy_hash,
+                "taxonomy_sha256": taxonomy_sha256(),
                 "data_hash_mode": "streamed_dataframe_collection_v1",
             },
         )
@@ -1415,10 +1704,20 @@ def main():
         "--no-correlation", action="store_true",
         help="不生成训练期因子相关性聚类产物")
     parser.add_argument(
-        "--fdr-method", choices=["bonferroni", "global", "hierarchical"],
-        default="bonferroni",
+        "--fdr-method", choices=["bonferroni", "global", "hierarchical", "deployment"],
+        default="hierarchical",
         help=("多重检验: bonferroni=全部原始OLS/HAC p值全局校正; "
-              "global=全部局部假设统一BH; hierarchical=先因子后局部BH"))
+              "global=全部局部假设统一BH; hierarchical=层级FDR; "
+              "deployment=仅对已冻结发现集做局部门槛适配"))
+    parser.add_argument(
+        "--fdr-alpha", type=float, default=None,
+        help="覆盖验证策略中的 discovery_q；默认读取 validation_policy",
+    )
+    parser.add_argument(
+        "--discovery-file", default=None,
+        help=("deployment 模式必填：P0 输出的 ic_by_window_period.json；"
+              "自动加载冻结因子、预处理版本和观察期元数据"),
+    )
     parser.add_argument(
         "--cache-only", action="store_true",
         help="严格只使用本地缓存；缓存未命中时禁止访问数据库")
@@ -1434,11 +1733,51 @@ def main():
 
     setup_logger("multi_factor")
 
-    # 确定因子列表
-    if args.factors:
-        all_factors = [f.strip() for f in args.factors.split(",") if f.strip()]
+    preprocessing_variants = None
+    candidate_metadata = None
+    if args.fdr_method == "deployment":
+        if not args.discovery_file:
+            parser.error("--fdr-method deployment requires --discovery-file")
+        from research.validation import validation_policy_sha256
+
+        discovery_path = args.discovery_file
+        if not os.path.isabs(discovery_path):
+            discovery_path = os.path.join(_PROJECT_ROOT, discovery_path)
+        frozen_names, preprocessing_variants, candidate_metadata = (
+            load_discovery_contract(
+                os.path.normpath(discovery_path),
+                expected_policy_sha256=validation_policy_sha256(
+                    config.validation_policy
+                ),
+                expected_taxonomy_sha256=taxonomy_sha256(),
+            )
+        )
+        if args.factors:
+            requested = [
+                value.strip() for value in args.factors.split(",")
+                if value.strip()
+            ]
+            unknown = sorted(set(requested) - set(frozen_names))
+            if unknown:
+                parser.error(
+                    f"--factors contains names outside frozen discovery: {unknown}"
+                )
+            all_factors = list(dict.fromkeys(requested))
+            preprocessing_variants = {
+                name: preprocessing_variants[name] for name in all_factors
+            }
+            candidate_metadata = {
+                name: candidate_metadata[name] for name in all_factors
+            }
+        else:
+            all_factors = frozen_names
     else:
-        all_factors = sorted(list_registered("factor").get("factor", {}).keys())
+        if args.discovery_file:
+            parser.error("--discovery-file is only valid with deployment mode")
+        if args.factors:
+            all_factors = [f.strip() for f in args.factors.split(",") if f.strip()]
+        else:
+            all_factors = sorted(list_registered("factor").get("factor", {}).keys())
     print(f"已注册因子: {len(all_factors)} 个")
 
     # 解析持有期
@@ -1467,7 +1806,10 @@ def main():
         workers=args.workers,
         factor_workers=args.factor_workers,
         config=config,
+        preprocessing_variants=preprocessing_variants,
+        candidate_metadata=candidate_metadata,
         fdr_method=args.fdr_method,
+        fdr_alpha=args.fdr_alpha,
         frequency=args.frequency,
     )
 

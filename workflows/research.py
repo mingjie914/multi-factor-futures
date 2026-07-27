@@ -23,7 +23,8 @@ Usage:
     # 指定周期单位；非日频使用真实 bar 索引
     python main.py research --all --multi-period --frequency daily
 
-    # 单持有期探索性筛选可放宽阈值；正式多周期筛选固定使用全局 Bonferroni
+    # 单持有期探索性筛选可覆盖展示阈值；正式多周期筛选固定读取验证策略
+    # 中的层级 FDR 与经济量级门槛。
     python main.py research --all --multi-period --t-threshold 1.74
 
     # 自定义日期范围 (IC检验区间; 因子计算自动提前1年预热)
@@ -274,12 +275,209 @@ def _apply_global_bonferroni(
     return total_hypotheses, cutoff
 
 
-FORMAL_IC_THRESHOLD = 0.02
-FORMAL_IC_POS_THRESHOLD = 0.52
+def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
+    """Apply the shared factor-level discovery policy and select a horizon."""
+    from research.validation import apply_hierarchical_fdr
+
+    entries_by_factor = {}
+    for result in results:
+        entries = list(result.get("all_periods", {}).values())
+        for entry in entries:
+            entry["estimable"] = int(entry.get("ols_n", 0) or 0) >= 2
+        entries_by_factor[str(result["name"])] = entries
+
+    audit = apply_hierarchical_fdr(
+        entries_by_factor,
+        q=float(policy.discovery_q),
+        fwer_alpha=float(policy.fwer_report_alpha),
+        p_key="ols_p_value",
+        estimable_key="estimable",
+    )
+    for result in results:
+        result.update({
+            "best_period": 0,
+            "best_variant": "",
+            "best_t": 0.0,
+            "best_ic_t": 0.0,
+            "best_p_value": 1.0,
+            "best_q_value": 1.0,
+            "best_ic": 0.0,
+            "best_ir": 0.0,
+            "best_ic_pos_ratio": 0.0,
+        })
+        entries = entries_by_factor[str(result["name"])]
+        approved = [
+            entry for entry in entries
+            if entry.get("hierarchical_fdr_significant", False)
+        ]
+        result["factor_fdr_significant"] = bool(
+            entries and entries[0].get("factor_fdr_significant", False)
+        )
+        result["hierarchical_fdr_significant"] = bool(approved)
+        result["bonferroni_significant"] = any(
+            entry.get("fwer_significant", False) for entry in entries
+        )
+        if not approved:
+            continue
+        best = min(
+            approved,
+            key=lambda entry: (
+                float(entry.get("local_q_value", 1.0)),
+                float(entry.get("ols_p_value", 1.0)),
+                -abs(float(entry.get("ols_hac_t", 0.0))),
+                int(entry.get("period", 0)),
+                str(entry.get("preprocessing_variant", "neutralized")),
+            ),
+        )
+        result.update({
+            "best_period": int(best.get("period", 0)),
+            "best_variant": str(best.get("preprocessing_variant", "neutralized")),
+            "best_t": float(best.get("ols_hac_t", 0.0)),
+            "best_ic_t": float(best.get("ic_hac_t", 0.0)),
+            "best_p_value": float(best.get("ols_p_value", 1.0)),
+            "best_q_value": max(
+                float(best.get("factor_q_value", 1.0)),
+                float(best.get("local_q_value", 1.0)),
+            ),
+            "best_ic": float(best.get("ic", 0.0)),
+            "best_ir": float(best.get("ir_nw", 0.0)),
+            "best_ic_pos_ratio": float(best.get("ic_pos_ratio", 0.0)),
+        })
+    return audit
 
 
-def _passes_post_bonferroni_quality(result: dict) -> bool:
-    """Apply economic-size and directional gates after raw OLS/HAC testing.
+def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
+    """Report ±20% policy sensitivity without changing baseline decisions."""
+    from research.validation import apply_hierarchical_fdr
+
+    scenarios = {}
+    labels = (("minus_20pct", 0.8), ("baseline", 1.0), ("plus_20pct", 1.2))
+    for label, multiplier in labels:
+        factor_entries = {
+            str(result["name"]): [
+                {
+                    "p_value": float(entry.get("ols_p_value", 1.0)),
+                    "estimable": bool(entry.get("estimable", False)),
+                }
+                for entry in result.get("all_periods", {}).values()
+            ]
+            for result in results
+        }
+        q_value = min(float(policy.discovery_q) * multiplier, 0.999999)
+        discovery = apply_hierarchical_fdr(
+            factor_entries,
+            q=q_value,
+            fwer_alpha=float(policy.fwer_report_alpha),
+            estimable_key="estimable",
+        )
+        selected_names = {
+            name
+            for name, entries in factor_entries.items()
+            if any(
+                entry.get("hierarchical_fdr_significant", False)
+                for entry in entries
+            )
+        }
+        economically_qualified = []
+        expected_directions = dict(policy.expected_directions or {})
+        for result in results:
+            name = str(result["name"])
+            if name not in selected_names:
+                continue
+            original_entries = list(result.get("all_periods", {}).values())
+            scenario_entries = factor_entries[name]
+            approved = [
+                (original, scenario)
+                for original, scenario in zip(original_entries, scenario_entries)
+                if scenario.get("hierarchical_fdr_significant", False)
+            ]
+            if not approved:
+                continue
+            best, _ = min(
+                approved,
+                key=lambda pair: (
+                    float(pair[1].get("local_q_value", 1.0)),
+                    float(pair[0].get("ols_p_value", 1.0)),
+                    -abs(float(pair[0].get("ols_hac_t", 0.0))),
+                    int(pair[0].get("period", 0)),
+                    str(pair[0].get("preprocessing_variant", "neutralized")),
+                ),
+            )
+            ic_value = float(best.get("ic", 0.0))
+            t_value = float(best.get("ols_hac_t", 0.0))
+            expected = expected_directions.get(name)
+            observed = 1 if ic_value >= 0.0 else -1
+            direction_ok = expected not in {-1, 1} or int(expected) == observed
+            if (
+                abs(ic_value) >= float(policy.min_abs_ic) * multiplier
+                and abs(t_value) >= float(policy.min_abs_t) * multiplier
+                and direction_ok
+            ):
+                economically_qualified.append(result)
+        post_available = [
+            result
+            for result in economically_qualified
+            if "passes_turnover" in result
+        ]
+        scenarios[label] = {
+            "threshold_multiplier": multiplier,
+            "discovery_q": q_value,
+            "factors_with_local_fdr_discovery": len(selected_names),
+            "factors_passing_scaled_ic_t_direction": len(
+                economically_qualified
+            ),
+            "post_metrics_available": len(post_available),
+            "passing_scaled_turnover": sum(
+                float(result.get("monthly_turnover", float("inf")))
+                < float(policy.max_monthly_turnover) * multiplier
+                for result in post_available
+            ),
+            "passing_scaled_annual_ratios": sum(
+                float(
+                    result.get("calendar_year_robustness", {}).get(
+                        "ic_sign_consistency", 0.0
+                    )
+                ) >= min(float(policy.annual_direction_ratio) * multiplier, 1.0)
+                and float(
+                    result.get("calendar_year_robustness", {}).get(
+                        "effect_year_ratio", 0.0
+                    )
+                ) >= min(float(policy.annual_effect_ratio) * multiplier, 1.0)
+                for result in post_available
+            ),
+            "passing_scaled_complete_cost_margin": sum(
+                bool(result.get("cost_coverage", {}).get("complete", False))
+                and float(
+                    result.get("cost_coverage", {}).get(
+                        "gross_annual_alpha", float("-inf")
+                    )
+                )
+                >= float(policy.cost_safety_margin)
+                * multiplier
+                * float(
+                    result.get("cost_coverage", {}).get(
+                        "total_annual_cost", float("inf")
+                    )
+                )
+                for result in post_available
+            ),
+            "discovery_audit": discovery,
+        }
+    return {
+        "report_only": True,
+        "selection_uses_baseline_only": True,
+        "post_metric_scope": "available_for_baseline_post_test_candidates_only",
+        "scenarios": scenarios,
+    }
+
+
+FORMAL_IC_THRESHOLD = 0.01
+FORMAL_T_THRESHOLD = 2.0
+FORMAL_IC_POS_THRESHOLD = 0.52  # compatibility/reporting only
+
+
+def _passes_post_bonferroni_quality(result: dict, policy=None) -> bool:
+    """Apply economic-size gates after multiplicity-controlled discovery.
 
     HAC IC-IR remains a reported stability diagnostic. A fixed 0.50 cutoff is
     not used because this framework samples a small futures cross-section
@@ -287,14 +485,34 @@ def _passes_post_bonferroni_quality(result: dict) -> bool:
     IC convention from which that heuristic was inherited.
     """
     best_ic = float(result.get("best_ic", 0.0))
-    positive_ratio = float(result.get("best_ic_pos_ratio", 0.0))
-    directional_hit_rate = (
-        positive_ratio if best_ic >= 0.0 else 1.0 - positive_ratio
-    )
+    ic_floor = float(getattr(policy, "min_abs_ic", FORMAL_IC_THRESHOLD))
+    t_floor = float(getattr(policy, "min_abs_t", FORMAL_T_THRESHOLD))
     return bool(
-        abs(best_ic) >= FORMAL_IC_THRESHOLD
-        and directional_hit_rate >= FORMAL_IC_POS_THRESHOLD
+        abs(best_ic) >= ic_floor
+        and abs(float(result.get("best_t", 0.0))) >= t_floor
     )
+
+
+def _annotate_expected_direction(result: dict, policy) -> bool:
+    expected = dict(getattr(policy, "expected_directions", {}) or {}).get(
+        str(result.get("name", ""))
+    )
+    observed = 1 if float(result.get("best_ic", 0.0)) >= 0.0 else -1
+    result["expected_direction"] = int(expected) if expected in {-1, 1} else None
+    result["observed_direction"] = observed
+    result["direction_predeclared"] = expected in {-1, 1}
+    result["direction_matches_prior"] = bool(expected == observed) if expected else None
+    result["direction_status"] = (
+        "matches_predeclared" if expected == observed
+        else "contradicts_predeclared" if expected in {-1, 1}
+        else "exploratory_unregistered"
+    )
+    return bool(expected == observed) if expected in {-1, 1} else False
+
+
+def result_direction_is_admissible(result: dict) -> bool:
+    """Reject contradictions while retaining unregistered exploratory signs."""
+    return result.get("direction_status") != "contradicts_predeclared"
 
 
 def _require_valid_hypothesis_observations(results: list[dict]) -> int:
@@ -515,8 +733,21 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from data.manager import DataManager, FrequencyDataProvider
     from factors.engine import FactorEngine
     from factors.processor import build_processing_context
+    from research.governance import factor_family
+    from research.validation import validate_policy, validation_policy_sha256
+    from core.sectors import TAXONOMY_VERSION, taxonomy_sha256
     from scipy import stats as _scipy_stats
 
+    policy = runner.config.validation_policy
+    validate_policy(policy)
+    policy_hash = validation_policy_sha256(policy)
+    explicit_family_map = dict(
+        getattr(runner.config.factor_governance, "explicit_family_map", {}) or {}
+    )
+    dual_track_families = set(policy.dual_track_families)
+
+    def _factor_family(name: str) -> str:
+        return factor_family(name, explicit_family_map)
     # 构造周期上下文；分钟数据加载后会用实际 bar 数校准年化因子。
     period_ctx = PeriodContext.from_string(frequency)
 
@@ -526,7 +757,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     print(f"  配置文件: {config_path}")
     print(f"  因子计算区间: {factor_start.date()} ~ {ic_end.date()} (含预热)")
     print(f"  IC检验区间: {ic_start.date()} ~ {ic_end.date()}")
-    print("  正式统计门槛: 未收缩单因子 OLS/HAC p 值 → 全局 Bonferroni")
+    print(
+        "  discovery gate: factor Simes/BH + selection-adjusted local BH "
+        f"(q={policy.discovery_q:.2f}); FWER is report-only"
+    )
     print(f"  周期单位: {period_ctx.unit.value} (1个周期 = "
           f"{period_ctx.bars_per_day}个bar/交易日)")
 
@@ -536,22 +770,14 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     else:
         print(f"  持有期模式: 窗口匹配 (5d→[3,5,10], 10d→[5,10,20], 20d→[10,20,40])")
 
-    # 方案A: 加载适配性研究结果, 过滤无效因子
+    # 适配性输出只作为部署元数据，不能预先缩小发现阶段的假设家族。
     adaptivity_data = _load_adaptivity_data(adaptivity_file)
     n_filtered = 0  # 预初始化, 避免作用域问题
     if adaptivity_data:
-        n_before = len(all_factors)
-        # 过滤 n_valid_sectors=0 的因子 (适配性研究确认在所有板块都无效)
-        # 同时保留不在适配性研究中的因子 (新因子未测试, 不强制过滤)
-        all_factors = [
-            f for f in all_factors
-            if f not in adaptivity_data
-            or _safe_int(adaptivity_data[f].get("n_valid_sectors", 0)) > 0
-        ]
-        n_filtered = n_before - len(all_factors)
-        print(f"  适配性研究: 已加载 {len(adaptivity_data)} 个因子记录")
-        if n_filtered > 0:
-            print(f"  适配性过滤: 移除 {n_filtered} 个无效因子 (n_valid_sectors=0)")
+        print(
+            f"  适配性研究: 已加载 {len(adaptivity_data)} 个因子记录，"
+            "仅用于部署标注，发现阶段移除 0 个候选"
+        )
         print()
     else:
         print("  适配性研究: 未指定有效输入文件，使用纯窗口匹配")
@@ -656,10 +882,18 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     )
     fwd_returns_by_period: dict[int, pd.DataFrame] = {}
     # 持有期集合: 显式模式 → periods_override; 窗口匹配模式 → 各窗口并集
+    family_horizons = dict(policy.family_horizons or {})
     if periods_override is not None:
         all_periods = sorted(set(periods_override))
     else:
-        all_periods = sorted({p for w in window_groups.keys() for p in _periods_for_window(w)})
+        all_periods = sorted({
+            period
+            for factor_name in all_factors
+            for period in (
+                family_horizons.get(_factor_family(factor_name))
+                or _periods_for_window(_infer_window(factor_name))
+            )
+        })
     for p in all_periods:
         forward_returns = data_mgr.get_forward_returns(
             calendar, universe, period=p
@@ -696,7 +930,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             batch_start:batch_start + research_chunk_size
         ]
         engine = FactorEngine(data_mgr)
-        factor_batch = engine.compute_factors(
+        computed_batch = engine.compute_factors(
             batch_names,
             calendar,
             universe,
@@ -704,8 +938,16 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             chunk_size=research_chunk_size,
         )
         factor_batch = runner.processor.process_batch(
-            factor_batch, processing_context
+            computed_batch, processing_context
         )
+        raw_variant_batch = {
+            name: runner.processor.process_excluding(
+                computed_batch[name], processing_context, {"neutralize"}
+            )
+            for name in batch_names
+            if name in computed_batch
+            and _factor_family(name) in dual_track_families
+        }
 
         def _evaluate_factor(fname):
             if fname not in factor_batch:
@@ -714,56 +956,63 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             periods = (
                 list(periods_override)
                 if periods_override is not None
-                else _periods_for_window(window)
+                else list(family_horizons.get(_factor_family(fname)) or _periods_for_window(window))
             )
-            f_ic = factor_batch[fname].loc[ic_start:ic_end]
             all_period_results = {}
-            for p in periods:
-                fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
-                try:
-                    stats = _joint_ic_ols_statistics(
-                        f_ic,
-                        fwd,
-                        forward_period=p,
-                        min_stocks=10,
-                    )
-                    t_stat = stats["ic_hac_t"]
-                    ic_mean = stats["ic"]
-                    ir_nw = stats["ir_nw"]
-                    ic_pos_ratio = stats["ic_pos_ratio"]
-                    ols_t = stats["ols_hac_t"]
-                    ols_p = float(
-                        2.0 * _scipy_stats.t.sf(
-                            abs(ols_t), df=max(stats["ols_n"] - 1, 1)
+            variants = {"neutralized": factor_batch[fname]}
+            if fname in raw_variant_batch:
+                variants["raw"] = raw_variant_batch[fname]
+            for variant, matrix in variants.items():
+                f_ic = matrix.loc[ic_start:ic_end]
+                for p in periods:
+                    fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
+                    try:
+                        stats = _joint_ic_ols_statistics(
+                            f_ic,
+                            fwd,
+                            forward_period=p,
+                            min_stocks=10,
                         )
-                    )
-                    ols_beta = stats["ols_beta"]
-                    ols_n = stats["ols_n"]
-                    ic_n = stats["ic_n"]
-                except Exception:
-                    t_stat = 0.0
-                    ic_mean = 0.0
-                    ir_nw = 0.0
-                    ic_pos_ratio = 0.0
-                    ols_t = 0.0
-                    ols_p = 1.0
-                    ols_beta = 0.0
-                    ols_n = 0
-                    ic_n = 0
+                        t_stat = stats["ic_hac_t"]
+                        ic_mean = stats["ic"]
+                        ir_nw = stats["ir_nw"]
+                        ic_pos_ratio = stats["ic_pos_ratio"]
+                        ols_t = stats["ols_hac_t"]
+                        ols_p = float(
+                            2.0 * _scipy_stats.t.sf(
+                                abs(ols_t), df=max(stats["ols_n"] - 1, 1)
+                            )
+                        )
+                        ols_beta = stats["ols_beta"]
+                        ols_n = stats["ols_n"]
+                        ic_n = stats["ic_n"]
+                    except Exception:
+                        t_stat = 0.0
+                        ic_mean = 0.0
+                        ir_nw = 0.0
+                        ic_pos_ratio = 0.0
+                        ols_t = 0.0
+                        ols_p = 1.0
+                        ols_beta = 0.0
+                        ols_n = 0
+                        ic_n = 0
 
-                all_period_results[f"period_{p}"] = {
-                    "ic": float(ic_mean),
-                    "ic_hac_t": float(t_stat),
-                    "t": float(ols_t),
-                    "ols_beta": float(ols_beta),
-                    "ols_hac_t": float(ols_t),
-                    "ols_p_value": float(ols_p),
-                    "ols_n": int(ols_n),
-                    "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
-                    "ir_nw": float(ir_nw),
-                    "ic_pos_ratio": float(ic_pos_ratio),
-                    "n": int(ic_n),
-                }
+                    label = f"{variant}_period_{p}"
+                    all_period_results[label] = {
+                        "period": int(p),
+                        "preprocessing_variant": variant,
+                        "ic": float(ic_mean),
+                        "ic_hac_t": float(t_stat),
+                        "t": float(ols_t),
+                        "ols_beta": float(ols_beta),
+                        "ols_hac_t": float(ols_t),
+                        "ols_p_value": float(ols_p),
+                        "ols_n": int(ols_n),
+                        "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
+                        "ir_nw": float(ir_nw),
+                        "ic_pos_ratio": float(ic_pos_ratio),
+                        "n": int(ic_n),
+                    }
 
             return {
                 "name": fname,
@@ -801,6 +1050,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 pool.shutdown(wait=True)
 
         engine.clear_cache()
+        del computed_batch, raw_variant_batch
         del factor_batch
         done = min(batch_start + research_chunk_size, total)
         print(f"  [{done}/{total}] 耗时 {time.time() - t0:.1f}s")
@@ -808,26 +1058,46 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     valid_hypotheses = _require_valid_hypothesis_observations(results)
 
     # 筛选显著因子 (业界标准筛选流程)
-    # 门槛1: t值显著性 (Bonferroni校正后)
-    # 门槛2: |IC| >= 0.02 且主方向命中率 >= 52%。IR_NW 保留为诊断，
-    # 后续由分段稳定性、DSR/PBO 与冻结验证治理。
+    # 正式门槛由层级 FDR、|IC|/|t|、预声明方向和后置交易属性共同治理。
 
-    # 第一阶段: 对每个预声明因子×持有期的原始单因子 OLS/HAC p 值
-    # 执行全局 Bonferroni。Ridge 尚未参与，也不产生筛选 p 值。
-    total_hypotheses, bonferroni_alpha = _apply_global_bonferroni(results)
-    bonferroni_t_threshold = float(_scipy_stats.norm.ppf(1 - bonferroni_alpha / 2))
+    # 第一阶段: 对每个预声明因子×持有期×预处理版本的原始单因子
+    # OLS/HAC p 值执行层级 FDR。Ridge 尚未参与，也不产生筛选 p 值。
+    discovery_audit = _apply_hierarchical_discovery(results, policy)
+    total_hypotheses = int(discovery_audit["total_hypotheses"])
+    bonferroni_alpha = float(discovery_audit["fwer_cutoff"])
+    bonferroni_t_threshold = float(
+        _scipy_stats.norm.ppf(1 - bonferroni_alpha / 2)
+    )
 
-    print(f"\nBonferroni 校正: m={total_hypotheses} 假设, "
-          f"alpha_adj={bonferroni_alpha:.6f}, "
-          f"参考正态阈值={bonferroni_t_threshold:.3f}")
+    print(
+        f"\nHierarchical FDR: factors={discovery_audit['factor_family_count']}, "
+        f"q={policy.discovery_q:.3f}, selected="
+        f"{discovery_audit['selected_factor_count']}, local_alpha="
+        f"{discovery_audit['local_alpha']:.6f}"
+    )
+    print(
+        f"  report-only FWER: m={total_hypotheses}, "
+        f"alpha={bonferroni_alpha:.6g}, reference |t|="
+        f"{bonferroni_t_threshold:.3f}"
+    )
 
-    t_significant = [r for r in results if r["bonferroni_significant"]]
+    t_significant = [
+        r for r in results if r["hierarchical_fdr_significant"]
+    ]
+    for result in t_significant:
+        _annotate_expected_direction(result, policy)
     # 第二阶段: 经济量级与方向稳定性门槛
     significant = [
-        r for r in t_significant if _passes_post_bonferroni_quality(r)
+        r for r in t_significant
+        if _passes_post_bonferroni_quality(r, policy)
+        and result_direction_is_admissible(r)
     ]
     rejected_by_quality = [
-        r for r in t_significant if not _passes_post_bonferroni_quality(r)
+        r for r in t_significant
+        if not (
+            _passes_post_bonferroni_quality(r, policy)
+            and result_direction_is_admissible(r)
+        )
     ]
     significant.sort(key=lambda x: abs(x["best_t"]), reverse=True)
     governance_cfg = getattr(runner.config, "factor_governance", None)
@@ -844,13 +1114,22 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     for r in significant:
         by_period.setdefault(r["best_period"], []).append(r["name"])
 
-    # 统计校正信息 (CR-002: 使用全局 Bonferroni 校正)
-    corr_info = f"m={total_hypotheses}, raw OLS/HAC p≤{bonferroni_alpha:.3g}"
+    # 统计校正信息；Bonferroni/FWER 只保留报告标签。
+    corr_info = (
+        f"Simes/BH q={policy.discovery_q:.2f}; local BH alpha="
+        f"{discovery_audit['local_alpha']:.3g}; FWER report p≤{bonferroni_alpha:.3g}"
+    )
 
     print("\n" + "=" * 80)
-    print(f"OLS/IC 检验完成: Bonferroni 显著 {len(t_significant)} 个 → IC/命中率门槛后 {len(significant)} 个")
-    print(f"  门槛: OLS/HAC p≤{bonferroni_alpha:.3g}, |IC|≥{FORMAL_IC_THRESHOLD}, IC命中率≥{FORMAL_IC_POS_THRESHOLD:.0%}; IR_NW仅作诊断")
-    print(f"  Bonferroni校正: {corr_info}")
+    print(
+        f"OLS/IC 检验完成: 层级FDR局部发现 {len(t_significant)} 个 "
+        f"→ 经济量级与预声明方向后 {len(significant)} 个"
+    )
+    print(
+        f"  门槛: |IC|≥{policy.min_abs_ic}, |t|≥{policy.min_abs_t}; "
+        "命中率与IR稳定性进入记分卡"
+    )
+    print(f"  多重检验: {corr_info}")
     if rejected_by_quality:
         print(f"  经济质量门槛淘汰: {len(rejected_by_quality)} 个 (t显著但IC/命中率不达标)")
     print("=" * 80)
@@ -883,7 +1162,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     if significant:
         from testing.layered import LayeredBacktest
         from testing.turnover import TurnoverTest
-        from testing.robustness import RobustnessTest
+        from testing.robustness import CalendarYearRobustnessTest
+        from optimization.costs import factor_cost_coverage
         from research.statistics import (
             deflated_sharpe_ratio,
             probability_backtest_overfitting,
@@ -892,7 +1172,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         print("\n=== 后置检验: 分层单调性 / 换手率 / 稳健性 ===")
         post_names = [row["name"] for row in significant]
         post_engine = FactorEngine(data_mgr)
-        factor_matrices = post_engine.compute_factors(
+        computed_post_matrices = post_engine.compute_factors(
             post_names,
             calendar,
             universe,
@@ -900,25 +1180,51 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             chunk_size=max(len(post_names), 1),
         )
         factor_matrices = runner.processor.process_batch(
-            factor_matrices, processing_context
+            computed_post_matrices, processing_context
         )
-        layered_test = LayeredBacktest(n_groups=5)
-        turnover_test = TurnoverTest()
-        robustness_test = RobustnessTest(n_segments=4)
+        layered_test = LayeredBacktest(n_groups=policy.n_return_groups)
+        turnover_test = TurnoverTest(
+            monthly_threshold=policy.max_monthly_turnover
+        )
+        scorecard = policy.scorecard
+        robustness_test = CalendarYearRobustnessTest(
+            min_ic_abs=policy.min_abs_ic,
+            direction_ratio=policy.annual_direction_ratio,
+            effect_ratio=policy.annual_effect_ratio,
+            minimum_years=policy.minimum_calendar_years,
+            minimum_days_per_year=policy.minimum_year_observations,
+            bootstrap_samples=policy.single_instrument_bootstrap_samples,
+            scorecard_weights=dict(scorecard.weights),
+            hit_rate_threshold=policy.deployment_hit_rate,
+            ir_std_max=scorecard.ir_std_max,
+            scorecard_threshold=scorecard.threshold,
+            scorecard_enforced=scorecard.enforced,
+        )
 
         for r in significant:
             fname = r["name"]
             best_p = r["best_period"]
             if fname not in factor_matrices:
                 continue
-            f_mat = factor_matrices[fname].loc[ic_start:ic_end]
+            if r.get("best_variant") == "raw":
+                selected_matrix = runner.processor.process_excluding(
+                    computed_post_matrices[fname],
+                    processing_context,
+                    {"neutralize"},
+                )
+            else:
+                selected_matrix = factor_matrices[fname]
+            f_mat = selected_matrix.loc[ic_start:ic_end]
             fwd = fwd_returns_by_period[best_p].loc[ic_start:ic_end]
 
             # 分层单调性
             failures = r.setdefault("post_test_failures", [])
             try:
                 layered_res = layered_test.run(
-                    f_mat, fwd, holding_period=best_p
+                    f_mat,
+                    fwd,
+                    holding_period=best_p,
+                    periods_per_year=period_ctx.bars_per_year,
                 )
                 r["layered_monotonicity"] = float(layered_res.monotonicity)
                 r["layered_ls_return"] = float(
@@ -960,9 +1266,21 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
             # 换手率
             try:
-                turnover_res = turnover_test.run(f_mat)
+                turnover_res = turnover_test.run(
+                    f_mat, rebalance_every=best_p
+                )
                 r["monthly_turnover"] = float(turnover_res.monthly_turnover)
-                r["passes_turnover"] = bool(turnover_res.monthly_turnover < 0.50)
+                r["annual_half_turnover"] = float(turnover_res.annual_turnover)
+                r["mean_absolute_weights"] = dict(
+                    turnover_res.mean_absolute_weights
+                )
+                r["turnover_definition"] = (
+                    "half_turnover_0.5_sum_abs_delta_weight"
+                )
+                r["passes_turnover"] = bool(
+                    turnover_res.monthly_turnover
+                    < policy.max_monthly_turnover
+                )
             except Exception as exc:
                 r["monthly_turnover"] = 0.0
                 r["passes_turnover"] = False
@@ -974,10 +1292,15 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
             # 稳健性 (时间分段)
             try:
-                robust_res = robustness_test.run(f_mat, fwd)
+                orientation = 1 if r["best_ic"] >= 0.0 else -1
+                robust_res = robustness_test.run(
+                    f_mat, fwd, orientation=orientation
+                )
                 r["ic_sign_consistency"] = float(robust_res.ic_sign_consistency)
                 r["ir_std"] = float(robust_res.ir_std)
-                r["passes_robustness"] = bool(robust_res.passes_ic_consistency and robust_res.passes_ir_stability)
+                r["calendar_year_robustness"] = robust_res.to_dict()
+                r["passes_robustness"] = bool(robust_res.passes_scorecard)
+                r["observation_channel"] = bool(robust_res.observation_channel)
             except Exception as exc:
                 r["ic_sign_consistency"] = 0.0
                 r["ir_std"] = 0.0
@@ -987,6 +1310,54 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                     "error_type": type(exc).__name__,
                     "message": str(exc),
                 })
+
+            one_way_cost = float(
+                getattr(runner.cost_model, "commission_rate", 0.0)
+                + getattr(runner.cost_model, "slippage", 0.0)
+            )
+            cost_coverage = factor_cost_coverage(
+                gross_annual_alpha=float(r.get("layered_ls_return", 0.0))
+                * (1.0 if r["best_ic"] >= 0.0 else -1.0),
+                annual_half_turnover=float(r.get("annual_half_turnover", 0.0)),
+                one_way_cost_rate=one_way_cost,
+                annual_roll_cost=getattr(
+                    runner.cost_model, "annual_roll_cost", None
+                ),
+                roll_cost_by_instrument=getattr(
+                    runner.cost_model, "roll_cost_by_instrument", None
+                ),
+                mean_absolute_weights=r.get("mean_absolute_weights", {}),
+                annual_fee=float(
+                    getattr(runner.cost_model, "annual_fee", 0.0)
+                ),
+                safety_margin=policy.cost_safety_margin,
+                roll_cost_source=str(
+                    getattr(runner.cost_model, "roll_cost_source", "")
+                ),
+            )
+            r["cost_coverage"] = cost_coverage
+            observation_reasons = []
+            if r.get("observation_channel", False):
+                observation_reasons.append("fewer_than_minimum_calendar_years")
+            if not cost_coverage["complete"]:
+                observation_reasons.append(cost_coverage["observation_reason"])
+            if (
+                policy.require_predeclared_direction_for_promotion
+                and not r.get("direction_predeclared", False)
+            ):
+                observation_reasons.append("economic_direction_not_predeclared")
+            if scorecard.enabled and not scorecard.calibrated:
+                observation_reasons.append("scorecard_not_pilot_calibrated")
+            observation_reasons.append("locked_oos_pending")
+            r["observation_reasons"] = sorted(set(observation_reasons))
+            r["observation_channel"] = bool(observation_reasons)
+            r["promotion_status"] = (
+                "observation" if observation_reasons else "wf_candidate"
+            )
+            r["weight_cap"] = (
+                policy.observation_weight_cap
+                if observation_reasons else 1.0
+            )
 
         if len(candidate_return_series) >= 2:
             candidate_frame = pd.concat(
@@ -1016,47 +1387,91 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                   f"{r.get('layered_ls_return',0):>7.2%} {r.get('monthly_turnover',0):>7.2%} "
                   f"{r.get('ic_sign_consistency',0):>7.1%} {robust_str:>4}")
 
-        # 最终筛选: 通过全部检验的因子
-        # 门槛: 单调性 >= 0.5 (Q1-Q5年化收益与组号相关系数, 业界标准)
-        MONO_THRESHOLD = 0.5
+        # Training candidates may proceed through the observation channel.
+        # Monotonicity is diagnostic; three-group spread and complete costs
+        # carry the economic meaning.
         final_factors = [
             r for r in significant
             if r.get("passes_turnover", False)
             and r.get("passes_robustness", False)
-            and abs(r.get("layered_monotonicity", 0.0)) >= MONO_THRESHOLD
+            and (
+                not r.get("cost_coverage", {}).get("complete", False)
+                or r.get("cost_coverage", {}).get("passes", False)
+            )
         ]
         rejected_final = [r for r in significant if r not in final_factors]
-        rejected_by_mono = [
-            r for r in significant
-            if r.get("passes_turnover", False)
-            and r.get("passes_robustness", False)
-            and abs(r.get("layered_monotonicity", 0.0)) < MONO_THRESHOLD
+        observations = [
+            r for r in final_factors if r.get("observation_channel", False)
         ]
-        print(f"\n最终通过全部检验: {len(final_factors)} 个 "
-              f"(换手率+稳健性+单调性淘汰 {len(rejected_final)} 个, "
-              f"其中单调性淘汰 {len(rejected_by_mono)} 个)")
+        print(
+            f"\n进入WF候选: {len(final_factors)} 个 "
+            f"(其中观察期 {len(observations)} 个，硬门槛淘汰 "
+            f"{len(rejected_final)} 个)"
+        )
 
     # 保存 JSON 结果
     final_factor_names = (
         [r["name"] for r in final_factors] if significant else []
     )
+    funnel_audit = {
+        "factors_submitted": len(results),
+        "hypotheses_declared": total_hypotheses,
+        "hypotheses_estimable": valid_hypotheses,
+        "factors_selected_by_simes_bh": int(
+            discovery_audit["selected_factor_count"]
+        ),
+        "factors_with_local_fdr_discovery": len(t_significant),
+        "factors_passing_ic_t_direction": len(significant),
+        "factors_passing_turnover": sum(
+            bool(row.get("passes_turnover", False)) for row in significant
+        ),
+        "factors_with_complete_cost_coverage": sum(
+            bool(row.get("cost_coverage", {}).get("passes", False))
+            for row in significant
+        ),
+        "wf_candidates": len(final_factors),
+        "observation_candidates": sum(
+            bool(row.get("observation_channel", False))
+            for row in final_factors
+        ),
+        "production_approved": 0,
+    }
+    threshold_sensitivity = _build_threshold_sensitivity(results, policy)
     out = {
         "config": {
             "factor_start": str(factor_start.date()),
             "ic_start": str(ic_start.date()),
             "ic_end": str(ic_end.date()),
             "t_threshold": bonferroni_t_threshold,
-            "bonferroni_correction": True,
-            "correction_formula": "raw_unpenalized_ols_hac_p <= 0.05 / m",
+            "bonferroni_correction": False,
+            "fwer_role": "report_only_not_a_gate",
+            "correction_formula": discovery_audit["method"],
+            "validation_policy": validate_policy(policy),
+            "validation_policy_sha256": policy_hash,
+            "taxonomy_version": TAXONOMY_VERSION,
+            "taxonomy_sha256": taxonomy_sha256(),
             "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
             "factor_preprocessing": [
                 "mad_winsorize_by_date",
+                "sector_neutralize_by_date_for_neutralized_variant",
                 "zscore_standardize_by_date",
             ],
+            "factor_preprocessing_variants": {
+                "neutralized": [
+                    "mad_winsorize_by_date",
+                    "sector_neutralize_by_date",
+                    "zscore_standardize_by_date",
+                ],
+                "raw": [
+                    "mad_winsorize_by_date",
+                    "zscore_standardize_by_date",
+                ],
+            },
             "selection_order": [
                 "predeclared_exposure_preprocessing",
                 "raw_ols_hac_p_values",
-                "global_bonferroni",
+                "factor_simes_bh",
+                "selection_adjusted_local_bh",
                 "economic_and_robustness_gates",
                 "layered_turnover_stability_diagnostics",
             ],
@@ -1068,7 +1483,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "total_hypotheses": total_hypotheses,
             "valid_hypotheses": valid_hypotheses,
             "bonferroni_alpha": bonferroni_alpha,
-            "ic_threshold": FORMAL_IC_THRESHOLD,
+            "ic_threshold": policy.min_abs_ic,
             # 周期架构信息 (新增字段, 向后兼容)
             "frequency": period_ctx.unit.value,
             "periods_mode": "explicit" if periods_override is not None else "window_match",
@@ -1077,8 +1492,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "bars_per_year": period_ctx.bars_per_year,
             "ir_threshold": None,
             "ir_role": "reported_diagnostic_and_downstream_stability_input",
-            "ic_pos_threshold": FORMAL_IC_POS_THRESHOLD,
-            "mono_threshold": 0.5,
+            "ic_pos_threshold": None,
+            "hit_rate_role": "scorecard_and_deployment_constraint",
+            "return_groups": policy.n_return_groups,
+            "mono_threshold": None,
             "n_factors_total": len(all_factors),
             "n_factors_t_significant": len(t_significant),
             "n_factors_significant": len(significant),
@@ -1090,6 +1507,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "all_results": results,
         "final_factors": final_factor_names,
         "selection_diagnostics": selection_diagnostics,
+        "discovery_audit": discovery_audit,
+        "funnel_audit": funnel_audit,
+        "threshold_sensitivity": threshold_sensitivity,
         "family_governance": family_governance_audit,
         "summary": {
             "by_window": {k: len(v) for k, v in window_groups.items()},
@@ -1104,6 +1524,19 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+    funnel_path = os.path.join(output_dir, "validation_funnel.json")
+    with open(funnel_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "validation_policy_sha256": policy_hash,
+                "taxonomy_sha256": taxonomy_sha256(),
+                "funnel_audit": funnel_audit,
+                "threshold_sensitivity": threshold_sensitivity,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
     print(f"\n结果已保存: {out_path}")
 
     # 输出 YAML 配置片段 (优先用 final_factors, 若后置检验未运行则回退 significant)
@@ -1135,6 +1568,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         print(_format_factor_line(r))
 
     print("\n筛选完成.")
+    return out
 
 
 def _run_correlation_analysis(

@@ -277,3 +277,187 @@ class RobustnessTest(FactorTest):
                 sector_ics[sector] = float(np.mean(daily_ics))
 
         return sector_ics
+
+
+class CalendarYearRobustnessResult(TestResult):
+    """Natural-year diagnostics and the frozen scorecard inputs."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    def summary(self) -> str:
+        status = "observation" if self.observation_channel else "eligible"
+        return (
+            f"calendar-year robustness: years={self.n_valid_years}, "
+            f"direction={self.ic_sign_consistency:.1%}, "
+            f"effect={self.effect_year_ratio:.1%}, "
+            f"score={self.scorecard_score:.3f}, status={status}"
+        )
+
+
+def _moving_block_mean_interval(
+    daily_values: pd.Series,
+    *,
+    samples: int,
+    confidence: float = 0.95,
+    seed: int = 20260728,
+) -> tuple[float, float]:
+    values = np.asarray(daily_values.dropna(), dtype=float)
+    if len(values) < 20 or samples < 1:
+        return float("nan"), float("nan")
+    block = max(int(round(np.sqrt(len(values)))), 2)
+    starts = np.arange(max(len(values) - block + 1, 1))
+    blocks_needed = int(np.ceil(len(values) / block))
+    rng = np.random.default_rng(seed)
+    means = np.empty(samples, dtype=float)
+    for offset in range(0, samples, 128):
+        batch = min(128, samples - offset)
+        sampled_starts = rng.choice(starts, size=(batch, blocks_needed))
+        indices = (
+            sampled_starts[:, :, None] + np.arange(block)[None, None, :]
+        ).reshape(batch, -1)[:, :len(values)]
+        means[offset:offset + batch] = values[indices].mean(axis=1)
+    tail = (1.0 - confidence) / 2.0
+    low, high = np.quantile(means, [tail, 1.0 - tail])
+    return float(low), float(high)
+
+
+class CalendarYearRobustnessTest(FactorTest):
+    """Evaluate stability by natural year without treating minute bars as days."""
+
+    name = "calendar_year_robustness"
+
+    def __init__(
+        self,
+        *,
+        min_ic_abs: float = 0.01,
+        direction_ratio: float = 0.60,
+        effect_ratio: float = 0.65,
+        minimum_years: int = 5,
+        minimum_days_per_year: int = 20,
+        min_cross_section: int = 10,
+        bootstrap_samples: int = 399,
+        scorecard_weights: Dict[str, float] = None,
+        hit_rate_threshold: float = 0.52,
+        ir_std_max: float = 0.30,
+        scorecard_threshold: float = 0.75,
+        scorecard_enforced: bool = False,
+    ):
+        self.min_ic_abs = float(min_ic_abs)
+        self.direction_ratio = float(direction_ratio)
+        self.effect_ratio = float(effect_ratio)
+        self.minimum_years = int(minimum_years)
+        self.minimum_days_per_year = int(minimum_days_per_year)
+        self.min_cross_section = int(min_cross_section)
+        self.bootstrap_samples = int(bootstrap_samples)
+        self.scorecard_weights = scorecard_weights or {
+            "annual_direction": 0.25,
+            "annual_effect": 0.25,
+            "hit_rate": 0.25,
+            "ir_stability": 0.25,
+        }
+        self.hit_rate_threshold = float(hit_rate_threshold)
+        self.ir_std_max = float(ir_std_max)
+        self.scorecard_threshold = float(scorecard_threshold)
+        self.scorecard_enforced = bool(scorecard_enforced)
+
+    def run(
+        self,
+        factor: FactorMatrix,
+        forward_returns: ReturnMatrix,
+        universe: UniverseSchedule = None,
+        **params,
+    ) -> CalendarYearRobustnessResult:
+        del universe
+        common_dates = factor.index.intersection(forward_returns.index)
+        f_aligned = factor.loc[common_dates]
+        r_aligned = forward_returns.loc[common_dates]
+        from testing.ic_test import _vectorized_spearman_ic
+
+        ic_series, _ = _vectorized_spearman_ic(
+            f_aligned, r_aligned, min_stocks=self.min_cross_section
+        )
+        ic_series = ic_series.replace([np.inf, -np.inf], np.nan).dropna()
+        orientation = int(params.get("orientation", 1))
+        orientation = 1 if orientation >= 0 else -1
+        oriented = ic_series * orientation
+
+        years = {}
+        year_irs = {}
+        valid_years = []
+        for year, values in oriented.groupby(oriented.index.year):
+            trading_days = int(pd.DatetimeIndex(values.index).normalize().nunique())
+            if trading_days < self.minimum_days_per_year:
+                continue
+            mean = float(values.mean())
+            std = float(values.std(ddof=1))
+            years[str(int(year))] = mean
+            year_irs[str(int(year))] = mean / std if std > 0.0 else 0.0
+            valid_years.append(int(year))
+
+        year_values = np.asarray(list(years.values()), dtype=float)
+        direction_consistency = (
+            float(np.mean(year_values > 0.0)) if len(year_values) else 0.0
+        )
+        effect_ratio = (
+            float(np.mean(year_values >= self.min_ic_abs))
+            if len(year_values) else 0.0
+        )
+        ir_values = np.asarray(list(year_irs.values()), dtype=float)
+        ir_std = float(ir_values.std(ddof=1)) if len(ir_values) > 1 else 0.0
+
+        daily_ic = oriented.groupby(oriented.index.normalize()).mean()
+        hit_rate = float((daily_ic > 0.0).mean()) if len(daily_ic) else 0.0
+        component_passes = {
+            "annual_direction": direction_consistency >= self.direction_ratio,
+            "annual_effect": effect_ratio >= self.effect_ratio,
+            "hit_rate": hit_rate >= self.hit_rate_threshold,
+            "ir_stability": ir_std < self.ir_std_max,
+        }
+        score = float(sum(
+            float(self.scorecard_weights.get(name, 0.0)) * float(passed)
+            for name, passed in component_passes.items()
+        ))
+
+        failed = [value < self.min_ic_abs for value in year_values]
+        longest_failure = current_failure = 0
+        for is_failed in failed:
+            current_failure = current_failure + 1 if is_failed else 0
+            longest_failure = max(longest_failure, current_failure)
+        ci_low, ci_high = _moving_block_mean_interval(
+            daily_ic, samples=self.bootstrap_samples
+        )
+        observation = len(valid_years) < self.minimum_years
+        scorecard_pass = score >= self.scorecard_threshold
+        return CalendarYearRobustnessResult(
+            segment_ics=years,
+            segment_irs=year_irs,
+            ic_sign_consistency=direction_consistency,
+            effect_year_ratio=effect_ratio,
+            ir_std=ir_std,
+            hit_rate=hit_rate,
+            n_valid_years=len(valid_years),
+            valid_years=valid_years,
+            observation_channel=observation,
+            observation_reason=(
+                f"requires_{self.minimum_years}_calendar_years"
+                if observation else ""
+            ),
+            longest_consecutive_failure_years=int(longest_failure),
+            worst_year_ic=(float(year_values.min()) if len(year_values) else 0.0),
+            block_bootstrap_ic_ci=[ci_low, ci_high],
+            scorecard_components=component_passes,
+            scorecard_weights=dict(self.scorecard_weights),
+            scorecard_score=score,
+            scorecard_threshold=self.scorecard_threshold,
+            scorecard_enforced=self.scorecard_enforced,
+            passes_scorecard=(scorecard_pass if self.scorecard_enforced else True),
+            passes_ic_consistency=bool(
+                direction_consistency >= self.direction_ratio
+                and effect_ratio >= self.effect_ratio
+            ),
+            passes_ir_stability=ir_std < self.ir_std_max,
+        )

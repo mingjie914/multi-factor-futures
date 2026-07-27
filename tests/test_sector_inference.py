@@ -124,7 +124,7 @@ def test_three_instrument_sector_keeps_cross_sectional_inference():
     assert result["stock_index"]["test_type"] == "cross_section_fama_macbeth"
 
 
-def test_single_instrument_sector_is_not_tested():
+def test_short_single_instrument_sector_enters_observation_channel():
     dates = pd.date_range("2022-01-03", periods=100, freq="B")
     factor = pd.DataFrame({"AU": np.arange(len(dates), dtype=float)}, index=dates)
     returns = factor * 0.01
@@ -137,4 +137,9 @@ def test_single_instrument_sector_is_not_tested():
         forward_period=1,
     )
 
-    assert result == {}
+    record = result["precious"]
+    assert record["test_type"] == "single_instrument_time_series"
+    assert record["observation_channel"] is True
+    assert record["sufficient_history"] is False
+    assert record["n_trading_days"] == 100
+    assert record["p_value"] == 1.0

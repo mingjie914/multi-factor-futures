@@ -382,6 +382,59 @@ class FactorGovernanceConfig(StrictConfigModel):
     explicit_family_map: Dict[str, str] = {}
 
 
+class ValidationScorecardConfig(StrictConfigModel):
+    """Frozen post-discovery scorecard configuration.
+
+    A scorecard may be reported before calibration, but it cannot become a
+    promotion gate until an isolated pilot artifact and its SHA-256 digest are
+    declared.  This prevents current candidates from calibrating their own
+    admission rule.
+    """
+
+    enabled: bool = True
+    enforced: bool = False
+    calibrated: bool = False
+    calibration_source: str = ""
+    calibration_sha256: str = ""
+    weights: Dict[str, float] = {
+        "annual_direction": 0.25,
+        "annual_effect": 0.25,
+        "hit_rate": 0.25,
+        "ir_stability": 0.25,
+    }
+    ir_std_max: float = 0.30
+    threshold: float = 0.75
+
+
+class ValidationPolicyConfig(StrictConfigModel):
+    """Versioned discovery, validation and observation-channel policy."""
+
+    version: str = "factor_validation_v2"
+    discovery_method: str = "hierarchical_fdr"
+    discovery_q: float = 0.10
+    fwer_report_alpha: float = 0.05
+    min_abs_ic: float = 0.01
+    min_abs_t: float = 2.0
+    deployment_hit_rate: float = 0.52
+    deployment_oos_hit_rate: float = 0.50
+    oos_fold_sign_ratio: float = 0.60
+    annual_direction_ratio: float = 0.60
+    annual_effect_ratio: float = 0.65
+    minimum_calendar_years: int = 5
+    minimum_year_observations: int = 20
+    n_return_groups: int = 3
+    max_monthly_turnover: float = 0.50
+    cost_safety_margin: float = 1.50
+    single_instrument_min_trading_days: int = 750
+    single_instrument_bootstrap_samples: int = 399
+    observation_weight_cap: float = 0.50
+    require_predeclared_direction_for_promotion: bool = True
+    expected_directions: Dict[str, int] = {}
+    dual_track_families: List[str] = ["carry", "trend", "macro_trend"]
+    family_horizons: Dict[str, List[int]] = {}
+    scorecard: ValidationScorecardConfig = ValidationScorecardConfig()
+
+
 class HorizonEnsembleConfig(StrictConfigModel):
     """Optional neighbouring-horizon assignment for walk-forward experiments."""
     enabled: bool = False
@@ -458,6 +511,7 @@ class FrameworkConfig(StrictConfigModel):
     factor_synthesis: FactorSynthesisConfig = FactorSynthesisConfig()  # 因子合成 + 日内确认
     research_artifacts: ResearchArtifactsConfig = ResearchArtifactsConfig()
     factor_governance: FactorGovernanceConfig = FactorGovernanceConfig()
+    validation_policy: ValidationPolicyConfig = ValidationPolicyConfig()
     horizon_ensemble: HorizonEnsembleConfig = HorizonEnsembleConfig()
     defensive_sleeve: DefensiveSleeveConfig = DefensiveSleeveConfig()
     supertrend_sleeve: SupertrendSleeveConfig = SupertrendSleeveConfig()

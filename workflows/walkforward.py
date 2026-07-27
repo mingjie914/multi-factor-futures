@@ -310,25 +310,71 @@ def _build_fold_bundle(
     fdr_method: str,
 ):
     from workflows.factor_adaptivity import run_adaptivity_analysis
+    from workflows.research import _run_multi_period_screening
     from research.artifacts import ResearchArtifactBundle, canonical_config_hash
+    from pipeline.runner import PipelineRunner
+
+    if fdr_method != "hierarchical":
+        raise ValueError(
+            "walk-forward discovery is frozen to validation_policy hierarchical FDR"
+        )
 
     train_config = copy.deepcopy(base_config)
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
     train_config.research_artifacts.required = False
     factor_start = (pd.Timestamp(train_start) - pd.DateOffset(years=1)).date().isoformat()
+    train_runner = PipelineRunner(config=train_config)
+    periods = [1, 3, 5, 10, 20, 40]
+    discovery = _run_multi_period_screening(
+        train_runner,
+        candidate_factors,
+        "<in-memory-config>",
+        1.96,
+        pd.Timestamp(factor_start),
+        pd.Timestamp(train_start),
+        pd.Timestamp(train_end),
+        periods_override=periods,
+        frequency="daily",
+        output_dir=str(output_dir),
+        adaptivity_file=None,
+    )
+    discovered_names = list(discovery.get("final_factors", []))
+    if not discovered_names:
+        raise RuntimeError(
+            "training fold produced no factor eligible for WF or observation channel"
+        )
+    discovered_set = set(discovered_names)
+    preprocessing_variants = {
+        str(row["name"]): str(row.get("best_variant", "neutralized"))
+        for row in discovery.get("all_results", [])
+        if str(row.get("name", "")) in discovered_set
+    }
+    candidate_metadata = {
+        str(row["name"]): {
+            "observation_channel": bool(row.get("observation_channel", False)),
+            "observation_reasons": list(row.get("observation_reasons", [])),
+            "promotion_status": str(row.get("promotion_status", "observation")),
+            "weight_cap": float(row.get("weight_cap", 1.0)),
+        }
+        for row in discovery.get("significant_factors", [])
+        if str(row.get("name", "")) in discovered_set
+    }
     run_adaptivity_analysis(
-        all_factors=candidate_factors,
+        all_factors=discovered_names,
         config_path="<in-memory-config>",
         factor_start=factor_start,
         ic_start=train_start,
         ic_end=train_end,
-        periods=[1, 3, 5, 10, 20, 40],
+        periods=periods,
         output_dir=str(output_dir),
         artifact_id=name,
         build_correlation=build_correlation,
         config=train_config,
-        fdr_method=fdr_method,
+        runner=train_runner,
+        fdr_method="deployment",
+        preprocessing_variants=preprocessing_variants,
+        candidate_metadata=candidate_metadata,
     )
     return ResearchArtifactBundle.load(
         output_dir,
@@ -367,6 +413,116 @@ def _load_existing_fold_bundle(
     return bundle
 
 
+def _evaluate_fold_factor_ics(runner, bundle, test_start: str, test_end: str) -> dict:
+    """Compute factor-level OOS ICs on one untouched walk-forward test fold."""
+    from factors.processor import build_processing_context
+    from workflows.research import _joint_ic_ols_statistics
+
+    summary = bundle.read_csv("factor_adaptivity_summary", encoding="utf-8-sig")
+    selected = set(runner.config.factors)
+    summary = summary[summary["factor"].astype(str).isin(selected)].copy()
+    if summary.empty:
+        return {}
+    factor_start = pd.Timestamp(test_start) - pd.DateOffset(years=1)
+    calendar = runner.data_manager.get_calendar(factor_start, test_end)
+    calendar = pd.DatetimeIndex(calendar)
+    universe = pd.Index(runner.config.universe)
+    context = build_processing_context(
+        runner.data_manager,
+        calendar,
+        universe,
+        runner.config.universe_selection,
+    )
+    names = sorted(set(summary["factor"].astype(str)))
+    computed = runner.factor_engine.compute_factors(
+        names,
+        calendar,
+        universe,
+        parallel=False,
+        chunk_size=max(len(names), 1),
+    )
+    processed = runner.processor.process_batch(computed, context)
+    periods = sorted({
+        int(value) for value in pd.to_numeric(
+            summary["best_period"], errors="coerce"
+        ).dropna() if int(value) > 0
+    })
+    returns = {
+        period: runner.data_manager.get_forward_returns(
+            calendar, universe, period=period
+        )
+        for period in periods
+    }
+    output = {}
+    for _, row in summary.iterrows():
+        name = str(row["factor"])
+        period = int(row["best_period"])
+        if name not in computed or period not in returns:
+            continue
+        if str(row.get("preprocessing_variant", "neutralized")) == "raw":
+            matrix = runner.processor.process_excluding(
+                computed[name], context, {"neutralize"}
+            )
+        else:
+            matrix = processed[name]
+        stats = _joint_ic_ols_statistics(
+            matrix.loc[test_start:test_end],
+            returns[period].loc[test_start:test_end],
+            forward_period=period,
+            min_stocks=10,
+        )
+        train_ic = float(row.get("best_ic", 0.0))
+        oos_ic = float(stats["ic"])
+        orientation = 1.0 if train_ic >= 0.0 else -1.0
+        output[name] = {
+            "period": period,
+            "preprocessing_variant": str(
+                row.get("preprocessing_variant", "neutralized")
+            ),
+            "train_ic": train_ic,
+            "oos_ic": oos_ic,
+            "oriented_oos_ic": oos_ic * orientation,
+            "same_direction": bool(oos_ic * orientation > 0.0),
+            "n_observations": int(stats["ic_n"]),
+        }
+    runner.factor_engine.clear_cache()
+    return output
+
+
+def summarize_factor_fold_survival(
+    folds: list[dict], *, minimum_fold_ratio: float = 0.60
+) -> dict:
+    """Aggregate fold direction survival without claiming a new locked OOS."""
+    histories = {}
+    for fold in folds:
+        for name, values in fold.get("factor_oos", {}).items():
+            histories.setdefault(name, []).append(values)
+    summary = {}
+    for name, values in histories.items():
+        same = [bool(item.get("same_direction", False)) for item in values]
+        longest = current = 0
+        for survived in same:
+            current = current + 1 if survived else 0
+            longest = max(longest, current)
+        summary[name] = {
+            "tested_folds": len(values),
+            "same_direction_folds": int(sum(same)),
+            "fold_sign_ratio": float(np.mean(same)) if same else 0.0,
+            "longest_consecutive_surviving_folds": int(longest),
+            "passes_fold_gate": bool(
+                same and np.mean(same) >= minimum_fold_ratio
+            ),
+            "passes_two_consecutive_fold_gate": bool(
+                longest >= 2 and np.mean(same) >= minimum_fold_ratio
+            ),
+            "observation_transition_ready": False,
+            "requires_positive_new_locked_oos": True,
+            "locked_oos_status": "pending_new_data_after_2026-07-25",
+            "production_approved": False,
+        }
+    return summary
+
+
 def walk_forward_4fold(
     base_config,
     *,
@@ -375,7 +531,7 @@ def walk_forward_4fold(
     build_correlation: bool = True,
     max_folds: int = None,
     fold_numbers: list[int] = None,
-    fdr_method: str = "bonferroni",
+    fdr_method: str = "hierarchical",
     reuse_artifacts: bool = False,
 ):
     """Nested walk-forward with unique, non-overlapping annual test folds."""
@@ -462,6 +618,9 @@ def walk_forward_4fold(
                 deduplicate_clusters=True,
                 drop_empty_sleeves=True,
             )
+            factor_oos = _evaluate_fold_factor_ics(
+                runner, bundle, test_start, test_end
+            )
             result = run_backtest_with_config(cfg, quiet=True, runner=runner)
             nav = result.combined_result.nav.dropna()
             if nav.empty:
@@ -505,6 +664,7 @@ def walk_forward_4fold(
             m["selected_factors"] = {
                 sub.name: list(sub.factors) for sub in cfg.sub_portfolios
             }
+            m["factor_oos"] = factor_oos
             m["candidate_factor_count"] = len(candidate_factors)
             m["elapsed"] = time.time() - t0
             portfolio_dir = run_root / name / "portfolio"
@@ -836,9 +996,9 @@ def main():
         help="训练折不生成因子相关性聚类",
     )
     parser.add_argument(
-        "--fdr-method", choices=["bonferroni", "global", "hierarchical"],
-        default="bonferroni",
-        help="训练折多重检验口径",
+        "--fdr-method", choices=["hierarchical"],
+        default="hierarchical",
+        help="训练折多重检验口径；默认使用验证策略中的层级FDR q",
     )
     parser.add_argument(
         "--reuse-artifacts", action="store_true",
@@ -901,6 +1061,10 @@ def main():
             reuse_artifacts=args.reuse_artifacts,
         )
         all_results["walk_forward"] = wf_results
+        all_results["factor_fold_survival"] = summarize_factor_fold_survival(
+            wf_results,
+            minimum_fold_ratio=config.validation_policy.oos_fold_sign_ratio,
+        )
     else:
         run_root.mkdir(parents=True, exist_ok=False)
 

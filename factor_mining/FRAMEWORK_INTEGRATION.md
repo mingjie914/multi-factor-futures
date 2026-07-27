@@ -43,6 +43,10 @@ $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
   --min-coverage 0.50
 ```
 
+若要一次预筛某次挖掘 run 的全部候选，可把 `--candidate-ids` 换成
+`--candidate-run-ids 'mine_run_id'`；候选 ID、候选文件和 run ID 三种选择方式互斥，
+选择结果为空会失败关闭，不会生成“完成但零候选”的快照。
+
 使用输出目录中的 `prescreen_candidates.snapshot.json`。`screen` 不按任意 quota 截断，
 相关性和成本结果是注释；只有结构或数据机械无效的候选会被排除。
 
@@ -96,10 +100,39 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 还必须覆盖 `universe_selection.min_listing_days` 与 `lookback`；否则研究会因 0 个有效
 假设失败关闭。
 
-正式执行前仍应使用 `research-futures-factors` 的 `prepare_study.py` 冻结假设、因子、
-bar 周期、日期和检验边界，再执行其记录的精确命令并运行 `audit_study.py`。正式查看
-真实历史的 IC、HAC t 值、收益或最优周期必须走该流程。合成数据调试、表达式编码和
-单元测试不需要机械执行完整协议。
+正式执行时应先冻结候选快照、因子名、bar 周期、日期和检验边界，并为每次研究指定
+新的 `--output-dir` 与 `--refuse-existing-output`。`main.py research` 输出的
+`ic_by_window_period.json` 会记录精确配置、验证策略与 taxonomy 哈希、完整假设数、
+因子级 Simes/BH、selection-adjusted 因子内 BH、报告用 FWER 标签和逐因子结果；
+`validation_funnel.json` 另存完整漏斗及阈值 ±20% 敏感性。正式查看真实历史的 IC、
+HAC t 值、收益或最优周期必须走该流程；合成数据调试、表达式编码和单元测试不需要
+机械执行完整协议。
+
+当前正式发现门槛读取 `validation_policy`：层级 FDR `q=0.10`、`|IC|>=0.01`、
+`|t|>=2.0`。Bonferroni/FWER 只作证据标签，不再是硬闸门。三分组、分钟换手按交易日
+聚合、自然年稳定性和完整移仓成本检查均在同一输出中记录；真实 roll ledger 未配置时
+候选自动进入观察期。
+
+### 5. 将冻结发现集交给部署适配与 WF
+
+手工运行部署参数适配时，必须把 P0 发现文件作为合同传入，不能把任意注册表清单直接
+送入 `deployment` 模式：
+
+```powershell
+& $PY -X utf8 -B main.py adaptivity `
+  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
+  --config config/parquet_research.yaml `
+  --fdr-method deployment `
+  --discovery-file 'runs\factor_research\study_id\ic_by_window_period.json' `
+  --frequency 1min --periods '1,5,15' `
+  --factor-start '2022-10-01' --ic-start '2023-01-01' --ic-end '2024-12-31' `
+  --output-dir 'runs\factor_research\study_id\deployment'
+```
+
+该命令会自动读取发现阶段的 `final_factors`、通过的 raw/neutralized 版本、观察期原因和
+权重上限，并校验验证策略与 taxonomy 哈希。更推荐使用 `main.py walkforward`：每一折
+会自动执行“训练期发现 → 冻结发现集部署适配 → 相关性/家族治理 → Ridge → 测试折”，
+主框架无需额外读取 SQLite，也不会自动修改交易配置。
 
 不要把 `mined_candidate` 直接加入交易配置。通过审计后，才用审计 JSON 记录状态：
 

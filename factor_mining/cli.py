@@ -102,6 +102,11 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         min_cross_section=args.min_cross_section,
         min_time_observations=args.min_time_observations,
         neutralize_volatility=not args.no_volatility_neutralization,
+        time_segments=args.time_segments,
+        turnover_penalty=args.turnover_penalty,
+        complexity_penalty=args.complexity_penalty,
+        coverage_penalty=args.coverage_penalty,
+        segment_floor_weight=args.segment_floor_weight,
     )
     gp_config = GPConfig(
         population_size=args.population,
@@ -113,6 +118,7 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         evaluator_cache_mb=args.evaluator_cache_mb,
         max_candidates=args.max_candidates,
         min_abs_ic=args.min_abs_ic,
+        windows=args.gp_windows,
         operators=args.operators or GPConfig().operators,
         allow_conditionals=args.allow_conditionals,
         seed=args.seed,
@@ -183,6 +189,10 @@ def _mine(args) -> int:
         "target_horizon": args.horizon_bars,
         "feature_config": asdict(feature_config),
         "seed": args.seed,
+        "gp_windows": list(args.gp_windows),
+        "population": args.population,
+        "generations": args.generations,
+        "operators": list(args.operators or GPConfig().operators),
     }
     run_id = args.run_id or (
         datetime.now(timezone.utc).strftime("mine_%Y%m%dT%H%M%SZ_")
@@ -204,6 +214,26 @@ def _mine(args) -> int:
         universe=args.universe,
         target=target,
         feature_config=feature_config,
+        metadata={
+            "population": args.population,
+            "generations": args.generations,
+            "elite_size": min(args.elite_size, args.population - 1),
+            "max_depth": args.max_depth,
+            "max_complexity": args.max_complexity,
+            "max_candidates": args.max_candidates,
+            "min_abs_ic": args.min_abs_ic,
+            "gp_windows": list(args.gp_windows),
+            "operators": list(args.operators or GPConfig().operators),
+            "allow_conditionals": args.allow_conditionals,
+            "sector_neutralization": args.sector_neutralization,
+            "validation_config": {
+                "time_segments": args.time_segments,
+                "turnover_penalty": args.turnover_penalty,
+                "complexity_penalty": args.complexity_penalty,
+                "coverage_penalty": args.coverage_penalty,
+                "segment_floor_weight": args.segment_floor_weight,
+            },
+        },
     )
     repository = _repository(args)
     repository.add_run(run_spec)
@@ -329,8 +359,17 @@ def _screen(args) -> int:
     candidate_ids = (
         args.candidate_ids
         if args.candidate_ids
-        else _candidate_ids_file(args.candidate_file)
+        else (
+            _candidate_ids_file(args.candidate_file)
+            if args.candidate_file
+            else tuple(
+                item.candidate_id
+                for item in repository.list_candidates(run_ids=args.candidate_run_ids)
+            )
+        )
     )
+    if not candidate_ids:
+        raise ValueError("candidate selection returned no candidates")
     candidates = tuple(repository.get_candidate(item) for item in candidate_ids)
     feature_config = candidates[0].feature_config
     universe = args.universe
@@ -444,6 +483,10 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--max-candidates", type=int, default=30)
     parser.add_argument("--min-abs-ic", type=float, default=0.01)
     parser.add_argument(
+        "--gp-windows", type=_csv_ints, default=GPConfig().windows,
+        help="rolling windows available to GP operators, in decision bars",
+    )
+    parser.add_argument(
         "--operators", type=_csv_strings, default=None,
         help="explicit GP operator vocabulary; defaults to the fast core set",
     )
@@ -455,6 +498,11 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     )
     parser.add_argument("--min-cross-section", type=int, default=4)
     parser.add_argument("--min-time-observations", type=int, default=30)
+    parser.add_argument("--time-segments", type=int, default=4)
+    parser.add_argument("--turnover-penalty", type=float, default=0.002)
+    parser.add_argument("--complexity-penalty", type=float, default=0.0005)
+    parser.add_argument("--coverage-penalty", type=float, default=0.0)
+    parser.add_argument("--segment-floor-weight", type=float, default=0.0)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--feature-memory-mb", type=int, default=4096)
     parser.add_argument("--evaluator-cache-mb", type=int, default=128)
@@ -502,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_selection = screen.add_mutually_exclusive_group(required=True)
     candidate_selection.add_argument("--candidate-ids", type=_csv_strings)
     candidate_selection.add_argument("--candidate-file", type=Path)
+    candidate_selection.add_argument("--candidate-run-ids", type=_csv_strings)
     screen.add_argument("--min-coverage", type=float, default=0.50)
     screen.add_argument("--min-cross-section", type=int, default=4)
     screen.add_argument("--min-time-observations", type=int, default=30)

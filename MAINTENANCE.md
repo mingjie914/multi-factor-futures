@@ -23,8 +23,8 @@ $PY = '.\.venv\Scripts\python.exe'
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-2026-07-27 的审查基线：完整测试 429 项约 9 秒；上述合成挖掘负载优化前约
-3.65 秒，向量化候选诊断后约 2.19 秒。机器、BLAS 和依赖版本不同会改变绝对值，
+2026-07-28 的审查基线：完整测试 445 项约 9 秒；上述合成挖掘负载优化前约
+3.65 秒，当前向量化候选诊断约 2.06 秒。机器、BLAS 和依赖版本不同会改变绝对值，
 持续集成更适合检查明显回退，而不是设置过紧的秒级硬门槛。
 
 ## 性能原则
@@ -67,7 +67,8 @@ SQLite candidate catalog -> immutable JSON snapshot
 
 因子统计准入、板块适配、后置交易属性检验与 Ridge 的完整先后关系见
 `docs/factor_validation_pipeline.md`。修改任何正式门槛或多重检验方法时必须同步更新
-该文档及研究结果中的方法元数据。
+该文档及研究结果中的方法元数据。研究 bundle 同时绑定验证策略 SHA-256 与 taxonomy
+SHA-256；任一变化必须新建输出目录并全量重跑 P0，不能复用旧 bundle。
 
 ## 清理策略
 

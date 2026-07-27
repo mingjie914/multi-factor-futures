@@ -55,6 +55,16 @@ terminal；若走 CLI，还需在 `LocalParquetData` 中显式映射对应数据
 `ts_rank` 使用 pandas 原生滚动排名，`decay_linear` 使用按列卷积；两者不再逐窗口
 回调 Python。慢统计族仍默认不进入快速 profile，应通过 `--operators` 显式分配搜索预算。
 
+“全面覆盖”指某次 campaign 明确启用上述特征族和算子族，并给每个 profile 分配搜索
+预算；它不可能也不应解释为穷举无限深度的全部表达式组合。每次运行的候选数、随机种子、
+profile、特征配置和目标 horizon 都必须冻结，未被该次表达式实际引用的 terminal 不应
+被宣称为已经得到充分搜索。
+
+`--gp-windows` 冻结 GP 时序算子的可用窗口；`--coverage-penalty` 与
+`--segment-floor-weight` 可在搜索适应度中惩罚稀疏覆盖和最差时间段，但这些仍是搜索
+排序项，不是正式 HAC/FDR 证据。run 元数据会保存人口、代数、窗口、算子和全部适应度
+参数；预筛可用 `--candidate-run-ids` 一次选择该 run 的全部候选。
+
 ## 性能原则
 
 - 特征和表达式数组使用只读 `float32`。
@@ -88,6 +98,12 @@ terminal；若走 CLI，还需在 `LocalParquetData` 中显式映射对应数据
 事后在 5/15/30 bar 中挑最优。若启用默认动态流动性品种池，`factor-start` 必须早于
 评价起点至少 `min_listing_days` 个交易日，并覆盖流动性 lookback。研究批次若得到
 0 个有效因子×周期观测会直接失败，不再产生“零样本但完成”的结论。
+
+2026-07-27 的 H=1/5/15/30/60/240 当前口径正式复核结果见
+[`../docs/factor_mining_validation_20260727.md`](../docs/factor_mining_validation_20260727.md)。
+该文件是旧 Bonferroni 口径的历史基线；当前正式准入使用
+[`../docs/factor_validation_pipeline.md`](../docs/factor_validation_pipeline.md) 所述 v2
+层级 FDR、自然年、成本和观察期流程，不能直接比较“通过数”而忽略方法版本。
 
 ## 开发冒烟
 

@@ -4,6 +4,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from factor_mining.api import FeatureConfig, TargetSpec
 from factor_mining.data import make_synthetic_panels
@@ -13,6 +14,7 @@ from factor_mining.operators import Expr, ExpressionEvaluator
 from factor_mining.validation import (
     PreparedTarget,
     ValidationConfig,
+    evaluate_candidate,
     _layer_diagnostics,
     _portfolio_diagnostics,
     mad_winsorize,
@@ -171,3 +173,55 @@ def test_mad_winsorize_handles_all_missing_rows_without_warning():
         result = mad_winsorize(signal, clip=5.0)
     assert np.isnan(result[0]).all()
     assert np.isfinite(result[1]).all()
+
+
+def test_robust_fitness_rewards_coverage_and_worst_segment():
+    panels = make_synthetic_panels(periods=120, symbols=8, seed=41)
+    target = PreparedTarget.from_close(
+        panels["close"], TargetSpec(name="forward_5p", horizon_bars=5)
+    )
+    signal = panels["close"].pct_change(fill_method=None).to_numpy()
+    sparse = signal.copy()
+    sparse[:, :4] = np.nan
+    base = ValidationConfig(
+        min_time_observations=20,
+        neutralize_volatility=False,
+        coverage_penalty=0.02,
+        segment_floor_weight=0.5,
+    )
+
+    dense_result = evaluate_candidate(signal, target, base)
+    sparse_result = evaluate_candidate(sparse, target, base)
+
+    assert dense_result.coverage > sparse_result.coverage
+    assert "oriented_segment_floor_ic" in dense_result.metrics
+    assert dense_result.fitness > sparse_result.fitness
+
+
+def test_coverage_uses_required_volatility_control_as_eligibility():
+    panels = make_synthetic_panels(periods=120, symbols=8, seed=43)
+    target = PreparedTarget.from_close(
+        panels["close"], TargetSpec(name="forward_5p", horizon_bars=5)
+    )
+    signal = panels["close"].pct_change(fill_method=None).to_numpy()
+    volatility = np.abs(signal)
+    volatility[:, :4] = np.nan
+
+    result = evaluate_candidate(
+        signal,
+        target,
+        ValidationConfig(min_time_observations=20, neutralize_volatility=True),
+        volatility=volatility,
+    )
+
+    assert result.coverage > 0.95
+    assert result.metrics["coverage_denominator"] == "target_and_volatility_control"
+
+
+def test_gp_window_vocabulary_is_positive_and_duplicate_free():
+    from factor_mining.gp import GPConfig
+
+    with pytest.raises(ValueError, match="positive"):
+        GPConfig(windows=(0, 5))
+    with pytest.raises(ValueError, match="duplicates"):
+        GPConfig(windows=(5, 5))

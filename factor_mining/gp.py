@@ -76,6 +76,10 @@ class GPConfig:
             raise ValueError("n_jobs must be -1 or a positive integer")
         if self.evaluator_cache_mb < 0:
             raise ValueError("evaluator_cache_mb cannot be negative")
+        if not self.windows or any(int(window) < 1 for window in self.windows):
+            raise ValueError("GP windows must contain positive bar counts")
+        if len(self.windows) != len(set(map(int, self.windows))):
+            raise ValueError("GP windows must not contain duplicates")
         probabilities = (
             self.crossover_probability
             + self.mutation_probability

@@ -518,6 +518,7 @@ class SectorGroupedOLSModel(ReturnModel):
         min_samples_per_sector: int = 100,
         fallback_to_global: bool = True,
         sector_factor_map: Optional[Dict[str, List[str]]] = None,
+        factor_weight_caps: Optional[Dict[str, float]] = None,
         unmapped_sector_policy: str = "global",
         ridge_alpha: float = 0.0,
         ridge_alphas: Optional[List[float]] = None,
@@ -528,6 +529,12 @@ class SectorGroupedOLSModel(ReturnModel):
         self._fallback_to_global = fallback_to_global
         # 方案B: 分板块因子集 {sector: [factor_name, ...]}
         self._sector_factor_map: Dict[str, List[str]] = sector_factor_map or {}
+        self._factor_weight_caps = {
+            str(name): float(cap)
+            for name, cap in (factor_weight_caps or {}).items()
+        }
+        if any(not 0.0 < cap <= 1.0 for cap in self._factor_weight_caps.values()):
+            raise ValueError("factor_weight_caps values must be in (0, 1]")
         if unmapped_sector_policy not in {"global", "zero"}:
             raise ValueError("unmapped_sector_policy must be 'global' or 'zero'")
         self._unmapped_sector_policy = unmapped_sector_policy
@@ -563,6 +570,10 @@ class SectorGroupedOLSModel(ReturnModel):
         if not factor_names:
             return self
         self._factor_names = factor_names
+        self._factor_cap_vector = np.asarray(
+            [self._factor_weight_caps.get(name, 1.0) for name in factor_names],
+            dtype=float,
+        )
 
         merged, factor_names, X_vals, y_vals, _ = stack_factors_and_returns(
             factors, forward_returns
@@ -698,10 +709,13 @@ class SectorGroupedOLSModel(ReturnModel):
                         f"factor {name!r} has no observation available as of {date}"
                     )
                 xs.append(frame.iloc[pos])
+            else:
+                xs.append(pd.Series(0.0, index=universe, name=name))
         if not xs:
             return pd.Series(0.0, index=universe)
 
         X = pd.concat(xs, axis=1).reindex(universe).fillna(0).values
+        X = X * self._factor_cap_vector[None, :]
 
         # 按品种板块选择系数 + 因子子集
         result = np.zeros(len(universe))
@@ -728,6 +742,7 @@ class SectorGroupedRidgeModel(SectorGroupedOLSModel):
         min_samples_per_sector: int = 100,
         fallback_to_global: bool = True,
         sector_factor_map: Optional[Dict[str, List[str]]] = None,
+        factor_weight_caps: Optional[Dict[str, float]] = None,
         unmapped_sector_policy: str = "global",
         ridge_alpha: float = 1.0,
         ridge_alphas: Optional[List[float]] = None,
@@ -738,6 +753,7 @@ class SectorGroupedRidgeModel(SectorGroupedOLSModel):
             min_samples_per_sector=min_samples_per_sector,
             fallback_to_global=fallback_to_global,
             sector_factor_map=sector_factor_map,
+            factor_weight_caps=factor_weight_caps,
             unmapped_sector_policy=unmapped_sector_policy,
             ridge_alpha=ridge_alpha,
             ridge_alphas=(ridge_alphas or [0.01, 0.1, 1.0, 10.0]),

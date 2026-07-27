@@ -61,6 +61,8 @@ class ValidationConfig:
     time_segments: int = 4
     turnover_penalty: float = 0.002
     complexity_penalty: float = 0.0005
+    coverage_penalty: float = 0.0
+    segment_floor_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.decision_lag_bars < 1:
@@ -71,6 +73,13 @@ class ValidationConfig:
             raise ValueError("long_short_fraction must be in (0, 0.5]")
         if self.layer_count < 2 or self.time_segments < 1:
             raise ValueError("layer_count/time_segments are invalid")
+        if any(value < 0.0 for value in (
+            self.turnover_penalty,
+            self.complexity_penalty,
+            self.coverage_penalty,
+            self.segment_floor_weight,
+        )):
+            raise ValueError("validation fitness penalties/weights cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -358,7 +367,15 @@ def evaluate_candidate(
     ic_ir = mean_ic / ic_std if np.isfinite(ic_std) and ic_std > _EPS else 0.0
     hit_rate = float(np.mean(np.sign(valid_ic) == direction))
     finite_target = np.isfinite(target.values)
-    coverage = float((np.isfinite(prepared) & finite_target).sum() / max(1, finite_target.sum()))
+    eligible_target = finite_target.copy()
+    if config.neutralize_volatility and volatility is not None:
+        eligible_target &= np.isfinite(
+            shift_signal(volatility, config.decision_lag_bars)
+        )
+    coverage = float(
+        (np.isfinite(prepared) & eligible_target).sum()
+        / max(1, eligible_target.sum())
+    )
 
     if full_diagnostics:
         gross, turnover = _portfolio_diagnostics(
@@ -396,12 +413,18 @@ def evaluate_candidate(
         if np.isfinite(part).any()
     )
     stable_fraction = float(np.mean(np.sign(segments) == direction)) if segments else 0.0
+    oriented_segment_floor = (
+        float(np.min(direction * np.asarray(segments, dtype=float)))
+        if segments else 0.0
+    )
     bounded_ir = min(abs(ic_ir), 3.0)
     fitness = (
         abs(mean_ic)
         + 0.02 * bounded_ir
         + 0.01 * hit_rate
         + 0.01 * stable_fraction
+        + config.segment_floor_weight * oriented_segment_floor
+        - config.coverage_penalty * (1.0 - coverage)
         - config.turnover_penalty * turnover_mean
         - config.complexity_penalty * max(0, complexity - 1)
     )
@@ -419,5 +442,14 @@ def evaluate_candidate(
         monotonicity=float(monotonicity),
         layer_returns=layers,
         segment_ic=segments,
-        metrics={"complexity": int(complexity)},
+        metrics={
+            "complexity": int(complexity),
+            "stable_segment_fraction": stable_fraction,
+            "oriented_segment_floor_ic": oriented_segment_floor,
+            "coverage_denominator": (
+                "target_and_volatility_control"
+                if config.neutralize_volatility and volatility is not None
+                else "target"
+            ),
+        },
     )
