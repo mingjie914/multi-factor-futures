@@ -596,7 +596,8 @@ class ProcessingContext:
     data: DataProvider
     dates: DateIndex
     universe: Universe
-    industry: Optional[pd.DataFrame] = None
+    industry: Optional[pd.DataFrame | pd.Series] = None
+    eligibility: Optional[pd.DataFrame] = None
 
 
 # ---------------------------------------------------------------------------

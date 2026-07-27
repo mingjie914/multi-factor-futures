@@ -22,6 +22,7 @@ from factor_mining.bridge import (
 from factor_mining.data import make_synthetic_panels
 from factor_mining.operators import Expr
 from factor_mining.repository import CandidateRepository, load_snapshot
+from factor_mining.validation import ValidationConfig, prepare_signal
 
 
 class FrameProvider:
@@ -144,6 +145,26 @@ def test_bridge_registers_normal_factor_and_preserves_point_in_time(tmp_path):
     assert baseline.columns.equals(universe)
     assert np.isfinite(baseline.iloc[5:].to_numpy()).any()
     pd.testing.assert_series_equal(baseline.iloc[-1], revised.iloc[-1])
+
+
+def test_bridge_combines_signal_and_target_entry_lags():
+    candidate = _candidate("mined_bridge_lag_alignment_test")
+    panels = make_synthetic_panels(periods=50, symbols=4)
+    dates = panels["close"].index
+    universe = panels["close"].columns
+
+    actual = compute_symbolic_candidate(
+        candidate, FrameProvider(panels), dates, universe
+    )
+    raw = panels["close"].pct_change(fill_method=None).rank(
+        axis=1, method="average", pct=True
+    ).to_numpy(dtype=np.float32)
+    expected = prepare_signal(
+        raw,
+        ValidationConfig(decision_lag_bars=2, neutralize_volatility=False),
+    )
+
+    np.testing.assert_allclose(actual.to_numpy(), expected, equal_nan=True)
 
 
 def test_bridge_fails_closed_on_missing_dependency(monkeypatch):

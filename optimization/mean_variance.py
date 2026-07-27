@@ -31,7 +31,17 @@ from optimization.costs import marginal_turnover_cost_rate
 
 @register("optimizer", "mean_variance")
 class MeanVarianceOptimizer(Optimizer):
-    """均值-方差优化器. max mu'w - 0.5*gamma*w'Sigma*w - cost_penalty*|w-w_prev|_1"""
+    """Research-only optimizer for calibrated expected-return forecasts.
+
+    The objective is ``mu'w - 0.5*gamma*w'Sigma*w - cost*|w-w_prev|_1``.
+    ``mu`` must be comparable out-of-sample return forecasts in the same unit
+    and horizon. Cross-sectional ranks, z-scores, and direction-only signals
+    do not satisfy that requirement and should use the formal hierarchical
+    futures allocator instead.
+    """
+
+    allocation_role = "cross_sectional_forecast_utility_optimization"
+    deployment_status = "research_only"
 
     # 求解器优先级: OSQP (QP专用, 纯Python绑定) > CLARABEL (Rust, 更精确) > SCIPY (纯Python兜底)
     # OSQP/CLARABEL 不触发 0xC0000005 崩溃 (与 ECOS/SCS 的 C 扩展不同)

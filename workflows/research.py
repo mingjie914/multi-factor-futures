@@ -297,6 +297,23 @@ def _passes_post_bonferroni_quality(result: dict) -> bool:
     )
 
 
+def _require_valid_hypothesis_observations(results: list[dict]) -> int:
+    """Fail a research batch that contains no estimable hypothesis at all."""
+
+    valid_count = sum(
+        int(values.get("ols_n", 0) or 0) >= 2
+        for result in results
+        for values in result.get("all_periods", {}).values()
+        if isinstance(values, dict)
+    )
+    if valid_count == 0:
+        raise RuntimeError(
+            "research produced zero valid factor-period tests; check factor "
+            "coverage, the point-in-time universe mask, and forward returns"
+        )
+    return int(valid_count)
+
+
 def _load_adaptivity_data(csv_path: str | None = None) -> dict:
     """加载因子适配性研究结果 (方案A: 最小集成).
 
@@ -497,7 +514,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from concurrent.futures import ThreadPoolExecutor
     from data.manager import DataManager, FrequencyDataProvider
     from factors.engine import FactorEngine
-    from core.interfaces import ProcessingContext
+    from factors.processor import build_processing_context
     from scipy import stats as _scipy_stats
 
     # 构造周期上下文；分钟数据加载后会用实际 bar 数校准年化因子。
@@ -631,6 +648,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
     # 预计算各持有期的 forward returns
     print("\n预计算 forward returns...")
+    processing_context = build_processing_context(
+        data_mgr,
+        calendar,
+        universe,
+        runner.config.universe_selection,
+    )
     fwd_returns_by_period: dict[int, pd.DataFrame] = {}
     # 持有期集合: 显式模式 → periods_override; 窗口匹配模式 → 各窗口并集
     if periods_override is not None:
@@ -638,9 +661,14 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     else:
         all_periods = sorted({p for w in window_groups.keys() for p in _periods_for_window(w)})
     for p in all_periods:
-        fwd_returns_by_period[p] = data_mgr.get_forward_returns(
+        forward_returns = data_mgr.get_forward_returns(
             calendar, universe, period=p
         )
+        if processing_context.eligibility is not None:
+            forward_returns = forward_returns.where(
+                processing_context.eligibility
+            )
+        fwd_returns_by_period[p] = forward_returns
     print(f"  持有期 (周期数): {all_periods}")
 
     # Stream each factor batch through inference, then release its matrices.
@@ -649,9 +677,6 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     results = []
     total = len(all_factors)
     t0 = time.time()
-    processing_context = ProcessingContext(
-        data=data_mgr, dates=calendar, universe=universe
-    )
     default_chunk_size = 64 if period_ctx.is_daily else 16
     research_chunk_size = max(
         int(os.environ.get("MF_RESEARCH_FACTOR_CHUNK_SIZE", default_chunk_size)),
@@ -779,6 +804,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         del factor_batch
         done = min(batch_start + research_chunk_size, total)
         print(f"  [{done}/{total}] 耗时 {time.time() - t0:.1f}s")
+
+    valid_hypotheses = _require_valid_hypothesis_observations(results)
 
     # 筛选显著因子 (业界标准筛选流程)
     # 门槛1: t值显著性 (Bonferroni校正后)
@@ -1039,6 +1066,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 "training_only_ridge",
             ],
             "total_hypotheses": total_hypotheses,
+            "valid_hypotheses": valid_hypotheses,
             "bonferroni_alpha": bonferroni_alpha,
             "ic_threshold": FORMAL_IC_THRESHOLD,
             # 周期架构信息 (新增字段, 向后兼容)
@@ -1170,6 +1198,17 @@ def _run_correlation_analysis(
     engine = FactorEngine(data_mgr)
     factor_matrices = engine.compute_factors(
         factor_names, calendar, universe, parallel=False, chunk_size=100
+    )
+    from factors.processor import build_processing_context
+
+    processing_context = build_processing_context(
+        data_mgr,
+        calendar,
+        universe,
+        runner.config.universe_selection,
+    )
+    factor_matrices = runner.processor.process_batch(
+        factor_matrices, processing_context
     )
     print(f"  完成: {len(factor_matrices)} 个因子, 耗时 {time.time()-t0:.1f}s")
 

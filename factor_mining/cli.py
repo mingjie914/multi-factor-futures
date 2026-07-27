@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+import csv
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sys
+
+import pandas as pd
 
 from factor_mining.api import (
     FeatureConfig,
@@ -21,7 +25,9 @@ from factor_mining.data import LocalParquetData, LocalParquetSpec, make_syntheti
 from factor_mining.features import FeatureEngine
 from factor_mining.gp import GPConfig, GPSearch
 from factor_mining.repository import CandidateRepository
+from factor_mining.screening import ScreeningConfig, screen_candidates
 from factor_mining.validation import PreparedTarget, ValidationConfig
+from core.sectors import sector_for
 
 
 DEFAULT_REPOSITORY = Path("runs/factor_mining/candidates.sqlite3")
@@ -46,6 +52,15 @@ def _csv_ints(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
     if not result or any(item < 1 for item in result):
         raise argparse.ArgumentTypeError("bar counts must be positive")
+    return result
+
+
+def _safe_id_fragment(value: str) -> str:
+    result = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", result):
+        raise argparse.ArgumentTypeError(
+            "candidate prefix may contain only letters, digits, and underscores"
+        )
     return result
 
 
@@ -98,6 +113,8 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         evaluator_cache_mb=args.evaluator_cache_mb,
         max_candidates=args.max_candidates,
         min_abs_ic=args.min_abs_ic,
+        operators=args.operators or GPConfig().operators,
+        allow_conditionals=args.allow_conditionals,
         seed=args.seed,
     )
     outcome = GPSearch(
@@ -107,7 +124,30 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         validation_config=validation,
         gp_config=gp_config,
         run_id=run_id,
+        group_labels=(
+            [sector_for(str(symbol)) for symbol in features.symbols]
+            if args.sector_neutralization else None
+        ),
     ).run()
+    if args.candidate_prefix:
+        namespaced = []
+        for candidate in outcome.candidates:
+            expression_hash = str(candidate.payload["expression_sha256"])
+            candidate_id = (
+                f"gp_{args.candidate_prefix}_h{args.horizon_bars}_"
+                f"{expression_hash[:12]}"
+            )
+            namespaced.append(replace(
+                candidate,
+                candidate_id=candidate_id,
+                framework_name=f"mined_{candidate_id}",
+                lineage={
+                    **candidate.lineage,
+                    "profile": args.candidate_prefix,
+                },
+                content_sha256="",
+            ))
+        outcome = replace(outcome, candidates=tuple(namespaced))
     if repository is not None:
         repository.add_candidates(outcome.candidates, run_id=run_id)
     print(canonical_json({
@@ -227,6 +267,147 @@ def _promote(args) -> int:
     return 0
 
 
+def _candidate_ids_file(path: Path) -> tuple[str, ...]:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = csv.DictReader(handle)
+        if "candidate_id" not in (rows.fieldnames or ()):
+            raise ValueError("candidate file must contain a candidate_id column")
+        result = tuple(
+            row["candidate_id"].strip() for row in rows
+            if row.get("candidate_id", "").strip()
+        )
+    if not result:
+        raise ValueError("candidate file contains no candidate ids")
+    if len(result) != len(set(result)):
+        raise ValueError("candidate file contains duplicate candidate ids")
+    return result
+
+
+def _record_prescreen_outcome(
+    repository: CandidateRepository,
+    candidate_id: str,
+    result: dict,
+    evidence: dict,
+    *,
+    run_id: str,
+) -> None:
+    """Persist diagnostics and terminally reject mechanical failures."""
+
+    candidate_evidence = {
+        **evidence,
+        "valid": bool(result["hard_pass"]),
+        "hard_reasons": result["hard_reasons"],
+    }
+    repository.record_evaluation(
+        candidate_id,
+        stage="mining_prescreen",
+        metrics=result,
+        evidence=candidate_evidence,
+        run_id=run_id,
+    )
+    if not result["hard_pass"]:
+        current = repository.get_candidate(candidate_id)
+        if current.status == "mined_candidate":
+            repository.promote(
+                candidate_id,
+                "rejected",
+                evidence=candidate_evidence,
+                run_id=run_id,
+            )
+        elif current.status != "rejected":
+            raise ValueError(
+                f"cannot apply prescreen rejection to {current.status}: "
+                f"{candidate_id}"
+            )
+
+
+def _screen(args) -> int:
+    data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
+    if not data_root:
+        raise ValueError("set --data-root or MF_PARQUET_ROOT")
+    repository = _repository(args)
+    candidate_ids = (
+        args.candidate_ids
+        if args.candidate_ids
+        else _candidate_ids_file(args.candidate_file)
+    )
+    candidates = tuple(repository.get_candidate(item) for item in candidate_ids)
+    feature_config = candidates[0].feature_config
+    universe = args.universe
+    panels = LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
+        universe, args.start, args.end, feature_config
+    )
+    outcome = screen_candidates(
+        candidates,
+        panels,
+        config=ScreeningConfig(
+            min_coverage=args.min_coverage,
+            min_cross_section=args.min_cross_section,
+            min_time_observations=args.min_time_observations,
+            min_variable_row_fraction=args.min_variable_row_fraction,
+            correlation_threshold=args.correlation_threshold,
+            max_correlation_observations=args.max_correlation_observations,
+            evaluator_cache_mb=args.evaluator_cache_mb,
+        ),
+    )
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    if output_dir.exists():
+        raise FileExistsError(output_dir)
+    output_dir.mkdir(parents=True)
+    result_frame = pd.DataFrame(outcome.results)
+    result_frame["hard_reasons"] = result_frame["hard_reasons"].map(
+        lambda values: "|".join(values)
+    )
+    result_frame["soft_flags"] = result_frame["soft_flags"].map(
+        lambda values: "|".join(values)
+    )
+    result_frame["dependencies"] = result_frame["dependencies"].map(canonical_json)
+    result_frame["formula"] = result_frame["formula"].map(canonical_json)
+    result_frame.to_csv(output_dir / "prescreen_results.csv", index=False)
+    outcome.correlation.to_parquet(output_dir / "signal_correlation.parquet")
+    summary = {
+        **outcome.summary(),
+        "screen_id": args.screen_id,
+        "start": args.start,
+        "end": args.end,
+        "frequency": feature_config.decision_frequency,
+        "universe": list(universe),
+        "candidate_source": str(args.candidate_file or "explicit_ids"),
+        "warning": "same-sample mining pre-screen; not formal HAC evidence",
+    }
+    summary_path = output_dir / "prescreen_summary.json"
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    snapshot_path = repository.write_snapshot(
+        output_dir / "prescreen_candidates.snapshot.json",
+        candidate_ids=outcome.passed_candidate_ids,
+    )
+    evidence = {
+        "scope": "mining_prescreen_not_formal_evidence",
+        "screen_id": args.screen_id,
+        "summary_path": str(summary_path),
+        "snapshot_path": str(snapshot_path),
+    }
+    by_id = {result["candidate_id"]: result for result in outcome.results}
+    for candidate_id in candidate_ids:
+        _record_prescreen_outcome(
+            repository,
+            candidate_id,
+            by_id[candidate_id],
+            evidence,
+            run_id=args.screen_id,
+        )
+    print(canonical_json({
+        **outcome.summary(),
+        "output_dir": str(output_dir),
+        "snapshot": str(snapshot_path),
+    }))
+    return 0
+
+
 def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -> None:
     parser.add_argument("--frequency", default="1min", choices=("1min", "5min", "15min"))
     parser.add_argument("--horizon-bars", type=int, default=15)
@@ -250,6 +431,11 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--no-technicals", action="store_true")
     parser.add_argument("--no-distribution", action="store_true")
     parser.add_argument("--no-volatility-neutralization", action="store_true")
+    parser.add_argument(
+        "--sector-neutralization",
+        action="store_true",
+        help="remove canonical futures-sector means during search and runtime",
+    )
     parser.add_argument("--population", type=int, default=160)
     parser.add_argument("--generations", type=int, default=8)
     parser.add_argument("--elite-size", type=int, default=12)
@@ -257,6 +443,16 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--max-complexity", type=int, default=24)
     parser.add_argument("--max-candidates", type=int, default=30)
     parser.add_argument("--min-abs-ic", type=float, default=0.01)
+    parser.add_argument(
+        "--operators", type=_csv_strings, default=None,
+        help="explicit GP operator vocabulary; defaults to the fast core set",
+    )
+    parser.add_argument("--allow-conditionals", action="store_true")
+    parser.add_argument(
+        "--candidate-prefix", type=_safe_id_fragment,
+        default=None,
+        help="namespace candidate ids across campaign profiles",
+    )
     parser.add_argument("--min-cross-section", type=int, default=4)
     parser.add_argument("--min-time-observations", type=int, default=30)
     parser.add_argument("--jobs", type=int, default=1)
@@ -293,6 +489,27 @@ def build_parser() -> argparse.ArgumentParser:
     pool.add_argument("--status", action="append", default=[])
     pool.add_argument("--limit", type=int, default=100)
     pool.set_defaults(handler=_pool_list)
+
+    screen = commands.add_parser(
+        "screen", help="pre-screen mined candidates on local bars"
+    )
+    screen.add_argument("--data-root", type=Path, default=None)
+    screen.add_argument("--universe", type=_csv_strings, required=True)
+    screen.add_argument("--start", required=True)
+    screen.add_argument("--end", required=True)
+    screen.add_argument("--screen-id", required=True)
+    screen.add_argument("--output-dir", type=Path, required=True)
+    candidate_selection = screen.add_mutually_exclusive_group(required=True)
+    candidate_selection.add_argument("--candidate-ids", type=_csv_strings)
+    candidate_selection.add_argument("--candidate-file", type=Path)
+    screen.add_argument("--min-coverage", type=float, default=0.50)
+    screen.add_argument("--min-cross-section", type=int, default=4)
+    screen.add_argument("--min-time-observations", type=int, default=30)
+    screen.add_argument("--min-variable-row-fraction", type=float, default=0.05)
+    screen.add_argument("--correlation-threshold", type=float, default=0.85)
+    screen.add_argument("--max-correlation-observations", type=int, default=100_000)
+    screen.add_argument("--evaluator-cache-mb", type=int, default=256)
+    screen.set_defaults(handler=_screen)
 
     snapshot = commands.add_parser("snapshot", help="freeze candidates for framework loading")
     snapshot.add_argument("--output", type=Path, required=True)

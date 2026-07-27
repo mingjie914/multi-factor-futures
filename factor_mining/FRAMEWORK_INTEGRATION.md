@@ -22,24 +22,29 @@ $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
   --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
   --start '2023-01-01' --end '2024-12-31' `
   --frequency 1min --horizon-bars 15 `
+  --sector-neutralization `
   --population 160 --generations 8
 ```
 
 此步骤只写独立 SQLite，候选状态为 `mined_candidate`。控制台 IC/IR/收益仅用于搜索
 诊断，不是正式入围证据。
 
-### 2. 查看并冻结待筛选集合
+### 2. 全量预筛并冻结机械合格集合
 
 ```powershell
 & $PY -B main.py mining `
-  --repository 'runs\factor_mining\candidates.sqlite3' pool-list `
-  --status mined_candidate --limit 30
-
-& $PY -B main.py mining `
-  --repository 'runs\factor_mining\candidates.sqlite3' snapshot `
+  --repository 'runs\factor_mining\candidates.sqlite3' screen `
+  --data-root $env:MF_PARQUET_ROOT `
+  --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
+  --start '2023-01-01' --end '2024-12-31' `
+  --screen-id 'screen_20260727' `
+  --output-dir 'runs\factor_mining\screens\screen_20260727' `
   --candidate-ids 'gp_xxxxx,gp_yyyyy' `
-  --output 'runs\factor_mining\snapshots\screen_20260727.json'
+  --min-coverage 0.50
 ```
+
+使用输出目录中的 `prescreen_candidates.snapshot.json`。`screen` 不按任意 quota 截断，
+相关性和成本结果是注释；只有结构或数据机械无效的候选会被排除。
 
 SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不可变交付快照；
 `Factor` 是主框架运行时接口。首版一般 GP 公式不能无损表达为现有
@@ -51,11 +56,14 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 
 ```powershell
 & $PY -X utf8 -B main.py research `
-  --mined-snapshot 'runs\factor_mining\snapshots\screen_20260727.json' `
+  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
   --config config/parquet_research.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
-  --multi-period --periods '5,15,30' --frequency 1min
+  --multi-period --periods '15' --frequency 1min
 ```
+
+周期必须匹配该批候选的挖掘目标。H=1、H=5 和 H=15 候选应拆成三个冻结研究，不能
+把同一批公式事后放进多个周期挑最优。
 
 `main.py` 会先校验快照，再导入具体工作流。随后
 `factors/user/auto_mined_bridge.py` 会：
@@ -75,13 +83,18 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 
 ```powershell
 & $PY -X utf8 -B main.py research `
-  --mined-snapshot 'runs\factor_mining\snapshots\screen_20260727.json' `
+  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
   --config config/parquet_research.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
-  --multi-period --periods '5,15,30' --frequency 1min `
+  --multi-period --periods '15' --frequency 1min `
   --factor-start '2022-10-01' --start '2023-01-01' --end '2024-12-31' `
-  --run-id 'mined_screen_20260727' --refuse-existing-output
+  --output-dir 'runs\factor_research\mined_screen_20260727\raw' `
+  --refuse-existing-output
 ```
+
+默认动态品种池需要足够的前置上市和流动性历史。`factor-start` 不只是技术指标预热，
+还必须覆盖 `universe_selection.min_listing_days` 与 `lookback`；否则研究会因 0 个有效
+假设失败关闭。
 
 正式执行前仍应使用 `research-futures-factors` 的 `prepare_study.py` 冻结假设、因子、
 bar 周期、日期和检验边界，再执行其记录的精确命令并运行 `audit_study.py`。正式查看

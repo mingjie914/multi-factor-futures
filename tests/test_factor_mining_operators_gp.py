@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+import pandas as pd
 
 from factor_mining.api import FeatureConfig, TargetSpec
 from factor_mining.data import make_synthetic_panels
@@ -55,6 +56,31 @@ def test_protected_division_preserves_missing_observations():
 
     assert np.isnan(result[0]).all()
     assert np.all(result[1:] == 0.0)
+
+
+def test_fast_rolling_rank_and_decay_match_reference_implementations():
+    _, _, features = _small_feature_set()
+    source = features.values["return_1p"]
+    frame = pd.DataFrame(source)
+    evaluator = ExpressionEvaluator(features)
+
+    rank = evaluator.evaluate(
+        Expr.operation("ts_rank", Expr.terminal("return_1p"), window=5)
+    )
+    expected_rank = frame.rolling(5, min_periods=2).apply(
+        lambda values: pd.Series(values).rank(pct=True).iloc[-1], raw=False
+    ).to_numpy()
+    np.testing.assert_allclose(rank, expected_rank, equal_nan=True, rtol=1e-6)
+
+    decay = evaluator.evaluate(
+        Expr.operation("decay_linear", Expr.terminal("return_1p"), window=5)
+    )
+    weights = np.arange(1, 6, dtype=float)
+    weights /= weights.sum()
+    expected_decay = frame.rolling(5, min_periods=5).apply(
+        lambda values: float(np.dot(values, weights)), raw=True
+    ).to_numpy()
+    np.testing.assert_allclose(decay, expected_decay, equal_nan=True, rtol=1e-6)
 
 
 def test_gp_search_is_deterministic_and_emits_bridgeable_candidates():

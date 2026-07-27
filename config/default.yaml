@@ -180,6 +180,11 @@ factors: []
 processing:
   - type: winsorize
     params: {method: mad, n_sigma: 3}
+  - type: neutralize
+    params:
+      by: [industry]
+      min_group_size: 2
+      missing_policy: error
   - type: standardize
     params: {method: zscore, by_date: true}
 
@@ -209,9 +214,19 @@ risk:
   covariance_estimator: shrinkage
 
 optimization:
-  type: mean_variance
-  risk_aversion: 2.0
-  cost_penalty: 0.5
+  # Formal path: hierarchical_asset_risk_parity. mean_variance remains a
+  # research-only challenger for horizon-matched, calibrated return forecasts.
+  type: hierarchical_asset_risk_parity
+  risk_aversion: 2.0  # research-only mean_variance
+  cost_penalty: 0.5  # research-only utility optimizers
+  hierarchical_asset_risk_parity:
+    target_volatility: 0.10
+    max_leverage: 2.0
+    covariance_shrinkage: 0.30
+    periods_per_year: 252
+    volatility_floor: 0.01
+    asset_class_budgets: {}
+    commodity_sector_budgets: {}
   dynamic_risk_limits:
     enabled: true
     asset_vol_budget: 0.025
@@ -224,8 +239,9 @@ optimization:
     covariance_shrinkage: 0.30
   constraints:
     - {type: net_exposure, lower: -0.5, upper: 0.5}
-    - {type: leverage, limit: 3.0, vol_target: 0.2}
+    - {type: leverage, limit: 2.0, vol_target: 0.0}
     - {type: sector_exposure, limit: 0.3}
+    - {type: turnover, limit: 0.30}
 
 costs:
   type: simple_futures
@@ -242,6 +258,41 @@ signals:
   batch: {entry_batches: 3, exit_batches: 2}
   output: {format: csv, path: ./signals_output}
 
+# Research universe: monthly point-in-time selection from lagged 60-day
+# liquidity. Sector floors protect small but economically distinct sleeves;
+# caps prevent the large agriculture/energy groups from dominating the IC.
+universe_selection:
+  enabled: true
+  mode: lagged_liquidity_sector_balanced
+  lookback: 60
+  rebalance_freq: monthly
+  target_count: 32
+  min_count: 28
+  max_count: 35
+  min_listing_days: 120
+  min_data_coverage: 0.95
+  score_weights: {amount: 0.7, oi: 0.3}
+  exit_buffer: 4
+  sector_minimums:
+    ferrous: 4
+    nonferrous: 3
+    precious: 2
+    energy: 5
+    agri: 6
+    stock_index: 4
+    bond: 2
+    other: 0
+  sector_maximums:
+    ferrous: 6
+    nonferrous: 5
+    precious: 2
+    energy: 7
+    agri: 8
+    stock_index: 4
+    bond: 2
+    other: 2
+
+# This is a separate post-forecast holding gate and remains disabled.
 asset_selection:
   enabled: false
   mode: hysteresis_top_n
@@ -289,7 +340,7 @@ meta_optimizer:
   reweight_freq: 20
   min_weight: 0.01
   max_weight: 0.60
-  target_volatility: 0.15
+  target_volatility: 0.10
   estimation_window: 252
   covariance_shrinkage: 0.30
   enforce_underlying_constraints: true

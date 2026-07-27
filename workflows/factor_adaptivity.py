@@ -70,7 +70,7 @@ from core.sectors import SECTOR_MAP
 from data.manager import DataManager, FrequencyDataProvider
 from data.cache import Cache
 from factors.engine import FactorEngine
-from core.interfaces import ProcessingContext
+from factors.processor import build_processing_context
 from testing.ic_test import _newey_west_ir
 from testing.regression import _newey_west_t_stat
 
@@ -1038,12 +1038,22 @@ def run_adaptivity_analysis(
     )
 
     print("\n预计算 forward returns...")
-    fwd_returns_by_period = {
-        period: data_mgr.get_forward_returns(
+    processing_context = build_processing_context(
+        data_mgr,
+        calendar,
+        valid_universe,
+        config.universe_selection,
+    )
+    fwd_returns_by_period = {}
+    for period in periods:
+        forward_returns = data_mgr.get_forward_returns(
             calendar, valid_universe, period=period
         )
-        for period in periods
-    }
+        if processing_context.eligibility is not None:
+            forward_returns = forward_returns.where(
+                processing_context.eligibility
+            )
+        fwd_returns_by_period[period] = forward_returns
     analysis_returns = {
         period: frame.loc[ic_start:ic_end]
         for period, frame in fwd_returns_by_period.items()
@@ -1065,9 +1075,6 @@ def run_adaptivity_analysis(
     )
     all_results = {}
     t0 = time.time()
-    processing_context = ProcessingContext(
-        data=data_mgr, dates=calendar, universe=valid_universe
-    )
     default_chunk_size = 64 if period_ctx.is_daily else 16
     chunk_size = max(
         int(os.environ.get("MF_ADAPTIVITY_FACTOR_CHUNK_SIZE", default_chunk_size)),

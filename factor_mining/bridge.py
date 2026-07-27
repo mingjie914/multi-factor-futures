@@ -65,7 +65,12 @@ def compute_symbolic_candidate(
     if postprocess.get("neutralize_volatility") and volatility_name:
         volatility = features.values.get(str(volatility_name))
     validation = ValidationConfig(
-        decision_lag_bars=int(candidate.payload.get("decision_lag_bars", 1)),
+        # The framework's forward return starts at the factor row.  Shift by
+        # both lags so it matches PreparedTarget's delayed entry exactly.
+        decision_lag_bars=(
+            int(candidate.payload.get("decision_lag_bars", 1))
+            + int(candidate.target.entry_delay_bars)
+        ),
         mad_clip=float(postprocess.get("mad_clip", 5.0)),
         neutralize_volatility=bool(postprocess.get("neutralize_volatility", False)),
     )

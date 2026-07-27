@@ -23,7 +23,7 @@ $PY = '.\.venv\Scripts\python.exe'
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-2026-07-27 的审查基线：完整测试 402 项约 8 秒；上述合成挖掘负载优化前约
+2026-07-27 的审查基线：完整测试 429 项约 9 秒；上述合成挖掘负载优化前约
 3.65 秒，向量化候选诊断后约 2.19 秒。机器、BLAS 和依赖版本不同会改变绝对值，
 持续集成更适合检查明显回退，而不是设置过紧的秒级硬门槛。
 
@@ -52,6 +52,18 @@ SQLite candidate catalog -> immutable JSON snapshot
 ```
 
 不得从 SQLite 直接运行因子，也不得让候选覆盖既有注册名。
+
+## 组合优化器生命周期
+
+- `hierarchical_asset_risk_parity` 标记为 `formal_default`，是正式研究、回测与实盘参考
+  信号的唯一默认品种配置器。
+- `mean_variance` 标记为 `research_only`，仅允许在预期收益已经按相同周期、相同单位
+  完成样本外幅度校准的对照实验中使用。
+- 两者不得串联；多周期 `meta_optimizer` 只在完整子组合之后配置资本。
+- 已删除被三层结构取代的 `hierarchical_sector` 注册入口。ERC 数值核心仍由
+  `risk_budgeting` 复用，不应作为遗留代码删除。
+- 更改默认优化器、目标波动率、换手或杠杆限制时，必须同步更新
+  `docs/three_layer_portfolio.md` 及对应测试。
 
 ## 清理策略
 

@@ -90,6 +90,8 @@ def test_main_dispatches_synthetic_mining_smoke(monkeypatch, capsys):
             "--periods", "80", "--symbols", "5",
             "--population", "8", "--generations", "1",
             "--max-candidates", "2",
+            "--candidate-prefix", "smoke",
+            "--sector-neutralization",
             "--rolling-windows", "3,15",
             "--feature-horizons", "1,5,15",
         ],
@@ -100,3 +102,4 @@ def test_main_dispatches_synthetic_mining_smoke(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert '"run_id":"synthetic_dev"' in output
     assert '"candidate_count"' in output
+    assert '"candidate_id":"gp_smoke_h15_' in output

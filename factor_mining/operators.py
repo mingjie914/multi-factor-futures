@@ -224,6 +224,32 @@ def _cross_section_rank(value: np.ndarray) -> np.ndarray:
     return _frame(value).rank(axis=1, method="average", pct=True).to_numpy(dtype=float)
 
 
+def _decay_linear(value: np.ndarray, window: int) -> np.ndarray:
+    """Weighted rolling mean without a Python callback per window."""
+
+    source = np.asarray(value, dtype=float)
+    result = np.full(source.shape, np.nan, dtype=float)
+    if len(source) < window:
+        return result
+    weights = np.arange(1, window + 1, dtype=float)
+    weights /= weights.sum()
+    kernel = weights[::-1]
+    count_kernel = np.ones(window, dtype=np.int16)
+    for column in range(source.shape[1]):
+        values = source[:, column]
+        finite = np.isfinite(values)
+        weighted = np.convolve(
+            np.where(finite, values, 0.0), kernel, mode="valid"
+        )
+        counts = np.convolve(
+            finite.astype(np.int16), count_kernel, mode="valid"
+        )
+        result[window - 1 :, column] = np.where(
+            counts == window, weighted, np.nan
+        )
+    return result
+
+
 class ExpressionEvaluator:
     """Evaluate expression trees with subtree memoization and protected closure."""
 
@@ -307,9 +333,9 @@ class ExpressionEvaluator:
             if op == "ts_kurt": return _rolling(args[0], window, "kurt")
             if op == "ts_rank":
                 min_periods = max(2, window // 2)
-                return _frame(args[0]).rolling(window, min_periods=min_periods).apply(
-                    lambda value: pd.Series(value).rank(pct=True).iloc[-1], raw=False
-                ).to_numpy()
+                return _frame(args[0]).rolling(
+                    window, min_periods=min_periods
+                ).rank(method="average", pct=True).to_numpy()
             if op == "ts_zscore":
                 mean = _rolling(args[0], window, "mean")
                 std = _rolling(args[0], window, "std")
@@ -323,13 +349,7 @@ class ExpressionEvaluator:
                     window, min_periods=max(2, window // 2)
                 ).cov(_frame(args[1])).to_numpy()
             if op == "decay_linear":
-                weights = np.arange(1, window + 1, dtype=float)
-                weights /= weights.sum()
-                return _frame(args[0]).rolling(
-                    window, min_periods=window
-                ).apply(
-                    lambda value: float(np.dot(value, weights)), raw=True
-                ).to_numpy()
+                return _decay_linear(args[0], window)
             if op == "cs_rank": return _cross_section_rank(args[0])
             if op in {"cs_zscore", "cs_demean"}:
                 valid = np.isfinite(args[0])

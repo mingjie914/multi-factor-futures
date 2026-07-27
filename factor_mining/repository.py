@@ -200,6 +200,37 @@ class CandidateRepository:
             raise KeyError(candidate_id)
         return CandidateSpec.from_dict(json.loads(row["candidate_json"]))
 
+    def record_evaluation(
+        self,
+        candidate_id: str,
+        *,
+        stage: str,
+        metrics: Mapping,
+        evidence: Mapping,
+        run_id: str | None = None,
+    ) -> int:
+        """Append evidence without changing the candidate's status."""
+        if not stage.strip():
+            raise ValueError("evaluation stage is required")
+        self.get_candidate(candidate_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO evaluations(
+                    candidate_id, run_id, stage, created_at, metrics_json, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate_id,
+                    run_id,
+                    stage,
+                    _utc_now(),
+                    canonical_json(dict(metrics)),
+                    canonical_json(dict(evidence)),
+                ),
+            )
+            return int(cursor.lastrowid)
+
     def promote(
         self,
         candidate_id: str,

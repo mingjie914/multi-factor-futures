@@ -202,11 +202,34 @@ class DynamicRiskLimitsConfig(StrictConfigModel):
     covariance_shrinkage: float = 0.30
 
 
+class HierarchicalAssetRiskParityConfig(StrictConfigModel):
+    """Parameters used only by the three-layer futures risk allocator."""
+
+    target_volatility: float = 0.10
+    max_leverage: float = 2.0
+    covariance_shrinkage: float = 0.30
+    periods_per_year: float = 252.0
+    volatility_floor: float = 0.01
+    asset_class_budgets: Dict[str, float] = {}
+    commodity_sector_budgets: Dict[str, float] = {}
+
+
 class OptimizationConfig(StrictConfigModel):
-    """Portfolio optimization configuration."""
-    type: str = "mean_variance"
+    """Portfolio optimizer routing and type-specific configuration.
+
+    The formal default is the three-layer futures allocator. ``risk_aversion``
+    and ``cost_penalty`` are retained only for research-only forecast-utility
+    challengers such as mean-variance. The formal allocator reads only
+    ``hierarchical_asset_risk_parity``, preventing parameter leakage between
+    the two scenarios.
+    """
+
+    type: str = "hierarchical_asset_risk_parity"
     risk_aversion: float = 2.0
     cost_penalty: float = 0.5
+    hierarchical_asset_risk_parity: HierarchicalAssetRiskParityConfig = (
+        HierarchicalAssetRiskParityConfig()
+    )
     constraints: List[Dict] = []
     dynamic_risk_limits: DynamicRiskLimitsConfig = DynamicRiskLimitsConfig()
 
@@ -240,6 +263,24 @@ class AssetSelectionConfig(StrictConfigModel):
     exit_buffer: int = 1
     min_abs_forecast: float = 0.0
     restrict_to_valid_sectors: bool = False
+
+
+class UniverseSelectionConfig(StrictConfigModel):
+    """Point-in-time, sector-balanced liquidity universe used before research."""
+
+    enabled: bool = False
+    mode: str = "lagged_liquidity_sector_balanced"
+    lookback: int = 60
+    rebalance_freq: str = "monthly"
+    target_count: int = 32
+    min_count: int = 28
+    max_count: int = 35
+    min_listing_days: int = 120
+    min_data_coverage: float = 0.95
+    score_weights: Dict[str, float] = {"amount": 0.7, "oi": 0.3}
+    exit_buffer: int = 4
+    sector_minimums: Dict[str, int] = {}
+    sector_maximums: Dict[str, int] = {}
 
 
 class BacktestConfig(StrictConfigModel):
@@ -296,7 +337,7 @@ class MetaOptimizerConfig(StrictConfigModel):
     reweight_freq: int = 20          # 重新优化权重的频率 (交易日)
     min_weight: float = 0.1          # 单子组合最小权重 (避免某子组合权重为0)
     max_weight: float = 0.6          # 单子组合最大权重 (避免过度集中)
-    target_volatility: float = 0.15  # 整体组合目标年化波动率 (用于缩放)
+    target_volatility: float = 0.10  # 整体组合目标年化波动率 (用于缩放)
     estimation_window: int = 252     # 估计协方差矩阵的窗口 (交易日)
     covariance_shrinkage: float = 0.30
     # 在 sleeve 叠加后按真实底层品种暴露再次校验整体约束。为空时继承
@@ -409,6 +450,7 @@ class FrameworkConfig(StrictConfigModel):
     optimization: OptimizationConfig = OptimizationConfig()
     costs: CostConfig = CostConfig()
     signals: SignalModeConfig = SignalModeConfig()
+    universe_selection: UniverseSelectionConfig = UniverseSelectionConfig()
     asset_selection: AssetSelectionConfig = AssetSelectionConfig()
     backtest: BacktestConfig = BacktestConfig()
     sub_portfolios: List[SubPortfolioConfig] = []  # 多频率子组合 (为空时走单组合回测)

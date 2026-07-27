@@ -21,13 +21,23 @@ class FactorProcessor:
         self, factor: FactorMatrix, context: ProcessingContext
     ) -> FactorMatrix:
         result = factor.copy()
+        eligibility = None
+        if context.eligibility is not None:
+            eligibility = context.eligibility.reindex(
+                index=result.index, columns=result.columns, fill_value=False
+            )
+            result = result.where(eligibility)
         for step in self._steps:
             try:
                 result = step.transform(result, context)
             except Exception as e:
+                if bool(getattr(step, "fail_closed", False)):
+                    raise
                 logging.getLogger(__name__).warning(
                     f"Processing step '{step.name}' failed: {e}"
                 )
+        if eligibility is not None:
+            result = result.where(eligibility)
         return result
 
     def process_batch(
@@ -48,3 +58,27 @@ def build_processing_steps(configs: List[dict]) -> List[ProcessingStep]:
         except KeyError:
             continue
     return steps
+
+
+def build_processing_context(
+    data,
+    dates,
+    universe,
+    universe_selection_config=None,
+) -> ProcessingContext:
+    """Build the shared sector labels and optional point-in-time universe mask."""
+
+    from core.sectors import sector_series
+    from data.universe_selection import build_universe_eligibility
+
+    dates = pd.DatetimeIndex(dates)
+    universe = pd.Index(universe)
+    return ProcessingContext(
+        data=data,
+        dates=dates,
+        universe=universe,
+        industry=sector_series(universe),
+        eligibility=build_universe_eligibility(
+            data, dates, universe, universe_selection_config
+        ),
+    )

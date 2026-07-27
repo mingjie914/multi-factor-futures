@@ -17,7 +17,11 @@ from core.registry import create, list_registered
 from data.manager import DataManager
 from data.cache import Cache
 from factors.engine import FactorEngine
-from factors.processor import FactorProcessor, build_processing_steps, ProcessingContext
+from factors.processor import (
+    FactorProcessor,
+    build_processing_context,
+    build_processing_steps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,17 +295,25 @@ class PipelineRunner:
         try:
             if opt_cfg.type == "mean_variance":
                 from optimization import mean_variance  # noqa: F401
-                # CR-023: mean_variance 接受 risk_aversion
+
                 self.optimizer = create(
                     "optimizer", opt_cfg.type,
                     risk_aversion=opt_cfg.risk_aversion,
                     cost_penalty=opt_cfg.cost_penalty,
                 )
-            elif opt_cfg.type in ("risk_budgeting", "hierarchical_sector"):
-                # CR-023: 这两个优化器不接受 risk_aversion, 只传 cost_penalty
+            elif opt_cfg.type == "risk_budgeting":
                 self.optimizer = create(
                     "optimizer", opt_cfg.type,
                     cost_penalty=opt_cfg.cost_penalty,
+                )
+            elif opt_cfg.type == "hierarchical_asset_risk_parity":
+                from optimization import hierarchical_asset_risk_parity  # noqa: F401
+
+                params = self._to_dict(
+                    opt_cfg.hierarchical_asset_risk_parity
+                )
+                self.optimizer = create(
+                    "optimizer", opt_cfg.type, **params
                 )
             else:
                 # 通用: 尝试传所有参数, 失败则只传 cost_penalty
@@ -316,6 +328,23 @@ class PipelineRunner:
                         "optimizer", opt_cfg.type,
                         cost_penalty=opt_cfg.cost_penalty,
                     )
+            optimizer_role = getattr(
+                self.optimizer, "allocation_role", "general_optimizer"
+            )
+            deployment_status = getattr(
+                self.optimizer, "deployment_status", "research_only"
+            )
+            logger.info(
+                "组合优化器: %s | 使用场景: %s | 状态: %s",
+                opt_cfg.type,
+                optimizer_role,
+                deployment_status,
+            )
+            if deployment_status == "research_only":
+                logger.warning(
+                    "优化器 %s 仅用于研究对照，不属于正式组合路径",
+                    opt_cfg.type,
+                )
         except Exception as e:
             logger.warning(f"优化器创建失败, 使用等权回退: {e}", exc_info=True)
             self.optimizer = None
@@ -423,6 +452,9 @@ class PipelineRunner:
             )
             self.backtester.asset_selector = self._new_asset_selector()
             self.backtester.dynamic_risk_controller = self.dynamic_risk_controller
+            self.backtester.universe_selection_config = (
+                self.config.universe_selection
+            )
         except Exception as e:
             logger.warning(f"回测引擎初始化失败: {e}", exc_info=True)
             self.backtester = None
@@ -621,9 +653,16 @@ class PipelineRunner:
         logger.info(f"  因子矩阵计算完成: {len(raw)} 个因子")
 
         logger.info(f"步骤4/5: 因子处理 + 前向收益计算")
-        ctx = ProcessingContext(data=self.data_manager, dates=full_dates, universe=universe)
+        ctx = build_processing_context(
+            self.data_manager,
+            full_dates,
+            universe,
+            self.config.universe_selection,
+        )
         processed = self.processor.process_batch(raw, ctx)
         fwd_ret = self.data_manager.get_forward_returns(full_dates, universe, period=forward_period)
+        if ctx.eligibility is not None:
+            fwd_ret = fwd_ret.where(ctx.eligibility)
         logger.info(f"  处理完成: {len(processed)} 个因子, 前向收益 shape={fwd_ret.shape}")
 
         logger.info(f"步骤5/5: IC/分层/回归检验 (持有期={forward_period}日)")
@@ -810,6 +849,9 @@ class PipelineRunner:
             )
             sub_backtester.asset_selector = self._new_asset_selector()
             sub_backtester.dynamic_risk_controller = self.dynamic_risk_controller
+            sub_backtester.universe_selection_config = (
+                self.config.universe_selection
+            )
             # 注入因子合成器 (按子组合因子过滤, 只合成该子组合内的因子)
             if factor_synthesizer is not None:
                 sub_backtester.factor_synthesizer = (

@@ -31,7 +31,7 @@ from core.interfaces import (
 )
 from data.manager import DataManager
 from factors.engine import FactorEngine
-from factors.processor import FactorProcessor, ProcessingContext
+from factors.processor import FactorProcessor, build_processing_context
 from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics
 from core.logger import get_logger
 
@@ -656,6 +656,8 @@ class Backtester:
         self._failure_ledger: List[dict] = []
         self.asset_selector = None
         self.dynamic_risk_controller = None
+        self.universe_selection_config = None
+        self._eligibility_mask: Optional[pd.DataFrame] = None
         self.forecast_averaging_vintages = 1
         self._forecast_vintages: List[pd.Series] = []
 
@@ -808,9 +810,13 @@ class Backtester:
         raw_factors = factor_engine.compute_factors(
             factor_names, all_dates, universe_static, parallel=False
         )
-        ctx = ProcessingContext(
-            data=data_manager, dates=all_dates, universe=universe_static,
+        ctx = build_processing_context(
+            data_manager,
+            all_dates,
+            universe_static,
+            self.universe_selection_config,
         )
+        self._eligibility_mask = ctx.eligibility
         processed_all = processor.process_batch(raw_factors, ctx)
 
         # 因子合成: 聚类内等权合成 (降低多重共线性, 保留全部显著因子信息)
@@ -826,6 +832,8 @@ class Backtester:
         fwd_returns = data_manager.get_forward_returns(
             all_dates, universe_static, period=holding_period
         )
+        if ctx.eligibility is not None:
+            fwd_returns = fwd_returns.where(ctx.eligibility)
 
         # 预计算日度收益 (用于日度NAV累积, 解决样本点不足和收益重叠问题)
         close = data_manager.get("close", all_dates, universe_static)
@@ -1357,6 +1365,17 @@ class Backtester:
                 universe = self._lookup_universe_schedule(
                     universe_schedule, date, universe_static
                 )
+                if self._eligibility_mask is not None:
+                    eligible_history = self._eligibility_mask.loc[
+                        self._eligibility_mask.index <= date
+                    ]
+                    if eligible_history.empty:
+                        universe = pd.Index([])
+                    else:
+                        eligible_row = eligible_history.iloc[-1].fillna(False)
+                        universe = universe.intersection(
+                            eligible_row.index[eligible_row.astype(bool)]
+                        )
                 if len(universe) > 0:
                     # 增量 alpha 重训 (含D3: 风险模型walk-forward重估计)
                     _, last_fit_idx = self._refit_alpha(

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from testing.ic_test import ICTest
 from testing.regression import _newey_west_t_stat, _vectorized_univariate_ols
-from workflows.research import _joint_ic_ols_statistics
+from workflows.research import (
+    _joint_ic_ols_statistics,
+    _require_valid_hypothesis_observations,
+)
 
 
 def test_joint_ic_ols_matches_separate_reference_paths():
@@ -61,3 +65,18 @@ def test_joint_ic_ols_fails_closed_on_small_cross_section():
     assert actual["ic_n"] == 0
     assert actual["ols_n"] == 0
     assert actual["ols_hac_t"] == 0.0
+
+
+def test_research_batch_rejects_zero_valid_hypotheses():
+    empty = [{"all_periods": {"period_1": {"ols_n": 0}}}]
+
+    with pytest.raises(RuntimeError, match="zero valid factor-period tests"):
+        _require_valid_hypothesis_observations(empty)
+
+    mixed = [{
+        "all_periods": {
+            "period_1": {"ols_n": 0},
+            "period_5": {"ols_n": 25},
+        }
+    }]
+    assert _require_valid_hypothesis_observations(mixed) == 1
