@@ -65,6 +65,10 @@ SQLite candidate catalog -> immutable JSON snapshot
 - 更改默认优化器、目标波动率、换手或杠杆限制时，必须同步更新
   `docs/three_layer_portfolio.md` 及对应测试。
 
+因子统计准入、板块适配、后置交易属性检验与 Ridge 的完整先后关系见
+`docs/factor_validation_pipeline.md`。修改任何正式门槛或多重检验方法时必须同步更新
+该文档及研究结果中的方法元数据。
+
 ## 清理策略
 
 可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、`_work/`、空的
