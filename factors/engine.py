@@ -188,18 +188,14 @@ class FactorEngine:
         spec_specs: list = []
 
         try:
-            from factors.spec_factor import is_spec_factor
-            from factors.specs import ALL_SPECS
+            from factors.specs import SPEC_BY_SLUG
         except ImportError:
             # SPEC 模块未加载, 全部走原路径
             return spec_result, list(factor_names)
 
-        # 构建 slug -> spec 索引 (一次构建, 复用)
-        spec_index = {s["slug"]: s for s in ALL_SPECS}
-
         for name in factor_names:
-            if name in spec_index and is_spec_factor(name):
-                spec_specs.append(spec_index[name])
+            if name in SPEC_BY_SLUG:
+                spec_specs.append(SPEC_BY_SLUG[name])
             else:
                 non_spec_names.append(name)
 
@@ -235,7 +231,9 @@ class FactorEngine:
         if parallel and len(factors_obj) > 1:
             with ThreadPoolExecutor(max_workers=min(max_workers, len(factors_obj))) as pool:
                 futures = {
-                    pool.submit(f.compute, self._data, dates, universe): f.name
+                    pool.submit(
+                        self.compute_factor, f, dates, universe
+                    ): f.name
                     for f in factors_obj
                 }
                 for future in as_completed(futures):

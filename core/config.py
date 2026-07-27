@@ -24,6 +24,19 @@ try:
 except ImportError:  # Pydantic 1.x compatibility
     ConfigDict = None
 
+_PYDANTIC_V2 = hasattr(BaseModel, "model_validate")
+
+
+class StrictConfigModel(BaseModel):
+    """Reject misspelled or obsolete configuration keys by default."""
+
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="forbid")
+    else:
+        class Config:
+            extra = "forbid"
+
+
 # ${VAR} 或 ${VAR:default} 模式 (CR-012: 环境变量引用)
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
@@ -56,13 +69,15 @@ def _expand_env_vars(value: Any) -> Any:
 # Sub-config models
 # ---------------------------------------------------------------------------
 
-class MySQLTableConfig(BaseModel):
+class MySQLTableConfig(StrictConfigModel):
     """Wind → framework field mapping for a single RDS table."""
     table_name: str
     columns: Dict[str, str] = {}
+    timestamp_convention: str = "start"
+    bar_minutes: int = 0
 
 
-class MySQLEndpointConfig(BaseModel):
+class MySQLEndpointConfig(StrictConfigModel):
     """One ordered MySQL endpoint. First healthy endpoint becomes active."""
     name: str = ""
     host: str = ""
@@ -73,7 +88,7 @@ class MySQLEndpointConfig(BaseModel):
     charset: str = "utf8mb4"
 
 
-class MySQLConfig(BaseModel):
+class MySQLConfig(StrictConfigModel):
     """MySQL / RDS connection configuration.
 
     Research: values from YAML.
@@ -90,11 +105,13 @@ class MySQLConfig(BaseModel):
     pool_size: int = 5
     connect_timeout: int = 5
     failure_cooldown: float = 30.0
+    dominant_lag_days: int = 1
+    schedule_buffer_days: int = 20
     endpoints: List[MySQLEndpointConfig] = []
     fallbacks: List[MySQLEndpointConfig] = []
 
 
-class DDBConfig(BaseModel):
+class DDBConfig(StrictConfigModel):
     """DolphinDB connection configuration (CR-014: 完整配置支持).
 
     Credentials via ${VAR} env var expansion.
@@ -111,45 +128,60 @@ class DDBConfig(BaseModel):
     dominant_lag_days: int = 1
 
 
-class DataSourceConfig(BaseModel):
+class ParquetConfig(StrictConfigModel):
+    """Local partitioned-Parquet futures data configuration."""
+
+    root_path: str = ""
+    datasets: Dict[str, str] = {
+        "daily": "futureshistoryprices1d",
+        "1min": "futureshistoryprices1m",
+        "15min": "futureshistoryprices15m",
+    }
+    dominant_lag_days: int = 1
+    schedule_buffer_days: int = 45
+    eager_fields: bool = True
+    panel_cache_entries: int = 1
+    curve_cache_enabled: bool = True
+    curve_cache_path: str = "./cache/curve_aggregates"
+    selected_cache_enabled: bool = True
+    selected_cache_path: str = "./cache/selected_contracts"
+
+
+class DataSourceConfig(StrictConfigModel):
     """Data source selection + cache + MySQL params."""
     source: str = "akshare_futures"
     cache: Dict[str, Any] = {}
     mysql: Optional[MySQLConfig] = None
     ddb: Optional[DDBConfig] = None  # CR-014: DDB 配置链路完整支持
+    parquet: Optional[ParquetConfig] = None
 
 
-class DateRangeConfig(BaseModel):
+class DateRangeConfig(StrictConfigModel):
     """Backtest / analysis date range."""
     start: str = "2018-01-01"
     end: str = "2024-12-31"
 
 
-class UniverseConfig(BaseModel):
-    """Universe configuration."""
-    universe: List[str] = []
-
-
-class ProcessingStepConfig(BaseModel):
+class ProcessingStepConfig(StrictConfigModel):
     """Single processing step (winsorize / standardize / neutralize / fillna)."""
     type: str
     params: Dict[str, Any] = {}
 
 
-class FactorTestConfig(BaseModel):
+class FactorTestConfig(StrictConfigModel):
     """Factor testing parameters."""
     ic: Dict = {}
     layered: Dict = {}
     regression: Dict = {}
 
 
-class AlphaConfig(BaseModel):
+class AlphaConfig(StrictConfigModel):
     """Return prediction model configuration."""
     type: str = "ols"
     params: Dict[str, Any] = {}
 
 
-class RiskConfig(BaseModel):
+class RiskConfig(StrictConfigModel):
     """Risk model configuration."""
     type: str = "barra_futures"
     style_factors: List[str] = []
@@ -157,7 +189,7 @@ class RiskConfig(BaseModel):
     covariance_estimator: str = "shrinkage"
 
 
-class DynamicRiskLimitsConfig(BaseModel):
+class DynamicRiskLimitsConfig(StrictConfigModel):
     """Volatility-aware limits applied after portfolio allocation."""
     enabled: bool = False
     asset_vol_budget: float = 0.025
@@ -170,7 +202,7 @@ class DynamicRiskLimitsConfig(BaseModel):
     covariance_shrinkage: float = 0.30
 
 
-class OptimizationConfig(BaseModel):
+class OptimizationConfig(StrictConfigModel):
     """Portfolio optimization configuration."""
     type: str = "mean_variance"
     risk_aversion: float = 2.0
@@ -183,14 +215,14 @@ class CostConfig(BaseModel):
     """Transaction cost model."""
     type: str = "simple_futures"
     # Allow arbitrary extra fields (commission_rate, slippage, margin_rate, ...)
-    if ConfigDict is not None:
+    if _PYDANTIC_V2:
         model_config = ConfigDict(extra="allow")
     else:
         class Config:
             extra = "allow"
 
 
-class SignalModeConfig(BaseModel):
+class SignalModeConfig(StrictConfigModel):
     """Signal generation configuration."""
     mode: str = "trend_following"
     position_sizer: str = "fixed_fraction"
@@ -200,7 +232,7 @@ class SignalModeConfig(BaseModel):
     output: Dict = {}
 
 
-class AssetSelectionConfig(BaseModel):
+class AssetSelectionConfig(StrictConfigModel):
     """Optional sector-aware forecast gate applied before optimization."""
     enabled: bool = False
     mode: str = "hysteresis_top_n"
@@ -210,9 +242,8 @@ class AssetSelectionConfig(BaseModel):
     restrict_to_valid_sectors: bool = False
 
 
-class BacktestConfig(BaseModel):
+class BacktestConfig(StrictConfigModel):
     """Backtest engine configuration."""
-    initial_capital: float = 1.0  # 已废弃: 净值从1.0开始, 性能指标基于收益率比率
     rebalance_freq: str = "weekly"
     benchmark: str = "csi300"
     plot: bool = True
@@ -222,7 +253,7 @@ class BacktestConfig(BaseModel):
     holding_period: int = 5       # 持有期 (周期数, 非天数; daily频率下1周期=1交易日)
 
 
-class SubPortfolioConfig(BaseModel):
+class SubPortfolioConfig(StrictConfigModel):
     """子组合配置 — 用于多频率子组合叠加.
 
     每个子组合有独立的因子集、调仓频率、持有期和资金占比.
@@ -254,7 +285,7 @@ class SubPortfolioConfig(BaseModel):
     forecast_averaging_vintages: int = 1
 
 
-class MetaOptimizerConfig(BaseModel):
+class MetaOptimizerConfig(StrictConfigModel):
     """元优化器配置 — 优化各子组合的资本配置权重.
 
     基于各子组合的历史收益和协方差矩阵, 优化资本配置权重,
@@ -281,20 +312,20 @@ class MetaOptimizerConfig(BaseModel):
     )
 
 
-class ConfirmMapEntry(BaseModel):
+class ConfirmMapEntry(StrictConfigModel):
     """日内确认映射条目 (方案A)."""
     target: str = ""          # 被确认的合成因子名
     confirm: str = ""         # 确认因子名
     weight: float = 0.3       # 确认强度
 
 
-class FactorSynthesisConfig(BaseModel):
+class FactorSynthesisConfig(StrictConfigModel):
     """因子合成配置 — 聚类合成 + 日内确认."""
     enabled: bool = True
     confirm_map: List[ConfirmMapEntry] = []
 
 
-class ResearchArtifactsConfig(BaseModel):
+class ResearchArtifactsConfig(StrictConfigModel):
     """Point-in-time research artifact bundle used by the trading pipeline."""
     enabled: bool = False
     path: str = ""
@@ -302,7 +333,7 @@ class ResearchArtifactsConfig(BaseModel):
     strict_config_hash: bool = True
 
 
-class FactorGovernanceConfig(BaseModel):
+class FactorGovernanceConfig(StrictConfigModel):
     """Optional training-only economic-family selection caps."""
     enabled: bool = False
     default_max_per_family: int = 20
@@ -310,7 +341,7 @@ class FactorGovernanceConfig(BaseModel):
     explicit_family_map: Dict[str, str] = {}
 
 
-class HorizonEnsembleConfig(BaseModel):
+class HorizonEnsembleConfig(StrictConfigModel):
     """Optional neighbouring-horizon assignment for walk-forward experiments."""
     enabled: bool = False
     neighbor_count: int = 1
@@ -319,7 +350,7 @@ class HorizonEnsembleConfig(BaseModel):
     retrain_freq_by_horizon: Dict[str, int] = {}
 
 
-class DefensiveSleeveConfig(BaseModel):
+class DefensiveSleeveConfig(StrictConfigModel):
     """Isolated optional trend/risk-allocation benchmark from index-method ideas."""
     enabled: bool = False
     integration_mode: str = "standalone"
@@ -338,7 +369,7 @@ class DefensiveSleeveConfig(BaseModel):
     annual_fee: float = 0.001
 
 
-class SupertrendSleeveConfig(BaseModel):
+class SupertrendSleeveConfig(StrictConfigModel):
     """ATR(20, 2) rule sleeve kept in shadow mode until promotion gates pass."""
     enabled: bool = True
     integration_mode: str = "shadow"
@@ -358,7 +389,7 @@ class SupertrendSleeveConfig(BaseModel):
 # Top-level config
 # ---------------------------------------------------------------------------
 
-class FrameworkConfig(BaseModel):
+class FrameworkConfig(StrictConfigModel):
     """Top-level framework configuration.
 
     Field names match the YAML keys in config/default.yaml:
@@ -403,7 +434,11 @@ _ENV_MAP = {
     "MF_MYSQL_USER": (("data", "mysql", "user"), str),
     "MF_MYSQL_PASSWORD": (("data", "mysql", "password"), str),
     "MF_MYSQL_DATABASE": (("data", "mysql", "database"), str),
-    "MF_BT_CAPITAL": (("backtest", "initial_capital"), float),
+    "MF_DDB_HOST": (("data", "ddb", "host"), str),
+    "MF_DDB_PORT": (("data", "ddb", "port"), int),
+    "MF_DDB_USER": (("data", "ddb", "user"), str),
+    "MF_DDB_PASSWORD": (("data", "ddb", "password"), str),
+    "MF_PARQUET_ROOT": (("data", "parquet", "root_path"), str),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
     "MF_DATE_END": (("date_range", "end"), str),
@@ -455,6 +490,7 @@ def load_config(path: str) -> FrameworkConfig:
     Returns:
         Validated FrameworkConfig instance.
     """
+    path = os.path.abspath(path)
     with open(path, "r", encoding="utf-8") as fh:
         if path.endswith((".yaml", ".yml")):
             raw = yaml.safe_load(fh)
@@ -463,6 +499,24 @@ def load_config(path: str) -> FrameworkConfig:
 
     if not isinstance(raw, dict):
         raise ValueError(f"Config file must contain a dict at top level, got {type(raw)}")
+
+    extends = raw.pop("extends", None)
+    if extends:
+        base_path = str(extends)
+        if not os.path.isabs(base_path):
+            base_path = os.path.join(os.path.dirname(path), base_path)
+        with open(base_path, "r", encoding="utf-8") as fh:
+            if base_path.endswith((".yaml", ".yml")):
+                base_raw = yaml.safe_load(fh)
+            else:
+                base_raw = json.load(fh)
+        if not isinstance(base_raw, dict):
+            raise ValueError(
+                f"Extended config must contain a dict, got {type(base_raw)}"
+            )
+        if "extends" in base_raw:
+            raise ValueError("Nested config extends is not supported")
+        raw = _deep_merge(base_raw, raw)
 
     # CR-012: 展开 ${VAR} 和 ${VAR:default} 环境变量引用
     raw = _expand_env_vars(raw)

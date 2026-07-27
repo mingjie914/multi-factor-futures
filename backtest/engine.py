@@ -627,14 +627,11 @@ class Backtester:
 
     def __init__(
         self,
-        initial_capital: float = 1.0,
         rebalance_freq: str = "weekly",
         cost_model: Optional[CostModel] = None,
         market_name: str = "futures",
     ):
-        # initial_capital 已废弃: 净值从1.0开始, 所有性能指标基于收益率比率计算
-        # 保留参数仅为向后兼容, 实际值为1.0
-        self.initial_capital = 1.0
+        self.initial_nav = 1.0
         self.rebalance_freq = rebalance_freq
         self.cost_model = cost_model
         self.market = market_name
@@ -1267,7 +1264,7 @@ class Backtester:
             log.warning("universe 为空, 回测直接返回初值")
             nav = pd.Series(index=rebalance_dates, dtype=float)
             if len(nav) > 0:
-                nav.iloc[0] = self.initial_capital
+                nav.iloc[0] = self.initial_nav
             nav = nav.ffill()
             return BacktestResult(
                 nav=nav, weights_history=pd.DataFrame(),
@@ -1302,7 +1299,7 @@ class Backtester:
         trade_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         holding_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         if n_bt > 0:
-            nav_arr[0] = self.initial_capital
+            nav_arr[0] = self.initial_nav
 
         current_weights = pd.Series(dtype=float)
         current_positions = pd.DataFrame()
@@ -1469,7 +1466,7 @@ class Backtester:
 
             # 更新 NAV (日度累积)
             if i == 0:
-                nav_arr[i] = self.initial_capital
+                nav_arr[i] = self.initial_nav
             else:
                 nav_arr[i] = nav_arr[i - 1] * (1.0 + port_ret)
 

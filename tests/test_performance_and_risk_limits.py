@@ -93,6 +93,47 @@ def test_batched_ic_preserves_ties_and_missing_value_semantics():
         pd.testing.assert_series_equal(batch[name], expected)
 
 
+def test_vectorized_layered_backtest_matches_qcut_reference():
+    from testing.layered import LayeredBacktest
+
+    rng = np.random.default_rng(27)
+    dates = pd.date_range("2024-01-02", periods=18, freq="B")
+    assets = pd.Index([f"A{i}" for i in range(17)])
+    factor = pd.DataFrame(
+        rng.normal(size=(18, 17)), index=dates, columns=assets
+    )
+    returns = pd.DataFrame(
+        rng.normal(size=(18, 17)), index=dates, columns=assets
+    )
+    factor.iloc[3, :4] = np.nan
+    returns.iloc[5, :3] = np.nan
+
+    actual = LayeredBacktest(n_groups=5).run(factor, returns)
+    expected = {f"Q{i + 1}": [] for i in range(5)}
+    valid_dates = []
+    for date in dates:
+        factor_row = factor.loc[date].dropna()
+        return_row = returns.loc[date]
+        if len(factor_row) < 10:
+            continue
+        labels = pd.qcut(
+            factor_row.rank(method="first"), 5, labels=list(expected)
+        )
+        grouped = return_row[factor_row.index].groupby(
+            labels, observed=False
+        ).mean()
+        for label in expected:
+            expected[label].append(float(grouped.get(label, 0.0)))
+        valid_dates.append(date)
+
+    for label, values in expected.items():
+        pd.testing.assert_series_equal(
+            actual.group_returns[label],
+            pd.Series(values, index=pd.DatetimeIndex(valid_dates)),
+            check_freq=False,
+        )
+
+
 def _reference_ridge_choice(X, y, dates, alphas, fit_intercept, n_folds):
     from alpha.ols import _fit_linear_coefficients
 
@@ -409,6 +450,34 @@ def test_data_manager_prefetch_reuses_positive_and_negative_fields():
     manager.get("missing", dates, universe)
     assert source.calls.count("close") == 1
     assert source.calls.count("missing") == 1
+
+
+def test_data_manager_does_not_write_when_cache_is_disabled():
+    from data.manager import DataManager
+
+    dates = pd.date_range("2024-01-02", periods=3, freq="B")
+    universe = pd.Index(["A"])
+
+    class Source:
+        def fetch_price(self, tickers, start, end, fields):
+            return {
+                fields[0]: pd.DataFrame(1.0, index=dates, columns=universe)
+            }
+
+    class DisabledCache:
+        def get(self, *args, **kwargs):
+            raise AssertionError("disabled cache must not be read")
+
+        def put(self, *args, **kwargs):
+            raise AssertionError("disabled cache must not be written")
+
+    manager = DataManager(
+        source=Source(),
+        cache=DisabledCache(),
+        config={"cache": {"enabled": False}},
+    )
+    result = manager.get("close", dates, universe)
+    assert result.shape == (3, 1)
 
 
 def test_cache_covering_lookup_loads_only_selected_parquet(monkeypatch, tmp_path):

@@ -1,11 +1,14 @@
+import os
+
 import dolphindb as ddb
 import pandas as pd
 
-# DolphinDB 连接配置
-hosts = ['10.118.1.68']  ## '172.24.128.112',
-ports = [8961] ## , 9961
-user = 'mjchen'
-password = 'cmj123'
+# Standalone callers use the same environment contract as core.config.
+_host = os.environ.get("MF_DDB_HOST", "")
+hosts = [_host] if _host else []
+ports = [int(os.environ.get("MF_DDB_PORT", "8961"))]
+user = os.environ.get("MF_DDB_USER", "")
+password = os.environ.get("MF_DDB_PASSWORD", "")
 
 # ============================================================================
 # 常用数据库与表路径常量（避免在各业务脚本中硬编码 dfs 路径）

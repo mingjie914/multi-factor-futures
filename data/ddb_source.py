@@ -13,10 +13,10 @@
 
 配置 (config/default.yaml):
     ddb:
-      host: '10.118.1.68'
+      host: '${MF_DDB_HOST}'
       port: 8961
-      user: 'mjchen'
-      password: 'cmj123'
+      user: '${MF_DDB_USER}'
+      password: '${MF_DDB_PASSWORD}'
       minute_db: 'dfs://kline_db'        # 分钟K线库
       minute_table: 'kline_futures_1min'  # 期货分钟K线表名
       eod_db: 'dfs://wind_db'             # 日度行情库
@@ -65,10 +65,10 @@ class DDBSource(DataSource):
 
     def __init__(self, ddb_config: Optional[dict] = None, **kwargs) -> None:
         self._config = ddb_config or {}
-        self._host = self._config.get("host", "10.118.1.68")
+        self._host = self._config.get("host", "")
         self._port = self._config.get("port", 8961)
-        self._user = self._config.get("user", "mjchen")
-        self._password = self._config.get("password", "cmj123")
+        self._user = self._config.get("user", "")
+        self._password = self._config.get("password", "")
         self._minute_db = self._config.get("minute_db", "dfs://kline_db")
         self._minute_table = self._config.get("minute_table", "kline_futures_1min")
         self._eod_db = self._config.get("eod_db", "dfs://wind_db")
@@ -83,8 +83,7 @@ class DDBSource(DataSource):
         """获取 DDB 连接 (用完需 close)."""
         from data import dolphindb_client as _gdb
 
-        # 客户端模块保留模块级凭据；此处用数据源配置覆盖。
-        # 此处用 ddb_source 配置的凭据覆盖 (来自 local.yaml 或代码默认值)
+        # Use credentials supplied by local.yaml or MF_DDB_* overrides.
         _gdb.user = self._user
         _gdb.password = self._password
         conn = _gdb.get_Conn(self._host, self._port)

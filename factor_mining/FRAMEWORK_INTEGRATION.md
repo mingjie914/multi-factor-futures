@@ -1,0 +1,122 @@
+# 主框架最短接入说明
+
+本文件是 `multi_factor` 主框架加载自动挖掘因子的接口契约。
+
+## 快速流程
+
+以下示例假设已经运行根目录 `setup.bat`：
+
+```powershell
+$PY = '.\.venv\Scripts\python.exe'
+```
+
+### 1. 挖掘到候选池
+
+以下周期全部是 1 分钟 bar 数，不是交易日。先用一个目标周期运行；不同目标周期应
+建立不同 run，避免搜索后再挑选周期而低估多重检验。
+
+```powershell
+$env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
+& $PY -B main.py mining `
+  --repository 'runs\factor_mining\candidates.sqlite3' mine `
+  --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
+  --start '2023-01-01' --end '2024-12-31' `
+  --frequency 1min --horizon-bars 15 `
+  --population 160 --generations 8
+```
+
+此步骤只写独立 SQLite，候选状态为 `mined_candidate`。控制台 IC/IR/收益仅用于搜索
+诊断，不是正式入围证据。
+
+### 2. 查看并冻结待筛选集合
+
+```powershell
+& $PY -B main.py mining `
+  --repository 'runs\factor_mining\candidates.sqlite3' pool-list `
+  --status mined_candidate --limit 30
+
+& $PY -B main.py mining `
+  --repository 'runs\factor_mining\candidates.sqlite3' snapshot `
+  --candidate-ids 'gp_xxxxx,gp_yyyyy' `
+  --output 'runs\factor_mining\snapshots\screen_20260727.json'
+```
+
+SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不可变交付快照；
+`Factor` 是主框架运行时接口。首版一般 GP 公式不能无损表达为现有
+`base + transform`，因此使用 `Factor` 桥接，而不强塞进 `SpecFactor`。
+
+### 3. 让主框架识别候选
+
+主框架命令直接使用 `--mined-snapshot`，无需先修改配置或环境变量：
+
+```powershell
+& $PY -X utf8 -B main.py research `
+  --mined-snapshot 'runs\factor_mining\snapshots\screen_20260727.json' `
+  --config config/parquet_research.yaml `
+  --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
+  --multi-period --periods '5,15,30' --frequency 1min
+```
+
+`main.py` 会先校验快照，再导入具体工作流。随后
+`factors/user/auto_mined_bridge.py` 会：
+
+1. 校验快照 SHA-256、候选内容哈希、数量和名称唯一性；
+2. 把每个符号候选转换为无参数 `Factor` 子类；
+3. 通过现有 `register_user_factor` 注册；
+4. 保留候选声明的依赖、1 分钟频率、决策 lag、MAD 和波动率中性化。
+
+未传入 `--mined-snapshot` 且未设置兼容环境变量
+`MF_MINED_CANDIDATE_SNAPSHOT` 时，该文件不做任何注册，现有框架行为完全不变。
+主框架不会读取 SQLite，也不会访问阿里云/MySQL。
+
+### 4. 用现有研究流程正式筛选
+
+注册名来自 `pool-list` 的 `framework_name`，例如：
+
+```powershell
+& $PY -X utf8 -B main.py research `
+  --mined-snapshot 'runs\factor_mining\snapshots\screen_20260727.json' `
+  --config config/parquet_research.yaml `
+  --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
+  --multi-period --periods '5,15,30' --frequency 1min `
+  --factor-start '2022-10-01' --start '2023-01-01' --end '2024-12-31' `
+  --run-id 'mined_screen_20260727' --refuse-existing-output
+```
+
+正式执行前仍应使用 `research-futures-factors` 的 `prepare_study.py` 冻结假设、因子、
+bar 周期、日期和检验边界，再执行其记录的精确命令并运行 `audit_study.py`。正式查看
+真实历史的 IC、HAC t 值、收益或最优周期必须走该流程。合成数据调试、表达式编码和
+单元测试不需要机械执行完整协议。
+
+不要把 `mined_candidate` 直接加入交易配置。通过审计后，才用审计 JSON 记录状态：
+
+```powershell
+& $PY -B main.py mining `
+  --repository 'runs\factor_mining\candidates.sqlite3' promote gp_xxxxx `
+  --status development_candidate `
+  --evidence-json 'runs\factor_research\study_id\audit.json' `
+  --run-id 'study_id'
+```
+
+`development_candidate`、`historical_candidate`、`oos_validated` 只表示证据阶段；均不
+自动进入组合。组合前仍需相关性、成本、容量、板块暴露和风险审核。
+
+## 主框架代码调用
+
+需要在 Python 进程内显式加载时，可直接调用：
+
+```python
+from factor_mining.bridge import register_snapshot
+
+names = register_snapshot("runs/factor_mining/snapshots/screen_20260727.json")
+```
+
+之后 `core.registry.get("factor", names[0])()` 与任何现有 `Factor` 的调用方式相同。
+
+## 失败策略
+
+- 快照被修改、表达式哈希不一致、名称重复：拒绝加载。
+- 缺少声明依赖或数据全空：因子输出全 NaN，不使用代理字段。
+- 黑箱 `model` 候选：首版桥接器明确拒绝。
+- 特征内存超过预算：挖掘进程失败并提示缩小数据/特征范围。
+- 环境变量为空：零副作用。

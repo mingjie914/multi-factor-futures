@@ -679,12 +679,103 @@ def test_research_artifact_bundle_validates_time_config_and_file_hash(tmp_path):
         ResearchArtifactBundle.load(tmp_path)
 
 
+def test_streamed_dataframe_hash_collection_matches_materialized_collection():
+    from research.artifacts import (
+        dataframe_collection_sha256,
+        dataframe_hash_collection_sha256,
+        dataframe_sha256,
+    )
+
+    frames = {
+        "factor:alpha": pd.DataFrame(
+            [[1.0, np.nan], [2.0, 3.0]],
+            index=pd.date_range("2024-01-01", periods=2),
+            columns=["RB", "CU"],
+        ),
+        "returns:5": pd.DataFrame(
+            [[0.01, -0.02], [0.03, 0.04]],
+            index=pd.date_range("2024-01-01", periods=2),
+            columns=["RB", "CU"],
+        ),
+    }
+    frame_hashes = {
+        name: dataframe_sha256(frame) for name, frame in frames.items()
+    }
+
+    assert dataframe_hash_collection_sha256(frame_hashes) == (
+        dataframe_collection_sha256(frames)
+    )
+
+
+def test_parallel_factor_engine_preserves_alignment_and_values(monkeypatch):
+    import factors.engine as engine_module
+
+    dates = pd.date_range("2024-01-01", periods=5, freq="B")
+    universe = pd.Index(["RB", "CU"])
+
+    class Data:
+        def prefetch(self, *args, **kwargs):
+            return None
+
+    def factor_class(name, offset):
+        class ExampleFactor:
+            def __init__(self):
+                self.name = name
+
+            def dependencies(self):
+                return ["close"]
+
+            def compute(self, data, requested_dates, requested_universe):
+                values = np.arange(8, dtype=float).reshape(4, 2) + offset
+                return pd.DataFrame(
+                    values,
+                    index=requested_dates[:4][::-1],
+                    columns=requested_universe[::-1],
+                )
+
+        return ExampleFactor
+
+    factors = {
+        "parallel_alpha_a": factor_class("parallel_alpha_a", 0.0),
+        "parallel_alpha_b": factor_class("parallel_alpha_b", 10.0),
+    }
+    monkeypatch.setattr(
+        engine_module,
+        "registry_get",
+        lambda kind, name: factors[name],
+    )
+
+    sequential = engine_module.FactorEngine(Data()).compute_factors(
+        list(factors), dates, universe, parallel=False
+    )
+    parallel = engine_module.FactorEngine(Data()).compute_factors(
+        list(factors), dates, universe, parallel=True, max_workers=2
+    )
+
+    for name in factors:
+        assert parallel[name].index.equals(dates)
+        assert parallel[name].columns.equals(universe)
+        pd.testing.assert_frame_equal(parallel[name], sequential[name])
+
+
 def test_default_config_does_not_load_legacy_report_artifacts():
     from core.config import load_config
 
     config = load_config("config/default.yaml")
     assert config.research_artifacts.enabled is False
     assert config.research_artifacts.path == ""
+
+
+def test_framework_config_rejects_unknown_keys_but_costs_remain_extensible():
+    from core.config import FrameworkConfig
+
+    with pytest.raises(ValueError, match="extra_forbidden|extra fields"):
+        FrameworkConfig(backtset={})
+    with pytest.raises(ValueError, match="extra_forbidden|extra fields"):
+        FrameworkConfig(data={"sorce": "random"})
+
+    config = FrameworkConfig(costs={"type": "custom", "custom_bps": 1.5})
+    assert config.costs.custom_bps == 1.5
 
 
 def test_benjamini_hochberg_controls_global_false_discovery_rate():

@@ -65,37 +65,47 @@ class LayeredBacktest(FactorTest):
         **params,
     ) -> LayeredResult:
         common_dates = factor.index.intersection(forward_returns.index)
+        common_columns = factor.columns.intersection(forward_returns.columns)
         group_labels = [f"Q{i+1}" for i in range(self.n_groups)]
-        group_rets: Dict[str, list] = {g: [] for g in group_labels}
-        # CR-026: 记录每个有效观测的真实日期 (跳过无效日期后不再用原始位置)
-        valid_dates: list = []
 
         # CR-026: holding_period 可通过 params 覆盖
         holding_period = params.get("holding_period", self.holding_period)
 
-        for dt in common_dates:
-            f_row = factor.loc[dt].dropna()
-            r_row = forward_returns.loc[dt]
-            common = f_row.index.intersection(r_row.index)
-            if len(common) < self.n_groups * 2:
-                continue
+        aligned_factor = factor.loc[common_dates, common_columns]
+        aligned_returns = forward_returns.loc[common_dates, common_columns]
+        ranks = aligned_factor.rank(axis=1, method="first").to_numpy(
+            dtype=float, copy=False
+        )
+        returns = aligned_returns.to_numpy(dtype=float, copy=False)
+        counts = np.isfinite(ranks).sum(axis=1)
+        valid_rows = counts >= self.n_groups * 2
+        valid_index = pd.DatetimeIndex(common_dates[valid_rows])
+        group_ids = np.zeros_like(ranks, dtype=np.int16)
+        for boundary_index in range(1, self.n_groups):
+            boundary = (
+                1.0
+                + boundary_index * (np.maximum(counts, 1) - 1.0)
+                / self.n_groups
+            )
+            group_ids += ranks > boundary[:, None]
 
-            # 用 qcut 替代手动排序分组，向量化计算组内均值
-            # CR-026: Q1 = 最低因子值组, Q5 = 最高因子值组
-            f_vals = f_row[common]
-            r_vals = r_row[common]
-            labels = pd.qcut(f_vals.rank(method="first"), self.n_groups,
-                             labels=group_labels)
-            grouped = r_vals.groupby(labels).mean()
-            for g in group_labels:
-                group_rets[g].append(float(grouped.get(g, 0.0)))
-            valid_dates.append(dt)
-
-        # CR-026: 使用真实有效日期作为索引 (不再用 common_dates 的前 N 个位置)
-        valid_index = pd.DatetimeIndex(valid_dates)
         gs: Dict[str, pd.Series] = {}
-        for g in group_labels:
-            gs[g] = pd.Series(group_rets[g], index=valid_index)
+        for group_index, label in enumerate(group_labels):
+            selected = (
+                valid_rows[:, None]
+                & np.isfinite(ranks)
+                & (group_ids == group_index)
+            )
+            finite = selected & np.isfinite(returns)
+            denominator = finite.sum(axis=1)
+            numerator = np.where(finite, returns, 0.0).sum(axis=1)
+            means = np.divide(
+                numerator,
+                denominator,
+                out=np.zeros(len(common_dates), dtype=float),
+                where=denominator > 0,
+            )
+            gs[label] = pd.Series(means[valid_rows], index=valid_index)
 
         # CR-026: 统一 spread 方向: Q5(高因子) - Q1(低因子), 标准多空方向
         ls = (gs[group_labels[-1]] - gs[group_labels[0]]).fillna(0)

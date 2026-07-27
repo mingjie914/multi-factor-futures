@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import urllib.parse
 from typing import Dict, List, Optional
@@ -35,6 +36,16 @@ class MySQLSource(DataSource):
     INDEX_FUTURES_ROOTS = {"IF", "IH", "IC", "IM"}
     # 国债期货品种代码 (行情在 cbondfutureseodprices)
     BOND_FUTURES_ROOTS = {"T", "TF", "TS", "TL"}
+    _INTRADAY_CURVE_FIELDS = {
+        "curve_total_oi",
+        "curve_top2_oi",
+        "curve_total_volume",
+        "curve_contract_count",
+        "curve_oi_breadth",
+        "curve_oi_concentration",
+        "curve_oi_hhi",
+    }
+    _INTRADAY_PRICE_FIELDS = {"open", "high", "low", "close"}
 
     def __init__(self, mysql_config: Optional[dict] = None, **kwargs) -> None:
         self._config = mysql_config or {}
@@ -44,6 +55,12 @@ class MySQLSource(DataSource):
         self._circuit_open_until = 0.0
         self._failure_cooldown = max(
             float(self._config.get("failure_cooldown", 30.0)), 0.0
+        )
+        self._dominant_lag_days = max(
+            int(self._config.get("dominant_lag_days", 1)), 1
+        )
+        self._schedule_buffer_days = max(
+            int(self._config.get("schedule_buffer_days", 20)), 7
         )
         self._endpoints = self._normalise_endpoints(self._config)
         self._table_map: Dict = (
@@ -218,6 +235,337 @@ class MySQLSource(DataSource):
         return ".".join(
             f"`{part.replace('`', '``')}`" for part in identifier.split(".")
         )
+
+    @staticmethod
+    def _normalise_intraday_frequency(frequency: str) -> tuple[str, Optional[str]]:
+        aliases = {
+            "5m": "5min",
+            "15m": "15min",
+            "30m": "30min",
+            "60m": "hourly",
+            "60min": "hourly",
+            "1h": "hourly",
+        }
+        value = aliases.get(str(frequency).lower(), str(frequency).lower())
+        routes = {
+            "5min": ("5min", None),
+            "15min": ("5min", "15min"),
+            "30min": ("5min", "30min"),
+            "hourly": ("5min", "60min"),
+        }
+        if value not in routes:
+            raise NotImplementedError(
+                f"MySQLSource does not support frequency={frequency!r}; "
+                "available intraday frequencies are 5min, 15min, 30min, hourly"
+            )
+        return routes[value]
+
+    def _assign_trading_dates(self, timestamps: pd.Series) -> pd.Series:
+        """Map night bars to the next exchange trading day."""
+        values = pd.to_datetime(timestamps, errors="coerce")
+        if values.empty:
+            return pd.Series(dtype="datetime64[ns]", index=timestamps.index)
+        natural_dates = values.dt.normalize()
+        targets = natural_dates.where(
+            values.dt.hour.lt(18), natural_dates + pd.Timedelta(days=1)
+        )
+        calendar = self.fetch_calendar(
+            targets.min() - pd.Timedelta(days=7),
+            targets.max() + pd.Timedelta(days=7),
+        )
+        calendar = pd.DatetimeIndex(calendar).normalize().unique().sort_values()
+        if len(calendar) == 0:
+            return targets.map(lambda value: value + pd.offsets.BDay(0))
+        locations = calendar.searchsorted(targets.to_numpy(), side="left")
+        assigned = np.full(len(targets), np.datetime64("NaT"), dtype="datetime64[ns]")
+        valid = locations < len(calendar)
+        assigned[valid] = calendar.to_numpy()[locations[valid]]
+        return pd.Series(assigned, index=timestamps.index)
+
+    def _fetch_intraday_contract_rows(
+        self,
+        tickers,
+        start,
+        end,
+        fields: List[str],
+    ) -> pd.DataFrame:
+        cfg = self._get_table_config("intraday_5m")
+        if not cfg:
+            raise ValueError("mysql.tables.intraday_5m is not configured")
+        columns = dict(cfg.get("columns") or {})
+        required = {"datetime", "ticker", "close", "volume", "oi"}
+        missing = sorted(required - set(columns))
+        if missing:
+            raise ValueError(
+                "intraday_5m configuration is missing columns: "
+                + ", ".join(missing)
+            )
+
+        roots = tuple(dict.fromkeys(str(value).strip().upper() for value in tickers))
+        if not roots:
+            return pd.DataFrame()
+        invalid = [root for root in roots if not re.fullmatch(r"[A-Z]+", root)]
+        if invalid:
+            raise ValueError("invalid futures roots: " + ", ".join(invalid))
+
+        logical_fields = tuple(dict.fromkeys(
+            ["close", "volume", "oi"]
+            + [field for field in fields if field in columns]
+        ))
+        selections = [
+            f"{self._quote_identifier(columns['datetime'])} AS `trade_datetime`",
+            f"{self._quote_identifier(columns['ticker'])} AS `symbol`",
+        ]
+        selections.extend(
+            f"{self._quote_identifier(columns[field])} AS "
+            f"{self._quote_identifier(field)}"
+            for field in logical_fields
+        )
+        buffer_start = (
+            pd.Timestamp(start).normalize()
+            - pd.Timedelta(days=self._schedule_buffer_days)
+        )
+        exclusive_end = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+        root_pattern = "^(" + "|".join(roots) + ")[0-9]+$"
+        datetime_sql = self._quote_identifier(columns["datetime"])
+        ticker_sql = self._quote_identifier(columns["ticker"])
+        sql = (
+            f"SELECT {', '.join(selections)} "
+            f"FROM {self._quote_identifier(str(cfg['table_name']))} "
+            f"WHERE {datetime_sql} >= '{buffer_start:%Y-%m-%d %H:%M:%S}' "
+            f"AND {datetime_sql} < '{exclusive_end:%Y-%m-%d %H:%M:%S}' "
+            f"AND {ticker_sql} REGEXP '{root_pattern}' "
+            f"ORDER BY {datetime_sql}, {ticker_sql}"
+        )
+        frame = self._read_sql(sql)
+        if frame.empty:
+            return frame
+        frame["trade_datetime"] = pd.to_datetime(
+            frame["trade_datetime"], errors="coerce"
+        )
+        frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+        frame["root"] = frame["symbol"].str.extract(
+            r"^([A-Z]+)(?=[0-9]+$)", expand=False
+        )
+        frame = frame.loc[frame["root"].isin(roots)].copy()
+        for field in logical_fields:
+            frame[field] = pd.to_numeric(frame[field], errors="coerce")
+        frame["trade_date"] = self._assign_trading_dates(
+            frame["trade_datetime"]
+        )
+        if str(cfg.get("timestamp_convention", "start")).lower() == "end":
+            bar_minutes = max(int(cfg.get("bar_minutes", 5)), 1)
+            frame["trade_datetime"] = (
+                frame["trade_datetime"] - pd.Timedelta(minutes=bar_minutes)
+            )
+        frame = frame.dropna(subset=["trade_datetime", "trade_date", "root"])
+        return (
+            frame.sort_values(["trade_datetime", "root", "symbol"])
+            .drop_duplicates(["trade_datetime", "root", "symbol"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    def _build_intraday_continuous_plan(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame()
+        daily_last = (
+            frame.sort_values("trade_datetime")
+            .groupby(["trade_date", "root", "symbol"], sort=True, as_index=False)
+            .tail(1)
+        )
+        dominant = (
+            daily_last.sort_values(
+                ["trade_date", "root", "oi", "volume", "symbol"],
+                ascending=[True, True, False, False, True],
+                na_position="last",
+            )
+            .drop_duplicates(["trade_date", "root"], keep="first")
+            .sort_values(["root", "trade_date"])
+        )
+        dominant["contract"] = dominant.groupby("root")["symbol"].shift(
+            self._dominant_lag_days
+        )
+        close_lookup = daily_last.set_index(
+            ["trade_date", "root", "symbol"]
+        )["close"]
+        plans = []
+        for root, group in dominant.groupby("root", sort=False):
+            adjustment = 1.0
+            previous_contract = None
+            previous_date = None
+            for row in group.itertuples(index=False):
+                contract = row.contract
+                if pd.isna(contract):
+                    previous_date = row.trade_date
+                    continue
+                contract = str(contract)
+                if (
+                    previous_contract is not None
+                    and contract != previous_contract
+                    and previous_date is not None
+                ):
+                    old_close = close_lookup.get(
+                        (previous_date, root, previous_contract), np.nan
+                    )
+                    new_close = close_lookup.get(
+                        (previous_date, root, contract), np.nan
+                    )
+                    if (
+                        np.isfinite(old_close)
+                        and np.isfinite(new_close)
+                        and float(new_close) > 0.0
+                    ):
+                        adjustment *= float(old_close) / float(new_close)
+                plans.append({
+                    "trade_date": row.trade_date,
+                    "root": root,
+                    "contract": contract,
+                    "adjustment": adjustment,
+                })
+                previous_contract = contract
+                previous_date = row.trade_date
+        return pd.DataFrame(plans)
+
+    @classmethod
+    def _intraday_curve_rows(cls, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame()
+        work = frame.copy()
+        work["oi"] = work["oi"].clip(lower=0.0)
+        work["volume"] = work["volume"].clip(lower=0.0)
+        work = work.sort_values(["root", "symbol", "trade_datetime"])
+        previous = work.groupby(["root", "symbol"])["oi"].shift(1)
+        work["oi_increased"] = work["oi"].gt(previous).where(previous.notna())
+        work["oi_sq"] = work["oi"].pow(2)
+        keys = ["trade_datetime", "root"]
+        aggregate = work.groupby(keys, sort=True).agg(
+            curve_total_oi=("oi", "sum"),
+            curve_total_volume=("volume", "sum"),
+            curve_contract_count=("oi", lambda values: int(values.gt(0).sum())),
+            curve_oi_breadth=("oi_increased", "mean"),
+            oi_sq_sum=("oi_sq", "sum"),
+        )
+        top2 = (
+            work.sort_values(keys + ["oi"], ascending=[True, True, False])
+            .groupby(keys, sort=True)
+            .head(2)
+            .groupby(keys, sort=True)["oi"]
+            .sum()
+            .rename("curve_top2_oi")
+        )
+        aggregate = aggregate.join(top2, how="left")
+        denominator = aggregate["curve_total_oi"].replace(0.0, np.nan)
+        aggregate["curve_oi_concentration"] = (
+            aggregate["curve_top2_oi"] / denominator
+        )
+        aggregate["curve_oi_hhi"] = aggregate.pop("oi_sq_sum") / denominator.pow(2)
+        return aggregate.reset_index()
+
+    @staticmethod
+    def _resample_intraday_rows(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        work = frame.copy()
+        work["trade_datetime"] = pd.to_datetime(
+            work["trade_datetime"]
+        ).dt.floor(rule)
+        aggregations = {
+            field: method
+            for field, method in (
+                ("open", "first"),
+                ("high", "max"),
+                ("low", "min"),
+                ("close", "last"),
+                ("volume", "sum"),
+                ("amount", "sum"),
+                ("oi", "last"),
+                ("curve_total_oi", "last"),
+                ("curve_top2_oi", "last"),
+                ("curve_total_volume", "sum"),
+                ("curve_contract_count", "last"),
+                ("curve_oi_breadth", "mean"),
+                ("curve_oi_concentration", "last"),
+                ("curve_oi_hhi", "last"),
+            )
+            if field in work.columns
+        }
+        return (
+            work.groupby(["trade_datetime", "root"], sort=True, as_index=False)
+            .agg(aggregations)
+        )
+
+    def fetch_price_at_frequency(
+        self,
+        tickers: TickerIndex,
+        start: Date,
+        end: Date,
+        fields: List[str],
+        frequency: str = "daily",
+    ) -> PricePanel:
+        if str(frequency).lower() == "daily":
+            return self.fetch_price(tickers, start, end, fields)
+        _, resample_rule = self._normalise_intraday_frequency(frequency)
+        requested = tuple(dict.fromkeys(str(field) for field in fields))
+        raw_fields = [
+            field for field in requested
+            if field in {"open", "high", "low", "close", "volume", "amount", "oi"}
+        ]
+        needs_curve = any(field in self._INTRADAY_CURVE_FIELDS for field in requested)
+        load_fields = list(dict.fromkeys(raw_fields + ["close", "volume", "oi"]))
+        raw = self._fetch_intraday_contract_rows(
+            tickers, start, end, load_fields
+        )
+        if raw.empty:
+            return {}
+
+        plan = self._build_intraday_continuous_plan(raw)
+        selected = raw.merge(
+            plan, on=["trade_date", "root"], how="inner", validate="many_to_one"
+        )
+        selected = selected.loc[selected["symbol"].eq(selected["contract"])].copy()
+        for field in self._INTRADAY_PRICE_FIELDS.intersection(raw_fields):
+            selected[field] = selected[field] * selected["adjustment"]
+        selected = selected[
+            ["trade_datetime", "root"]
+            + [field for field in raw_fields if field in selected]
+        ]
+
+        combined = selected
+        if needs_curve:
+            curve = self._intraday_curve_rows(raw)
+            combined = curve if combined.empty else combined.merge(
+                curve, on=["trade_datetime", "root"], how="outer"
+            )
+        start_date = pd.Timestamp(start).normalize()
+        end_date = pd.Timestamp(end).normalize()
+        valid_dates = raw[
+            ["trade_datetime", "trade_date"]
+        ].drop_duplicates("trade_datetime")
+        valid_timestamps = valid_dates.loc[
+            valid_dates["trade_date"].between(start_date, end_date),
+            "trade_datetime",
+        ]
+        combined = combined.loc[
+            combined["trade_datetime"].isin(valid_timestamps)
+        ]
+        if resample_rule:
+            combined = self._resample_intraday_rows(combined, resample_rule)
+
+        result: PricePanel = {}
+        for field in requested:
+            if field == "oi_change" and "oi" in combined:
+                panel = combined.pivot(
+                    index="trade_datetime", columns="root", values="oi"
+                ).sort_index().diff()
+            elif field in combined:
+                panel = combined.pivot(
+                    index="trade_datetime", columns="root", values=field
+                ).sort_index()
+            else:
+                continue
+            panel.index = pd.DatetimeIndex(panel.index)
+            result[field] = panel.reindex(columns=list(tickers))
+        return result
 
     def fetch_macro(
         self,

@@ -47,6 +47,7 @@ import sys
 import json
 import time
 import argparse
+import gc
 from concurrent.futures import ThreadPoolExecutor
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,13 +65,14 @@ from factors.specs.technicals import *  # noqa: F401,F403
 from factors.specs.directional import *  # noqa: F401,F403
 from factors.specs.volume_stat import *  # noqa: F401,F403
 from core.config import load_config
+from core.period import PeriodContext
 from core.sectors import SECTOR_MAP
-from data.manager import DataManager
+from data.manager import DataManager, FrequencyDataProvider
 from data.cache import Cache
 from factors.engine import FactorEngine
 from core.interfaces import ProcessingContext
-from testing.ic_test import ICTest, _vectorized_pearson_ic, _newey_west_ir
-from testing.regression import _newey_west_t_stat, _vectorized_univariate_ols
+from testing.ic_test import _newey_west_ir
+from testing.regression import _newey_west_t_stat
 
 # 默认持有期列表 (周期数, daily频率下=交易日)
 DEFAULT_PERIODS = [1, 3, 5, 10, 20, 40]
@@ -165,6 +167,119 @@ def _load_data_from_cache(data_mgr, universe, factor_start, ic_end):
     return True, best_dates
 
 
+def _cross_section_ic_and_slopes(
+    factor_values: np.ndarray,
+    return_values: np.ndarray,
+    index: pd.Index,
+    *,
+    min_stocks: int,
+) -> tuple[pd.Series, pd.Series]:
+    """Compute Pearson IC and raw OLS slopes from one centered array pass."""
+    # Pearson historically treats infinities as present and rejects the row
+    # only after the centered products become non-finite. Raw OLS excludes
+    # infinities before centering. Reuse the Pearson pass for ordinary rows
+    # and recompute only the exceptional rows to preserve that contract.
+    valid = ~np.isnan(factor_values) & ~np.isnan(return_values)
+    counts = valid.sum(axis=1)
+    safe_counts = np.maximum(counts, 1)
+    factor_masked = np.where(valid, factor_values, 0.0)
+    returns_masked = np.where(valid, return_values, 0.0)
+    factor_mean = factor_masked.sum(axis=1) / safe_counts
+    returns_mean = returns_masked.sum(axis=1) / safe_counts
+    factor_centered = np.where(
+        valid, factor_values - factor_mean[:, None], 0.0
+    )
+    returns_centered = np.where(
+        valid, return_values - returns_mean[:, None], 0.0
+    )
+
+    cross_product = np.einsum(
+        "ij,ij->i", factor_centered, returns_centered
+    )
+    factor_ss = np.einsum(
+        "ij,ij->i", factor_centered, factor_centered
+    )
+    returns_ss = np.einsum(
+        "ij,ij->i", returns_centered, returns_centered
+    )
+
+    ic_denominator = np.sqrt(factor_ss * returns_ss)
+    ic_usable = (
+        (counts >= min_stocks)
+        & np.isfinite(cross_product)
+        & np.isfinite(ic_denominator)
+        & (ic_denominator > 0.0)
+    )
+    ic_values = np.divide(
+        cross_product,
+        ic_denominator,
+        out=np.full(len(index), np.nan, dtype=float),
+        where=ic_usable,
+    )
+
+    slope_valid = np.isfinite(factor_values) & np.isfinite(return_values)
+    slope_counts = counts.copy()
+    slope_cross_product = cross_product.copy()
+    slope_factor_ss = factor_ss.copy()
+    exceptional_rows = np.any(slope_valid != valid, axis=1)
+    if exceptional_rows.any():
+        exceptional_factor = factor_values[exceptional_rows]
+        exceptional_returns = return_values[exceptional_rows]
+        exceptional_valid = slope_valid[exceptional_rows]
+        exceptional_counts = exceptional_valid.sum(axis=1)
+        exceptional_safe_counts = np.maximum(exceptional_counts, 1)
+        exceptional_factor_masked = np.where(
+            exceptional_valid, exceptional_factor, 0.0
+        )
+        exceptional_returns_masked = np.where(
+            exceptional_valid, exceptional_returns, 0.0
+        )
+        exceptional_factor_mean = (
+            exceptional_factor_masked.sum(axis=1) / exceptional_safe_counts
+        )
+        exceptional_return_mean = (
+            exceptional_returns_masked.sum(axis=1) / exceptional_safe_counts
+        )
+        exceptional_factor_centered = np.where(
+            exceptional_valid,
+            exceptional_factor - exceptional_factor_mean[:, None],
+            0.0,
+        )
+        exceptional_returns_centered = np.where(
+            exceptional_valid,
+            exceptional_returns - exceptional_return_mean[:, None],
+            0.0,
+        )
+        slope_counts[exceptional_rows] = exceptional_counts
+        slope_cross_product[exceptional_rows] = np.einsum(
+            "ij,ij->i",
+            exceptional_factor_centered,
+            exceptional_returns_centered,
+        )
+        slope_factor_ss[exceptional_rows] = np.einsum(
+            "ij,ij->i",
+            exceptional_factor_centered,
+            exceptional_factor_centered,
+        )
+
+    slope_usable = (
+        (slope_counts >= min_stocks)
+        & np.isfinite(slope_cross_product)
+        & np.isfinite(slope_factor_ss)
+        & (slope_factor_ss > np.finfo(float).eps)
+    )
+    slopes = np.divide(
+        slope_cross_product,
+        slope_factor_ss,
+        out=np.full(len(index), np.nan, dtype=float),
+        where=slope_usable,
+    )
+    return (
+        pd.Series(ic_values[ic_usable], index=index[ic_usable], dtype=float),
+        pd.Series(slopes[slope_usable], index=index[slope_usable], dtype=float),
+    )
+
+
 def _compute_ic_by_sector(
     factor_mat: pd.DataFrame,
     fwd_returns: pd.DataFrame,
@@ -189,23 +304,50 @@ def _compute_ic_by_sector(
     if len(common_cols) < 2 or len(common_dates) < 10:
         return {}
 
-    f = factor_mat.loc[common_dates, common_cols]
-    r = fwd_returns.loc[common_dates, common_cols]
+    if factor_mat.index.equals(common_dates) and factor_mat.columns.equals(common_cols):
+        f = factor_mat
+    else:
+        f = factor_mat.loc[common_dates, common_cols]
+    if fwd_returns.index.equals(common_dates) and fwd_returns.columns.equals(common_cols):
+        r = fwd_returns
+    else:
+        r = fwd_returns.loc[common_dates, common_cols]
+    factor_values = f.to_numpy(dtype=float, copy=False)
+    return_values = r.to_numpy(dtype=float, copy=False)
 
     # 按板块分组品种
-    sector_tickers = {}
-    for ticker in common_cols:
+    sector_positions = {}
+    for position, ticker in enumerate(common_cols):
         sec = sector_map.get(str(ticker), "other")
-        sector_tickers.setdefault(sec, []).append(ticker)
+        sector_positions.setdefault(sec, []).append(position)
 
     results = {}
-    for sector, tickers in sector_tickers.items():
-        if len(tickers) < min_stocks:
+    for sector, positions in sector_positions.items():
+        if len(positions) < 2:
             continue
-        f_sec = f[tickers]
-        r_sec = r[tickers]
-        # 板块内截面IC, min_stocks降低到3 (板块品种数少)
-        ic_series, valid_mask = _vectorized_pearson_ic(f_sec, r_sec, min_stocks=min_stocks)
+        # DataFrame column selection historically yielded C-contiguous arrays.
+        # Preserve that reduction order so near-constant rows retain identical
+        # zero-variance decisions after the numpy fast path.
+        factor_sector = np.ascontiguousarray(factor_values[:, positions])
+        returns_sector = np.ascontiguousarray(return_values[:, positions])
+        if len(positions) < min_stocks:
+            pooled = _compute_pooled_ts_fixed_effects_arrays(
+                factor_sector,
+                returns_sector,
+                common_dates,
+                forward_period=forward_period,
+            )
+            if pooled:
+                results[sector] = pooled
+            continue
+
+        # Pearson IC and raw OLS share alignment, masking and centering.
+        ic_series, ols_slopes = _cross_section_ic_and_slopes(
+            factor_sector,
+            returns_sector,
+            common_dates,
+            min_stocks=min_stocks,
+        )
         if len(ic_series) < 10:
             continue
         ic_list = ic_series.tolist()
@@ -215,9 +357,6 @@ def _compute_ic_by_sector(
         # IC remains the economic-effect diagnostic. Statistical admission is
         # based on the raw, unpenalized univariate Fama-MacBeth OLS slope.
         _, ic_t_stat = _newey_west_ir(ic_series, forward_period=forward_period)
-        ols_slopes = _vectorized_univariate_ols(
-            f_sec, r_sec, min_stocks=min_stocks
-        )
         ols_t_stat = _newey_west_t_stat(
             ols_slopes, forward_period=forward_period
         )
@@ -239,12 +378,181 @@ def _compute_ic_by_sector(
             "ols_hac_t": float(ols_t_stat),
             "ols_p_value": p_value,
             "ols_n": int(len(ols_slopes)),
-            "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
+            "inference_models": {
+                "cross_section": "unpenalized_univariate_fama_macbeth_ols_hac",
+                "small_sector": "unpenalized_pooled_ols_instrument_fe_time_hac",
+            },
+            "test_type": "cross_section_fama_macbeth",
             "p_value": p_value,
             "n_obs": len(ic_list),
             "hit_rate": hit_rate,
         }
     return results
+
+
+def _compute_pooled_ts_fixed_effects(
+    factor_mat: pd.DataFrame,
+    fwd_returns: pd.DataFrame,
+    *,
+    forward_period: int,
+) -> dict:
+    """Pooled predictive regression for sectors with only two instruments."""
+    common_dates = factor_mat.index.intersection(fwd_returns.index)
+    common_cols = factor_mat.columns.intersection(fwd_returns.columns)
+    if len(common_cols) < 2 or len(common_dates) < 20:
+        return {}
+
+    factor = factor_mat.loc[common_dates, common_cols].to_numpy(
+        dtype=float, copy=False
+    )
+    returns = fwd_returns.loc[common_dates, common_cols].to_numpy(
+        dtype=float, copy=False
+    )
+    return _compute_pooled_ts_fixed_effects_arrays(
+        factor,
+        returns,
+        common_dates,
+        forward_period=forward_period,
+    )
+
+
+def _compute_pooled_ts_fixed_effects_arrays(
+    factor: np.ndarray,
+    returns: np.ndarray,
+    index: pd.Index,
+    *,
+    forward_period: int,
+) -> dict:
+    """Array implementation of the two-instrument fixed-effects test."""
+    if factor.shape[1] < 2 or factor.shape[0] < 20:
+        return {}
+    available_values = ~np.isnan(factor) & ~np.isnan(returns)
+    available_counts = available_values.sum(axis=0)
+    factor_sums = np.where(available_values, factor, 0.0).sum(axis=0)
+    return_sums = np.where(available_values, returns, 0.0).sum(axis=0)
+    factor_means = np.divide(
+        factor_sums,
+        available_counts,
+        out=np.full(factor.shape[1], np.nan, dtype=float),
+        where=available_counts > 0,
+    )
+    return_means = np.divide(
+        return_sums,
+        available_counts,
+        out=np.full(returns.shape[1], np.nan, dtype=float),
+        where=available_counts > 0,
+    )
+
+    # Instrument fixed effects are removed over the declared evaluation sample.
+    x_raw = np.where(available_values, factor - factor_means, np.nan)
+    y_raw = np.where(available_values, returns - return_means, np.nan)
+    valid_values = np.isfinite(x_raw) & np.isfinite(y_raw)
+    x_values = np.where(valid_values, x_raw, 0.0)
+    y_values = np.where(valid_values, y_raw, 0.0)
+    if int(valid_values.sum()) < 50:
+        return {}
+    denominator = float(np.square(x_values).sum())
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        return {}
+
+    beta = float((x_values * y_values).sum() / denominator)
+    residual = np.where(valid_values, y_values - beta * x_values, 0.0)
+    score = (x_values * residual).sum(axis=1)
+    active = valid_values.sum(axis=1) >= 2
+    score = score[active]
+    if len(score) < 20:
+        return {}
+
+    score = score - score.mean()
+    n_times = len(score)
+    gamma0 = float(np.dot(score, score) / n_times)
+    max_lag = min(max(int(forward_period) - 1, 0), n_times - 1)
+    long_run_variance = gamma0
+    for lag in range(1, max_lag + 1):
+        weight = 1.0 - lag / (max_lag + 1.0)
+        covariance = float(np.dot(score[lag:], score[:-lag]) / n_times)
+        long_run_variance += 2.0 * weight * covariance
+    variance = max(n_times * long_run_variance, 0.0) / denominator ** 2
+    standard_error = float(np.sqrt(variance))
+    t_stat = beta / standard_error if standard_error > 0.0 else 0.0
+    p_value = float(
+        2.0 * scipy_stats.t.sf(abs(t_stat), df=max(n_times - 1, 1))
+    )
+
+    column_counts = valid_values.sum(axis=0)
+    factor_std = np.sqrt(
+        np.divide(
+            np.square(x_values).sum(axis=0),
+            column_counts,
+            out=np.full(factor.shape[1], np.nan, dtype=float),
+            where=column_counts > 0,
+        )
+    )
+    return_std = np.sqrt(
+        np.divide(
+            np.square(y_values).sum(axis=0),
+            column_counts,
+            out=np.full(returns.shape[1], np.nan, dtype=float),
+            where=column_counts > 0,
+        )
+    )
+    standardized_valid = (
+        valid_values
+        & np.isfinite(factor_std)[None, :]
+        & np.isfinite(return_std)[None, :]
+        & (factor_std[None, :] > 0.0)
+        & (return_std[None, :] > 0.0)
+    )
+    products = np.divide(
+        x_values * y_values,
+        factor_std[None, :] * return_std[None, :],
+        out=np.zeros_like(x_values, dtype=float),
+        where=standardized_valid,
+    )
+    row_counts = standardized_valid.sum(axis=1)
+    predictive_values = np.divide(
+        products.sum(axis=1),
+        row_counts,
+        out=np.full(factor.shape[0], np.nan, dtype=float),
+        where=row_counts > 0,
+    )
+    predictive_mask = (row_counts >= 2) & np.isfinite(predictive_values)
+    predictive_score = pd.Series(
+        predictive_values[predictive_mask],
+        index=index[predictive_mask],
+        dtype=float,
+    )
+    if len(predictive_score) < 20:
+        return {}
+    ic_mean = float(predictive_score.mean())
+    ic_std = float(predictive_score.std(ddof=0))
+    ir = ic_mean / ic_std if ic_std > 0.0 else 0.0
+    _, ic_t_stat = _newey_west_ir(
+        predictive_score, forward_period=forward_period
+    )
+    hit_rate = float(
+        (predictive_score > 0.0).mean()
+        if ic_mean >= 0.0
+        else (predictive_score < 0.0).mean()
+    )
+
+    return {
+        "ic_series": predictive_score,
+        "ic_mean": ic_mean,
+        "ic_std": ic_std,
+        "ir": ir,
+        "t_stat": float(t_stat),
+        "ic_t_stat": float(ic_t_stat),
+        "ols_beta": beta,
+        "ols_hac_t": float(t_stat),
+        "ols_p_value": p_value,
+        "ols_n": int(n_times),
+        "inference_model": "unpenalized_pooled_ols_instrument_fe_time_hac",
+        "test_type": "pooled_time_series_fixed_effects",
+        "p_value": p_value,
+        "n_obs": int(len(predictive_score)),
+        "hit_rate": hit_rate,
+    }
 
 
 def _compute_oos_consistency(ic_series: pd.Series, oos_ratio: float = OOS_SPLIT_RATIO) -> dict:
@@ -414,6 +722,10 @@ def _analyze_factor_across_periods(
                 "oos_ic": oos["oos_ic"],
                 "oos_hit_rate": oos["oos_hit_rate"],
                 "oos_consistent": oos["is_consistent"],
+                "test_type": values.get(
+                    "test_type", "cross_section_fama_macbeth"
+                ),
+                "inference_model": values.get("inference_model", ""),
                 "passes_thresholds": (
                     _is_sector_valid(values) and oos["is_consistent"]
                 ),
@@ -629,9 +941,11 @@ def run_adaptivity_analysis(
     artifact_id: str = None,
     build_correlation: bool = True,
     workers: int = None,
+    factor_workers: int = None,
     config=None,
     fdr_method: str = "bonferroni",
     fdr_alpha: float = 0.05,
+    frequency: str = "daily",
 ):
     """运行因子适配性分析.
 
@@ -647,6 +961,17 @@ def run_adaptivity_analysis(
     periods = periods or DEFAULT_PERIODS
     periods = sorted(set(periods))
     workers = max(1, int(workers or min(4, os.cpu_count() or 1)))
+    period_ctx = PeriodContext.from_string(frequency)
+    factor_workers = max(
+        1,
+        int(
+            factor_workers
+            or os.environ.get(
+                "MF_ADAPTIVITY_FACTOR_WORKERS",
+                1 if period_ctx.is_daily else min(2, workers),
+            )
+        ),
+    )
 
     print("=" * 70)
     print(f"因子适配性研究 ({len(all_factors)} 个因子 × {len(SECTOR_MAP)} 品种 × {len(periods)} 持有期)")
@@ -655,7 +980,9 @@ def run_adaptivity_analysis(
     print(f"  因子计算区间: {factor_start} ~ {ic_end} (含预热)")
     print(f"  IC检验区间: {ic_start} ~ {ic_end}")
     print(f"  持有期 (周期数): {periods}")
+    print(f"  周期单位: {period_ctx.unit.value}")
     print(f"  因子分析线程: {workers}")
+    print(f"  非 SPEC 因子计算线程: {factor_workers}")
     print(f"  板块数: {len(set(SECTOR_MAP.values()))} "
           f"({', '.join(sorted(set(SECTOR_MAP.values())))})")
     print(f"  样本外验证: 前{int(OOS_SPLIT_RATIO*100)}%训练 / 后{int((1-OOS_SPLIT_RATIO)*100)}%测试")
@@ -665,20 +992,30 @@ def run_adaptivity_analysis(
         print(f"  仅分析板块: {sectors_filter}")
     print()
 
-    # 复用 PipelineRunner 初始化数据层 (成熟逻辑, 正确处理 pydantic 配置转换)
     from pipeline.runner import PipelineRunner
-    runner = PipelineRunner(config=config) if config is not None else PipelineRunner(config_path)
-    config = runner.config
-    data_mgr = runner.data_manager
 
+    runner = (
+        PipelineRunner(config=config)
+        if config is not None
+        else PipelineRunner(config_path)
+    )
+    config = runner.config
+    base_data_mgr = runner.data_manager
     universe = pd.Index(config.universe) if config.universe else pd.Index([])
-    calendar = data_mgr.get_calendar(factor_start, ic_end)
+
+    if period_ctx.is_daily:
+        data_mgr = base_data_mgr
+        calendar = data_mgr.get_calendar(factor_start, ic_end)
+    else:
+        data_mgr = FrequencyDataProvider(
+            base_data_mgr, frequency, factor_start, ic_end, universe
+        )
+        calendar = data_mgr.get_calendar()
     if hasattr(calendar, "tz") and calendar.tz is not None:
         calendar = calendar.tz_localize(None)
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
-    # 若 MySQL 连接失败导致日历为空, 从缓存加载
-    if len(calendar) == 0:
+    if len(calendar) == 0 and period_ctx.is_daily:
         cache_ok, cache_dates = _load_data_from_cache(
             data_mgr, universe, factor_start, ic_end,
         )
@@ -688,73 +1025,121 @@ def run_adaptivity_analysis(
                 calendar = calendar.tz_localize(None)
             calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
-    print(f"交易日历: {len(calendar)} 天, universe: {len(universe)} 品种")
-
-    # 过滤有效品种 (在universe中且有板块映射的)
     valid_universe = [t for t in universe if str(t) in SECTOR_MAP]
     if sectors_filter:
-        valid_universe = [t for t in valid_universe if SECTOR_MAP[str(t)] in sectors_filter]
-    print(f"有效品种 (有板块映射): {len(valid_universe)}")
+        valid_universe = [
+            t for t in valid_universe
+            if SECTOR_MAP[str(t)] in sectors_filter
+        ]
+    valid_universe = pd.Index(valid_universe)
+    print(
+        f"研究日历: {len(calendar)} bars, universe: "
+        f"{len(valid_universe)} mapped instruments"
+    )
 
-    # 计算所有因子矩阵 (一次性)
-    print(f"\n计算 {len(all_factors)} 个因子矩阵 (含预热期)...")
-    t0 = time.time()
-    engine = FactorEngine(data_mgr)
-    factor_matrices = engine.compute_factors(
-        all_factors, calendar, pd.Index(valid_universe),
-        parallel=False, chunk_size=100,
-    )
-    processing_context = ProcessingContext(
-        data=data_mgr, dates=calendar, universe=pd.Index(valid_universe)
-    )
-    factor_matrices = runner.processor.process_batch(
-        factor_matrices, processing_context
-    )
-    print(f"  完成: {len(factor_matrices)} 个因子, 耗时 {time.time()-t0:.1f}s")
-
-    # 预计算各持有期的 forward returns
     print("\n预计算 forward returns...")
-    fwd_returns_by_period = {}
-    for p in periods:
-        fwd_returns_by_period[p] = data_mgr.get_forward_returns(
-            calendar, pd.Index(valid_universe), period=p,
+    fwd_returns_by_period = {
+        period: data_mgr.get_forward_returns(
+            calendar, valid_universe, period=period
         )
-    print(f"  持有期 (周期数): {periods}")
-
-    # 批量适配性分析
-    print(f"\n=== 开始适配性 IC 检验 ({len(all_factors)} 因子 × {len(periods)} 持有期 × 多板块) ===")
-    all_results = {}
-    t0 = time.time()
-    available_factors = [name for name in all_factors if name in factor_matrices]
+        for period in periods
+    }
     analysis_returns = {
         period: frame.loc[ic_start:ic_end]
         for period, frame in fwd_returns_by_period.items()
     }
+    artifact_data_hashes = {}
+    dataframe_sha256 = None
+    if artifact_id:
+        from research.artifacts import dataframe_sha256 as _dataframe_sha256
 
-    def _evaluate(name):
-        return name, _analyze_factor_across_periods(
-            factor_matrices[name].loc[ic_start:ic_end],
-            analysis_returns,
-            periods,
-            SECTOR_MAP,
+        dataframe_sha256 = _dataframe_sha256
+        artifact_data_hashes.update({
+            f"returns:{period}": dataframe_sha256(frame)
+            for period, frame in analysis_returns.items()
+        })
+
+    print(
+        f"\n=== 开始流式适配性 IC 检验 "
+        f"({len(all_factors)} 因子 × {len(periods)} 持有期 × 多板块) ==="
+    )
+    all_results = {}
+    t0 = time.time()
+    processing_context = ProcessingContext(
+        data=data_mgr, dates=calendar, universe=valid_universe
+    )
+    default_chunk_size = 64 if period_ctx.is_daily else 16
+    chunk_size = max(
+        int(os.environ.get("MF_ADAPTIVITY_FACTOR_CHUNK_SIZE", default_chunk_size)),
+        1,
+    )
+    print(f"  因子分块大小: {chunk_size}")
+    ta_cn_inputs_ready = False
+
+    for batch_start in range(0, len(all_factors), chunk_size):
+        batch_names = all_factors[batch_start:batch_start + chunk_size]
+        is_ta_cn_batch = any(
+            name.startswith(("gtja191_alpha", "wq101_alpha"))
+            for name in batch_names
         )
+        if (
+            not ta_cn_inputs_ready
+            and is_ta_cn_batch
+        ):
+            from factors.user.ta_cn_formula_library import _formula_inputs
 
-    if workers == 1:
-        evaluated = map(_evaluate, available_factors)
-        pool = None
-    else:
-        pool = ThreadPoolExecutor(max_workers=workers)
-        evaluated = pool.map(_evaluate, available_factors)
+            _formula_inputs(data_mgr, calendar, valid_universe)
+            ta_cn_inputs_ready = True
+        engine = FactorEngine(data_mgr)
+        factor_batch = engine.compute_factors(
+            batch_names,
+            calendar,
+            valid_universe,
+            parallel=factor_workers > 1,
+            max_workers=factor_workers,
+            chunk_size=chunk_size,
+        )
+        factor_batch = runner.processor.process_batch(
+            factor_batch, processing_context
+        )
+        available = [name for name in batch_names if name in factor_batch]
 
-    try:
-        for idx, (fname, factor_result) in enumerate(evaluated, 1):
-            all_results[fname] = factor_result
-            if idx % 20 == 0 or idx == len(available_factors):
-                elapsed = time.time() - t0
-                print(f"  [{idx}/{len(available_factors)}] 耗时 {elapsed:.1f}s")
-    finally:
-        if pool is not None:
-            pool.shutdown(wait=True)
+        def _evaluate(name):
+            analysis_factor = factor_batch[name].loc[ic_start:ic_end]
+            factor_result = _analyze_factor_across_periods(
+                analysis_factor,
+                analysis_returns,
+                periods,
+                SECTOR_MAP,
+            )
+            frame_hash = (
+                dataframe_sha256(analysis_factor)
+                if dataframe_sha256 is not None
+                else None
+            )
+            return name, factor_result, frame_hash
+
+        if workers == 1:
+            evaluated = map(_evaluate, available)
+            pool = None
+        else:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            evaluated = pool.map(_evaluate, available)
+        try:
+            for fname, factor_result, frame_hash in evaluated:
+                all_results[fname] = factor_result
+                if frame_hash is not None:
+                    artifact_data_hashes[f"factor:{fname}"] = frame_hash
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+
+        engine.clear_cache()
+        del factor_batch
+        if is_ta_cn_batch:
+            gc.collect()
+        done = min(batch_start + chunk_size, len(all_factors))
+        print(f"  [{done}/{len(all_factors)}] 耗时 {time.time() - t0:.1f}s")
 
     n_hypotheses = _apply_multiple_testing(
         all_results, method=fdr_method, alpha=fdr_alpha
@@ -793,12 +1178,16 @@ def run_adaptivity_analysis(
             "factor_start": str(factor_start),
             "ic_start": str(ic_start),
             "ic_end": str(ic_end),
+            "frequency": period_ctx.unit.value,
+            "bar_count": len(calendar),
             "periods": periods,
             "sectors": sorted(set(SECTOR_MAP.values())),
             "n_factors": n_total,
             "n_factors_with_valid_sector": n_with_valid_sector,
             "n_hypotheses": n_hypotheses,
             "analysis_workers": workers,
+            "factor_compute_workers": factor_workers,
+            "factor_chunk_size": chunk_size,
             "fdr_method": fdr_method,
             "fdr_alpha": fdr_alpha,
             "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
@@ -899,9 +1288,27 @@ def run_adaptivity_analysis(
         for name, result in all_results.items()
         if result["valid_sectors"]
     ]
+
+    def _compute_processed_matrices(names: list[str]) -> dict:
+        if not names:
+            return {}
+        recompute_engine = FactorEngine(data_mgr)
+        matrices = recompute_engine.compute_factors(
+            names,
+            calendar,
+            valid_universe,
+            parallel=False,
+            chunk_size=max(len(names), 1),
+        )
+        matrices = runner.processor.process_batch(matrices, processing_context)
+        recompute_engine.clear_cache()
+        return matrices
+
     if build_correlation and len(significant) >= 2:
         from factors.correlation_analysis import analyze_and_save
 
+        significant_names = [item["name"] for item in significant]
+        factor_matrices = _compute_processed_matrices(significant_names)
         selected_matrices = {
             item["name"]: factor_matrices[item["name"]].loc[ic_start:ic_end]
             for item in significant
@@ -926,20 +1333,18 @@ def run_adaptivity_analysis(
         from research.artifacts import (
             ResearchArtifactBundle,
             canonical_config_hash,
-            dataframe_collection_sha256,
+            dataframe_hash_collection_sha256,
             source_tree_hash,
         )
 
-        data_frames = {
-            **{f"factor:{name}": frame.loc[ic_start:ic_end] for name, frame in factor_matrices.items()},
-            **{f"returns:{period}": frame.loc[ic_start:ic_end] for period, frame in fwd_returns_by_period.items()},
-        }
         bundle = ResearchArtifactBundle.create(
             output_dir,
             artifact_id=artifact_id,
             train_start=ic_start,
             train_end=ic_end,
-            data_sha256=dataframe_collection_sha256(data_frames),
+            data_sha256=dataframe_hash_collection_sha256(
+                artifact_data_hashes
+            ),
             config_sha256=canonical_config_hash(config),
             code_sha256=source_tree_hash(Path(_PROJECT_ROOT)),
             files=artifact_files,
@@ -947,8 +1352,10 @@ def run_adaptivity_analysis(
                 "candidate_factors": len(all_factors),
                 "selected_factors": len(significant),
                 "periods": periods,
+                "frequency": period_ctx.unit.value,
                 "fdr_method": fdr_method,
                 "fdr_alpha": fdr_alpha,
+                "data_hash_mode": "streamed_dataframe_collection_v1",
             },
         )
         print(f"研究 bundle 已冻结: {bundle.root}")
@@ -964,6 +1371,12 @@ def main():
     parser.add_argument(
         "--periods", default=None,
         help=f"持有期列表, 逗号分隔 (默认: {','.join(map(str, DEFAULT_PERIODS))})")
+    parser.add_argument(
+        "--frequency",
+        choices=["daily", "1min", "5min", "15min", "30min", "hourly"],
+        default="daily",
+        help="bar frequency used for factor windows and holding periods",
+    )
     parser.add_argument(
         "--factors", default=None,
         help="指定因子名, 逗号分隔 (默认: 全部已注册因子)")
@@ -985,6 +1398,9 @@ def main():
     parser.add_argument(
         "--workers", type=int, default=None,
         help="因子级分析线程数 (默认: min(4, CPU数); 设为1禁用并行)")
+    parser.add_argument(
+        "--factor-workers", type=int, default=None,
+        help="非 SPEC 因子计算线程数 (日频默认1, 日内默认min(2, --workers))")
     parser.add_argument(
         "--artifact-id", default=None,
         help="非空时在输出完成后创建不可覆盖的研究 bundle manifest")
@@ -1042,8 +1458,10 @@ def main():
         artifact_id=args.artifact_id,
         build_correlation=not args.no_correlation,
         workers=args.workers,
+        factor_workers=args.factor_workers,
         config=config,
         fdr_method=args.fdr_method,
+        frequency=args.frequency,
     )
 
 

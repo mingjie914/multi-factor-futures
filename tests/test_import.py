@@ -27,8 +27,8 @@ def test_imports():
 
     # L0
     try:
-        from core.types import (MarketState, Position, Signal, DiscoveredFactor,
-                                 FactorMatrix, ReturnMatrix, WeightVector, NAVSeries)
+        from core.types import (MarketState, Position, Signal,
+                                FactorMatrix, ReturnMatrix, WeightVector, NAVSeries)
         from core.interfaces import (Factor, DataProvider, DataSource, RiskModel, Optimizer)
         from core.registry import register, get, create, list_registered, register_factor
         from core.market import Market

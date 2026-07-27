@@ -10,11 +10,11 @@ data:
     path: ./cache
     backend: parquet
   mysql:
-    host: '${MYSQL_HOST}'
+    host: '${MF_MYSQL_HOST}'
     port: 3306
-    user: '${MYSQL_USER}'
-    password: '${MYSQL_PASSWORD}'
-    database: '${MYSQL_DATABASE:testmm}'
+    user: '${MF_MYSQL_USER}'
+    password: '${MF_MYSQL_PASSWORD}'
+    database: '${MF_MYSQL_DATABASE:testmm}'
     charset: utf8mb4
     tables:
       commodity_eod:
@@ -32,6 +32,20 @@ data:
           amount: S_DQ_AMOUNT
           oi: S_DQ_OI
           oi_change: S_DQ_OICHANGE
+      intraday_5m:
+        table_name: ths_data_5minute
+        timestamp_convention: end
+        bar_minutes: 5
+        columns:
+          datetime: time
+          ticker: code
+          open: open
+          high: high
+          low: low
+          close: close
+          volume: volume
+          amount: amt
+          oi: oi
       contract_mapping:
         table_name: cfuturescontractmapping
         columns:
@@ -76,19 +90,35 @@ data:
     query_timeout: 30
     connect_timeout: 5
     failure_cooldown: 30
+    dominant_lag_days: 1
+    schedule_buffer_days: 20
     endpoints: []
     fallbacks: []
   ddb:
-    host: '${DDB_HOST}'
+    host: '${MF_DDB_HOST}'
     port: 8961
-    user: '${DDB_USER}'
-    password: '${DDB_PASSWORD}'
+    user: '${MF_DDB_USER}'
+    password: '${MF_DDB_PASSWORD}'
     minute_db: dfs://kline_db
     minute_table: kline_futures_1min
     eod_db: dfs://wind_db
     eod_table: CCommodityFuturesEODPrices
     data_version: v1
     dominant_lag_days: 1
+  parquet:
+    root_path: '${MF_PARQUET_ROOT:}'
+    datasets:
+      daily: futureshistoryprices1d
+      1min: futureshistoryprices1m
+      15min: futureshistoryprices15m
+    dominant_lag_days: 1
+    schedule_buffer_days: 45
+    eager_fields: true
+    panel_cache_entries: 1
+    curve_cache_enabled: true
+    curve_cache_path: './cache/curve_aggregates'
+    selected_cache_enabled: true
+    selected_cache_path: './cache/selected_contracts'
 
 # 2017 is warm-up; formal historical studies evaluate from 2018.
 date_range:
@@ -221,7 +251,6 @@ asset_selection:
   restrict_to_valid_sectors: false
 
 backtest:
-  initial_capital: 1.0
   rebalance_freq: weekly
   benchmark: csi300
   plot: true

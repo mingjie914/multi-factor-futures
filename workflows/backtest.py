@@ -3,7 +3,6 @@
 Usage:
     python main.py backtest
     python main.py backtest --config config/default.yaml
-    python main.py backtest --config config/default.yaml --capital 2000000
     python main.py backtest --start 2022-01-01 --end 2024-12-31 --no-plot
 """
 from __future__ import annotations
@@ -30,9 +29,6 @@ def main():
     parser.add_argument(
         "--config", default="config/default.yaml",
         help="配置文件路径 (默认: config/default.yaml)")
-    parser.add_argument(
-        "--capital", type=float, default=None,
-        help="初始资金 (覆盖配置文件)")
     parser.add_argument(
         "--factors", default=None,
         help="覆盖配置中的因子列表, 逗号分隔 (如: momentum_20d,skewness_20d)")
@@ -79,8 +75,6 @@ def main():
             cfg.date_range.end = args.end
         if args.freq:
             cfg.backtest.rebalance_freq = args.freq
-        if args.capital:
-            cfg.backtest.initial_capital = args.capital
         if args.cache_only:
             cfg.data.cache["only"] = True
         if args.output_dir:
@@ -99,7 +93,6 @@ def main():
     print(f"  因子列表: {runner.config.factors}")
     print(f"  日期范围: {runner.config.date_range.start} ~ {runner.config.date_range.end}")
     print(f"  调仓频率: {runner.config.backtest.rebalance_freq}")
-    print(f"  初始资金: {runner.config.backtest.initial_capital:,.0f}")
 
     try:
         result = runner.run_full_pipeline()

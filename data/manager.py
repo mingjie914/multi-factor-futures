@@ -107,6 +107,11 @@ class DataManager(DataProvider):
                 from data import ddb_source  # noqa: F401
             except ImportError:
                 pass
+        elif source_name == "parquet_futures":
+            try:
+                from data import parquet_source  # noqa: F401
+            except ImportError:
+                pass
 
         def _to_dict(obj):
             if obj is None:
@@ -127,6 +132,12 @@ class DataManager(DataProvider):
                 source = create(
                     "data_source", source_name,
                     ddb_config=_to_dict(dc.ddb),
+                )
+            elif source_name == "parquet_futures" and dc.parquet:
+                source = create(
+                    "data_source", source_name,
+                    parquet_config=_to_dict(dc.parquet),
+                    mysql_config=_to_dict(dc.mysql) if dc.mysql else None,
                 )
             else:
                 source = create("data_source", source_name)
@@ -203,7 +214,7 @@ class DataManager(DataProvider):
             df = df.reindex(index=dates, columns=universe)
 
         # 写缓存
-        if self._cache and not df.empty:
+        if self._cache and cache_enabled and not df.empty:
             try:
                 self._cache.put(
                     self._market,
@@ -535,11 +546,135 @@ class DataManager(DataProvider):
                     all_fields.update(deps)
         if dates is None or universe is None:
             return
-        self._prefetch_signature = self._request_signature(dates, universe)
-        self._prefetched_data = {}
+        signature = self._request_signature(dates, universe)
+        if self._prefetch_signature != signature:
+            self._prefetched_data = {}
+        self._prefetch_signature = signature
         for field in sorted(all_fields):
-            self.get(field, dates, universe)
+            if field not in self._prefetched_data:
+                self.get(field, dates, universe)
 
     def clear_prefetch(self) -> None:
         self._prefetch_signature = None
         self._prefetched_data.clear()
+
+
+class FrequencyDataProvider(DataProvider):
+    """Provide non-daily research data on its real bar index."""
+
+    def __init__(
+        self,
+        manager: DataManager,
+        frequency: str,
+        start,
+        end,
+        universe: Universe,
+    ) -> None:
+        if str(frequency).lower() == "daily":
+            raise ValueError("FrequencyDataProvider is only for non-daily bars")
+        self._manager = manager
+        self.frequency = str(frequency).lower()
+        self._start = pd.Timestamp(start)
+        self._end = pd.Timestamp(end)
+        self._universe = pd.Index(universe)
+        self._panels: Dict[str, pd.DataFrame] = {}
+        self._loaded_fields: set[str] = set()
+
+    def _load(self, fields: List[str]) -> None:
+        missing = [
+            str(field) for field in dict.fromkeys(fields)
+            if str(field) not in self._loaded_fields
+        ]
+        if not missing:
+            return
+        panel = self._manager.source.fetch_price_at_frequency(
+            self._universe,
+            self._start,
+            self._end,
+            missing,
+            frequency=self.frequency,
+        )
+        for field in missing:
+            frame = panel.get(field)
+            if frame is not None and not frame.empty:
+                result = frame.copy()
+                result.index = pd.DatetimeIndex(result.index)
+                self._panels[field] = result.sort_index().reindex(
+                    columns=self._universe
+                )
+        self._loaded_fields.update(missing)
+
+    def get_calendar(self) -> pd.DatetimeIndex:
+        self._load(["close"])
+        close = self._panels.get("close")
+        if close is None or close.empty:
+            return pd.DatetimeIndex([])
+        return pd.DatetimeIndex(close.index.unique()).sort_values()
+
+    def get(self, field: str, dates: DateIndex, universe: Universe) -> pd.DataFrame:
+        self._load([field])
+        frame = self._panels.get(field)
+        if frame is None:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        return frame.reindex(index=dates, columns=universe)
+
+    def get_at_frequency(
+        self,
+        field: str,
+        dates: DateIndex,
+        universe: Universe,
+        frequency: str = "daily",
+    ) -> pd.DataFrame:
+        if str(frequency).lower() == self.frequency:
+            return self.get(field, dates, universe)
+        return self._manager.get_at_frequency(field, dates, universe, frequency)
+
+    def get_forward_returns(
+        self, dates: DateIndex, universe: Universe, period: int = 1
+    ) -> ReturnMatrix:
+        close = self.get("close", dates, universe)
+        result = pd.DataFrame(np.nan, index=dates, columns=universe, dtype=float)
+        for ticker in universe:
+            series = close[ticker].dropna()
+            if series.empty:
+                continue
+            forward = series.shift(-int(period)) / series - 1.0
+            result.loc[forward.index, ticker] = forward
+        return result
+
+    def get_industry(
+        self, dates: DateIndex, universe: Universe
+    ) -> pd.DataFrame:
+        return self._manager.get_industry(dates, universe)
+
+    def get_universe(self, date: Date) -> Universe:
+        return self._manager.get_universe(date)
+
+    def get_macro(
+        self,
+        fields: List[str],
+        start: Optional[Date] = None,
+        end: Optional[Date] = None,
+    ) -> pd.DataFrame:
+        return self._manager.get_macro(fields, start=start, end=end)
+
+    def get_contract_pair(
+        self, field: str, dates: DateIndex, universe: Universe
+    ) -> Dict[str, pd.DataFrame]:
+        empty = pd.DataFrame(np.nan, index=dates, columns=universe)
+        return {"near": empty.copy(), "far": empty.copy()}
+
+    def prefetch(
+        self,
+        factors: list,
+        dates: DateIndex = None,
+        universe: Universe = None,
+    ) -> None:
+        fields = []
+        for factor in factors:
+            dependencies = factor.dependencies() if hasattr(factor, "dependencies") else []
+            fields.extend(dependencies or [])
+        self._load(fields)
+
+    def clear_prefetch(self) -> None:
+        return None

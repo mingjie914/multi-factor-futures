@@ -132,6 +132,24 @@ def test_batch_missing_open_interest_only_invalidates_dependent_specs():
     assert provider.requested.count("oi") == 1
 
 
+def test_general_spec_batch_does_not_consume_current_bar():
+    dates, universe, frames = _sample_frames()
+    spec = next(
+        spec for spec in ALL_SPECS
+        if spec["slug"] == "log_momentum_10d_raw"
+    )
+    baseline = compute_spec_factors_batch(
+        [spec], FrameProvider(frames), dates, universe
+    )[spec["slug"]]
+    changed = {field: frame.copy() for field, frame in frames.items()}
+    changed["close"].iloc[-1] *= 5.0
+    revised = compute_spec_factors_batch(
+        [spec], FrameProvider(changed), dates, universe
+    )[spec["slug"]]
+
+    pd.testing.assert_series_equal(baseline.iloc[-1], revised.iloc[-1])
+
+
 def test_intraday_batch_fails_closed_without_intraday_source():
     dates, universe, frames = _sample_frames()
     provider = FrameProvider(frames)

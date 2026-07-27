@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# === 原有实验性因子 (保留, 不动) ===
+# === Hand-authored factor library ===
 from . import (
     liquidity,
     momentum,
@@ -26,7 +26,7 @@ from . import (
     cross_frequency,
 )
 
-# === QuantSkills SPEC 驱动因子 (1488 个: 1296 日度 + 192 分钟级) ===
+# === SPEC-driven factors; the runtime log is the authoritative count ===
 from factors.specs import register_all_spec_factors
 
 try:

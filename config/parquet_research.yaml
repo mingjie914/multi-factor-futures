@@ -1,0 +1,11 @@
+extends: default.yaml
+
+data:
+  source: parquet_futures
+  cache:
+    enabled: false
+
+# Windows and holding periods are bar counts at the selected frequency.
+date_range:
+  start: '2017-01-01'
+  end: '2026-05-31'

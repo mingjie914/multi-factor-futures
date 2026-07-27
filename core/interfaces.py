@@ -571,27 +571,6 @@ class SLTPRule(abc.ABC):
 
 
 # ---------------------------------------------------------------------------
-# Mining algorithm
-# ---------------------------------------------------------------------------
-
-
-class MiningAlgorithm(abc.ABC):
-    """An automated factor mining algorithm."""
-
-    name: str = ""
-
-    @abc.abstractmethod
-    def search(
-        self,
-        data: DataProvider,
-        dates: DateIndex,
-        universe: Universe,
-    ) -> List[DiscoveredFactor]:
-        """Search for new factors and return discovered candidates."""
-        ...
-
-
-# ---------------------------------------------------------------------------
 # Context dataclasses
 # ---------------------------------------------------------------------------
 

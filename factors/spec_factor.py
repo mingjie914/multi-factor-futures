@@ -4,7 +4,7 @@
 每个因子 = base 计算 (原始信号) + transform 变换 (标准化/平滑/排名等).
 
 优势:
-- 12 个 base × 8 种 transform × 3 种窗口 = 288 个因子, 代码零重复
+- base × transform × window 由 SPEC 批量定义, 避免公式代码重复
 - 向量化计算: 一次性处理所有品种, 性能比逐品种循环快 10-50 倍
 - SPEC 字典同时作为因子元数据, 便于索引和文档生成
 
@@ -38,6 +38,20 @@ def _minp(window: int, floor: int = 5) -> int:
 _DEFAULT_SPEC_FIELDS = ["open", "high", "low", "close", "volume"]
 
 
+def _normalise_frequency(value: object) -> str:
+    aliases = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "60m": "hourly",
+        "60min": "hourly",
+        "1h": "hourly",
+    }
+    raw = str(value).lower()
+    return aliases.get(raw, raw)
+
+
 def _spec_dependencies(spec: dict) -> List[str]:
     """Return stable, de-duplicated source fields declared by a SPEC."""
     fields = spec.get("dependencies") or _DEFAULT_SPEC_FIELDS
@@ -66,6 +80,16 @@ def _fetch_intraday_ohlcv(
         {field: DataFrame(index=分钟时间戳, columns=tickers)} 或 {} (不可用)
     """
     try:
+        requested_frequency = _normalise_frequency(freq)
+        provider_frequency = getattr(data, "frequency", None)
+        if provider_frequency is not None:
+            if _normalise_frequency(provider_frequency) != requested_frequency:
+                return {}
+            return {
+                field: data.get(field, dates, universe)
+                for field in _DEFAULT_SPEC_FIELDS
+            }
+
         source = getattr(data, "source", None)
         if source is None:
             return {}
@@ -89,7 +113,7 @@ def _fetch_intraday_ohlcv(
 def _resample_to_daily(
     minute_df: pd.DataFrame, dates: pd.DatetimeIndex,
 ) -> pd.DataFrame:
-    """将分钟级 DataFrame 按日重采样, 取每日最后一个非 NaN 值.
+    """Aggregate intraday values by exchange trading day and lag one day.
 
     分钟因子的输出最终需要与日度因子对齐 (日度日期索引),
     以便后续 IC 检验/组合优化/回测统一处理.
@@ -106,11 +130,53 @@ def _resample_to_daily(
     # 确保 index 是 DatetimeIndex
     if not isinstance(minute_df.index, pd.DatetimeIndex):
         minute_df.index = pd.DatetimeIndex(minute_df.index)
-    # 按日分组取最后一个非 NaN 值 (尾盘值, 反映当日最终状态)
-    daily = minute_df.groupby(minute_df.index.normalize()).last()
+    trading_calendar = pd.DatetimeIndex(dates).normalize().unique().sort_values()
+    natural_dates = minute_df.index.normalize()
+    targets = natural_dates.where(
+        minute_df.index.hour < 18,
+        natural_dates + pd.Timedelta(days=1),
+    )
+    locations = trading_calendar.searchsorted(targets, side="left")
+    trading_dates = np.full(
+        len(targets), np.datetime64("NaT"), dtype="datetime64[ns]"
+    )
+    valid = locations < len(trading_calendar)
+    trading_dates[valid] = trading_calendar.to_numpy()[locations[valid]]
+    usable = ~pd.isna(trading_dates)
+    daily = minute_df.loc[usable].groupby(trading_dates[usable]).last()
     daily.index = pd.DatetimeIndex(daily.index)
-    # 重索引到目标日期
-    return daily.reindex(dates)
+    # The trading-day close is only available after that close. Shift the
+    # exposure so research never assumes execution at the same close.
+    return daily.reindex(dates).shift(1)
+
+
+def _apply_spec_decision_lag(frame: pd.DataFrame, spec: dict) -> pd.DataFrame:
+    """Apply the point-in-time lag declared by a SPEC (one bar by default)."""
+    lag = max(int(spec.get("decision_lag_bars", 1)), 0)
+    return frame.shift(lag) if lag else frame
+
+
+def _finalize_intraday_result(
+    frame: pd.DataFrame,
+    data,
+    dates,
+    universe,
+    spec: dict,
+) -> pd.DataFrame:
+    """Align an intraday SPEC to either real bars or daily decisions."""
+    provider_frequency = getattr(data, "frequency", None)
+    spec_frequency = _normalise_frequency(spec.get("frequency", "daily"))
+    if provider_frequency is not None:
+        if _normalise_frequency(provider_frequency) != spec_frequency:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        return _apply_spec_decision_lag(frame, spec).reindex(
+            index=dates, columns=universe
+        )
+
+    daily = _resample_to_daily(frame, pd.DatetimeIndex(dates))
+    if daily.empty:
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    return daily.reindex(index=dates, columns=universe)
 
 
 def _zscore_df(df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -708,7 +774,9 @@ class SpecFactor(Factor):
         try:
             signal = compute_base_df(base, params, ohlcv_data)
             transformed = apply_transform_df(signal, transform, params, ohlcv_data)
-            result = transformed.reindex(index=dates, columns=universe)
+            result = _apply_spec_decision_lag(
+                transformed, self.spec
+            ).reindex(index=dates, columns=universe)
             return result
         except Exception:
             logging.getLogger("multi_factor").exception(f"SpecFactor '{self.name}' 计算失败")
@@ -738,11 +806,9 @@ class SpecFactor(Factor):
             )
             return pd.DataFrame(np.nan, index=dates, columns=universe)
 
-        # 3. 按日重采样 (取每日最后一个bar的值), 对齐到日度日期
-        daily_result = _resample_to_daily(transformed, pd.DatetimeIndex(dates))
-        if daily_result.empty:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        return daily_result.reindex(index=dates, columns=universe)
+        return _finalize_intraday_result(
+            transformed, data, dates, universe, self.spec
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -808,10 +874,9 @@ def _create_compute_method(spec: dict):
                     f"动态 SpecFactor '{spec['slug']}' 分钟级计算失败"
                 )
                 return pd.DataFrame(np.nan, index=dates, columns=universe)
-            daily_result = _resample_to_daily(transformed, pd.DatetimeIndex(dates))
-            if daily_result.empty:
-                return pd.DataFrame(np.nan, index=dates, columns=universe)
-            return daily_result.reindex(index=dates, columns=universe)
+            return _finalize_intraday_result(
+                transformed, data, dates, universe, spec
+            )
 
         # 日度因子: 原有路径
         fields = _spec_dependencies(spec)
@@ -825,7 +890,9 @@ def _create_compute_method(spec: dict):
         try:
             signal = compute_base_df(base, params, ohlcv_data)
             transformed = apply_transform_df(signal, transform, params, ohlcv_data)
-            result = transformed.reindex(index=dates, columns=universe)
+            result = _apply_spec_decision_lag(
+                transformed, spec
+            ).reindex(index=dates, columns=universe)
             return result
         except Exception:
             logging.getLogger("multi_factor").exception(f"动态 SpecFactor 计算失败")
@@ -868,6 +935,25 @@ def _compute_intraday_spec_factors_batch(
         by_frequency.setdefault(spec.get("frequency", "daily"), []).append(spec)
 
     for frequency, frequency_specs in by_frequency.items():
+        provider_frequency = getattr(data, "frequency", None)
+        if (
+            provider_frequency is not None
+            and _normalise_frequency(provider_frequency)
+            != _normalise_frequency(frequency)
+        ):
+            log.warning(
+                "SPEC batch: provider frequency %s is incompatible with %s; "
+                "%d factors remain invalid",
+                provider_frequency,
+                frequency,
+                len(frequency_specs),
+            )
+            for spec in frequency_specs:
+                result[spec["slug"]] = pd.DataFrame(
+                    np.nan, index=dates, columns=universe
+                )
+            continue
+
         minute_ohlcv = _fetch_intraday_ohlcv(
             data, dates, universe, freq=frequency
         )
@@ -885,7 +971,7 @@ def _compute_intraday_spec_factors_batch(
 
         minute_ohlcv["_return_1d"] = minute_ohlcv["close"].astype(
             float, copy=False
-        ).pct_change()
+        ).pct_change(fill_method=None)
 
         groups: Dict[tuple, list] = {}
         for spec in frequency_specs:
@@ -916,11 +1002,8 @@ def _compute_intraday_spec_factors_batch(
                         minute_ohlcv,
                         period_ctx,
                     )
-                    daily = _resample_to_daily(
-                        transformed, pd.DatetimeIndex(dates)
-                    )
-                    result[spec["slug"]] = daily.reindex(
-                        index=dates, columns=universe
+                    result[spec["slug"]] = _finalize_intraday_result(
+                        transformed, data, dates, universe, spec
                     )
                 except Exception:
                     log.warning(
@@ -943,8 +1026,7 @@ def compute_spec_factors_batch(
 
     按 (base, window, fast, slow) 分组, 每组只计算一次 base 信号,
     然后对组内所有 transform 复用该 base 信号. 相比逐因子独立计算,
-    可减少 base 计算次数从 N 到 N/8 (8 个 transform 共享一个 base),
-    在 672 因子场景下预计 10-14 倍加速.
+    可将 base 计算次数从因子数降到独立参数组数.
 
     设计考虑:
     - 异常隔离: 单个分组失败不影响其他分组, 返回 NaN 矩阵
@@ -1074,9 +1156,13 @@ def compute_spec_factors_batch(
                     transformed.index.equals(target_index)
                     and transformed.columns.equals(target_columns)
                 ):
-                    result[slug] = transformed
+                    result[slug] = _apply_spec_decision_lag(
+                        transformed, spec
+                    )
                 else:
-                    result[slug] = transformed.reindex(
+                    result[slug] = _apply_spec_decision_lag(
+                        transformed, spec
+                    ).reindex(
                         index=dates, columns=universe
                     )
             except Exception:

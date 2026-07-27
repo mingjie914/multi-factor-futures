@@ -10,8 +10,8 @@ Usage:
     # 自定义配置文件
     python main.py multi --config config/default.yaml
 
-    # 自定义日期范围 + 初始资金
-    python main.py multi --start 2022-01-01 --end 2024-12-31 --capital 2000000
+    # 自定义日期范围
+    python main.py multi --start 2022-01-01 --end 2024-12-31
 
     # 跳过净值图绘制
     python main.py multi --no-plot
@@ -40,9 +40,6 @@ def main():
     parser.add_argument(
         "--config", default="config/default.yaml",
         help="配置文件路径 (默认: config/default.yaml)")
-    parser.add_argument(
-        "--capital", type=float, default=None,
-        help="已废弃: 净值从1.0开始, 此参数被忽略")
     parser.add_argument(
         "--start", default=None,
         help="起始日期 (覆盖配置文件)")
@@ -84,8 +81,6 @@ def main():
         print(f"框架初始化失败: {e}")
         print(f"   请检查配置文件: {config_path}")
         sys.exit(1)
-
-    # initial_capital 已废弃 (净值从1.0开始), --capital 参数忽略
 
     # 检查 sub_portfolios 配置
     if not runner.config.sub_portfolios:

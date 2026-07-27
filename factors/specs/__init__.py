@@ -43,6 +43,7 @@ SPECS_BY_CATEGORY = {
 
 # 全部因子 slug 列表
 ALL_SLUGS = [s["slug"] for s in ALL_SPECS]
+SPEC_BY_SLUG = {spec["slug"]: spec for spec in ALL_SPECS}
 
 
 def register_all_spec_factors() -> list:

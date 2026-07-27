@@ -157,6 +157,11 @@ class PipelineRunner:
                 from data import ddb_source  # noqa: F401
             except ImportError as exc:
                 raise ImportError("DolphinDB 数据源模块导入失败") from exc
+        elif source_name == "parquet_futures":
+            try:
+                from data import parquet_source  # noqa: F401
+            except ImportError as exc:
+                raise ImportError("Parquet 数据源模块导入失败") from exc
         elif source_name == "random":
             from data import random_source  # noqa: F401
 
@@ -167,6 +172,12 @@ class PipelineRunner:
             elif source_name == "ddb_futures" and dc.ddb:
                 source = create("data_source", source_name,
                                 ddb_config=self._to_dict(dc.ddb))
+            elif source_name == "parquet_futures" and dc.parquet:
+                source = create(
+                    "data_source", source_name,
+                    parquet_config=self._to_dict(dc.parquet),
+                    mysql_config=self._to_dict(dc.mysql) if dc.mysql else None,
+                )
             else:
                 source = create("data_source", source_name)
         except Exception as e:
@@ -406,7 +417,6 @@ class PipelineRunner:
         try:
             from backtest.engine import Backtester
             self.backtester = Backtester(
-                initial_capital=bt_cfg.initial_capital,
                 rebalance_freq=bt_cfg.rebalance_freq,
                 cost_model=self.cost_model,
                 market_name=self.config.market,
@@ -748,14 +758,9 @@ class PipelineRunner:
             raise ValueError("sub_portfolios 配置为空, 请先在 config 中配置子组合")
 
         n_sub = len(sub_configs)
+        total_capital = 1.0
         dr = self.config.date_range
         universe = pd.Index(self.config.universe)
-        # initial_capital 已废弃: 净值从1.0开始, 子组合按收益率叠加
-        total_capital = 1.0
-
-        # 各子组合使用初始等额资本独立跑回测, 后续由元优化器分配权重
-        sub_capital = total_capital  # 每个子组合净值从1.0开始, 收益率归一化后按权重叠加
-
         sub_results: List[dict] = []
         sub_returns: Dict[str, pd.Series] = {}
 
@@ -793,7 +798,6 @@ class PipelineRunner:
             # 为该子组合创建独立的 backtester 实例
             from backtest.engine import Backtester
             sub_backtester = Backtester(
-                initial_capital=sub_capital,
                 rebalance_freq=sp_cfg.rebalance_freq,
                 cost_model=self.cost_model,
                 market_name=self.config.market,

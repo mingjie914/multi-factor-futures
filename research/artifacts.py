@@ -34,12 +34,19 @@ def dataframe_sha256(frame: pd.DataFrame) -> str:
 
 
 def dataframe_collection_sha256(frames: Mapping[str, pd.DataFrame]) -> str:
+    return dataframe_hash_collection_sha256(
+        {name: dataframe_sha256(frame) for name, frame in frames.items()}
+    )
+
+
+def dataframe_hash_collection_sha256(frame_hashes: Mapping[str, str]) -> str:
+    """Combine precomputed dataframe hashes using the collection contract."""
     digest = hashlib.sha256()
-    for name, frame in sorted(frames.items()):
+    for name, frame_hash in sorted(frame_hashes.items()):
         encoded_name = str(name).encode("utf-8")
         digest.update(len(encoded_name).to_bytes(4, "big"))
         digest.update(encoded_name)
-        digest.update(bytes.fromhex(dataframe_sha256(frame)))
+        digest.update(bytes.fromhex(str(frame_hash)))
     return digest.hexdigest()
 
 

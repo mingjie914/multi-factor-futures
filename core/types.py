@@ -156,29 +156,3 @@ class Signal:
     mode: str = ""
     reason: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DiscoveredFactor:
-    """A factor discovered through automated mining.
-
-    Attributes:
-        name: Human-readable factor name.
-        expression: Mathematical / logical expression defining the factor.
-        category: Factor category (default 'auto_mined').
-        eval_result: Optional evaluation results.
-    """
-
-    name: str
-    expression: str
-    category: str = "auto_mined"
-    eval_result: Optional[Dict] = None
-
-    def to_factor_instance(self) -> "Factor":
-        """Convert this discovered factor into a concrete Factor instance.
-
-        Note:
-            This is a placeholder pending real import to avoid circular
-            dependencies at module level.
-        """
-        raise NotImplementedError("Concrete Factor conversion not yet implemented.")

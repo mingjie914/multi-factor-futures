@@ -9,6 +9,8 @@
 
 akshare>=1.10.0
 dolphindb>=1.30.0
+sqlalchemy>=1.4.0,<3
+pymysql>=1.0.0,<2
 scikit-learn>=1.0.0
 matplotlib>=3.5.0
-seaborn>=0.12.0
+ta_cn[cn]==0.5.2

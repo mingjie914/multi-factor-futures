@@ -20,7 +20,7 @@ Usage:
     # 适用场景: "因子应在所有持有期上测试, 找到最优持有期"
     python main.py research --all --multi-period --periods 1,5,10,20,40
 
-    # 指定周期单位 (默认 daily; 未来支持 15min/30min/hourly)
+    # 指定周期单位；非日频使用真实 bar 索引
     python main.py research --all --multi-period --frequency daily
 
     # 单持有期探索性筛选可放宽阈值；正式多周期筛选固定使用全局 Bonferroni
@@ -39,7 +39,7 @@ Usage:
     - 因子 slug 中的 "5d" 后缀表示 "5个周期" (bar数), 不是 "5个日历天"
     - 持有期 (holding_period) 同样是 "周期数" 语义
     - 当 --frequency=daily (默认) 时, 1个周期 = 1个交易日
-    - 当 --frequency=15min 时, 1个周期 = 1个15分钟bar (未来扩展)
+    - 当 --frequency=15min 时, 1个周期 = 1个15分钟bar
 """
 from __future__ import annotations
 import sys
@@ -93,6 +93,94 @@ def _safe_str(val, default: str = "") -> str:
         return str(val)
     except (ValueError, TypeError):
         return default
+
+
+def _joint_ic_ols_statistics(
+    factor,
+    forward_returns,
+    *,
+    forward_period: int,
+    min_stocks: int = 10,
+) -> dict:
+    """Compute Pearson IC and raw univariate OLS from one matrix pass."""
+    import numpy as np
+    import pandas as pd
+    from testing.ic_test import _newey_west_ir
+    from testing.regression import _newey_west_t_stat
+
+    common_dates = factor.index.intersection(forward_returns.index)
+    common_cols = factor.columns.intersection(forward_returns.columns)
+    if len(common_dates) == 0 or len(common_cols) < min_stocks:
+        return {
+            "ic": 0.0, "ic_hac_t": 0.0, "ir_nw": 0.0,
+            "ic_pos_ratio": 0.0, "ic_n": 0, "ols_beta": 0.0,
+            "ols_hac_t": 0.0, "ols_n": 0,
+        }
+
+    x = factor.loc[common_dates, common_cols].to_numpy(
+        dtype=float, copy=False
+    )
+    y = forward_returns.loc[common_dates, common_cols].to_numpy(
+        dtype=float, copy=False
+    )
+    valid = np.isfinite(x) & np.isfinite(y)
+    counts = valid.sum(axis=1)
+    safe_counts = np.maximum(counts, 1)
+    x_masked = np.where(valid, x, 0.0)
+    y_masked = np.where(valid, y, 0.0)
+    x_mean = x_masked.sum(axis=1) / safe_counts
+    y_mean = y_masked.sum(axis=1) / safe_counts
+    x_centered = np.where(valid, x - x_mean[:, None], 0.0)
+    y_centered = np.where(valid, y - y_mean[:, None], 0.0)
+    numerator = np.einsum("ij,ij->i", x_centered, y_centered)
+    x_ss = np.einsum("ij,ij->i", x_centered, x_centered)
+    y_ss = np.einsum("ij,ij->i", y_centered, y_centered)
+
+    ic_denominator = np.sqrt(x_ss * y_ss)
+    ic_usable = (
+        (counts >= min_stocks)
+        & np.isfinite(numerator)
+        & np.isfinite(ic_denominator)
+        & (ic_denominator > 0.0)
+    )
+    ic_values = np.divide(
+        numerator,
+        ic_denominator,
+        out=np.full(len(common_dates), np.nan, dtype=float),
+        where=ic_usable,
+    )[ic_usable]
+    ic_series = pd.Series(ic_values, dtype=float)
+    ir_nw, ic_hac_t = _newey_west_ir(ic_series, forward_period)
+
+    ols_usable = (
+        (counts >= min_stocks)
+        & np.isfinite(numerator)
+        & np.isfinite(x_ss)
+        & (x_ss > np.finfo(float).eps)
+    )
+    slope_values = np.divide(
+        numerator,
+        x_ss,
+        out=np.full(len(common_dates), np.nan, dtype=float),
+        where=ols_usable,
+    )[ols_usable]
+    slope_series = pd.Series(slope_values, dtype=float)
+    ols_hac_t = _newey_west_t_stat(slope_series, forward_period)
+
+    return {
+        "ic": float(ic_values.mean()) if len(ic_values) else 0.0,
+        "ic_hac_t": float(ic_hac_t),
+        "ir_nw": float(ir_nw),
+        "ic_pos_ratio": (
+            float((ic_values > 0.0).mean()) if len(ic_values) else 0.0
+        ),
+        "ic_n": int(len(ic_values)),
+        "ols_beta": (
+            float(slope_values.mean()) if len(slope_values) else 0.0
+        ),
+        "ols_hac_t": float(ols_hac_t),
+        "ols_n": int(len(slope_values)),
+    }
 
 
 def _parse_requested_factors(raw: str | None) -> list[str]:
@@ -401,28 +489,19 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
     Args:
         periods_override: 显式持有期列表 (周期数). None 表示用窗口匹配模式.
-        frequency: 周期单位 ("daily"/"15min"/"30min"/"hourly"). 默认 "daily".
-                   当前仅用于日志显示和 PeriodContext 构造, 不影响计算逻辑
-                   (因为非日度周期需要 DataProvider 频率感知支持).
+        frequency: 周期单位 ("daily"/"1min"/"5min"/"15min"/"30min"/"hourly").
+                   非日度研究通过 FrequencyDataProvider 使用真实 bar 索引。
     """
     import numpy as np
     import pandas as pd
-    from data.manager import DataManager
+    from concurrent.futures import ThreadPoolExecutor
+    from data.manager import DataManager, FrequencyDataProvider
     from factors.engine import FactorEngine
     from core.interfaces import ProcessingContext
-    from testing.ic_test import ICTest
-    from testing.regression import (
-        _newey_west_t_stat,
-        _vectorized_univariate_ols,
-    )
     from scipy import stats as _scipy_stats
 
-    # 构造 PeriodContext (当前仅用于日志, 未来扩展分钟周期时传入计算)
-    try:
-        period_ctx = PeriodContext.from_string(frequency)
-    except ValueError:
-        print(f"  警告: 不支持的 frequency={frequency!r}, 回退到 daily")
-        period_ctx = PeriodContext.from_string("daily")
+    # 构造周期上下文；分钟数据加载后会用实际 bar 数校准年化因子。
+    period_ctx = PeriodContext.from_string(frequency)
 
     print("=" * 60)
     print(f"因子多持有期窗口匹配筛选 ({len(all_factors)} 个)")
@@ -469,17 +548,23 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     print("  分组: " + ", ".join(f"{k}={len(v)}" for k, v in window_groups.items()))
     print()
 
-    data_mgr = runner.data_manager
+    base_data_mgr = runner.data_manager
     universe = pd.Index(runner.config.universe) if runner.config.universe else pd.Index([])
 
-    # 优先从缓存获取交易日历 (绕过 MySQL 连接问题)
-    calendar = data_mgr.get_calendar(factor_start, ic_end)
+    if period_ctx.is_daily:
+        data_mgr = base_data_mgr
+        calendar = data_mgr.get_calendar(factor_start, ic_end)
+    else:
+        data_mgr = FrequencyDataProvider(
+            base_data_mgr, frequency, factor_start, ic_end, universe
+        )
+        calendar = data_mgr.get_calendar()
     if hasattr(calendar, "tz") and calendar.tz is not None:
         calendar = calendar.tz_localize(None)
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
     # 若 MySQL 连接失败导致日历为空, 从缓存的 close parquet 提取交易日历
-    if len(calendar) == 0:
+    if len(calendar) == 0 and period_ctx.is_daily:
         import os as _os
         _cache_dir = _os.path.join(_PROJECT_ROOT, "cache")
         _close_files = [f for f in _os.listdir(_cache_dir)
@@ -522,22 +607,27 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             print(f"  (从缓存加载数据: {len(_ohlcv_cache)} 个字段)")
 
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
+    if not period_ctx.is_daily and len(calendar):
+        close_for_frequency = data_mgr.get("close", calendar, universe)
+        per_instrument_day = (
+            close_for_frequency.notna()
+            .groupby(close_for_frequency.index.normalize())
+            .sum()
+            .stack()
+        )
+        active_counts = per_instrument_day.loc[per_instrument_day.gt(0)]
+        if not active_counts.empty:
+            observed_bars_per_day = max(int(round(active_counts.median())), 1)
+            period_ctx = PeriodContext(
+                unit=period_ctx.unit,
+                bars_per_day=observed_bars_per_day,
+                bars_per_year=observed_bars_per_day * 252,
+            )
+            print(
+                f"  observed annualization: {observed_bars_per_day} bars/instrument-day, "
+                f"{period_ctx.bars_per_year} bars/year"
+            )
     print(f"交易日历: {len(calendar)} 天, universe: {len(universe)} 品种")
-
-    # 计算所有因子矩阵 (一次性, 串行最稳定)
-    print(f"\n计算 {len(all_factors)} 个因子矩阵 (含预热期)...")
-    t0 = time.time()
-    engine = FactorEngine(data_mgr)
-    factor_matrices = engine.compute_factors(
-        all_factors, calendar, universe, parallel=False, chunk_size=100
-    )
-    processing_context = ProcessingContext(
-        data=data_mgr, dates=calendar, universe=universe
-    )
-    factor_matrices = runner.processor.process_batch(
-        factor_matrices, processing_context
-    )
-    print(f"  完成: {len(factor_matrices)} 个因子, 耗时 {time.time()-t0:.1f}s")
 
     # 预计算各持有期的 forward returns
     print("\n预计算 forward returns...")
@@ -553,101 +643,142 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
     print(f"  持有期 (周期数): {all_periods}")
 
-    # 批量 IC 检验 (向量化)
-    print("\n=== 开始 IC 检验 ===")
+    # Stream each factor batch through inference, then release its matrices.
+    # This keeps census peak memory bounded by the batch size.
+    print("\n=== 开始 IC 检验 (流式因子分块) ===")
     results = []
     total = len(all_factors)
     t0 = time.time()
+    processing_context = ProcessingContext(
+        data=data_mgr, dates=calendar, universe=universe
+    )
+    default_chunk_size = 64 if period_ctx.is_daily else 16
+    research_chunk_size = max(
+        int(os.environ.get("MF_RESEARCH_FACTOR_CHUNK_SIZE", default_chunk_size)),
+        1,
+    )
+    analysis_workers = max(
+        int(os.environ.get(
+            "MF_RESEARCH_ANALYSIS_WORKERS", min(8, os.cpu_count() or 1)
+        )),
+        1,
+    )
+    print(f"  因子分块大小: {research_chunk_size}")
+    print(f"  因子检验线程: {analysis_workers}")
 
-    for idx, fname in enumerate(all_factors, 1):
-        if fname not in factor_matrices:
-            continue
-        window = _infer_window(fname)
-        # 持有期: 显式模式 → periods_override; 窗口匹配模式 → 按窗口推断
-        if periods_override is not None:
-            periods = list(periods_override)
-        else:
-            periods = _periods_for_window(window)
+    for batch_start in range(0, total, research_chunk_size):
+        batch_names = all_factors[
+            batch_start:batch_start + research_chunk_size
+        ]
+        engine = FactorEngine(data_mgr)
+        factor_batch = engine.compute_factors(
+            batch_names,
+            calendar,
+            universe,
+            parallel=False,
+            chunk_size=research_chunk_size,
+        )
+        factor_batch = runner.processor.process_batch(
+            factor_batch, processing_context
+        )
 
-        f_mat = factor_matrices[fname]
-        f_ic = f_mat.loc[ic_start:ic_end]
-
-        all_period_results = {}
-        for p in periods:
-            fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
-            # Census selection consumes Pearson IC only. Avoid computing and
-            # discarding Spearman ranks and decay diagnostics for every test.
-            test = ICTest(
-                methods=["pearson"], decay_periods=[], forward_period=p
+        def _evaluate_factor(fname):
+            if fname not in factor_batch:
+                return None
+            window = _infer_window(fname)
+            periods = (
+                list(periods_override)
+                if periods_override is not None
+                else _periods_for_window(window)
             )
-            try:
-                res = test.run(f_ic, fwd)
-                t_stat = res.t_stat
-                ic_mean = res.ic_mean
-                ir_nw = res.ir_newey_west
-                ic_pos_ratio = (res.ic_series > 0).mean() if len(res.ic_series) > 0 else 0.0
-                ols_slopes = _vectorized_univariate_ols(
-                    f_ic, fwd, min_stocks=10
-                )
-                ols_t = _newey_west_t_stat(ols_slopes, forward_period=p)
-                ols_p = float(
-                    2.0 * _scipy_stats.t.sf(
-                        abs(ols_t), df=max(len(ols_slopes) - 1, 1)
+            f_ic = factor_batch[fname].loc[ic_start:ic_end]
+            all_period_results = {}
+            for p in periods:
+                fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
+                try:
+                    stats = _joint_ic_ols_statistics(
+                        f_ic,
+                        fwd,
+                        forward_period=p,
+                        min_stocks=10,
                     )
-                )
-                ols_beta = float(ols_slopes.mean()) if len(ols_slopes) else 0.0
-            except Exception:
-                t_stat = 0.0
-                ic_mean = 0.0
-                ir_nw = 0.0
-                ic_pos_ratio = 0.0
-                ols_t = 0.0
-                ols_p = 1.0
-                ols_beta = 0.0
-                ols_slopes = pd.Series(dtype=float)
-                res = None
+                    t_stat = stats["ic_hac_t"]
+                    ic_mean = stats["ic"]
+                    ir_nw = stats["ir_nw"]
+                    ic_pos_ratio = stats["ic_pos_ratio"]
+                    ols_t = stats["ols_hac_t"]
+                    ols_p = float(
+                        2.0 * _scipy_stats.t.sf(
+                            abs(ols_t), df=max(stats["ols_n"] - 1, 1)
+                        )
+                    )
+                    ols_beta = stats["ols_beta"]
+                    ols_n = stats["ols_n"]
+                    ic_n = stats["ic_n"]
+                except Exception:
+                    t_stat = 0.0
+                    ic_mean = 0.0
+                    ir_nw = 0.0
+                    ic_pos_ratio = 0.0
+                    ols_t = 0.0
+                    ols_p = 1.0
+                    ols_beta = 0.0
+                    ols_n = 0
+                    ic_n = 0
 
-            all_period_results[f"period_{p}"] = {
-                "ic": float(ic_mean),
-                "ic_hac_t": float(t_stat),
-                "t": float(ols_t),
-                "ols_beta": float(ols_beta),
-                "ols_hac_t": float(ols_t),
-                "ols_p_value": float(ols_p),
-                "ols_n": int(len(ols_slopes)),
-                "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
-                "ir_nw": float(ir_nw),
-                "ic_pos_ratio": float(ic_pos_ratio),
-                "n": int(res.n_obs) if res else 0,
+                all_period_results[f"period_{p}"] = {
+                    "ic": float(ic_mean),
+                    "ic_hac_t": float(t_stat),
+                    "t": float(ols_t),
+                    "ols_beta": float(ols_beta),
+                    "ols_hac_t": float(ols_t),
+                    "ols_p_value": float(ols_p),
+                    "ols_n": int(ols_n),
+                    "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
+                    "ir_nw": float(ir_nw),
+                    "ic_pos_ratio": float(ic_pos_ratio),
+                    "n": int(ic_n),
+                }
+
+            return {
+                "name": fname,
+                "window": window,
+                "best_period": 0,
+                "best_t": 0.0,
+                "best_ic_t": 0.0,
+                "best_p_value": 1.0,
+                "best_ic": 0.0,
+                "best_ir": 0.0,
+                "best_ic_pos_ratio": 0.0,
+                "all_periods": all_period_results,
+                "n_periods_tested": len(periods),
+                "adaptivity_best_sector": _safe_str(adaptivity_data.get(fname, {}).get("best_sector", "")),
+                "adaptivity_valid_sectors": _safe_str(adaptivity_data.get(fname, {}).get("valid_sectors", "")),
+                "adaptivity_n_valid_sectors": _safe_int(adaptivity_data.get(fname, {}).get("n_valid_sectors", 0)),
+                "adaptivity_recommended_period": _safe_int(adaptivity_data.get(fname, {}).get("recommended_period", 0)),
+                "adaptivity_decay_type": _safe_str(adaptivity_data.get(fname, {}).get("decay_type", "")),
             }
 
-        # CR-002: Bonferroni 校正改为全局 m 假设数校正 (不再用 t×√n_periods)
-        # 全局 m = n_factors × n_periods, 在筛选阶段统一计算
-        n_periods = len(periods)
+        if analysis_workers == 1 or len(batch_names) <= 1:
+            evaluated = map(_evaluate_factor, batch_names)
+            pool = None
+        else:
+            pool = ThreadPoolExecutor(
+                max_workers=min(analysis_workers, len(batch_names))
+            )
+            evaluated = pool.map(_evaluate_factor, batch_names)
+        try:
+            for factor_result in evaluated:
+                if factor_result is not None:
+                    results.append(factor_result)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
 
-        results.append({
-            "name": fname,
-            "window": window,
-            "best_period": 0,
-            "best_t": 0.0,
-            "best_ic_t": 0.0,
-            "best_p_value": 1.0,
-            "best_ic": 0.0,
-            "best_ir": 0.0,
-            "best_ic_pos_ratio": 0.0,
-            "all_periods": all_period_results,
-            "n_periods_tested": n_periods,
-            # 方案A: 适配性研究信息 (供输出层展示, 不影响筛选逻辑)
-            "adaptivity_best_sector": _safe_str(adaptivity_data.get(fname, {}).get("best_sector", "")),
-            "adaptivity_valid_sectors": _safe_str(adaptivity_data.get(fname, {}).get("valid_sectors", "")),
-            "adaptivity_n_valid_sectors": _safe_int(adaptivity_data.get(fname, {}).get("n_valid_sectors", 0)),
-            "adaptivity_recommended_period": _safe_int(adaptivity_data.get(fname, {}).get("recommended_period", 0)),
-            "adaptivity_decay_type": _safe_str(adaptivity_data.get(fname, {}).get("decay_type", "")),
-        })
-
-        if idx % 50 == 0 or idx == total:
-            elapsed = time.time() - t0
-            print(f"  [{idx}/{total}] 耗时 {elapsed:.1f}s")
+        engine.clear_cache()
+        del factor_batch
+        done = min(batch_start + research_chunk_size, total)
+        print(f"  [{done}/{total}] 耗时 {time.time() - t0:.1f}s")
 
     # 筛选显著因子 (业界标准筛选流程)
     # 门槛1: t值显著性 (Bonferroni校正后)
@@ -732,6 +863,18 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
 
         print("\n=== 后置检验: 分层单调性 / 换手率 / 稳健性 ===")
+        post_names = [row["name"] for row in significant]
+        post_engine = FactorEngine(data_mgr)
+        factor_matrices = post_engine.compute_factors(
+            post_names,
+            calendar,
+            universe,
+            parallel=False,
+            chunk_size=max(len(post_names), 1),
+        )
+        factor_matrices = runner.processor.process_batch(
+            factor_matrices, processing_context
+        )
         layered_test = LayeredBacktest(n_groups=5)
         turnover_test = TurnoverTest()
         robustness_test = RobustnessTest(n_segments=4)
@@ -1082,9 +1225,8 @@ def main():
              "需配合 --multi-period 使用")
     parser.add_argument(
         "--frequency", default="daily",
-        choices=["daily", "15min", "30min", "hourly"],
-        help="周期单位 (默认 daily). 非日度周期需要 DataProvider 频率感知支持, "
-             "当前仅 daily 完整可用")
+        choices=["daily", "1min", "5min", "15min", "30min", "hourly"],
+        help="周期单位 (默认 daily). 非日度研究使用数据源的真实 bar 索引")
     parser.add_argument(
         "--t-threshold", type=float, default=1.96,
         help="筛选时 t 值绝对值阈值 (默认 1.96, 即 95%% 置信度)")

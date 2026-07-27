@@ -2,7 +2,7 @@
 
 本模块定义了因子框架的"周期"概念, 解决以下问题:
 1. slug 中的 `5d` 后缀实际语义为"5个周期" (bar数), 而非"5天"
-2. 未来扩展到 15 分钟等日内周期时, 需要统一的周期上下文
+2. 1/5/15/30/60 分钟研究需要统一的周期上下文
 3. 持有期 (holding_period) 同样是"周期数"语义
 
 核心概念:
@@ -34,6 +34,8 @@ class PeriodUnit(str, Enum):
     """
 
     DAILY = "daily"          # 日度 (1个交易日 = 1个bar)
+    MINUTE_1 = "1min"
+    MINUTE_5 = "5min"
     MINUTE_15 = "15min"      # 15分钟 (国内期货日盘 ~4小时 = 16个bar/天)
     MINUTE_30 = "30min"      # 30分钟 (8个bar/天)
     HOURLY = "hourly"        # 小时 (4个bar/天)
@@ -43,6 +45,8 @@ class PeriodUnit(str, Enum):
 # 年化因子 = 每交易日bar数 × 252 (假设252个交易日/年)
 _PERIOD_META = {
     PeriodUnit.DAILY: {"bars_per_day": 1, "bars_per_year": 252},
+    PeriodUnit.MINUTE_1: {"bars_per_day": 240, "bars_per_year": 240 * 252},
+    PeriodUnit.MINUTE_5: {"bars_per_day": 48, "bars_per_year": 48 * 252},
     PeriodUnit.MINUTE_15: {"bars_per_day": 16, "bars_per_year": 16 * 252},
     PeriodUnit.MINUTE_30: {"bars_per_day": 8, "bars_per_year": 8 * 252},
     PeriodUnit.HOURLY: {"bars_per_day": 4, "bars_per_year": 4 * 252},
@@ -95,8 +99,18 @@ class PeriodContext:
         Raises:
             ValueError: 不支持的频率字符串
         """
+        aliases = {
+            "1m": "1min",
+            "5m": "5min",
+            "15m": "15min",
+            "30m": "30min",
+            "60m": "hourly",
+            "60min": "hourly",
+            "1h": "hourly",
+        }
+        normalised = aliases.get(str(freq).lower(), str(freq).lower())
         try:
-            unit = PeriodUnit(freq)
+            unit = PeriodUnit(normalised)
         except ValueError as e:
             raise ValueError(
                 f"不支持的频率: {freq!r}, 支持的值: "
@@ -141,10 +155,7 @@ def parse_slug_window(slug: str) -> Optional[str]:
 
 # 默认的窗口 → 持有期映射 (日度场景)
 # 与统一研究工作流中的 _periods_for_window 完全一致, 保持向后兼容
-# 分钟因子窗口 (16p/80p/240p) 的持有期按日度等价折算:
-#   16p (1天) → [1, 3, 5] 日
-#   80p (5天) → [3, 5, 10] 日
-#   240p (15天) → [5, 10, 20] 日
+# `p` 只表示 bar 数，不隐含分钟频率；持有期也按当前频率的 bar 数解释。
 _DEFAULT_HOLDING_PERIODS = {
     # 日度窗口
     "5d": [3, 5, 10],
@@ -164,9 +175,8 @@ def holding_periods_for_window(
 ) -> List[int]:
     """根据计算窗口推荐持有期列表.
 
-    保留与 workflows.research._periods_for_window 完全相同的默认映射, 以确保
-    向后兼容. 当 period_ctx 提供且非日度时, 可基于周期单位调整持有期,
-    但当前实现仅返回默认映射 (分钟周期扩展时再实现).
+    保留与 workflows.research._periods_for_window 完全相同的默认映射。返回值
+    始终是当前 frequency 下的 bar 数，不自动换算为交易日。
 
     Args:
         window: 窗口标签 (如 "5d", "10d", "20d", "16p", "80p", "240p", "other")
@@ -175,9 +185,6 @@ def holding_periods_for_window(
     Returns:
         持有期列表 (周期数, 已排序去重, **新列表副本**)
     """
-    # 当前: 保持与现有逻辑完全一致
-    # 未来: 当 period_ctx.unit != DAILY 时, 可按比例缩放持有期
-    # (例如 5d 日度 → [3,5,10] 日, 5d 15分钟 → [3*16, 5*16, 10*16] 15分钟bar)
     # 返回副本以避免调用方修改模块级常量
     periods = _DEFAULT_HOLDING_PERIODS.get(window)
     if periods is None:

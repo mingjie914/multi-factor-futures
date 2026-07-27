@@ -151,27 +151,12 @@ class RobustnessTest(FactorTest):
             f_seg = f_aligned.loc[seg_dates]
             r_seg = r_aligned.loc[seg_dates]
 
-            # 逐日IC (Spearman rank IC)
-            daily_ics = []
-            for dt in seg_dates:
-                # CR-028: 对 (factor, forward_return) 做 pairwise dropna
-                # 旧代码只对 f_row dropna, r_row 仍可能含 NaN 导致 spearmanr 异常
-                f_row = f_seg.loc[dt]
-                r_row = r_seg.loc[dt]
-                common = f_row.index.intersection(r_row.index)
-                if len(common) < self.min_cross_section:
-                    continue
-                f_vals = f_row[common]
-                r_vals = r_row[common]
-                # pairwise dropna: 只保留两者都非 NaN 的品种
-                valid_mask = f_vals.notna() & r_vals.notna()
-                if valid_mask.sum() < self.min_cross_section:
-                    continue
-                ic, _ = spearmanr(
-                    f_vals[valid_mask].values, r_vals[valid_mask].values
-                )
-                if not np.isnan(ic):
-                    daily_ics.append(ic)
+            from testing.ic_test import _vectorized_spearman_ic
+
+            daily_ic_series, _ = _vectorized_spearman_ic(
+                f_seg, r_seg, min_stocks=self.min_cross_section
+            )
+            daily_ics = daily_ic_series.to_list()
 
             seg_key = f"seg{seg_idx+1}"
             if len(daily_ics) < 5:
@@ -281,19 +266,12 @@ class RobustnessTest(FactorTest):
             f_sector = f_aligned[sector_tickers]
             r_sector = r_aligned[sector_tickers]
 
-            daily_ics = []
-            for dt in f_sector.index:
-                f_row = f_sector.loc[dt]
-                r_row = r_sector.loc[dt]
-                # pairwise dropna
-                valid_mask = f_row.notna() & r_row.notna()
-                if valid_mask.sum() < self.min_cross_section:
-                    continue
-                ic, _ = spearmanr(
-                    f_row[valid_mask].values, r_row[valid_mask].values
-                )
-                if not np.isnan(ic):
-                    daily_ics.append(ic)
+            from testing.ic_test import _vectorized_spearman_ic
+
+            daily_ic_series, _ = _vectorized_spearman_ic(
+                f_sector, r_sector, min_stocks=self.min_cross_section
+            )
+            daily_ics = daily_ic_series.to_list()
 
             if len(daily_ics) >= 5:
                 sector_ics[sector] = float(np.mean(daily_ics))
