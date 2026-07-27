@@ -423,8 +423,12 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
             "threshold_multiplier": multiplier,
             "discovery_q": q_value,
             "factors_with_local_fdr_discovery": len(selected_names),
+            "local_fdr_factor_names": sorted(selected_names),
             "factors_passing_scaled_ic_t_direction": len(
                 economically_qualified
+            ),
+            "economic_factor_names": sorted(
+                str(result["name"]) for result in economically_qualified
             ),
             "post_metrics_available": len(post_available),
             "passing_scaled_turnover": sum(
@@ -463,6 +467,15 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
             ),
             "discovery_audit": discovery,
         }
+    baseline = scenarios["baseline"]
+    for scenario in scenarios.values():
+        for prefix in ("local_fdr", "economic"):
+            current = set(scenario[f"{prefix}_factor_names"])
+            reference = set(baseline[f"{prefix}_factor_names"])
+            union = current | reference
+            scenario[f"{prefix}_jaccard_vs_baseline"] = (
+                float(len(current & reference) / len(union)) if union else 1.0
+            )
     return {
         "report_only": True,
         "selection_uses_baseline_only": True,

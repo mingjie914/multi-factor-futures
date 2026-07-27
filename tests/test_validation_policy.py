@@ -213,14 +213,86 @@ def test_fold_survival_cannot_claim_promotion_before_new_locked_oos():
     from workflows.walkforward import summarize_factor_fold_survival
 
     folds = [
-        {"factor_oos": {"signal": {"same_direction": True}}},
-        {"factor_oos": {"signal": {"same_direction": True}}},
+        {"factor_oos": {"signal": {
+            "same_direction": True,
+            "oriented_oos_ic": 0.02,
+            "n_observations": 100,
+        }}},
+        {"factor_oos": {"signal": {
+            "same_direction": True,
+            "oriented_oos_ic": 0.01,
+            "n_observations": 50,
+        }}},
     ]
     result = summarize_factor_fold_survival(folds)["signal"]
+    assert result["combined_oriented_oos_ic"] == pytest.approx(1.0 / 60.0)
+    assert result["combined_oos_same_direction"] is True
     assert result["passes_two_consecutive_fold_gate"] is True
     assert result["observation_transition_ready"] is False
     assert result["requires_positive_new_locked_oos"] is True
     assert result["production_approved"] is False
+
+
+def test_fold_survival_rejects_negative_combined_oos_despite_fold_majority():
+    from workflows.walkforward import summarize_factor_fold_survival
+
+    folds = [
+        {"factor_oos": {"signal": {
+            "same_direction": True,
+            "oriented_oos_ic": 0.01,
+            "n_observations": 100,
+        }}},
+        {"factor_oos": {"signal": {
+            "same_direction": True,
+            "oriented_oos_ic": 0.01,
+            "n_observations": 100,
+        }}},
+        {"factor_oos": {"signal": {
+            "same_direction": False,
+            "oriented_oos_ic": -0.10,
+            "n_observations": 100,
+        }}},
+    ]
+    result = summarize_factor_fold_survival(folds)["signal"]
+    assert result["fold_sign_ratio"] == pytest.approx(2.0 / 3.0)
+    assert result["combined_oriented_oos_ic"] < 0.0
+    assert result["passes_fold_gate"] is False
+
+
+def test_threshold_sensitivity_reports_factor_names_and_jaccard():
+    from types import SimpleNamespace
+
+    from workflows.research import _build_threshold_sensitivity
+
+    policy = SimpleNamespace(
+        discovery_q=0.10,
+        fwer_report_alpha=0.05,
+        expected_directions={},
+        min_abs_ic=0.01,
+        min_abs_t=2.0,
+        max_monthly_turnover=0.50,
+        annual_direction_ratio=0.60,
+        annual_effect_ratio=0.65,
+        cost_safety_margin=1.5,
+    )
+    results = [{
+        "name": "signal",
+        "all_periods": {"1": {
+            "ols_p_value": 0.001,
+            "estimable": True,
+            "ic": 0.02,
+            "ols_hac_t": 3.0,
+            "period": 1,
+            "preprocessing_variant": "neutralized",
+        }},
+    }]
+    report = _build_threshold_sensitivity(results, policy)
+
+    for scenario in report["scenarios"].values():
+        assert scenario["local_fdr_factor_names"] == ["signal"]
+        assert scenario["economic_factor_names"] == ["signal"]
+        assert scenario["local_fdr_jaccard_vs_baseline"] == pytest.approx(1.0)
+        assert scenario["economic_jaccard_vs_baseline"] == pytest.approx(1.0)
 
 
 def test_deployment_adaptivity_loads_only_frozen_discovery_contract(tmp_path):

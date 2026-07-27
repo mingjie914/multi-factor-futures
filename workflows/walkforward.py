@@ -492,7 +492,14 @@ def _evaluate_fold_factor_ics(runner, bundle, test_start: str, test_end: str) ->
 def summarize_factor_fold_survival(
     folds: list[dict], *, minimum_fold_ratio: float = 0.60
 ) -> dict:
-    """Aggregate fold direction survival without claiming a new locked OOS."""
+    """Aggregate fold survival without claiming a new locked OOS.
+
+    A factor must pass both parts of the OOS direction contract: its pooled,
+    observation-weighted oriented IC must be positive and at least the
+    configured share of folds must have the training direction.  The pooled
+    check prevents a few small positive folds from masking one economically
+    dominant negative fold.
+    """
     histories = {}
     for fold in folds:
         for name, values in fold.get("factor_oos", {}).items():
@@ -500,6 +507,27 @@ def summarize_factor_fold_survival(
     summary = {}
     for name, values in histories.items():
         same = [bool(item.get("same_direction", False)) for item in values]
+        weighted_ics = []
+        weights = []
+        for item in values:
+            oriented_ic = float(item.get("oriented_oos_ic", float("nan")))
+            if not np.isfinite(oriented_ic):
+                continue
+            weight = float(item.get("n_observations", 1.0))
+            if not np.isfinite(weight) or weight <= 0.0:
+                continue
+            weighted_ics.append(oriented_ic)
+            weights.append(weight)
+        combined_oriented_oos_ic = (
+            float(np.average(weighted_ics, weights=weights))
+            if weighted_ics
+            else None
+        )
+        combined_oos_same_direction = bool(
+            combined_oriented_oos_ic is not None
+            and combined_oriented_oos_ic > 0.0
+        )
+        fold_sign_ratio = float(np.mean(same)) if same else 0.0
         longest = current = 0
         for survived in same:
             current = current + 1 if survived else 0
@@ -507,13 +535,18 @@ def summarize_factor_fold_survival(
         summary[name] = {
             "tested_folds": len(values),
             "same_direction_folds": int(sum(same)),
-            "fold_sign_ratio": float(np.mean(same)) if same else 0.0,
+            "fold_sign_ratio": fold_sign_ratio,
+            "combined_oriented_oos_ic": combined_oriented_oos_ic,
+            "combined_oos_same_direction": combined_oos_same_direction,
             "longest_consecutive_surviving_folds": int(longest),
             "passes_fold_gate": bool(
-                same and np.mean(same) >= minimum_fold_ratio
+                combined_oos_same_direction
+                and fold_sign_ratio >= minimum_fold_ratio
             ),
             "passes_two_consecutive_fold_gate": bool(
-                longest >= 2 and np.mean(same) >= minimum_fold_ratio
+                combined_oos_same_direction
+                and longest >= 2
+                and fold_sign_ratio >= minimum_fold_ratio
             ),
             "observation_transition_ready": False,
             "requires_positive_new_locked_oos": True,
