@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -224,6 +225,65 @@ def test_bridge_uses_framework_point_in_time_mask_inside_expression():
         revised.iloc[:, :-2], baseline.iloc[:, :-2], equal_nan=True
     )
     assert revised.iloc[:, -2:].isna().all().all()
+
+
+def test_bridge_extends_frozen_group_labels_to_dynamic_universe():
+    candidate = _candidate("mined_bridge_group_label_extension_test")
+    candidate = CandidateSpec.from_dict({
+        **candidate.to_dict(),
+        "content_sha256": "",
+        "payload": {
+            **candidate.payload,
+            "group_labels": {"RB": "ferrous", "HC": "ferrous"},
+        },
+    })
+    panels = make_synthetic_panels(periods=80, symbols=3, seed=19)
+    panels = {
+        field: frame.set_axis(["RB", "HC", "CU"], axis=1)
+        for field, frame in panels.items()
+    }
+    dates = panels["close"].index
+    universe = pd.Index(["RB", "HC", "CU"])
+
+    with pytest.warns(RuntimeWarning, match="CU .*group_labels"):
+        result = compute_symbolic_candidate(
+            candidate, FrameProvider(panels), dates, universe
+        )
+
+    assert result.columns.tolist() == ["RB", "HC", "CU"]
+    assert np.isfinite(result.iloc[5:].to_numpy()).any()
+
+
+def test_bridge_preserves_snapshot_group_labels_for_original_universe(monkeypatch):
+    candidate = _candidate("mined_bridge_group_label_regression_test")
+    labeled = CandidateSpec.from_dict({
+        **candidate.to_dict(),
+        "content_sha256": "",
+        "payload": {
+            **candidate.payload,
+            "group_labels": {"RB": "ferrous", "HC": "ferrous"},
+        },
+    })
+    panels = make_synthetic_panels(periods=80, symbols=2, seed=23)
+    panels = {
+        field: frame.set_axis(["RB", "HC"], axis=1)
+        for field, frame in panels.items()
+    }
+    dates = panels["close"].index
+    universe = pd.Index(["RB", "HC"])
+
+    def fail_sector_inference(symbol):
+        raise AssertionError(f"unexpected taxonomy inference for {symbol}")
+
+    monkeypatch.setattr("core.sectors.sector_for", fail_sector_inference)
+    with warnings.catch_warnings(record=True) as caught:
+        result = compute_symbolic_candidate(
+            labeled, FrameProvider(panels), dates, universe
+        )
+
+    assert caught == []
+    assert result.columns.tolist() == ["RB", "HC"]
+    assert np.isfinite(result.iloc[5:].to_numpy()).any()
 
 
 def test_bridge_fails_closed_on_missing_dependency(monkeypatch):

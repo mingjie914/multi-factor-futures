@@ -21,7 +21,13 @@ from factor_mining.api import (
     canonical_json,
     content_hash,
 )
-from factor_mining.data import LocalParquetData, LocalParquetSpec, make_synthetic_panels
+from factor_mining.data import (
+    LocalParquetData,
+    LocalParquetSpec,
+    MySQLRDSData,
+    MySQLRDSDataSpec,
+    make_synthetic_panels,
+)
 from factor_mining.features import FeatureEngine
 from factor_mining.gp import GPConfig, GPSearch
 from factor_mining.repository import CandidateRepository
@@ -66,6 +72,22 @@ def _safe_id_fragment(value: str) -> str:
 
 def _repository(args) -> CandidateRepository:
     return CandidateRepository(args.repository)
+
+
+def _load_market_panels(args, universe, start, end, feature_config):
+    source = str(getattr(args, "source", "parquet")).lower()
+    if source == "parquet":
+        data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
+        if not data_root:
+            raise ValueError("set --data-root or MF_PARQUET_ROOT")
+        return LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
+            universe, start, end, feature_config
+        )
+    if source == "mysql":
+        return MySQLRDSData(MySQLRDSDataSpec(Path(args.config))).load_panels(
+            universe, start, end, feature_config
+        )
+    raise ValueError(f"unsupported mining data source: {source}")
 
 
 def _feature_config(args) -> FeatureConfig:
@@ -207,9 +229,6 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
 
 
 def _mine(args) -> int:
-    data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
-    if not data_root:
-        raise ValueError("set --data-root or MF_PARQUET_ROOT")
     feature_config = _feature_config(args)
     run_payload = {
         "start": args.start,
@@ -276,8 +295,8 @@ def _mine(args) -> int:
     )
     repository = _repository(args)
     repository.add_run(run_spec)
-    panels = LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
-        args.universe, args.start, args.end, feature_config
+    panels = _load_market_panels(
+        args, args.universe, args.start, args.end, feature_config
     )
     from core.config import ValidationPolicyConfig
     from core.factor_contract import normalise_frequency
@@ -422,9 +441,6 @@ def _record_prescreen_outcome(
 
 
 def _screen(args) -> int:
-    data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
-    if not data_root:
-        raise ValueError("set --data-root or MF_PARQUET_ROOT")
     repository = _repository(args)
     candidate_ids = (
         args.candidate_ids
@@ -443,8 +459,8 @@ def _screen(args) -> int:
     candidates = tuple(repository.get_candidate(item) for item in candidate_ids)
     feature_config = candidates[0].feature_config
     universe = args.universe
-    panels = LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
-        universe, args.start, args.end, feature_config
+    panels = _load_market_panels(
+        args, universe, args.start, args.end, feature_config
     )
     outcome = screen_candidates(
         candidates,
@@ -635,6 +651,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     mine = commands.add_parser("mine", help="run GP against local Parquet bars")
+    mine.add_argument("--source", default="parquet", choices=("parquet", "mysql"))
+    mine.add_argument("--config", default="config/default.yaml")
     mine.add_argument("--data-root", type=Path, default=None)
     mine.add_argument("--universe", type=_csv_strings, required=True)
     mine.add_argument("--start", required=True)
@@ -655,6 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
     screen = commands.add_parser(
         "screen", help="pre-screen mined candidates on local bars"
     )
+    screen.add_argument("--source", default="parquet", choices=("parquet", "mysql"))
+    screen.add_argument("--config", default="config/default.yaml")
     screen.add_argument("--data-root", type=Path, default=None)
     screen.add_argument("--universe", type=_csv_strings, required=True)
     screen.add_argument("--start", required=True)

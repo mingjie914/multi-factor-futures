@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Mapping
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,7 @@ from factor_mining.validation import ValidationConfig, prepare_signal
 
 SNAPSHOT_ENV = "MF_MINED_CANDIDATE_SNAPSHOT"
 _REGISTERED_EXPECTED_DIRECTIONS: dict[str, int] = {}
+_WARNED_INFERRED_GROUP_LABELS: set[str] = set()
 
 
 def registered_expected_directions(
@@ -106,9 +108,25 @@ def compute_symbolic_candidate(
     group_mapping = candidate.payload.get("group_labels") or {}
     group_labels = None
     if group_mapping:
-        if any(str(symbol) not in group_mapping for symbol in universe):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        group_labels = [group_mapping[str(symbol)] for symbol in universe]
+        from core.sectors import sector_for
+
+        group_labels = []
+        for symbol in universe:
+            symbol_text = str(symbol)
+            label = group_mapping.get(symbol_text)
+            if not label:
+                label = sector_for(symbol_text)
+                warning_key = symbol_text
+                if warning_key not in _WARNED_INFERRED_GROUP_LABELS:
+                    warnings.warn(
+                        "WARNING: 品种 "
+                        f"{symbol_text} 未在快照 group_labels 中，"
+                        f"使用当前 taxonomy 推断为 {label}。",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    _WARNED_INFERRED_GROUP_LABELS.add(warning_key)
+            group_labels.append(str(label))
     signal = prepare_signal(
         candidate.expected_direction * raw,
         validation,

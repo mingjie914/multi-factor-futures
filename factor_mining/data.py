@@ -72,6 +72,49 @@ class LocalParquetData:
         return panels
 
 
+@dataclass(frozen=True)
+class MySQLRDSDataSpec:
+    config_path: Path = Path("config/default.yaml")
+
+
+class MySQLRDSData:
+    """Read configured RDS/MySQL futures data through the framework source."""
+
+    def __init__(self, spec: MySQLRDSDataSpec):
+        from core.config import load_config
+        from data.mysql_source import MySQLSource
+
+        config = load_config(str(Path(spec.config_path).expanduser().resolve()))
+        mysql_config = config.data.mysql
+        if mysql_config is None:
+            raise ValueError("config.data.mysql is required for --source mysql")
+        if hasattr(mysql_config, "model_dump"):
+            payload = mysql_config.model_dump()
+        else:
+            payload = dict(mysql_config)
+        self._source = MySQLSource(payload)
+
+    def load_panels(
+        self,
+        universe: Sequence[str],
+        start,
+        end,
+        feature_config: FeatureConfig,
+    ) -> Dict[str, pd.DataFrame]:
+        fields = list(dict.fromkeys(feature_config.raw_fields))
+        panels = self._source.fetch_price_at_frequency(
+            list(universe),
+            pd.Timestamp(start),
+            pd.Timestamp(end),
+            fields,
+            frequency=feature_config.decision_frequency,
+        )
+        close = panels.get("close")
+        if close is None or close.empty:
+            raise ValueError("MySQL/RDS query returned no close data")
+        return panels
+
+
 def make_synthetic_panels(
     *,
     periods: int = 600,

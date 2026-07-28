@@ -5,7 +5,13 @@ import pandas as pd
 import pytest
 
 from factor_mining.api import FeatureConfig, TargetSpec
-from factor_mining.data import LocalParquetData, LocalParquetSpec, make_synthetic_panels
+from factor_mining.data import (
+    LocalParquetData,
+    LocalParquetSpec,
+    MySQLRDSData,
+    MySQLRDSDataSpec,
+    make_synthetic_panels,
+)
 from factor_mining.features import FeatureEngine
 from factor_mining.validation import PreparedTarget, ValidationConfig, prepare_signal
 
@@ -111,3 +117,59 @@ def test_local_adapter_explicitly_disables_mysql(tmp_path, monkeypatch):
 
     assert captured["mysql"] is None
     assert captured["config"]["root_path"] == str(tmp_path.resolve())
+
+
+def test_mysql_rds_adapter_uses_configured_intraday_source(tmp_path, monkeypatch):
+    captured = {}
+
+    class MysqlConfig:
+        def model_dump(self):
+            return {
+                "host": "db",
+                "tables": {"intraday_5m": {"table_name": "ths_data_5minute"}},
+            }
+
+    class DataConfig:
+        mysql = MysqlConfig()
+
+    class Config:
+        data = DataConfig()
+
+    class FakeSource:
+        def __init__(self, mysql_config):
+            captured["config"] = mysql_config
+
+        def fetch_price_at_frequency(self, universe, start, end, fields, frequency):
+            captured["call"] = {
+                "universe": list(universe),
+                "fields": list(fields),
+                "frequency": frequency,
+            }
+            index = pd.date_range("2024-01-02 09:00", periods=3, freq="5min")
+            return {
+                "close": pd.DataFrame({"RB": [1.0, 2.0, 3.0]}, index=index),
+                "volume": pd.DataFrame({"RB": [10.0, 11.0, 12.0]}, index=index),
+            }
+
+    monkeypatch.setattr("core.config.load_config", lambda path: Config())
+    monkeypatch.setattr("data.mysql_source.MySQLSource", FakeSource)
+
+    data = MySQLRDSData(MySQLRDSDataSpec(tmp_path / "config.yaml"))
+    panels = data.load_panels(
+        ["RB"],
+        "2024-01-02",
+        "2024-01-03",
+        FeatureConfig(
+            source_frequency="5min",
+            decision_frequency="5min",
+            raw_fields=("close", "volume"),
+        ),
+    )
+
+    assert (
+        captured["config"]["tables"]["intraday_5m"]["table_name"]
+        == "ths_data_5minute"
+    )
+    assert captured["call"]["frequency"] == "5min"
+    assert captured["call"]["fields"] == ["close", "volume"]
+    assert panels["close"].columns.tolist() == ["RB"]
