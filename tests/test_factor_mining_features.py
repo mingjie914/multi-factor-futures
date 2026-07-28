@@ -88,6 +88,16 @@ def test_target_uses_delayed_entry_and_forward_bar_horizon():
     assert np.isnan(target.values[-3:, 0]).all()
 
 
+def test_target_horizon_uses_each_instruments_own_valid_bars():
+    index = pd.date_range("2024-01-02 09:00", periods=5, freq="1min")
+    close = pd.DataFrame({"A": [100.0, 101.0, np.nan, 103.0, 104.0]}, index=index)
+    spec = TargetSpec(name="fwd_1p", horizon_bars=1, entry_delay_bars=1)
+
+    target = PreparedTarget.from_close(close, spec)
+
+    assert target.values[0, 0] == pytest.approx(103.0 / 101.0 - 1.0)
+
+
 def test_local_adapter_explicitly_disables_mysql(tmp_path, monkeypatch):
     captured = {}
 

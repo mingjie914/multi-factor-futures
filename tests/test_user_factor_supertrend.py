@@ -107,8 +107,8 @@ def test_supertrend_state_distance_and_flip_are_coherent(sample_data):
 
     valid = state.notna() & distance.notna()
     assert ((np.sign(distance.where(valid)) == state.where(valid)) | ~valid).all().all()
-    assert set(np.unique(state.stack())) <= {-1.0, 1.0}
-    assert set(np.unique(flip.stack())) <= {-1.0, 0.0, 1.0}
+    assert set(np.unique(state.stack().dropna())) <= {-1.0, 1.0}
+    assert set(np.unique(flip.stack().dropna())) <= {-1.0, 0.0, 1.0}
     assert -1.0 in set(flip["SWITCH"].dropna())
     assert distance.abs().max().max() <= 5.0
 

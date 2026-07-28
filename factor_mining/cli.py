@@ -107,6 +107,10 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         complexity_penalty=args.complexity_penalty,
         coverage_penalty=args.coverage_penalty,
         segment_floor_weight=args.segment_floor_weight,
+        rebalance_every_bars=(
+            args.rebalance_every_bars or args.horizon_bars
+        ),
+        economic_fitness_weight=args.economic_fitness_weight,
     )
     gp_config = GPConfig(
         population_size=args.population,
@@ -193,6 +197,10 @@ def _mine(args) -> int:
         "population": args.population,
         "generations": args.generations,
         "operators": list(args.operators or GPConfig().operators),
+        "rebalance_every_bars": (
+            args.rebalance_every_bars or args.horizon_bars
+        ),
+        "economic_fitness_weight": args.economic_fitness_weight,
     }
     run_id = args.run_id or (
         datetime.now(timezone.utc).strftime("mine_%Y%m%dT%H%M%SZ_")
@@ -232,6 +240,10 @@ def _mine(args) -> int:
                 "complexity_penalty": args.complexity_penalty,
                 "coverage_penalty": args.coverage_penalty,
                 "segment_floor_weight": args.segment_floor_weight,
+                "rebalance_every_bars": (
+                    args.rebalance_every_bars or args.horizon_bars
+                ),
+                "economic_fitness_weight": args.economic_fitness_weight,
             },
         },
     )
@@ -387,6 +399,8 @@ def _screen(args) -> int:
             correlation_threshold=args.correlation_threshold,
             max_correlation_observations=args.max_correlation_observations,
             evaluator_cache_mb=args.evaluator_cache_mb,
+            diagnostic_horizons=args.diagnostic_horizons,
+            persistence_lags=args.persistence_lags,
         ),
     )
 
@@ -403,6 +417,9 @@ def _screen(args) -> int:
     )
     result_frame["dependencies"] = result_frame["dependencies"].map(canonical_json)
     result_frame["formula"] = result_frame["formula"].map(canonical_json)
+    for column in ("predictive_ic_decay", "signal_rank_persistence"):
+        if column in result_frame:
+            result_frame[column] = result_frame[column].map(canonical_json)
     result_frame.to_csv(output_dir / "prescreen_results.csv", index=False)
     outcome.correlation.to_parquet(output_dir / "signal_correlation.parquet")
     summary = {
@@ -413,6 +430,7 @@ def _screen(args) -> int:
         "frequency": feature_config.decision_frequency,
         "universe": list(universe),
         "candidate_source": str(args.candidate_file or "explicit_ids"),
+        "diagnostic_universe_policy": "static_declared_universe",
         "warning": "same-sample mining pre-screen; not formal HAC evidence",
     }
     summary_path = output_dir / "prescreen_summary.json"
@@ -504,6 +522,18 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--coverage-penalty", type=float, default=0.0)
     parser.add_argument("--segment-floor-weight", type=float, default=0.0)
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument(
+        "--rebalance-every-bars",
+        type=int,
+        default=0,
+        help="declared execution schedule; 0 uses the target horizon",
+    )
+    parser.add_argument(
+        "--economic-fitness-weight",
+        type=float,
+        default=0.50,
+        help="weight of cost-adjusted rank-portfolio return in GP fitness",
+    )
     parser.add_argument("--feature-memory-mb", type=int, default=4096)
     parser.add_argument("--evaluator-cache-mb", type=int, default=128)
     parser.add_argument("--seed", type=int, default=17)
@@ -559,6 +589,18 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--max-correlation-observations", type=int, default=100_000)
     screen.add_argument("--evaluator-cache-mb", type=int, default=256)
     screen.set_defaults(handler=_screen)
+    screen.add_argument(
+        "--diagnostic-horizons",
+        type=_csv_ints,
+        default=(1, 3, 5, 10, 20, 40),
+        help="forward-bar horizons for the mining-stage IC decay report",
+    )
+    screen.add_argument(
+        "--persistence-lags",
+        type=_csv_ints,
+        default=(1, 3, 5, 10, 20, 40),
+        help="bar lags for cross-sectional signal-rank persistence",
+    )
 
     snapshot = commands.add_parser("snapshot", help="freeze candidates for framework loading")
     snapshot.add_argument("--output", type=Path, required=True)

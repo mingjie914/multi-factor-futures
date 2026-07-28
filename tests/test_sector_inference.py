@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from workflows.factor_adaptivity import (
     _compute_ic_by_sector,
@@ -72,7 +73,7 @@ def test_sector_fast_path_preserves_zero_variance_row_decisions():
     )["ferrous"]
 
     assert result["n_obs"] == len(expected_ic)
-    assert result["ic_mean"] == expected_ic.mean()
+    assert result["ic_mean"] == pytest.approx(expected_ic.mean())
 
 
 def test_two_instrument_sector_uses_pooled_fixed_effects():

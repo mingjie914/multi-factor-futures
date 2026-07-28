@@ -33,10 +33,27 @@ class PreparedTarget:
             raise ValueError(
                 "the first release supports session_policy='allow_cross_session' only"
             )
-        entry = close.shift(-spec.entry_delay_bars)
-        exit_price = close.shift(-(spec.entry_delay_bars + spec.horizon_bars))
-        target = exit_price.divide(entry.where(entry.abs() > _EPS)) - 1.0
-        values = target.replace([np.inf, -np.inf], np.nan).to_numpy(dtype=np.float32)
+        # Shift each contract on its own valid-bar calendar.  A matrix-wide
+        # shift would turn a missing quote for one contract into a different
+        # economic horizon from the formal framework's return label.
+        close_values = close.to_numpy(dtype=float, copy=False)
+        values = np.full(close_values.shape, np.nan, dtype=np.float32)
+        offset = int(spec.entry_delay_bars + spec.horizon_bars)
+        for column in range(close_values.shape[1]):
+            valid_rows = np.flatnonzero(np.isfinite(close_values[:, column]))
+            if len(valid_rows) <= offset:
+                continue
+            series = close_values[valid_rows, column]
+            output_rows = valid_rows[:-offset]
+            entry = series[
+                spec.entry_delay_bars:len(series) - spec.horizon_bars
+            ]
+            exit_price = series[offset:]
+            usable = np.abs(entry) > _EPS
+            values[output_rows[usable], column] = (
+                exit_price[usable] / entry[usable] - 1.0
+            ).astype(np.float32)
+        values[~np.isfinite(values)] = np.nan
         values.setflags(write=False)
         rank_values = _rank_rows(values).astype(np.float32)
         rank_values.setflags(write=False)
@@ -63,6 +80,8 @@ class ValidationConfig:
     complexity_penalty: float = 0.0005
     coverage_penalty: float = 0.0
     segment_floor_weight: float = 0.0
+    rebalance_every_bars: int = 1
+    economic_fitness_weight: float = 0.50
 
     def __post_init__(self) -> None:
         if self.decision_lag_bars < 1:
@@ -73,6 +92,10 @@ class ValidationConfig:
             raise ValueError("long_short_fraction must be in (0, 0.5]")
         if self.layer_count < 2 or self.time_segments < 1:
             raise ValueError("layer_count/time_segments are invalid")
+        if self.rebalance_every_bars < 1:
+            raise ValueError("rebalance_every_bars must be at least one")
+        if not 0.0 <= self.economic_fitness_weight <= 1.0:
+            raise ValueError("economic_fitness_weight must be in [0, 1]")
         if any(value < 0.0 for value in (
             self.turnover_penalty,
             self.complexity_penalty,
@@ -219,10 +242,30 @@ def _row_nanmean(value: np.ndarray) -> np.ndarray:
     )
 
 
+def _row_nanstd(value: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(value)
+    count = finite.sum(axis=1)
+    mean = _row_nanmean(value)
+    centered = np.where(finite, value - mean, 0.0)
+    variance = np.divide(
+        np.einsum("ij,ij->i", centered, centered),
+        count,
+        out=np.full(len(value), np.nan, dtype=float),
+        where=count > 0,
+    )
+    return np.sqrt(variance)
+
+
 def _rank_ic(
     signal: np.ndarray, target_rank: np.ndarray, minimum: int
 ) -> tuple[np.ndarray, np.ndarray]:
     signal_rank = _rank_rows(signal)
+    return _rank_ic_from_ranks(signal_rank, target_rank, minimum), signal_rank
+
+
+def _rank_ic_from_ranks(
+    signal_rank: np.ndarray, target_rank: np.ndarray, minimum: int
+) -> np.ndarray:
     valid = np.isfinite(signal_rank) & np.isfinite(target_rank)
     count = valid.sum(axis=1)
     x = np.where(valid, signal_rank, np.nan)
@@ -234,10 +277,189 @@ def _rank_ic(
     result = np.divide(
         numerator,
         denominator,
-        out=np.full(len(signal), np.nan),
+        out=np.full(len(signal_rank), np.nan),
         where=(count >= minimum) & (denominator > _EPS),
     )
-    return result, signal_rank
+    return result
+
+
+def _mean_rank_correlation(
+    left: np.ndarray,
+    right: np.ndarray,
+    minimum: int,
+    *,
+    chunk_rows: int = 8192,
+) -> tuple[float, int]:
+    """Memory-bounded mean row correlation for large minute panels."""
+
+    total = 0.0
+    observations = 0
+    for start in range(0, len(left), chunk_rows):
+        stop = min(start + chunk_rows, len(left))
+        x_raw = left[start:stop]
+        y_raw = right[start:stop]
+        valid = np.isfinite(x_raw) & np.isfinite(y_raw)
+        counts = valid.sum(axis=1)
+        x = np.where(valid, x_raw, np.nan)
+        y = np.where(valid, y_raw, np.nan)
+        x -= _row_nanmean(x)
+        y -= _row_nanmean(y)
+        numerator = np.nansum(x * y, axis=1)
+        denominator = np.sqrt(
+            np.nansum(x * x, axis=1) * np.nansum(y * y, axis=1)
+        )
+        usable = (counts >= minimum) & (denominator > _EPS)
+        correlations = np.divide(
+            numerator,
+            denominator,
+            out=np.full(len(x), np.nan, dtype=float),
+            where=usable,
+        )[usable]
+        total += float(np.sum(correlations))
+        observations += int(len(correlations))
+    return (
+        float(total / observations) if observations else 0.0,
+        observations,
+    )
+
+
+def _rank_weight_portfolio(
+    signal_rank: np.ndarray,
+    target: np.ndarray,
+    *,
+    direction: int,
+    rebalance_every_bars: int,
+    minimum: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fast rank-weight portfolio used only by the mining fitness.
+
+    The weighting convention matches the formal turnover test: demean ranks,
+    normalize gross exposure to one, and charge half-turnover only when the
+    declared schedule rebalances.  It avoids an argsort in every GP fitness
+    evaluation.
+    """
+
+    oriented = float(direction) * np.asarray(signal_rank, dtype=float)
+    valid_signal = np.isfinite(oriented)
+    counts = valid_signal.sum(axis=1)
+    centered = oriented - _row_nanmean(oriented)
+    gross_exposure = np.nansum(np.abs(centered), axis=1, keepdims=True)
+    weights = np.divide(
+        centered,
+        gross_exposure,
+        out=np.zeros_like(centered),
+        where=(gross_exposure > _EPS) & valid_signal,
+    )
+    decision_rows = np.arange(0, len(weights), int(rebalance_every_bars))
+    decision_weights = weights[decision_rows]
+    decision_target = np.asarray(target, dtype=float)[decision_rows]
+    joint_counts = (
+        np.isfinite(decision_target) & valid_signal[decision_rows]
+    ).sum(axis=1)
+    usable = (counts[decision_rows] >= minimum) & (joint_counts >= minimum)
+    gross = np.full(len(decision_rows), np.nan, dtype=float)
+    gross[usable] = np.nansum(
+        decision_weights[usable] * decision_target[usable], axis=1
+    )
+    turnover = np.full(len(decision_rows), np.nan, dtype=float)
+    if len(decision_rows) > 1:
+        turnover[1:] = 0.5 * np.abs(np.diff(decision_weights, axis=0)).sum(axis=1)
+    return gross, turnover
+
+
+def predictive_ic_decay(
+    prepared_signal: np.ndarray,
+    targets: Mapping[int, PreparedTarget],
+    *,
+    min_cross_section: int,
+    signal_rank: np.ndarray | None = None,
+) -> dict:
+    """Return a true forward-horizon rank-IC curve in decision bars."""
+
+    curve = {}
+    signal_rank = (
+        _rank_rows(prepared_signal) if signal_rank is None else signal_rank
+    )
+    for horizon in sorted(int(value) for value in targets):
+        mean_ic, observations = _mean_rank_correlation(
+            signal_rank,
+            targets[horizon].rank_values,
+            min_cross_section,
+        )
+        curve[str(horizon)] = {
+            "mean_rank_ic": mean_ic,
+            "n_observations": observations,
+        }
+    if curve:
+        eligible_horizons = [
+            key for key, value in curve.items()
+            if int(value["n_observations"]) > 0
+        ]
+        peak = max(
+            eligible_horizons,
+            key=lambda key: (
+                abs(float(curve[key]["mean_rank_ic"])),
+                -int(key),
+            ),
+        ) if eligible_horizons else ""
+    else:
+        peak = ""
+    return {
+        "horizon_unit": "decision_bars",
+        "curve": curve,
+        "peak_horizon_bars": int(peak) if peak else None,
+        "peak_abs_rank_ic": (
+            abs(float(curve[peak]["mean_rank_ic"])) if peak else 0.0
+        ),
+    }
+
+
+def signal_rank_persistence(
+    prepared_signal: np.ndarray,
+    *,
+    lags: Sequence[int],
+    min_cross_section: int,
+    half_life_threshold: float = 0.50,
+    signal_rank: np.ndarray | None = None,
+) -> dict:
+    """Measure persistence of cross-sectional signal ranks across bar lags."""
+
+    ranks = (
+        _rank_rows(np.asarray(prepared_signal, dtype=float))
+        if signal_rank is None
+        else signal_rank
+    )
+    curve = {}
+    for lag in sorted(set(int(value) for value in lags)):
+        if lag < 1:
+            raise ValueError("signal persistence lags must be positive")
+        if lag >= len(ranks):
+            curve[str(lag)] = {"mean_rank_autocorrelation": 0.0, "n_observations": 0}
+            continue
+        mean_correlation, observations = _mean_rank_correlation(
+            ranks[:-lag], ranks[lag:], min_cross_section
+        )
+        curve[str(lag)] = {
+            "mean_rank_autocorrelation": mean_correlation,
+            "n_observations": observations,
+        }
+    half_life = next(
+        (
+            int(lag)
+            for lag in sorted(curve, key=int)
+            if int(curve[lag]["n_observations"]) > 0
+            and float(curve[lag]["mean_rank_autocorrelation"]) < half_life_threshold
+        ),
+        None,
+    )
+    return {
+        "lag_unit": "decision_bars",
+        "definition": "mean_cross_sectional_rank_correlation_t_vs_t_plus_lag",
+        "curve": curve,
+        "half_life_threshold": float(half_life_threshold),
+        "half_life_bars": half_life,
+        "half_life_censored": half_life is None,
+    }
 
 
 def _portfolio_diagnostics(
@@ -245,6 +467,7 @@ def _portfolio_diagnostics(
     target: np.ndarray,
     fraction: float,
     minimum: int,
+    rebalance_every_bars: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     rows, columns = signal.shape
     valid = np.isfinite(signal) & np.isfinite(target)
@@ -272,13 +495,18 @@ def _portfolio_diagnostics(
     ordered_weights[long] = np.broadcast_to(scale[:, None], long.shape)[long]
     weights = np.zeros_like(ordered_weights)
     np.put_along_axis(weights, order, ordered_weights, axis=1)
+    decision_rows = np.arange(0, rows, int(rebalance_every_bars))
+    decision_usable = usable[decision_rows]
     returns = np.full(rows, np.nan)
-    returns[usable] = np.nansum(
-        weights[usable] * target[usable], axis=1, dtype=float
+    selected_rows = decision_rows[decision_usable]
+    returns[selected_rows] = np.nansum(
+        weights[selected_rows] * target[selected_rows], axis=1, dtype=float
     )
     turnover = np.full(rows, np.nan)
-    if rows > 1:
-        turnover[1:] = 0.5 * np.abs(np.diff(weights, axis=0)).sum(axis=1)
+    if len(decision_rows) > 1:
+        turnover[decision_rows[1:]] = 0.5 * np.abs(
+            np.diff(weights[decision_rows], axis=0)
+        ).sum(axis=1)
     return returns, turnover
 
 
@@ -377,15 +605,49 @@ def evaluate_candidate(
         / max(1, eligible_target.sum())
     )
 
+    rank_gross, rank_turnover = _rank_weight_portfolio(
+        signal_rank,
+        target.values,
+        direction=direction,
+        rebalance_every_bars=config.rebalance_every_bars,
+        minimum=config.min_cross_section,
+    )
+    rank_net = np.where(
+        np.isfinite(rank_turnover),
+        rank_gross - rank_turnover * (
+            2.0 * target.spec.cost_bps / 10_000.0
+        ),
+        np.nan,
+    )
+    rank_net_mean = (
+        float(np.nanmean(rank_net)) if np.isfinite(rank_net).any() else 0.0
+    )
+    row_dispersion = _row_nanstd(target.values)
+    target_dispersion = (
+        float(np.nanmean(row_dispersion))
+        if np.isfinite(row_dispersion).any()
+        else 0.0
+    )
+    cost_adjusted_return_score = (
+        float(np.clip(rank_net_mean / target_dispersion, -1.0, 1.0))
+        if target_dispersion > _EPS
+        else 0.0
+    )
+
     if full_diagnostics:
         gross, turnover = _portfolio_diagnostics(
             direction * prepared,
             target.values,
             config.long_short_fraction,
             config.min_cross_section,
+            rebalance_every_bars=config.rebalance_every_bars,
         )
-        net = gross - np.nan_to_num(turnover) * (
-            target.spec.cost_bps / 10_000.0
+        net = np.where(
+            np.isfinite(turnover),
+            gross - turnover * (
+                2.0 * target.spec.cost_bps / 10_000.0
+            ),
+            np.nan,
         )
         layers, monotonicity = _layer_diagnostics(
             direction * prepared,
@@ -399,9 +661,10 @@ def evaluate_candidate(
             float(np.nanmean(turnover)) if np.isfinite(turnover).any() else 0.0
         )
     else:
-        changes = np.abs(np.diff(signal_rank, axis=0))
         turnover_mean = (
-            float(np.nanmean(changes)) if np.isfinite(changes).any() else 0.0
+            float(np.nanmean(rank_turnover))
+            if np.isfinite(rank_turnover).any()
+            else 0.0
         )
         gross_mean = float("nan")
         net_mean = float("nan")
@@ -418,8 +681,10 @@ def evaluate_candidate(
         if segments else 0.0
     )
     bounded_ir = min(abs(ic_ir), 3.0)
+    economic_weight = float(config.economic_fitness_weight)
     fitness = (
-        abs(mean_ic)
+        (1.0 - economic_weight) * abs(mean_ic)
+        + economic_weight * cost_adjusted_return_score
         + 0.02 * bounded_ir
         + 0.01 * hit_rate
         + 0.01 * stable_fraction
@@ -450,6 +715,24 @@ def evaluate_candidate(
                 "target_and_volatility_control"
                 if config.neutralize_volatility and volatility is not None
                 else "target"
+            ),
+            "rebalance_every_bars": int(config.rebalance_every_bars),
+            "rank_weight_gross_mean": (
+                float(np.nanmean(rank_gross))
+                if np.isfinite(rank_gross).any()
+                else 0.0
+            ),
+            "rank_weight_net_mean": rank_net_mean,
+            "rank_weight_turnover_mean": (
+                float(np.nanmean(rank_turnover))
+                if np.isfinite(rank_turnover).any()
+                else 0.0
+            ),
+            "target_cross_sectional_dispersion": target_dispersion,
+            "cost_adjusted_return_score": cost_adjusted_return_score,
+            "economic_fitness_weight": economic_weight,
+            "mining_cost_definition": (
+                "half_turnover_times_two_times_one_way_cost_bps"
             ),
         },
     )

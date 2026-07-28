@@ -61,6 +61,16 @@ def test_prescreen_keeps_correlated_valid_candidates_and_rejects_constants():
     assert outcome.passed_candidate_ids == ("gp_screen_a", "gp_screen_b")
     by_id = {item["candidate_id"]: item for item in outcome.results}
     assert "high_peer_correlation" in by_id["gp_screen_a"]["soft_flags"]
+    assert set(by_id["gp_screen_a"]["predictive_ic_decay"]["curve"]) == {
+        "1", "3", "5", "10", "20", "40"
+    }
+    persistence = by_id["gp_screen_a"]["signal_rank_persistence"]
+    assert persistence["lag_unit"] == "decision_bars"
+    assert set(persistence["curve"]) == {"1", "3", "5", "10", "20", "40"}
+    assert (
+        by_id["gp_screen_a"]["diagnostic_universe_policy"]
+        == "static_declared_universe"
+    )
     assert "no_terminal_dependency" in by_id["gp_screen_constant"]["hard_reasons"]
     assert "insufficient_cross_sectional_variation" in by_id[
         "gp_screen_constant"

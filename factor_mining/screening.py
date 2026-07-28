@@ -12,7 +12,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from factor_mining.api import CandidateSpec, content_hash
+from factor_mining.api import CandidateSpec, TargetSpec, content_hash
 from factor_mining.features import FeatureEngine
 from factor_mining.gp import expression_lookback
 from factor_mining.operators import Expr, ExpressionEvaluator
@@ -20,7 +20,9 @@ from factor_mining.validation import (
     PreparedTarget,
     ValidationConfig,
     evaluate_candidate,
+    predictive_ic_decay,
     prepare_signal,
+    signal_rank_persistence,
 )
 
 
@@ -36,6 +38,8 @@ class ScreeningConfig:
     max_correlation_observations: int = 100_000
     evaluator_cache_mb: int = 256
     clipped_value: float = 0.99e8
+    diagnostic_horizons: tuple[int, ...] = (1, 3, 5, 10, 20, 40)
+    persistence_lags: tuple[int, ...] = (1, 3, 5, 10, 20, 40)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -51,6 +55,10 @@ class ScreeningConfig:
             raise ValueError("max_correlation_observations must be at least 100")
         if self.evaluator_cache_mb < 0:
             raise ValueError("evaluator_cache_mb cannot be negative")
+        if any(value < 1 for value in self.diagnostic_horizons):
+            raise ValueError("diagnostic_horizons must be positive bar counts")
+        if any(value < 1 for value in self.persistence_lags):
+            raise ValueError("persistence_lags must be positive bar counts")
 
 
 @dataclass(frozen=True)
@@ -126,11 +134,8 @@ def _variable_row_fraction(signal_rank: np.ndarray, minimum: int) -> float:
 
 
 def _sample_rank_signal(
-    prepared: np.ndarray, max_observations: int, minimum: int
+    rank: np.ndarray, max_observations: int, minimum: int
 ) -> tuple[np.ndarray, float]:
-    rank = pd.DataFrame(prepared).rank(
-        axis=1, method="average", pct=True
-    ).to_numpy(dtype=np.float32)
     flat = rank.ravel()
     step = max(1, int(np.ceil(len(flat) / max_observations)))
     sample = np.asarray(flat[::step], dtype=np.float32)
@@ -241,6 +246,30 @@ def screen_candidates(
         target: PreparedTarget.from_close(close, target)
         for target in {candidate.target for candidate in candidates}
     }
+    decay_targets = {}
+    for candidate in candidates:
+        key = (
+            candidate.target.entry_delay_bars,
+            candidate.target.entry_price,
+            candidate.target.session_policy,
+        )
+        if key in decay_targets:
+            continue
+        decay_targets[key] = {
+            int(horizon): PreparedTarget.from_close(
+                close,
+                TargetSpec(
+                    name=f"diagnostic_forward_{int(horizon)}p",
+                    decision_frequency=candidate.frequency,
+                    horizon_bars=int(horizon),
+                    entry_delay_bars=candidate.target.entry_delay_bars,
+                    entry_price=candidate.target.entry_price,
+                    session_policy=candidate.target.session_policy,
+                    cost_bps=candidate.target.cost_bps,
+                ),
+            )
+            for horizon in screening.diagnostic_horizons
+        }
     evaluator = ExpressionEvaluator(
         features, cache_max_bytes=screening.evaluator_cache_mb * 1024 * 1024
     )
@@ -287,6 +316,14 @@ def screen_candidates(
             neutralize_volatility=bool(
                 postprocess.get("neutralize_volatility", False)
             ),
+            rebalance_every_bars=int(
+                candidate.payload.get(
+                    "rebalance_every_bars", 1
+                )
+            ),
+            economic_fitness_weight=float(
+                candidate.payload.get("economic_fitness_weight", 0.0)
+            ),
         )
         volatility_name = postprocess.get("volatility_feature")
         volatility = (
@@ -300,6 +337,9 @@ def screen_candidates(
                 volatility=volatility,
                 group_labels=_group_labels(candidate, features.symbols),
             )
+            prepared_rank = pd.DataFrame(prepared).rank(
+                axis=1, method="average", pct=True
+            ).to_numpy(dtype=np.float32)
             diagnostic = evaluate_candidate(
                 candidate.expected_direction * raw,
                 targets[candidate.target],
@@ -310,13 +350,35 @@ def screen_candidates(
                 full_diagnostics=True,
             )
             sample, variable_fraction = _sample_rank_signal(
-                prepared,
+                prepared_rank,
                 screening.max_correlation_observations,
                 validation.min_cross_section,
             )
             metrics.update(diagnostic.to_metrics())
+            decay_key = (
+                candidate.target.entry_delay_bars,
+                candidate.target.entry_price,
+                candidate.target.session_policy,
+            )
+            metrics["predictive_ic_decay"] = predictive_ic_decay(
+                prepared,
+                decay_targets[decay_key],
+                min_cross_section=validation.min_cross_section,
+                signal_rank=prepared_rank,
+            )
+            metrics["signal_rank_persistence"] = signal_rank_persistence(
+                prepared,
+                lags=screening.persistence_lags,
+                min_cross_section=validation.min_cross_section,
+                signal_rank=prepared_rank,
+            )
             metrics.update({
                 "expected_direction": candidate.expected_direction,
+                "diagnostic_universe_policy": "static_declared_universe",
+                "economic_search_contract_frozen": bool(
+                    "rebalance_every_bars" in candidate.payload
+                    and "economic_fitness_weight" in candidate.payload
+                ),
                 "direction_stable": bool(diagnostic.mean_ic >= 0),
                 "variable_row_fraction": variable_fraction,
                 "expression_complexity": expression.complexity,

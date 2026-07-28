@@ -35,6 +35,24 @@
 目标使用 `close[t+entry_delay+horizon] / close[t+entry_delay] - 1`，候选信号还会
 额外执行至少 1 bar 的决策滞后，避免当前收盘数据被当前决策消费。
 
+挖掘端和正式框架都按每个合约自身的有效 bar 移位，不会因为某个合约在公共分钟索引上
+缺一根报价，就把该合约的 H=15 错算成不同经济长度。正式研究的 IC/OLS 也是逐分钟
+时间截面计算；只有自然年稳健性、日换手聚合和治理记分卡使用日/年汇总。因此不能把
+当前零产出归因为“1 分钟信号被先聚合成日频 IC”。
+
+预筛默认额外输出两类不参与正式准入的诊断：
+
+- `predictive_ic_decay`：同一已滞后信号分别预测未来 1/3/5/10/20/40 根 bar 收益；
+- `signal_rank_persistence`：横截面信号排名在上述 bar lag 的平均相关性，并报告首次跌破
+  0.5 的半衰期。未在最大 lag 内跌破时明确标记为右删失，而不是伪造半衰期。
+
+它们回答的是“预测作用在哪个分钟 horizon”与“排名能保持多久”。旧 `ICTest.ic_decay`
+计算的是 IC 时间序列本身的自相关，不等同于这两项诊断。
+
+预筛目前使用候选快照声明的静态品种全集，结果会明确写入
+`diagnostic_universe_policy=static_declared_universe`。正式 P0 仍使用主框架的滞后
+流动性动态品种池；静态预筛曲线只能定位 horizon，不能替代动态池下的正式 IC。
+
 ## 特征和算子
 
 默认快速路径读取 `open/high/low/close/volume/amount/oi/oi_change`，并构建：
@@ -64,6 +82,26 @@ profile、特征配置和目标 horizon 都必须冻结，未被该次表达式�
 `--segment-floor-weight` 可在搜索适应度中惩罚稀疏覆盖和最差时间段，但这些仍是搜索
 排序项，不是正式 HAC/FDR 证据。run 元数据会保存人口、代数、窗口、算子和全部适应度
 参数；预筛可用 `--candidate-run-ids` 一次选择该 run 的全部候选。
+
+GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使用横截面 rank
+权重组合在声明调仓节奏下的成本后收益，经同期目标收益横截面离散度归一化后参与搜索；
+原换手与复杂度惩罚继续保留。`--rebalance-every-bars 0` 默认采用目标 horizon，显式非零
+值则冻结为独立执行节奏。成本使用 `TargetSpec.cost_bps`，因此生产 campaign 必须声明
+现实的单边成本，并按 `half_turnover × 2 × one_way_cost` 扣减；不能用 0 成本搜索后再
+宣称具有经济意义。该 fitness 仍是训练期搜索
+目标，不替代正式成本覆盖、FDR 或 OOS。
+
+## 期货特异数据覆盖
+
+当前 GP 默认并未把 WorldQuant 101 或 GTJA 191 公式当作 terminal；它们位于独立的兼容
+公式库，不能解释本轮 GP 候选零通过。现有 terminal 已覆盖 OHLCVA、持仓量及其变化，
+并可选加入合约曲线的持仓广度/集中度，但以下真实期货数据仍未形成可靠的本地 point-in-time
+面板：近远月价格与到期日、现货基差、会员多空持仓、库存/仓单、逐笔方向和订单簿。
+
+因此当前 `curve_*` 不得被称为展期收益率或期限斜率，分钟 OHLCV 代理也不得被称为真实
+订单簿不平衡/VPIN。下一步应先补齐这些本地数据契约和发布时间滞后，再作为 terminal
+加入；库存/仓单需要按预声明板块适用性路由。IPCA、Conditional Autoencoder、XGBoost
+和 LLM 生成表达式属于后续独立搜索后端，必须复用同一候选快照、成本和 OOS 协议。
 
 ## 性能原则
 

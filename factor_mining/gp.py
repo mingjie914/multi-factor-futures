@@ -426,6 +426,12 @@ class GPSearch:
                 "expression": expression.to_dict(),
                 "expression_sha256": expression.sha256,
                 "decision_lag_bars": self.validation_config.decision_lag_bars,
+                "rebalance_every_bars": (
+                    self.validation_config.rebalance_every_bars
+                ),
+                "economic_fitness_weight": (
+                    self.validation_config.economic_fitness_weight
+                ),
                 "postprocess": {
                     "mad_clip": self.validation_config.mad_clip,
                     "cross_sectional_demean": True,
