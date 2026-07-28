@@ -61,7 +61,7 @@ def compute_all_metrics(
     periods_per_year: int = 252,
     risk_free_rate: float = RISK_FREE_RATE,
 ) -> Dict[str, float]:
-    ret = returns if returns is not None else nav.pct_change()
+    ret = returns if returns is not None else nav.pct_change(fill_method=None)
     metrics = {
         "annual_return": compute_annual_return(nav, periods_per_year),
         "sharpe": compute_sharpe(
@@ -87,9 +87,11 @@ def compute_all_metrics(
 def compute_split_metrics(
     nav: pd.Series,
     returns: pd.Series = None,
-    train_ratio: float = 0.6,
+    train_ratio: float = 0.75,
     periods_per_year: int = 252,
     risk_free_rate: float = RISK_FREE_RATE,
+    minimum_train_bars: int = 750,
+    minimum_test_bars: int = 250,
 ) -> Dict[str, Dict[str, float]]:
     """样本外验证: 将回测期间按 train_ratio 分割, 分别计算前段(训练期)和后段(测试期)指标.
 
@@ -104,13 +106,17 @@ def compute_split_metrics(
     Returns:
         {"train": {metrics}, "test": {metrics}}
     """
-    if nav.empty or len(nav) < 10:
+    if nav.empty:
         return {"train": {}, "test": {}}
 
-    ret = returns if returns is not None else nav.pct_change()
+    ret = returns if returns is not None else nav.pct_change(fill_method=None)
     n = len(nav)
     split_idx = int(n * train_ratio)
-    if split_idx < 5 or n - split_idx < 5:
+    if (
+        split_idx < int(minimum_train_bars)
+        or n - split_idx < int(minimum_test_bars)
+        or split_idx / max(n - split_idx, 1) < 3.0
+    ):
         return {"train": {}, "test": {}}
 
     # 训练期: 从起点到 split_idx (归一化 nav 从 1 开始)

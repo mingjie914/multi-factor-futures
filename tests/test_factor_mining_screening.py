@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from factor_mining.api import CandidateSpec, FeatureConfig, TargetSpec
 from factor_mining.cli import _record_prescreen_outcome
 from factor_mining.data import make_synthetic_panels
@@ -75,6 +77,101 @@ def test_prescreen_keeps_correlated_valid_candidates_and_rejects_constants():
     assert "insufficient_cross_sectional_variation" in by_id[
         "gp_screen_constant"
     ]["hard_reasons"]
+
+
+def test_prescreen_applies_point_in_time_eligibility_and_excludes_warmup():
+    panels = make_synthetic_panels(periods=180, symbols=8, seed=43)
+    candidate = _candidate("gp_dynamic_pool", Expr.terminal("return_1p"))
+    eligibility = pd.DataFrame(
+        False,
+        index=panels["close"].index,
+        columns=panels["close"].columns,
+    )
+    eligibility.iloc[90:, :6] = True
+
+    outcome = screen_candidates(
+        (candidate,),
+        panels,
+        eligibility=eligibility,
+        config=ScreeningConfig(
+            min_time_observations=20,
+            min_coverage=0.20,
+            min_variable_row_fraction=0.05,
+        ),
+    )
+
+    result = outcome.results[0]
+    assert result["hard_pass"] is True
+    assert result["diagnostic_universe_policy"] == "point_in_time_eligibility"
+    assert 20 <= result["time_observations"] < 90
+
+
+def test_prescreen_retains_dynamic_pool_warmup_for_signal_processing():
+    panels = make_synthetic_panels(periods=180, symbols=8, seed=45)
+    candidate = _candidate(
+        "gp_dynamic_warmup",
+        Expr.operation("ts_mean", Expr.terminal("return_1p"), window=5),
+    )
+    evaluation = pd.DataFrame(
+        False,
+        index=panels["close"].index,
+        columns=panels["close"].columns,
+    )
+    evaluation.iloc[90:, :6] = True
+    processing = pd.DataFrame(
+        False,
+        index=panels["close"].index,
+        columns=panels["close"].columns,
+    )
+    processing.iloc[:, :6] = True
+    config = ScreeningConfig(min_time_observations=20, min_coverage=0.20)
+
+    retained = screen_candidates(
+        (candidate,),
+        panels,
+        eligibility=evaluation,
+        processing_eligibility=processing,
+        config=config,
+    ).results[0]
+    truncated = screen_candidates(
+        (candidate,),
+        panels,
+        eligibility=evaluation,
+        processing_eligibility=evaluation,
+        config=config,
+    ).results[0]
+
+    assert retained["time_observations"] > truncated["time_observations"]
+
+
+def test_prescreen_excludes_ineligible_symbols_before_neutralization():
+    panels = make_synthetic_panels(periods=180, symbols=8, seed=44)
+    candidate = _candidate(
+        "gp_dynamic_neutralization",
+        Expr.operation(
+            "square", Expr.operation("cs_zscore", Expr.terminal("return_1p"))
+        ),
+    )
+    eligibility = pd.DataFrame(
+        True,
+        index=panels["close"].index,
+        columns=panels["close"].columns,
+    )
+    eligibility.iloc[:, 6:] = False
+    config = ScreeningConfig(min_time_observations=20, min_coverage=0.20)
+
+    baseline = screen_candidates(
+        (candidate,), panels, eligibility=eligibility, config=config
+    ).results[0]
+
+    perturbed = {name: frame.copy() for name, frame in panels.items()}
+    perturbed["close"].iloc[:, 6:] *= 10_000.0
+    result = screen_candidates(
+        (candidate,), perturbed, eligibility=eligibility, config=config
+    ).results[0]
+
+    assert result["mean_rank_ic"] == baseline["mean_rank_ic"]
+    assert result["coverage"] == baseline["coverage"]
 
 
 def test_recording_prescreen_evidence_does_not_promote_candidate(tmp_path):

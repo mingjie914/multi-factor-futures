@@ -242,7 +242,7 @@ def test_meta_combination_nets_opposite_bottom_trades_and_costs():
         sub_results.append({"config": SimpleNamespace(name=name), "result": result})
 
     runner = PipelineRunner.__new__(PipelineRunner)
-    runner.cost_model = SimpleFuturesCost(commission_rate=0.001, slippage=0.0)
+    runner.cost_model = SimpleFuturesCost()
     runner.config = SimpleNamespace(
         optimization=SimpleNamespace(constraints=[])
     )
@@ -548,7 +548,7 @@ def test_asset_selector_hard_gates_optimizer_universe():
     assert target["AU"] == 0.0
 
 
-def test_mean_variance_uses_transaction_cost_in_return_units():
+def test_mean_variance_does_not_charge_or_penalize_diagnostic_turnover():
     from optimization.costs import SimpleFuturesCost, marginal_turnover_cost_rate
     from optimization.mean_variance import MeanVarianceOptimizer
 
@@ -561,10 +561,10 @@ def test_mean_variance_uses_transaction_cost_in_return_units():
             )
 
     universe = pd.Index(["A", "B"])
-    costs = SimpleFuturesCost(commission_rate=0.0001, slippage=0.001)
+    costs = SimpleFuturesCost()
     assert marginal_turnover_cost_rate(
         costs, universe, pd.Timestamp("2025-01-01")
-    ) == pytest.approx(0.0011)
+    ) == pytest.approx(0.0)
 
     weights = MeanVarianceOptimizer(cost_penalty=0.5).optimize(
         pd.Series({"A": 0.01, "B": -0.01}),
@@ -1214,6 +1214,105 @@ def test_ddb_dominant_contract_is_t_minus_one_and_roll_is_continuous():
     )["RB"]
     # Roll-day return equals the new contract's own return from t-1 to t.
     assert continuous.iloc[2] / continuous.iloc[1] - 1 == pytest.approx(204 / 202 - 1)
+
+
+def test_roll_adjustment_uses_latest_common_close_and_fails_without_overlap():
+    from data.continuous_contract import (
+        RolloverAdjustmentError,
+        _compute_rollover_ratio,
+    )
+
+    old = pd.DataFrame(
+        {"close": [100.0, 101.0]},
+        index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+    )
+    new = pd.DataFrame(
+        {"close": [200.0]}, index=pd.to_datetime(["2024-01-02"])
+    )
+    ratio = _compute_rollover_ratio(
+        {"OLD": old, "NEW": new}, "OLD", "NEW", pd.Timestamp("2024-01-03")
+    )
+    assert ratio == pytest.approx(0.5)
+
+    disjoint = pd.DataFrame(
+        {"close": [200.0]}, index=pd.to_datetime(["2024-01-04"])
+    )
+    with pytest.raises(RolloverAdjustmentError, match="no common close"):
+        _compute_rollover_ratio(
+            {"OLD": old, "NEW": disjoint},
+            "OLD", "NEW", pd.Timestamp("2024-01-04"),
+        )
+
+
+def test_ddb_minute_roll_is_ratio_adjusted_before_resampling(monkeypatch):
+    from data.ddb_source import DDBSource
+
+    source = DDBSource({"dominant_lag_days": 1})
+    rows = []
+    daily = [
+        ("2024-01-01", {"RB2401": (100.0, 100), "RB2405": (200.0, 10)}),
+        ("2024-01-02", {"RB2401": (101.0, 5), "RB2405": (202.0, 500)}),
+        ("2024-01-03", {"RB2401": (102.0, 5), "RB2405": (204.0, 500)}),
+    ]
+    for day, contracts in daily:
+        for contract, (price, volume) in contracts.items():
+            rows.append({
+                "TradeDate": day, "InstrumentID": contract, "Time": "15:00:00",
+                "OpenPrice": price, "HighPrice": price, "LowPrice": price,
+                "ClosePrice": price, "Volume": volume,
+                "Turnover": price * volume,
+            })
+    monkeypatch.setattr(source, "_query", lambda script: pd.DataFrame(rows))
+
+    panel = source.fetch_price_at_frequency(
+        ["RB"], "2024-01-02", "2024-01-03", ["close"], "1min"
+    )["close"]
+
+    assert panel.loc["2024-01-03 15:00", "RB"] / panel.loc[
+        "2024-01-02 15:00", "RB"
+    ] - 1 == pytest.approx(204.0 / 202.0 - 1.0)
+
+
+def test_mysql_daily_refuses_legacy_full_window_contract_fallback(monkeypatch):
+    from data.mysql_source import MySQLSource
+
+    source = object.__new__(MySQLSource)
+    monkeypatch.setattr(
+        source, "_get_table_config",
+        lambda name: {"columns": {"close": "S_DQ_CLOSE"}},
+    )
+    monkeypatch.setattr(
+        source, "_fetch_main_contract_mapping",
+        lambda *args, **kwargs: pd.DataFrame(),
+    )
+    assert not hasattr(source, "_fetch_price_legacy")
+    with pytest.raises(RuntimeError, match="refusing.*legacy fallback"):
+        source.fetch_price(["RB"], "2024-01-01", "2024-12-31", ["close"])
+
+
+def test_walkforward_assignment_excludes_insufficient_sample_factor():
+    from core.config import load_config
+    from workflows.walkforward import _assign_fold_factors
+
+    config = load_config("config/default.yaml")
+
+    class Bundle:
+        def has(self, logical_name):
+            return False
+
+        def read_csv(self, logical_name, **kwargs):
+            return pd.DataFrame({
+                "factor": ["eligible", "observation"],
+                "best_period": [5, 5],
+                "n_valid_sectors": [1, 1],
+                "best_q": [0.01, 0.001],
+                "best_t": [3.0, 10.0],
+                "sample_sufficient": [True, False],
+            })
+
+    _assign_fold_factors(config, Bundle(), drop_empty_sleeves=True)
+    selected = {factor for sub in config.sub_portfolios for factor in sub.factors}
+    assert selected == {"eligible"}
 
 
 def test_ddb_minute_bars_filter_to_one_t_minus_one_contract(monkeypatch):

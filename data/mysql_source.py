@@ -735,11 +735,10 @@ class MySQLSource(DataSource):
                 result.update(cont)
                 return result
 
-        # 回退: 旧逻辑
-        legacy = self._fetch_price_legacy(tickers, start, end, supported)
-        if legacy:
-            result.update(legacy)
-        return result
+        raise RuntimeError(
+            "main-contract mapping is unavailable or continuous construction "
+            "failed; refusing the full-window single-contract legacy fallback"
+        )
 
     def _fetch_main_contract_mapping(
         self,
@@ -897,103 +896,6 @@ class MySQLSource(DataSource):
                 price_panel[field] = pd.DataFrame()
 
         return price_panel
-
-    def _fetch_price_legacy(
-        self,
-        tickers: TickerIndex,
-        start: Date,
-        end: Date,
-        fields: List[str],
-    ) -> PricePanel:
-        """旧逻辑: 查所有合约, 每品种选非空值最多的单一合约 (不处理换月跳空).
-
-        CR-016: 旧实现只查询 commodity_eod 表且排除单字母品种 (L/P/J/T 等),
-        导致股指期货和国债期货在 legacy fallback 中消失.
-        修复: 按品种根代码路由到对应的行情表 (商品/股指/国债),
-        并移除单字母品种排除逻辑.
-        """
-        base_cfg = self._get_table_config("commodity_eod")
-        if not base_cfg:
-            return {}
-
-        col_map = base_cfg.get("columns", {})
-        date_col = col_map.get("date", "TRADE_DT")
-        ticker_col = col_map.get("ticker", "S_INFO_WINDCODE")
-
-        # CR-016: 按品种根代码路由到对应的行情表 (商品/股指/国债期货分别在不同表)
-        root_to_table: Dict[str, str] = {}
-        table_to_roots: Dict[str, list] = {}
-        for t in tickers:
-            root = str(t).split(".")[0]
-            tbl = self._get_price_table_for_root(root)
-            root_to_table[root] = tbl
-            table_to_roots.setdefault(tbl, []).append(t)
-
-        # 分表查询, 合并结果
-        all_dfs: list = []
-        for table_name, table_tickers in table_to_roots.items():
-            tbl_cfg = self._get_table_config_for(table_name)
-            sql = self._build_query(
-                tbl_cfg, fields + ["date", "ticker"], table_tickers, start, end,
-            )
-            try:
-                df = self._read_sql(sql)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"_fetch_price_legacy 查询 {table_name} 失败: {e}"
-                )
-                continue
-            if not df.empty:
-                all_dfs.append(df)
-
-        if not all_dfs:
-            return {}
-
-        df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
-        if df.empty:
-            return {}
-
-        df[date_col] = pd.to_datetime(df[date_col].astype(str))
-
-        result: PricePanel = {}
-        for field in fields:
-            wind_col = col_map.get(field, field)
-            if wind_col not in df.columns:
-                continue
-            pivot = df.pivot_table(
-                index=date_col, columns=ticker_col, values=wind_col,
-                aggfunc="first",
-            )
-            pivot.index.name = "date"
-            pivot.columns.name = None
-
-            if not pivot.empty:
-                roots = {}
-                for col in pivot.columns:
-                    root = str(col).split(".")[0].rstrip("0123456789")
-                    # CR-016: 移除单字母品种排除 (旧代码 if len(root) < 2: continue)
-                    # 单字母品种如 L/P/J/A/M (农产品), T (国债期货) 是合法品种
-                    if not root:
-                        continue
-                    if root not in roots:
-                        roots[root] = []
-                    roots[root].append(col)
-
-                new_cols = {}
-                for root, cols in roots.items():
-                    if len(cols) == 1:
-                        new_cols[cols[0]] = root
-                    else:
-                        best = max(cols, key=lambda c: pivot[c].notna().sum())
-                        new_cols[best] = root
-
-                pivot = pivot.rename(columns=new_cols)
-                pivot = pivot.loc[:, ~pivot.columns.duplicated()]
-
-            result[field] = pivot
-
-        return result
 
     def fetch_fundamental(
         self,

@@ -6,8 +6,8 @@
 
 - 源码与配置模板进入 Git。
 - SQLite 候选库、市场数据缓存和普通运行输出留在本机，不进入 Git。
-- `runs/factor_research/` 与 `runs/locked_oos/` 是不可覆盖证据；Git 当前只保留
-  `runs/README.md` 和 append-only holdout ledger，较大证据应由只读归档保存。
+- Git 只长期保留 `runs/README.md` 和 append-only holdout ledger。普通本地结果不进入
+  Git；需要长期保留的大型证据应先写入只读归档，再从工作区清理。
 - `config/trading.yaml` 只能由人工批准流程修改，研究代码不得自动写入。
 
 ## 例行检查
@@ -23,9 +23,8 @@ $PY = '.\.venv\Scripts\python.exe'
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-2026-07-28 的审查基线：完整测试 445 项约 9 秒；上述合成挖掘负载优化前约
-3.65 秒，当前向量化候选诊断约 2.06 秒。机器、BLAS 和依赖版本不同会改变绝对值，
-持续集成更适合检查明显回退，而不是设置过紧的秒级硬门槛。
+完整测试在当前开发机通常约 10 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
+持续集成更适合检查明显回退，而不是维护容易过期的固定秒数或测试项数量。
 
 ## 性能原则
 
@@ -62,22 +61,28 @@ SQLite candidate catalog -> immutable JSON snapshot
 - 两者不得串联；多周期 `meta_optimizer` 只在完整子组合之后配置资本。
 - 已删除被三层结构取代的 `hierarchical_sector` 注册入口。ERC 数值核心仍由
   `risk_budgeting` 复用，不应作为遗留代码删除。
-- 更改默认优化器、目标波动率、换手或杠杆限制时，必须同步更新
+- 更改默认优化器、目标波动率、换手诊断或杠杆限制时，必须同步更新
   `docs/three_layer_portfolio.md` 及对应测试。
 
 因子统计准入、板块适配、后置交易属性检验与 Ridge 的完整先后关系见
 `docs/factor_validation_pipeline.md`。修改任何正式门槛或多重检验方法时必须同步更新
 该文档及研究结果中的方法元数据。研究 bundle 同时绑定验证策略 SHA-256 与 taxonomy
-SHA-256；任一变化必须新建输出目录并全量重跑 P0，不能复用旧 bundle。
+SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle 在完成必要外部归档后
+应从工作区删除。
 
 ## 清理策略
 
 可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、`_work/`、空的
 `signals_output/`。清理前必须确认路径位于仓库内。
 
-不要批量清理：`cache/`、`runs/factor_research/`、`runs/locked_oos/`、
-`runs/factor_mining/`。前两类包含数据或研究证据；候选库清理前应先导出所需快照和
-审计记录。
+不要清理：`cache/` 和 `runs/factor_research/holdout_ledger.jsonl`。前者是本地行情缓存，
+后者记录已消费 OOS。`runs/factor_mining/`、普通 `runs/factor_research/<study_id>/` 和
+回测输出在协议变更后应清理；若结果仍需审计，先保存 manifest、哈希和外部归档 URI。
+
+期货成本模型不再保留单次手续费、滑点或按换手扣费的兼容参数。筛选期只使用年化
+0.02%，筛选成功后的研究回测使用年化 0.02% 加 0.105% 移仓成本。换手只输出诊断；
+旧配置若仍含 `commission_rate`、`slippage`、`turnover_penalty` 或
+`max_monthly_turnover`，必须迁移后再运行，不能静默兼容。
 
 ## Git 与远程仓库
 

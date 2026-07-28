@@ -13,5 +13,7 @@ def factor_info(f: Factor) -> dict:
         "name": f.name,
         "category": f.category,
         "frequency": f.frequency,
+        "validation_horizons": list(f.validation_horizons),
+        "horizon_unit": f.horizon_unit,
         "description": f.description,
     }

@@ -613,10 +613,31 @@ class ParquetFuturesSource(DataSource):
 
         concrete = daily.loc[~daily["suffix"].isin(_SYNTHETIC_SUFFIXES)].copy()
         concrete = self._deduplicate(concrete, ["trade_date", "root", "symbol"])
-        close_lookup = concrete.set_index(
-            ["trade_date", "root", "symbol"]
-        )["close"]
-
+        available = pd.MultiIndex.from_frame(
+            concrete.loc[concrete["close"].notna(), ["trade_date", "root", "symbol"]]
+        )
+        selected_keys = pd.MultiIndex.from_frame(
+            mapping[["trade_date", "root", "contract"]].rename(
+                columns={"contract": "symbol"}
+            )
+        )
+        current_keys = pd.MultiIndex.from_frame(
+            mapping[["trade_date", "root", "symbol"]]
+        )
+        selected_missing = ~selected_keys.isin(available)
+        current_available = current_keys.isin(available)
+        mapping.loc[selected_missing & current_available, "contract"] = mapping.loc[
+            selected_missing & current_available, "symbol"
+        ]
+        unresolved = selected_missing & ~current_available
+        if unresolved.any():
+            sample = mapping.loc[
+                unresolved, ["trade_date", "root", "contract", "symbol"]
+            ].head(5).to_dict("records")
+            raise ValueError(
+                "continuous-contract plan has no available selected or current "
+                f"contract close: {sample}"
+            )
         plans = []
         for root, group in mapping.groupby("root", sort=False):
             adjustment = 1.0
@@ -629,16 +650,35 @@ class ParquetFuturesSource(DataSource):
                     and contract != previous_contract
                     and previous_date is not None
                 ):
-                    old_key = (previous_date, root, previous_contract)
-                    new_key = (previous_date, root, contract)
-                    old_close = close_lookup.get(old_key, np.nan)
-                    new_close = close_lookup.get(new_key, np.nan)
-                    if (
-                        np.isfinite(old_close)
-                        and np.isfinite(new_close)
-                        and float(new_close) > 0.0
-                    ):
-                        adjustment *= float(old_close) / float(new_close)
+                    root_prices = concrete.loc[
+                        concrete["root"].eq(root)
+                        & concrete["symbol"].isin([previous_contract, contract])
+                        & concrete["trade_date"].le(previous_date),
+                        ["trade_date", "symbol", "close"],
+                    ].pivot_table(
+                        index="trade_date", columns="symbol", values="close",
+                        aggfunc="last",
+                    )
+                    if previous_contract not in root_prices or contract not in root_prices:
+                        common = pd.DataFrame()
+                    else:
+                        common = root_prices[
+                            [previous_contract, contract]
+                        ].dropna(how="any")
+                    if common.empty:
+                        from data.continuous_contract import RolloverAdjustmentError
+
+                        raise RolloverAdjustmentError(
+                            f"no common close at or before {previous_date.date()} for "
+                            f"{previous_contract}->{contract}"
+                        )
+                    old_close = float(common.iloc[-1][previous_contract])
+                    new_close = float(common.iloc[-1][contract])
+                    if not np.isfinite(new_close) or new_close <= 0.0:
+                        raise ValueError(
+                            f"invalid rollover close for {previous_contract}->{contract}"
+                        )
+                    adjustment *= old_close / new_close
                 plans.append(
                     {
                         "trade_date": row.trade_date,

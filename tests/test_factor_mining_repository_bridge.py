@@ -18,6 +18,7 @@ from factor_mining.bridge import (
     compute_symbolic_candidate,
     register_snapshot,
     register_snapshot_from_environment,
+    registered_expected_directions,
 )
 from factor_mining.data import make_synthetic_panels
 from factor_mining.operators import Expr
@@ -90,7 +91,6 @@ def test_sqlite_catalog_and_immutable_snapshot_can_coexist(tmp_path):
             snapshot, candidate_ids=(candidate.candidate_id,)
         )
 
-
 def test_repository_can_freeze_candidate_selection_by_run(tmp_path):
     repository, candidate = _repository_with_candidate(tmp_path)
 
@@ -98,6 +98,27 @@ def test_repository_can_freeze_candidate_selection_by_run(tmp_path):
         CandidateSpec.from_dict(candidate.to_dict()),
     )
     assert repository.list_candidates(run_ids=("missing_run",)) == ()
+
+
+def test_snapshot_registration_freezes_train_oriented_direction(tmp_path):
+    repository = CandidateRepository(tmp_path / "directions.sqlite3")
+    candidate = _candidate("mined_bridge_direction_registry_test")
+    repository.add_run(MiningRunSpec(
+        run_id="repo_test", mode=RunMode.DEV, seed=1,
+        start="2024-01-01", end="2024-02-01", universe=("A", "B"),
+        target=candidate.target, feature_config=candidate.feature_config,
+    ))
+    repository.add_candidates((candidate,), run_id="repo_test")
+    snapshot = repository.write_snapshot(
+        tmp_path / "direction_selected.json",
+        candidate_ids=(candidate.candidate_id,),
+    )
+
+    register_snapshot(snapshot)
+
+    assert registered_expected_directions((candidate.framework_name,)) == {
+        candidate.framework_name: 1
+    }
 
 
 def test_candidate_status_requires_evidence_and_cannot_move_backwards(tmp_path):
@@ -150,6 +171,9 @@ def test_bridge_registers_normal_factor_and_preserves_point_in_time(tmp_path):
     assert names == (candidate.framework_name,)
     assert factor.dependencies() == ["close"]
     assert factor.frequency == "1min"
+    assert factor.validation_horizons == (candidate.target.horizon_bars,)
+    assert factor.requires_training_sample_contract is True
+    assert factor.training_bars == 0
     assert baseline.index.equals(dates)
     assert baseline.columns.equals(universe)
     assert np.isfinite(baseline.iloc[5:].to_numpy()).any()
@@ -174,6 +198,32 @@ def test_bridge_combines_signal_and_target_entry_lags():
     )
 
     np.testing.assert_allclose(actual.to_numpy(), expected, equal_nan=True)
+
+
+def test_bridge_uses_framework_point_in_time_mask_inside_expression():
+    candidate = _candidate("mined_bridge_dynamic_pool_test")
+    panels = make_synthetic_panels(periods=80, symbols=5, seed=17)
+    dates = panels["close"].index
+    universe = panels["close"].columns
+    eligibility = pd.DataFrame(True, index=dates, columns=universe)
+    eligibility.iloc[:, -2:] = False
+
+    provider = FrameProvider(panels)
+    provider._factor_eligibility = eligibility
+    baseline = compute_symbolic_candidate(candidate, provider, dates, universe)
+
+    changed = {field: frame.copy() for field, frame in panels.items()}
+    changed["close"].iloc[:, -2:] *= 10_000.0
+    revised_provider = FrameProvider(changed)
+    revised_provider._factor_eligibility = eligibility
+    revised = compute_symbolic_candidate(
+        candidate, revised_provider, dates, universe
+    )
+
+    np.testing.assert_allclose(
+        revised.iloc[:, :-2], baseline.iloc[:, :-2], equal_nan=True
+    )
+    assert revised.iloc[:, -2:].isna().all().all()
 
 
 def test_bridge_fails_closed_on_missing_dependency(monkeypatch):

@@ -37,8 +37,8 @@ $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
   --data-root $env:MF_PARQUET_ROOT `
   --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
   --start '2023-01-01' --end '2024-12-31' `
-  --screen-id 'screen_20260727' `
-  --output-dir 'runs\factor_mining\screens\screen_20260727' `
+  --screen-id 'screen_id' `
+  --output-dir 'runs\factor_mining\screens\screen_id' `
   --candidate-ids 'gp_xxxxx,gp_yyyyy' `
   --min-coverage 0.50
 ```
@@ -60,7 +60,7 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 
 ```powershell
 & $PY -X utf8 -B main.py research `
-  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
+  --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
   --config config/parquet_research.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
   --multi-period --periods '15' --frequency 1min
@@ -77,8 +77,8 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 3. 通过现有 `register_user_factor` 注册；
 4. 保留候选声明的依赖、1 分钟频率、决策 lag、MAD 和波动率中性化。
 
-未传入 `--mined-snapshot` 且未设置兼容环境变量
-`MF_MINED_CANDIDATE_SNAPSHOT` 时，该文件不做任何注册，现有框架行为完全不变。
+未传入 `--mined-snapshot` 时，该文件不做任何注册，现有框架行为完全不变。网关内部使用
+`MF_MINED_CANDIDATE_SNAPSHOT` 在导入前传递已校验路径，不应由普通研究命令手工设置。
 主框架不会读取 SQLite，也不会访问阿里云/MySQL。
 
 ### 4. 用现有研究流程正式筛选
@@ -87,12 +87,12 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 
 ```powershell
 & $PY -X utf8 -B main.py research `
-  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
+  --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
   --config config/parquet_research.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
   --multi-period --periods '15' --frequency 1min `
   --factor-start '2022-10-01' --start '2023-01-01' --end '2024-12-31' `
-  --output-dir 'runs\factor_research\mined_screen_20260727\raw' `
+  --output-dir 'runs\factor_research\study_id\raw' `
   --refuse-existing-output
 ```
 
@@ -110,8 +110,8 @@ HAC t 值、收益或最优周期必须走该流程；合成数据调试、表�
 
 当前正式发现门槛读取 `validation_policy`：层级 FDR `q=0.10`、`|IC|>=0.01`、
 `|t|>=2.0`。Bonferroni/FWER 只作证据标签，不再是硬闸门。三分组、分钟换手按交易日
-聚合、自然年稳定性和完整移仓成本检查均在同一输出中记录；真实 roll ledger 未配置时
-候选自动进入观察期。
+聚合、自然年稳定性和成本检查均在同一输出中记录。筛选期仅扣年化 0.02% 固定成本，
+换手仅作诊断且不是准入门槛；筛选成功后的研究回测再加入年化 0.105% 移仓成本。
 
 ### 5. 将冻结发现集交给部署适配与 WF
 
@@ -120,7 +120,7 @@ HAC t 值、收益或最优周期必须走该流程；合成数据调试、表�
 
 ```powershell
 & $PY -X utf8 -B main.py adaptivity `
-  --mined-snapshot 'runs\factor_mining\screens\screen_20260727\prescreen_candidates.snapshot.json' `
+  --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
   --config config/parquet_research.yaml `
   --fdr-method deployment `
   --discovery-file 'runs\factor_research\study_id\ic_by_window_period.json' `
@@ -154,7 +154,7 @@ HAC t 值、收益或最优周期必须走该流程；合成数据调试、表�
 ```python
 from factor_mining.bridge import register_snapshot
 
-names = register_snapshot("runs/factor_mining/snapshots/screen_20260727.json")
+names = register_snapshot("runs/factor_mining/screens/screen_id/prescreen_candidates.snapshot.json")
 ```
 
 之后 `core.registry.get("factor", names[0])()` 与任何现有 `Factor` 的调用方式相同。

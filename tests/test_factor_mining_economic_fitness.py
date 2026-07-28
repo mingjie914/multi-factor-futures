@@ -32,16 +32,18 @@ def _aligned_target(cost_bps: float) -> tuple[np.ndarray, PreparedTarget]:
     return raw_signal, target
 
 
-def test_economic_fitness_penalizes_cost_after_declared_rebalancing():
+def test_economic_fitness_prorates_fixed_annual_cost_without_turnover_charge():
     signal, free_target = _aligned_target(cost_bps=0.0)
-    _, costly_target = _aligned_target(cost_bps=50.0)
+    # Deliberately extreme annual rate keeps the score away from its +1 clip;
+    # the arithmetic assertion below is the actual policy regression guard.
+    annual_cost_bps = 50_000.0
+    _, costly_target = _aligned_target(cost_bps=annual_cost_bps)
     config = ValidationConfig(
         min_cross_section=4,
         min_time_observations=20,
         neutralize_volatility=False,
         rebalance_every_bars=5,
         economic_fitness_weight=1.0,
-        turnover_penalty=0.0,
         complexity_penalty=0.0,
     )
 
@@ -55,14 +57,16 @@ def test_economic_fitness_penalizes_cost_after_declared_rebalancing():
         free.metrics["rank_weight_net_mean"]
         - costly.metrics["rank_weight_net_mean"]
     ) == pytest.approx(
-        costly.metrics["rank_weight_turnover_mean"] * 2.0 * 50.0 / 10_000.0
+            annual_cost_bps / 10_000.0 * 5.0 / (240.0 * 252.0)
+    )
+    assert costly.metrics["cost_uses_turnover"] is False
+    assert costly.metrics["mining_cost_definition"] == (
+        "fixed_annual_cost_prorated_by_target_holding_bars"
     )
     assert costly.metrics["cost_adjusted_return_score"] < free.metrics[
         "cost_adjusted_return_score"
     ]
     assert costly.fitness < free.fitness
-
-
 def test_forward_ic_curve_and_signal_half_life_have_bar_semantics():
     ascending = np.arange(8, dtype=np.float32)
     descending = ascending[::-1]

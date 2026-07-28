@@ -22,7 +22,7 @@ class Momentum5D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return close.shift(1).pct_change(5)
+        return close.shift(1).pct_change(5, fill_method=None)
 
 
 @register_factor("momentum_10d", category="momentum")
@@ -39,7 +39,7 @@ class Momentum10D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return close.shift(1).pct_change(10)
+        return close.shift(1).pct_change(10, fill_method=None)
 
 
 @register_factor("reversal_2d", category="reversal")
@@ -56,7 +56,7 @@ class Reversal2D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return -close.pct_change(2)
+        return -close.pct_change(2, fill_method=None)
 
 
 @register_factor("volatility_10d", category="volatility")
@@ -73,7 +73,7 @@ class Volatility10D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         return ret.rolling(10).std() * np.sqrt(252)
 
 
@@ -91,7 +91,7 @@ class OIChange5D(Factor):
         oi = data.get("oi", dates, universe)
         if oi.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return oi.pct_change(5)
+        return oi.pct_change(5, fill_method=None)
 
 
 @register_factor("intraday_range_5d", category="volatility")
@@ -129,7 +129,7 @@ class VolumePriceCorr5D(Factor):
         volume = data.get("volume", dates, universe)
         if close.empty or volume.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         return ret_abs.rolling(5).corr(volume)
 
 

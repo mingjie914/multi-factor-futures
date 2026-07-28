@@ -26,11 +26,12 @@ class AkshareFuturesSource(DataSource):
     """akshare 期货数据源. 免费，有缺失，适合 MVP.
 
     提供:
-    - 主力连续合约 (back_adj 方式)
+    - 新浪主力连续合约（日线）
     - 基础日线 (OHLCV)
     - 交易日历
     """
     market = "futures"
+    formal_research_safe = False
 
     def __init__(self, **kwargs) -> None:
         # 缓存已获取的 DataFrame 避免重复 API 调用
@@ -45,12 +46,14 @@ class AkshareFuturesSource(DataSource):
     ) -> PricePanel:
         """拉取期货日线行情.
 
-        注意: akshare 的主力连续合约代码为 'main' 或具体品种代码.
-        参数 tickers 可以是 ['RB'] 代表螺纹钢主力连续.
+        AKShare ``futures_main_sina`` 使用 ``RB0``/``IF0`` 形式的主力
+        连续代码，并返回中文字段。这里显式完成代码和字段适配；该免费源
+        不提供可审计的逐次换月台账，因此不应用于正式准入研究。
         """
         result: PricePanel = {}
         for ticker in tickers:
-            sym = str(ticker).split(".")[0]  # 去掉交易所后缀
+            root = str(ticker).split(".")[0].upper()
+            sym = f"{root}0"
             # 尝试获取主力连续
             try:
                 ak = _get_ak()
@@ -63,7 +66,12 @@ class AkshareFuturesSource(DataSource):
                 'date': 'date', 'open': 'open', 'high': 'high',
                 'low': 'low', 'close': 'close', 'volume': 'volume',
                 'hold': 'oi', 'close_0': 'settle',
+                '日期': 'date', '开盘价': 'open', '最高价': 'high',
+                '最低价': 'low', '收盘价': 'close', '成交量': 'volume',
+                '持仓量': 'oi', '动态结算价': 'settle',
             })
+            if "date" not in df.columns:
+                continue
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date')
             mask = (df['date'] >= pd.Timestamp(start)) & (

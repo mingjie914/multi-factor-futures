@@ -96,6 +96,15 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
     )
     features = FeatureEngine(feature_config).build(panels)
     close = panels["close"].reindex(index=features.index, columns=features.symbols)
+    valid_bars = close.notna().sum(axis=0)
+    positive_counts = valid_bars.loc[valid_bars.gt(0)]
+    training_bars = int(positive_counts.median()) if not positive_counts.empty else 0
+    valid_days = pd.Series({
+        symbol: int(close[symbol].dropna().index.normalize().nunique())
+        for symbol in close.columns
+    })
+    positive_days = valid_days.loc[valid_days.gt(0)]
+    training_days = int(positive_days.median()) if not positive_days.empty else 0
     target = PreparedTarget.from_close(close, target_spec)
     validation = ValidationConfig(
         decision_lag_bars=args.decision_lag_bars,
@@ -103,7 +112,6 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         min_time_observations=args.min_time_observations,
         neutralize_volatility=not args.no_volatility_neutralization,
         time_segments=args.time_segments,
-        turnover_penalty=args.turnover_penalty,
         complexity_penalty=args.complexity_penalty,
         coverage_penalty=args.coverage_penalty,
         segment_floor_weight=args.segment_floor_weight,
@@ -123,6 +131,7 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         max_candidates=args.max_candidates,
         min_abs_ic=args.min_abs_ic,
         windows=args.gp_windows,
+        required_terminal_prefixes=args.required_terminal_prefixes,
         operators=args.operators or GPConfig().operators,
         allow_conditionals=args.allow_conditionals,
         seed=args.seed,
@@ -139,6 +148,22 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
             if args.sector_neutralization else None
         ),
     ).run()
+    outcome = replace(
+        outcome,
+        candidates=tuple(
+            replace(
+                candidate,
+                metrics={
+                    **candidate.metrics,
+                    "training_bars": training_bars,
+                    "training_days": training_days,
+                    "training_start": str(pd.Timestamp(features.index.min())),
+                    "training_end": str(pd.Timestamp(features.index.max())),
+                },
+            )
+            for candidate in outcome.candidates
+        ),
+    )
     if args.candidate_prefix:
         namespaced = []
         for candidate in outcome.candidates:
@@ -197,10 +222,12 @@ def _mine(args) -> int:
         "population": args.population,
         "generations": args.generations,
         "operators": list(args.operators or GPConfig().operators),
+        "required_terminal_prefixes": list(args.required_terminal_prefixes),
         "rebalance_every_bars": (
             args.rebalance_every_bars or args.horizon_bars
         ),
         "economic_fitness_weight": args.economic_fitness_weight,
+        "annual_transaction_cost_bps": args.cost_bps,
     }
     run_id = args.run_id or (
         datetime.now(timezone.utc).strftime("mine_%Y%m%dT%H%M%SZ_")
@@ -232,11 +259,11 @@ def _mine(args) -> int:
             "min_abs_ic": args.min_abs_ic,
             "gp_windows": list(args.gp_windows),
             "operators": list(args.operators or GPConfig().operators),
+            "required_terminal_prefixes": list(args.required_terminal_prefixes),
             "allow_conditionals": args.allow_conditionals,
             "sector_neutralization": args.sector_neutralization,
             "validation_config": {
                 "time_segments": args.time_segments,
-                "turnover_penalty": args.turnover_penalty,
                 "complexity_penalty": args.complexity_penalty,
                 "coverage_penalty": args.coverage_penalty,
                 "segment_floor_weight": args.segment_floor_weight,
@@ -252,6 +279,37 @@ def _mine(args) -> int:
     panels = LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
         args.universe, args.start, args.end, feature_config
     )
+    from core.config import ValidationPolicyConfig
+    from core.factor_contract import normalise_frequency
+
+    close = panels.get("close", pd.DataFrame())
+    counts = close.notna().sum(axis=0) if not close.empty else pd.Series(dtype=int)
+    counts = counts.loc[counts.gt(0)]
+    observed_training_bars = int(counts.median()) if not counts.empty else 0
+    day_counts = pd.Series({
+        symbol: int(close[symbol].dropna().index.normalize().nunique())
+        for symbol in close.columns
+    }) if not close.empty else pd.Series(dtype=int)
+    day_counts = day_counts.loc[day_counts.gt(0)]
+    observed_training_days = int(day_counts.median()) if not day_counts.empty else 0
+    policy = ValidationPolicyConfig()
+    canonical_frequency = normalise_frequency(args.frequency)
+    minimum_training_bars = int(
+        policy.minimum_train_bars_by_frequency[canonical_frequency]
+    )
+    minimum_training_days = int(
+        policy.minimum_train_days_by_frequency[canonical_frequency]
+    )
+    if (
+        observed_training_bars < minimum_training_bars
+        or observed_training_days < minimum_training_days
+    ):
+        raise ValueError(
+            "data observation only: GP training sample has median "
+            f"{observed_training_bars} valid bars and {observed_training_days} "
+            f"trading days/instrument; requires {minimum_training_bars} bars "
+            f"and {minimum_training_days} days for {canonical_frequency}"
+        )
     _run_search(args, panels, run_id, repository)
     return 0
 
@@ -429,8 +487,16 @@ def _screen(args) -> int:
         "end": args.end,
         "frequency": feature_config.decision_frequency,
         "universe": list(universe),
-        "candidate_source": str(args.candidate_file or "explicit_ids"),
         "diagnostic_universe_policy": "static_declared_universe",
+        "candidate_source": (
+            str(args.candidate_file)
+            if args.candidate_file
+            else (
+                "run_ids:" + ",".join(args.candidate_run_ids)
+                if args.candidate_run_ids
+                else "explicit_ids"
+            )
+        ),
         "warning": "same-sample mining pre-screen; not formal HAC evidence",
     }
     summary_path = output_dir / "prescreen_summary.json"
@@ -438,15 +504,17 @@ def _screen(args) -> int:
         json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    snapshot_path = repository.write_snapshot(
-        output_dir / "prescreen_candidates.snapshot.json",
-        candidate_ids=outcome.passed_candidate_ids,
-    )
+    snapshot_path = None
+    if outcome.passed_candidate_ids:
+        snapshot_path = repository.write_snapshot(
+            output_dir / "prescreen_candidates.snapshot.json",
+            candidate_ids=outcome.passed_candidate_ids,
+        )
     evidence = {
         "scope": "mining_prescreen_not_formal_evidence",
         "screen_id": args.screen_id,
         "summary_path": str(summary_path),
-        "snapshot_path": str(snapshot_path),
+        "snapshot_path": str(snapshot_path) if snapshot_path else None,
     }
     by_id = {result["candidate_id"]: result for result in outcome.results}
     for candidate_id in candidate_ids:
@@ -460,8 +528,13 @@ def _screen(args) -> int:
     print(canonical_json({
         **outcome.summary(),
         "output_dir": str(output_dir),
-        "snapshot": str(snapshot_path),
+        "snapshot": str(snapshot_path) if snapshot_path else None,
     }))
+    if snapshot_path is None:
+        raise ValueError(
+            "screen produced no mechanically eligible candidates; "
+            "evaluations were recorded and no snapshot was written"
+        )
     return 0
 
 
@@ -470,7 +543,15 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--horizon-bars", type=int, default=15)
     parser.add_argument("--entry-delay-bars", type=int, default=1)
     parser.add_argument("--decision-lag-bars", type=int, default=1)
-    parser.add_argument("--cost-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--cost-bps",
+        type=float,
+        default=2.0,
+        help=(
+            "fixed annual validation cost in basis points; reported turnover "
+            "does not multiply this charge (default: 2.0)"
+        ),
+    )
     parser.add_argument(
         "--feature-horizons",
         type=_csv_ints,
@@ -508,6 +589,10 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
         "--operators", type=_csv_strings, default=None,
         help="explicit GP operator vocabulary; defaults to the fast core set",
     )
+    parser.add_argument(
+        "--required-terminal-prefixes", type=_csv_strings, default=(),
+        help="require each expression to use at least one matching terminal family",
+    )
     parser.add_argument("--allow-conditionals", action="store_true")
     parser.add_argument(
         "--candidate-prefix", type=_safe_id_fragment,
@@ -517,11 +602,9 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--min-cross-section", type=int, default=4)
     parser.add_argument("--min-time-observations", type=int, default=30)
     parser.add_argument("--time-segments", type=int, default=4)
-    parser.add_argument("--turnover-penalty", type=float, default=0.002)
     parser.add_argument("--complexity-penalty", type=float, default=0.0005)
     parser.add_argument("--coverage-penalty", type=float, default=0.0)
     parser.add_argument("--segment-floor-weight", type=float, default=0.0)
-    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument(
         "--rebalance-every-bars",
         type=int,
@@ -534,6 +617,7 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
         default=0.50,
         help="weight of cost-adjusted rank-portfolio return in GP fitness",
     )
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--feature-memory-mb", type=int, default=4096)
     parser.add_argument("--evaluator-cache-mb", type=int, default=128)
     parser.add_argument("--seed", type=int, default=17)
@@ -588,7 +672,6 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--correlation-threshold", type=float, default=0.85)
     screen.add_argument("--max-correlation-observations", type=int, default=100_000)
     screen.add_argument("--evaluator-cache-mb", type=int, default=256)
-    screen.set_defaults(handler=_screen)
     screen.add_argument(
         "--diagnostic-horizons",
         type=_csv_ints,
@@ -601,6 +684,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=(1, 3, 5, 10, 20, 40),
         help="bar lags for cross-sectional signal-rank persistence",
     )
+    screen.set_defaults(handler=_screen)
 
     snapshot = commands.add_parser("snapshot", help="freeze candidates for framework loading")
     snapshot.add_argument("--output", type=Path, required=True)

@@ -118,7 +118,9 @@ def summarize(run_root: Path) -> dict:
         nav = pd.read_csv(
             portfolio_dir / "combined_nav.csv", index_col=0, parse_dates=True
         ).iloc[:, 0]
-        all_returns.append(nav.pct_change().dropna().rename(segment))
+        all_returns.append(
+            nav.pct_change(fill_method=None).dropna().rename(segment)
+        )
         selected = {
             factor
             for factors in fold.get("selected_factors", {}).values()

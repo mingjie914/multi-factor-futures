@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from core.factor_contract import bind_factor_contract, validate_factor_contract
 from core.registry import _REGISTRIES
 from workflows.research import (
     _passes_post_bonferroni_quality,
@@ -16,6 +17,20 @@ def test_requested_factor_parser_is_stable_and_deduplicated():
     assert _parse_requested_factors(" beta,alpha,beta ") == ["beta", "alpha"]
     with pytest.raises(ValueError, match="at least one"):
         _parse_requested_factors(" , ")
+
+
+def test_registered_factor_contract_rejects_formal_horizon_override():
+    class LegacyFactor:
+        name = "contract_probe_5d"
+        frequency = "daily"
+
+    bind_factor_contract(LegacyFactor, LegacyFactor.name)
+    factor = LegacyFactor()
+    assert factor.validation_horizons == (3, 5, 10)
+    with pytest.raises(ValueError, match="requested horizons.*do not match"):
+        validate_factor_contract(
+            factor, provider_frequency="daily", requested_horizons=[5]
+        )
 
 
 def test_requested_factor_validation_rejects_unknown_names():

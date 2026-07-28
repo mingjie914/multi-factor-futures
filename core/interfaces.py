@@ -296,6 +296,10 @@ class Factor(abc.ABC):
     category: str = ""
     # 周期单位: 与 core.period.PeriodUnit 枚举值对应
     frequency: str = "daily"
+    # Formal forward-return horizons, in bars at ``frequency``. Registration
+    # freezes a deterministic value for legacy factors that do not declare it.
+    validation_horizons: tuple[int, ...] = ()
+    horizon_unit: str = "bars"
     description: str = ""
 
     @abc.abstractmethod

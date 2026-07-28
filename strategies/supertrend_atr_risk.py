@@ -233,7 +233,7 @@ class SupertrendATRRiskStrategy:
             turnover=turnover,
             costs=costs,
             split_metrics=compute_split_metrics(
-                nav, result_returns, train_ratio=0.6
+                nav, result_returns, train_ratio=0.75
             ),
             failure_ledger=failures,
         )

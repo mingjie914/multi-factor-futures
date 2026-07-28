@@ -9,7 +9,12 @@ import pytest
 from factor_mining.api import FeatureConfig, TargetSpec
 from factor_mining.data import make_synthetic_panels
 from factor_mining.features import FeatureEngine
-from factor_mining.gp import GPConfig, GPSearch, expression_lookback
+from factor_mining.gp import (
+    GPConfig,
+    GPSearch,
+    expression_lookback,
+    infer_economic_category,
+)
 from factor_mining.operators import Expr, ExpressionEvaluator
 from factor_mining.validation import (
     PreparedTarget,
@@ -46,6 +51,36 @@ def test_expression_roundtrip_protected_division_and_lookback():
     assert expression_lookback(expression, features) == 6
     assert result.shape == features.shape
     assert not np.isinf(result).any()
+
+
+def test_cross_section_operators_use_point_in_time_mask():
+    _, _, features = _small_feature_set()
+    mask = np.ones(features.shape, dtype=bool)
+    mask[:, -2:] = False
+    expression = Expr.operation(
+        "square", Expr.operation("cs_zscore", Expr.terminal("return_1p"))
+    )
+
+    baseline = ExpressionEvaluator(
+        features, cross_section_mask=mask
+    ).evaluate(expression)
+    values = dict(features.values)
+    changed = values["return_1p"].copy()
+    changed[:, -2:] = 1_000_000.0
+    values["return_1p"] = changed
+    perturbed_features = type(features)(
+        index=features.index,
+        symbols=features.symbols,
+        values=values,
+        raw_dependencies=features.raw_dependencies,
+        lookbacks=features.lookbacks,
+    )
+    result = ExpressionEvaluator(
+        perturbed_features, cross_section_mask=mask
+    ).evaluate(expression)
+
+    np.testing.assert_allclose(result[:, :-2], baseline[:, :-2], equal_nan=True)
+    assert np.isnan(result[:, -2:]).all()
 
 
 def test_protected_division_preserves_missing_observations():
@@ -123,6 +158,55 @@ def test_gp_search_is_deterministic_and_emits_bridgeable_candidates():
         assert candidate.payload["decision_lag_bars"] == 1
         assert candidate.content_sha256 == ""
         candidate.validated()
+
+
+def test_gp_can_require_a_terminal_family():
+    panels, feature_config, features = _small_feature_set()
+    target = PreparedTarget.from_close(
+        panels["close"], TargetSpec(name="forward_5p", horizon_bars=5)
+    )
+    outcome = GPSearch(
+        features,
+        target,
+        feature_config=feature_config,
+        validation_config=ValidationConfig(
+            min_time_observations=20, neutralize_volatility=True
+        ),
+        gp_config=GPConfig(
+            population_size=20,
+            generations=1,
+            elite_size=4,
+            max_candidates=4,
+            required_terminal_prefixes=("volume_",),
+            seed=31,
+        ),
+    ).run()
+
+    assert outcome.candidates
+    for candidate in outcome.candidates:
+        expression = Expr.from_dict(candidate.payload["expression"])
+        assert any(name.startswith("volume_") for name in expression.terminals())
+
+
+def test_gp_required_terminal_family_fails_when_unavailable():
+    panels, feature_config, features = _small_feature_set()
+    target = PreparedTarget.from_close(
+        panels["close"], TargetSpec(name="forward_5p", horizon_bars=5)
+    )
+
+    with pytest.raises(ValueError, match="no usable terminals match"):
+        GPSearch(
+            features,
+            target,
+            feature_config=feature_config,
+            gp_config=GPConfig(required_terminal_prefixes=("curve_",)),
+        )
+
+
+def test_economic_category_uses_actual_terminals():
+    assert infer_economic_category(("curve_oi_hhi", "macd_diff_12_26_9")) == "term_structure"
+    assert infer_economic_category(("macd_diff_12_26_9",)) == "momentum"
+    assert infer_economic_category(("oi_change_15p",)) == "volume_oi"
 
 
 def test_vectorized_candidate_diagnostics_match_row_reference():

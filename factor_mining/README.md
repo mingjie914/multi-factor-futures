@@ -49,9 +49,10 @@
 它们回答的是“预测作用在哪个分钟 horizon”与“排名能保持多久”。旧 `ICTest.ic_decay`
 计算的是 IC 时间序列本身的自相关，不等同于这两项诊断。
 
-预筛目前使用候选快照声明的静态品种全集，结果会明确写入
+默认 `screen` 预筛使用候选快照声明的静态品种全集，结果会明确写入
 `diagnostic_universe_policy=static_declared_universe`。正式 P0 仍使用主框架的滞后
 流动性动态品种池；静态预筛曲线只能定位 horizon，不能替代动态池下的正式 IC。
+动态池下的正式检验统一通过 `main.py research` 执行，不再保留一次性对齐脚本。
 
 ## 特征和算子
 
@@ -85,10 +86,10 @@ profile、特征配置和目标 horizon 都必须冻结，未被该次表达式�
 
 GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使用横截面 rank
 权重组合在声明调仓节奏下的成本后收益，经同期目标收益横截面离散度归一化后参与搜索；
-原换手与复杂度惩罚继续保留。`--rebalance-every-bars 0` 默认采用目标 horizon，显式非零
-值则冻结为独立执行节奏。成本使用 `TargetSpec.cost_bps`，因此生产 campaign 必须声明
-现实的单边成本，并按 `half_turnover × 2 × one_way_cost` 扣减；不能用 0 成本搜索后再
-宣称具有经济意义。该 fitness 仍是训练期搜索
+复杂度惩罚继续保留，换手率仅作诊断且不影响 fitness。`--rebalance-every-bars 0` 默认采用目标 horizon，显式非零
+值则冻结为独立执行节奏。成本使用 `TargetSpec.cost_bps` 声明固定年化费率，当前默认
+为年化 2 bp，并按目标持有 bar 数摊销；换手率仅作诊断，不按换手率或换手次数扣费。
+因子筛选成功后的完整研究回测会另外加入年化 10.5 bp 移仓成本。该 fitness 仍是训练期搜索
 目标，不替代正式成本覆盖、FDR 或 OOS。
 
 ## 期货特异数据覆盖
@@ -137,11 +138,9 @@ GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使�
 评价起点至少 `min_listing_days` 个交易日，并覆盖流动性 lookback。研究批次若得到
 0 个有效因子×周期观测会直接失败，不再产生“零样本但完成”的结论。
 
-2026-07-27 的 H=1/5/15/30/60/240 当前口径正式复核结果见
-[`../docs/factor_mining_validation_20260727.md`](../docs/factor_mining_validation_20260727.md)。
-该文件是旧 Bonferroni 口径的历史基线；当前正式准入使用
-[`../docs/factor_validation_pipeline.md`](../docs/factor_validation_pipeline.md) 所述 v2
-层级 FDR、自然年、成本和观察期流程，不能直接比较“通过数”而忽略方法版本。
+政策升级前的日期化复核报告和本地结果已经清除。当前正式准入只使用
+[`../docs/factor_validation_pipeline.md`](../docs/factor_validation_pipeline.md) 所述流程；
+新结果必须写入新目录，不能与旧方法的通过数直接比较。
 
 ## 开发冒烟
 

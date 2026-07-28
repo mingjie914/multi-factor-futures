@@ -154,7 +154,6 @@ def parse_slug_window(slug: str) -> Optional[str]:
 
 
 # 默认的窗口 → 持有期映射 (日度场景)
-# 与统一研究工作流中的 _periods_for_window 完全一致, 保持向后兼容
 # `p` 只表示 bar 数，不隐含分钟频率；持有期也按当前频率的 bar 数解释。
 _DEFAULT_HOLDING_PERIODS = {
     # 日度窗口
@@ -175,8 +174,7 @@ def holding_periods_for_window(
 ) -> List[int]:
     """根据计算窗口推荐持有期列表.
 
-    保留与 workflows.research._periods_for_window 完全相同的默认映射。返回值
-    始终是当前 frequency 下的 bar 数，不自动换算为交易日。
+    返回值始终是当前 frequency 下的 bar 数，不自动换算为交易日。
 
     Args:
         window: 窗口标签 (如 "5d", "10d", "20d", "16p", "80p", "240p", "other")

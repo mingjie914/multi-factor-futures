@@ -102,12 +102,18 @@ def build_processing_context(
 
     dates = pd.DatetimeIndex(dates)
     universe = pd.Index(universe)
+    eligibility = build_universe_eligibility(
+        data, dates, universe, universe_selection_config
+    )
+    # Snapshot factors contain cross-sectional operators and candidate-level
+    # neutralization before the generic processor runs.  Publish the exact
+    # point-in-time mask on this research-local provider so the bridge can use
+    # the same eligible cross-section during expression evaluation.
+    setattr(data, "_factor_eligibility", eligibility)
     return ProcessingContext(
         data=data,
         dates=dates,
         universe=universe,
         industry=sector_series(universe),
-        eligibility=build_universe_eligibility(
-            data, dates, universe, universe_selection_config
-        ),
+        eligibility=eligibility,
     )

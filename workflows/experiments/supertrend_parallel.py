@@ -71,11 +71,14 @@ def _evaluate_variant(
     costs: pd.DataFrame,
     weights: pd.DataFrame,
     *,
-    allocation_cost_rate: float = 0.0011,
+    allocation_cost_rate: float = 0.0,
 ) -> tuple[pd.Series, dict]:
     weights = weights.reindex(returns.index).ffill()
     allocation_turnover = weights.diff().abs().sum(axis=1).fillna(0.0)
-    allocation_cost = allocation_turnover * allocation_cost_rate
+    # Compatibility argument retained for old experiment callers; current
+    # policy records allocation turnover but never converts it into a fee.
+    del allocation_cost_rate
+    allocation_cost = pd.Series(0.0, index=returns.index)
     net_return = (returns * weights).sum(axis=1) - allocation_cost
     nav = (1.0 + net_return).cumprod()
     metrics = compute_all_metrics(nav, returns=net_return)
@@ -84,6 +87,7 @@ def _evaluate_variant(
     )
     metrics["embedded_cost_proxy"] = float((costs * weights).sum().sum())
     metrics["allocation_cost_proxy"] = float(allocation_cost.sum())
+    metrics["allocation_turnover"] = float(allocation_turnover.sum())
     metrics["total_cost_proxy"] = (
         metrics["embedded_cost_proxy"] + metrics["allocation_cost_proxy"]
     )
@@ -91,7 +95,7 @@ def _evaluate_variant(
     metrics["min_supertrend_weight"] = float(weights["supertrend"].min())
     metrics["max_supertrend_weight"] = float(weights["supertrend"].max())
     metrics["split_diagnostic"] = compute_split_metrics(
-        nav, returns=net_return, train_ratio=0.6
+        nav, returns=net_return, train_ratio=0.75
     )
     return nav, metrics
 
@@ -215,7 +219,8 @@ def main() -> None:
                 "dynamic_supertrend_bounds": [0.10, 0.30],
                 "estimation_window": 252,
                 "covariance_shrinkage": 0.30,
-                "allocation_cost_rate": 0.0011,
+                "allocation_cost_rate": 0.0,
+                "allocation_turnover_cost_policy": "diagnostic_only_not_charged",
                 "cost_note": (
                     "Sleeve costs stay embedded; dynamic sleeve-weight turnover "
                     "pays an additional conservative cost proxy without cross-sleeve netting."

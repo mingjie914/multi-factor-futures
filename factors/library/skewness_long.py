@@ -21,7 +21,7 @@ class Skewness150D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         # 研报: 偏度必须窗口期放到很长(140-180日)才能体现效果
         # Miffre(2013): 做空高偏度品种, 做多低偏度品种, 年化8.01%
         return ret.rolling(150).skew()

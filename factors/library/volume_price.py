@@ -22,7 +22,7 @@ class VolumePriceCorr20D(Factor):
         volume = data.get("volume", dates, universe)
         if close.empty or volume.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         # 量价同向 (正相关): 放量上涨/下跌, 趋势确认
         # 量价背离 (负相关): 放量但价格不动, 可能反转
         return ret_abs.rolling(20).corr(volume)

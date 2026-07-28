@@ -268,26 +268,33 @@ def test_barra_prefetch_reuses_slow_market_fields():
     assert data.industry_calls == 1
 
 
-def test_cost_configuration_charges_two_bps_and_daily_management_fee():
+def test_cost_configuration_prorates_annual_policy_without_turnover_charge():
     from optimization.costs import SimpleFuturesCost
 
     model = SimpleFuturesCost(
-        commission_rate=0.0002, slippage=0.0, annual_fee=0.00105
+        annual_transaction_cost=0.0002,
+        annual_roll_cost=0.00105,
     )
     target = pd.Series({"A": 0.6, "B": -0.4})
     current = pd.Series({"A": 0.1, "B": -0.2})
     date = pd.Timestamp("2025-01-02")
-    assert model.estimate_cost(target, current, date) == pytest.approx(0.00014)
-    assert model.estimate_holding_cost(target, date) == pytest.approx(0.00105 / 252.0)
+    assert model.estimate_cost(target, current, date) == pytest.approx(0.0)
+    assert model.estimate_holding_cost(target, date) == pytest.approx(
+        (0.0002 + 0.00105) / 252.0
+    )
+
+    with pytest.raises(TypeError):
+        SimpleFuturesCost(commission_rate=0.0002)
 
 
 def test_default_config_registers_shadow_supertrend_and_new_costs():
     from core.config import load_config
 
     config = load_config("config/default.yaml")
-    assert config.costs.commission_rate == pytest.approx(0.0002)
-    assert config.costs.slippage == pytest.approx(0.0)
-    assert config.costs.annual_fee == pytest.approx(0.00105)
+    assert config.costs.annual_transaction_cost == pytest.approx(0.0002)
+    assert config.costs.annual_fee == pytest.approx(0.0)
+    assert config.costs.annual_roll_cost == pytest.approx(0.00105)
+    assert config.costs.cost_stage == "post_screen_backtest"
     assert config.supertrend_sleeve.enabled is True
     assert config.supertrend_sleeve.integration_mode == "shadow"
     assert config.supertrend_sleeve.capital_weight == pytest.approx(0.0)
@@ -312,9 +319,7 @@ def test_meta_combination_charges_management_fee_once_after_netting():
         sub_results.append({"config": SimpleNamespace(name=name), "result": result})
 
     runner = PipelineRunner.__new__(PipelineRunner)
-    runner.cost_model = SimpleFuturesCost(
-        commission_rate=0.0002, slippage=0.0, annual_fee=0.00105
-    )
+    runner.cost_model = SimpleFuturesCost(annual_fee=0.00105)
     runner.config = SimpleNamespace(optimization=SimpleNamespace(constraints=[]))
     meta_cfg = SimpleNamespace(
         underlying_constraints=[],

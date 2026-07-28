@@ -218,8 +218,16 @@ def screen_candidates(
     panels: Mapping[str, pd.DataFrame],
     *,
     config: ScreeningConfig | None = None,
+    eligibility: pd.DataFrame | None = None,
+    processing_eligibility: pd.DataFrame | None = None,
 ) -> ScreeningOutcome:
-    """Evaluate all candidates without selecting on an arbitrary quota."""
+    """Evaluate all candidates without selecting on an arbitrary quota.
+
+    ``eligibility`` selects evaluation observations. ``processing_eligibility``
+    selects the point-in-time cross-section used while computing the signal.
+    Keeping them separate retains warm-up history without admitting warm-up
+    rows into screening statistics.
+    """
     if not candidates:
         raise ValueError("screening candidates cannot be empty")
     screening = config or ScreeningConfig()
@@ -241,6 +249,24 @@ def screen_candidates(
     features = FeatureEngine(feature_config).build(
         panels, required_features=required_features
     )
+    eligibility_values = None
+    if eligibility is not None:
+        aligned_eligibility = eligibility.reindex(
+            index=features.index,
+            columns=features.symbols,
+            fill_value=False,
+        ).fillna(False)
+        eligibility_values = aligned_eligibility.to_numpy(dtype=bool)
+    processing_eligibility_values = eligibility_values
+    if processing_eligibility is not None:
+        aligned_processing_eligibility = processing_eligibility.reindex(
+            index=features.index,
+            columns=features.symbols,
+            fill_value=False,
+        ).fillna(False)
+        processing_eligibility_values = (
+            aligned_processing_eligibility.to_numpy(dtype=bool)
+        )
     close = panels["close"].reindex(index=features.index, columns=features.symbols)
     targets = {
         target: PreparedTarget.from_close(close, target)
@@ -271,7 +297,9 @@ def screen_candidates(
             for horizon in screening.diagnostic_horizons
         }
     evaluator = ExpressionEvaluator(
-        features, cache_max_bytes=screening.evaluator_cache_mb * 1024 * 1024
+        features,
+        cache_max_bytes=screening.evaluator_cache_mb * 1024 * 1024,
+        cross_section_mask=processing_eligibility_values,
     )
     results: list[dict] = []
     samples: list[np.ndarray | None] = []
@@ -331,22 +359,37 @@ def screen_candidates(
         )
         try:
             raw = evaluator.evaluate(expression, copy=False)
+            signal = candidate.expected_direction * raw
+            signal_for_processing = signal
+            volatility_for_processing = volatility
+            if processing_eligibility_values is not None:
+                signal_for_processing = np.where(
+                    processing_eligibility_values, signal, np.nan
+                )
+                if volatility is not None:
+                    volatility_for_processing = np.where(
+                        processing_eligibility_values, volatility, np.nan
+                    )
             prepared = prepare_signal(
-                candidate.expected_direction * raw,
+                signal_for_processing,
                 validation,
-                volatility=volatility,
+                volatility=volatility_for_processing,
                 group_labels=_group_labels(candidate, features.symbols),
             )
+            if eligibility_values is not None:
+                prepared = np.where(eligibility_values, prepared, np.nan)
             prepared_rank = pd.DataFrame(prepared).rank(
                 axis=1, method="average", pct=True
             ).to_numpy(dtype=np.float32)
             diagnostic = evaluate_candidate(
-                candidate.expected_direction * raw,
+                signal,
                 targets[candidate.target],
                 validation,
                 complexity=expression.complexity,
                 volatility=volatility,
                 group_labels=_group_labels(candidate, features.symbols),
+                eligibility=eligibility_values,
+                processing_eligibility=processing_eligibility_values,
                 full_diagnostics=True,
             )
             sample, variable_fraction = _sample_rank_signal(
@@ -374,7 +417,11 @@ def screen_candidates(
             )
             metrics.update({
                 "expected_direction": candidate.expected_direction,
-                "diagnostic_universe_policy": "static_declared_universe",
+                "diagnostic_universe_policy": (
+                    "point_in_time_eligibility"
+                    if eligibility_values is not None
+                    else "static_declared_universe"
+                ),
                 "economic_search_contract_frozen": bool(
                     "rebalance_every_bars" in candidate.payload
                     and "economic_fitness_weight" in candidate.payload

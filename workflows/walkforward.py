@@ -193,6 +193,11 @@ def _assign_fold_factors(
         (pd.to_numeric(summary["n_valid_sectors"], errors="coerce").fillna(0) > 0)
         & (pd.to_numeric(summary["best_period"], errors="coerce").fillna(0) > 0)
     ].copy()
+    if "sample_sufficient" in approved.columns:
+        sample_ok = approved["sample_sufficient"].map(
+            lambda value: str(value).strip().lower() in {"1", "true", "yes"}
+        )
+        approved = approved.loc[sample_ok].copy()
     if approved.empty:
         raise RuntimeError("训练期没有通过全局 FDR 和稳定性门槛的因子")
     approved["best_q"] = pd.to_numeric(approved["best_q"], errors="coerce").fillna(1.0)
@@ -569,14 +574,15 @@ def walk_forward_4fold(
 ):
     """Nested walk-forward with unique, non-overlapping annual test folds."""
     configured_end = pd.Timestamp(base_config.date_range.end)
+    configured_start = pd.Timestamp(base_config.date_range.start).date().isoformat()
     segments = [
-        ("段1", "2021-01-01", "2022-06-30", "2022-07-01", "2023-06-30"),
-        ("段2", "2021-01-01", "2023-06-30", "2023-07-01", "2024-06-30"),
-        ("段3", "2021-01-01", "2024-06-30", "2024-07-01", "2025-06-30"),
+        ("段1", configured_start, "2022-06-30", "2022-07-01", "2023-06-30"),
+        ("段2", configured_start, "2023-06-30", "2023-07-01", "2024-06-30"),
+        ("段3", configured_start, "2024-06-30", "2024-07-01", "2025-06-30"),
     ]
     if configured_end >= pd.Timestamp("2025-07-01"):
         segments.append((
-            "段4", "2021-01-01", "2025-06-30", "2025-07-01",
+            "段4", configured_start, "2025-06-30", "2025-07-01",
             configured_end.date().isoformat(),
         ))
     if fold_numbers is not None:
@@ -613,6 +619,30 @@ def walk_forward_4fold(
     results = []
     for name, train_start, train_end, test_start, test_end in segments:
         print(f"\n[{name}] 训练 {train_start}~{train_end}, 测试 {test_start}~{test_end}")
+
+        from research.sample_policy import assess_sample_counts
+
+        train_dates = pd.bdate_range(train_start, train_end)
+        test_dates = pd.bdate_range(test_start, test_end)
+        sample_assessment = assess_sample_counts(
+            len(train_dates), len(test_dates),
+            policy=base_config.validation_policy,
+            frequency="daily",
+            train_days=len(train_dates), test_days=len(test_dates),
+        )
+        if not sample_assessment.sufficient:
+            results.append({
+                "segment": name,
+                "train_start": train_start,
+                "train_end": train_end,
+                "test_start": test_start,
+                "test_end": test_end,
+                "status": "observation",
+                "observation_channel": True,
+                "sample_assessment": sample_assessment.to_dict(),
+                "production_approved": False,
+            })
+            continue
 
         try:
             t0 = time.time()
@@ -679,7 +709,7 @@ def walk_forward_4fold(
             from research.statistics import deflated_sharpe_ratio
 
             m["dsr"] = deflated_sharpe_ratio(
-                nav.pct_change().dropna(),
+                nav.pct_change(fill_method=None).dropna(),
                 n_trials=len(candidate_factors),
                 risk_free_rate=0.0,
             )
@@ -688,6 +718,8 @@ def walk_forward_4fold(
             m["train_end"] = train_end
             m["test_start"] = test_start
             m["test_end"] = test_end
+            m["sample_assessment"] = sample_assessment.to_dict()
+            m["observation_channel"] = False
             m["actual_test_start"] = str(actual_start.date())
             m["actual_test_end"] = str(actual_end.date())
             m["alpha_type"] = base_config.alpha.type
@@ -819,7 +851,7 @@ def monte_carlo_perturbation(base_config, n_simulations=1000):
             nav = r.nav
 
         if nav is not None and len(nav) > 0:
-            sub_returns[name] = nav.pct_change().dropna()
+            sub_returns[name] = nav.pct_change(fill_method=None).dropna()
 
     if not sub_returns:
         print("  无法提取子组合收益序列, 跳过蒙特卡洛")

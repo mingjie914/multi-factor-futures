@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from core.interfaces import Factor
+from core.factor_contract import normalise_frequency, validate_factor_contract
 from core.registry import get as registry_get
 from core.types import DateIndex, FactorMatrix, Universe
 from data.manager import DataManager
@@ -32,6 +33,9 @@ class FactorEngine:
 
     def __init__(self, data_manager: DataManager):
         self._data = data_manager
+        self._frequency = normalise_frequency(
+            getattr(data_manager, "frequency", "daily")
+        )
         self._factor_cache: Dict[str, FactorMatrix] = {}
 
     @staticmethod
@@ -60,6 +64,9 @@ class FactorEngine:
         self, factor: Factor, dates: DateIndex, universe: Universe
     ) -> FactorMatrix:
         """计算单个因子矩阵."""
+        validate_factor_contract(
+            factor, provider_frequency=self._frequency
+        )
         cache_key = self._cache_key(factor, dates, universe)
         if cache_key in self._factor_cache:
             cached = self._factor_cache[cache_key]
@@ -113,6 +120,10 @@ class FactorEngine:
                 prefetch_factors.append(registry_get("factor", name)())
             except (KeyError, TypeError):
                 continue
+        for factor in prefetch_factors:
+            validate_factor_contract(
+                factor, provider_frequency=self._frequency
+            )
         try:
             self._data.prefetch(prefetch_factors, dates, universe)
         except Exception:

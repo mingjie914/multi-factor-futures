@@ -253,9 +253,23 @@ def _decay_linear(value: np.ndarray, window: int) -> np.ndarray:
 class ExpressionEvaluator:
     """Evaluate expression trees with subtree memoization and protected closure."""
 
-    def __init__(self, features: FeatureSet, *, cache_max_bytes: int = 128 * 1024 * 1024):
+    def __init__(
+        self,
+        features: FeatureSet,
+        *,
+        cache_max_bytes: int = 128 * 1024 * 1024,
+        cross_section_mask: np.ndarray | None = None,
+    ):
         self.features = features
         self.cache_max_bytes = max(0, int(cache_max_bytes))
+        self.cross_section_mask = None
+        if cross_section_mask is not None:
+            mask = np.asarray(cross_section_mask)
+            if mask.shape != features.shape:
+                raise ValueError("cross_section_mask shape differs from features")
+            if mask.dtype != np.bool_:
+                raise TypeError("cross_section_mask must be a boolean array")
+            self.cross_section_mask = mask
         self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_bytes = 0
 
@@ -350,18 +364,25 @@ class ExpressionEvaluator:
                 ).cov(_frame(args[1])).to_numpy()
             if op == "decay_linear":
                 return _decay_linear(args[0], window)
-            if op == "cs_rank": return _cross_section_rank(args[0])
+            if op == "cs_rank":
+                value = args[0]
+                if self.cross_section_mask is not None:
+                    value = np.where(self.cross_section_mask, value, np.nan)
+                return _cross_section_rank(value)
             if op in {"cs_zscore", "cs_demean"}:
-                valid = np.isfinite(args[0])
+                value = args[0]
+                if self.cross_section_mask is not None:
+                    value = np.where(self.cross_section_mask, value, np.nan)
+                valid = np.isfinite(value)
                 count = valid.sum(axis=1, keepdims=True)
                 mean = np.divide(
-                    np.where(valid, args[0], 0.0).sum(axis=1, keepdims=True),
+                    np.where(valid, value, 0.0).sum(axis=1, keepdims=True),
                     count,
                     out=np.full((len(args[0]), 1), np.nan, dtype=float),
                     where=count > 0,
                 )
-                if op == "cs_demean": return args[0] - mean
-                squared = np.where(valid, (args[0] - mean) ** 2, 0.0).sum(
+                if op == "cs_demean": return value - mean
+                squared = np.where(valid, (value - mean) ** 2, 0.0).sum(
                     axis=1, keepdims=True
                 )
                 std = np.sqrt(np.divide(
@@ -370,7 +391,7 @@ class ExpressionEvaluator:
                     out=np.full_like(squared, np.nan, dtype=float),
                     where=count > 0,
                 ))
-                return _protected_divide(args[0] - mean, std)
+                return _protected_divide(value - mean, std)
             if op == "gt": return _protected_compare(args[0], args[1], "gt")
             if op == "lt": return _protected_compare(args[0], args[1], "lt")
             if op == "logical_and": return _protected_logical(args[0], args[1], "and")

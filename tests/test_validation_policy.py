@@ -78,31 +78,47 @@ def test_intraday_turnover_is_aggregated_by_trading_day():
     assert sum(result.mean_absolute_weights.values()) == pytest.approx(1.0)
 
 
-def test_cost_coverage_fails_closed_and_supports_instrument_roll_rates():
+def test_validation_cost_is_fixed_annual_rate_and_roll_is_deferred():
     from optimization.costs import factor_cost_coverage
 
-    incomplete = factor_cost_coverage(
-        gross_annual_alpha=0.10,
-        annual_half_turnover=2.0,
-        one_way_cost_rate=0.001,
-        annual_roll_cost=None,
-    )
-    assert incomplete["complete"] is False
-    assert incomplete["passes"] is False
-
-    complete = factor_cost_coverage(
-        gross_annual_alpha=0.10,
-        annual_half_turnover=2.0,
-        one_way_cost_rate=0.001,
-        annual_roll_cost=None,
-        roll_cost_by_instrument={"RB": 0.02, "CU": 0.01},
-        mean_absolute_weights={"RB": 0.60, "CU": 0.40},
-        roll_cost_source="roll_ledger_sha256:abc",
+    low_turnover = factor_cost_coverage(
+        gross_annual_alpha=0.001,
+        annual_half_turnover=0.1,
+        annual_roll_cost=0.00105,
+        annual_transaction_cost=0.0002,
+        include_roll_cost=False,
+        cost_stage="factor_validation",
         safety_margin=1.5,
     )
-    assert complete["complete"] is True
-    assert complete["estimated_weighted_roll_cost"] == pytest.approx(0.016)
-    assert complete["passes"] is True
+    high_turnover = factor_cost_coverage(
+        gross_annual_alpha=0.001,
+        annual_half_turnover=1000.0,
+        annual_roll_cost=0.00105,
+        annual_transaction_cost=0.0002,
+        include_roll_cost=False,
+        cost_stage="factor_validation",
+        safety_margin=1.5,
+    )
+
+    assert low_turnover["annual_trading_cost"] == pytest.approx(0.0002)
+    assert high_turnover["annual_trading_cost"] == pytest.approx(0.0002)
+    assert low_turnover["annual_roll_cost_charged"] == pytest.approx(0.0)
+    assert low_turnover["transaction_cost_mode"] == (
+        "fixed_annual_exposure_rate"
+    )
+    assert low_turnover["complete"] is True
+    assert low_turnover["passes"] is True
+
+    post_screen = factor_cost_coverage(
+        gross_annual_alpha=0.01,
+        annual_half_turnover=999.0,
+        annual_transaction_cost=0.0002,
+        annual_roll_cost=0.00105,
+        include_roll_cost=True,
+        safety_margin=1.5,
+    )
+    assert post_screen["annual_roll_cost_charged"] == pytest.approx(0.00105)
+    assert post_screen["total_annual_cost"] == pytest.approx(0.00125)
 
 
 def test_calendar_year_robustness_uses_natural_years_and_minimum_history():
@@ -157,6 +173,72 @@ def test_single_instrument_ts_channel_uses_unique_trading_days_and_conservative_
     assert record["p_value"] == max(
         record["hac_p_value"], record["wild_bootstrap_p_value"]
     )
+
+
+def test_frequency_sample_policy_enforces_daily_and_one_minute_boundaries():
+    from core.config import ValidationPolicyConfig
+    from research.sample_policy import assess_sample_counts, minimum_training_days
+
+    policy = ValidationPolicyConfig()
+    assert assess_sample_counts(
+        750, 250, policy=policy, frequency="daily"
+    ).sufficient
+    assert not assess_sample_counts(
+        749, 250, policy=policy, frequency="daily"
+    ).sufficient
+    assert assess_sample_counts(
+        14400, 4800, policy=policy, frequency="1min"
+    ).sufficient
+    too_short = assess_sample_counts(
+        14399, 4800, policy=policy, frequency="1min"
+    )
+    assert not too_short.sufficient
+    assert "insufficient_train_bars" in too_short.reasons
+    assert minimum_training_days(policy, "daily") == 750
+    assert minimum_training_days(policy, "1min") == 60
+    dense_but_too_short = assess_sample_counts(
+        14400, 4800, policy=policy, frequency="1min",
+        train_days=59, test_days=20,
+    )
+    assert not dense_but_too_short.sufficient
+    assert "insufficient_train_days" in dense_but_too_short.reasons
+
+
+def test_adaptivity_oos_split_marks_short_data_as_observation():
+    from core.config import ValidationPolicyConfig
+    from workflows.factor_adaptivity import _compute_oos_consistency
+
+    policy = ValidationPolicyConfig()
+    short = pd.Series(
+        np.linspace(-0.01, 0.01, 999),
+        index=pd.date_range("2020-01-01", periods=999, freq="B"),
+    )
+    result = _compute_oos_consistency(short, policy=policy, frequency="daily")
+    assert result["observation_channel"] is True
+    assert result["train_bars"] == 749
+    assert result["test_bars"] == 250
+    assert "insufficient_train_bars" in result["observation_reasons"]
+
+
+def test_intraday_single_instrument_gate_uses_frequency_specific_days(monkeypatch):
+    import workflows.factor_adaptivity as adaptivity
+    from core.config import ValidationPolicyConfig
+
+    observed = []
+
+    def fake_sector(*args, **kwargs):
+        observed.append(kwargs["single_min_trading_days"])
+        return {}
+
+    monkeypatch.setattr(adaptivity, "_compute_ic_by_sector", fake_sector)
+    index = pd.date_range("2024-01-02 09:00", periods=10, freq="min")
+    frame = pd.DataFrame({"A": np.arange(10.0)}, index=index)
+    adaptivity._analyze_factor_across_periods(
+        frame, {1: frame}, [1], {"A": "sector"},
+        validation_policy=ValidationPolicyConfig(), frequency="1min",
+    )
+
+    assert observed == [60]
 
 
 def test_taxonomy_change_requires_full_p0_replay():
@@ -270,7 +352,7 @@ def test_threshold_sensitivity_reports_factor_names_and_jaccard():
         expected_directions={},
         min_abs_ic=0.01,
         min_abs_t=2.0,
-        max_monthly_turnover=0.50,
+        monthly_turnover_reference=0.50,
         annual_direction_ratio=0.60,
         annual_effect_ratio=0.65,
         cost_safety_margin=1.5,

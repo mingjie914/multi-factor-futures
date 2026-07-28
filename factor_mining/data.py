@@ -18,6 +18,11 @@ class LocalParquetSpec:
     dominant_lag_days: int = 1
     schedule_buffer_days: int = 45
     eager_fields: bool = False
+    panel_cache_entries: int = 1
+    curve_cache_enabled: bool = False
+    curve_cache_path: Path | None = None
+    selected_cache_enabled: bool = False
+    selected_cache_path: Path | None = None
 
 
 class LocalParquetData:
@@ -35,9 +40,14 @@ class LocalParquetData:
             "dominant_lag_days": int(spec.dominant_lag_days),
             "schedule_buffer_days": int(spec.schedule_buffer_days),
             "eager_fields": bool(spec.eager_fields),
-            "panel_cache_entries": 1,
-            "curve_cache_enabled": False,
+            "panel_cache_entries": int(spec.panel_cache_entries),
+            "curve_cache_enabled": bool(spec.curve_cache_enabled),
+            "selected_cache_enabled": bool(spec.selected_cache_enabled),
         }
+        if spec.curve_cache_path is not None:
+            config["curve_cache_path"] = str(spec.curve_cache_path)
+        if spec.selected_cache_path is not None:
+            config["selected_cache_path"] = str(spec.selected_cache_path)
         # mysql_config=None is the local-only boundary.
         self._source = ParquetFuturesSource(parquet_config=config, mysql_config=None)
 

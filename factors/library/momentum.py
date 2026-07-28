@@ -21,7 +21,7 @@ class Momentum20D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return close.shift(1).pct_change(20)
+        return close.shift(1).pct_change(20, fill_method=None)
 
 
 @register_factor("momentum_60d_skip5", category="momentum")
@@ -38,4 +38,4 @@ class Momentum60D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return close.shift(5).pct_change(60)
+        return close.shift(5).pct_change(60, fill_method=None)

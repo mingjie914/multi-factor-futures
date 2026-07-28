@@ -33,6 +33,12 @@ from data.manager import DataManager
 from factors.engine import FactorEngine
 from factors.processor import FactorProcessor, build_processing_context
 from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics
+from backtest.research_ledger import (
+    ResearchReturnLedger,
+    align_transition_weights,
+    close_marked_step,
+    default_research_ledger_metadata,
+)
 from core.logger import get_logger
 
 logger = get_logger("multi_factor")
@@ -51,6 +57,7 @@ class BacktestResult:
         split_metrics: Dict[str, Dict[str, float]] = None,
         failure_ledger: List[dict] = None,
         costs: pd.Series = None,
+        research_ledger: ResearchReturnLedger = None,
     ):
         self.nav = nav
         self.weights_history = weights_history
@@ -62,6 +69,7 @@ class BacktestResult:
         self.split_metrics = split_metrics if split_metrics is not None else {}
         self.failure_ledger = failure_ledger if failure_ledger is not None else []
         self.costs = costs if costs is not None else pd.Series(dtype=float)
+        self.research_ledger = research_ledger
 
     def summary(self) -> str:
         m = self.metrics
@@ -115,6 +123,8 @@ class BacktestResult:
             self.weights_history.to_csv(root / "weights.csv")
         if not self.positions_history.empty:
             self.positions_history.to_csv(root / "positions.csv")
+        if self.research_ledger is not None:
+            self.research_ledger.save(root)
         (root / "failures.json").write_text(
             json.dumps(
                 self.failure_ledger,
@@ -188,7 +198,7 @@ class BacktestResult:
             axes[1].grid(True, alpha=0.3)
         else:
             # 如果没有权重数据, 画累计收益率
-            returns = nav_clean.pct_change().fillna(0)
+            returns = nav_clean.pct_change(fill_method=None).fillna(0)
             cum_ret = (1 + returns).cumprod() - 1
             axes[1].plot(cum_ret.index, cum_ret.values * 100,
                          color="#34a853", linewidth=1.5)
@@ -297,7 +307,7 @@ class MultiPortfolioResult:
             combined_nav = combined_nav.loc[first_valid:]
 
         # 计算组合收益系列
-        combined_returns = combined_nav.pct_change().dropna()
+        combined_returns = combined_nav.pct_change(fill_method=None).dropna()
 
         # 计算叠加后组合的绩效指标
         combined_metrics = compute_all_metrics(combined_nav, returns=combined_returns)
@@ -314,7 +324,7 @@ class MultiPortfolioResult:
         # 样本分段诊断 (固定权重叠加, 非独立OOS)
         from backtest.metrics import compute_split_metrics
         combined_split = compute_split_metrics(
-            combined_nav, combined_returns, train_ratio=0.6
+            combined_nav, combined_returns, train_ratio=0.75
         )
 
         combined_result = BacktestResult(
@@ -370,7 +380,7 @@ class MultiPortfolioResult:
             })
 
         # 叠加后的组合指标
-        combined_returns = combined_nav.pct_change().dropna()
+        combined_returns = combined_nav.pct_change(fill_method=None).dropna()
         combined_metrics = compute_all_metrics(combined_nav, returns=combined_returns)
 
         # 子组合内部换手与叠加后真实底层换手分别报告。后者来自聚合目标
@@ -404,7 +414,7 @@ class MultiPortfolioResult:
         # 样本分段诊断 (叠加组合, 非独立OOS)
         from backtest.metrics import compute_split_metrics
         combined_split = compute_split_metrics(
-            combined_nav, combined_returns, train_ratio=0.6
+            combined_nav, combined_returns, train_ratio=0.75
         )
 
         combined_result = BacktestResult(
@@ -635,7 +645,7 @@ class Backtester:
         self.rebalance_freq = rebalance_freq
         self.cost_model = cost_model
         self.market = market_name
-        self.training_window = 504
+        self.training_window = 750
         self.retrain_freq = 10
         self.holding_period = 5
         # 事件驱动调仓参数 (回撤触发额外调仓)
@@ -838,7 +848,7 @@ class Backtester:
         # 预计算日度收益 (用于日度NAV累积, 解决样本点不足和收益重叠问题)
         close = data_manager.get("close", all_dates, universe_static)
         if not close.empty:
-            daily_returns = close.pct_change()
+            daily_returns = close.pct_change(fill_method=None)
         else:
             daily_returns = pd.DataFrame(
                 0.0, index=all_dates, columns=universe_static
@@ -913,7 +923,11 @@ class Backtester:
         # 滚动窗口 = 最近 training_window 个交易日
         start_idx = max(0, train_cutoff_idx + 1 - self.training_window)
         end_idx = train_cutoff_idx + 1
-        if end_idx <= 30:
+        if end_idx - start_idx < self.training_window:
+            log.info(
+                "alpha remains observation-only @ %s: %s/%s training bars",
+                pd.Timestamp(date).date(), end_idx - start_idx, self.training_window,
+            )
             return None, last_fit_idx
 
         # 滚动窗口切片 (iloc为O(1)视图)
@@ -1302,10 +1316,20 @@ class Backtester:
         # 预分配 numpy 数组 (日度频率)
         nav_arr = np.full(n_bt, np.nan, dtype=np.float64)
         returns_arr = np.full(n_bt, np.nan, dtype=np.float64)
+        gross_returns_arr = np.full(n_bt, 0.0, dtype=np.float64)
         turnover_arr = np.full(n_bt, 0.0, dtype=np.float64)
         cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         trade_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         holding_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
+        asset_returns_arr = np.zeros(
+            (n_bt, len(universe_static)), dtype=np.float64
+        )
+        effective_weights_arr = np.zeros(
+            (n_bt, len(universe_static)), dtype=np.float64
+        )
+        contributions_arr = np.zeros(
+            (n_bt, len(universe_static)), dtype=np.float64
+        )
         if n_bt > 0:
             nav_arr[0] = self.initial_nav
 
@@ -1398,29 +1422,6 @@ class Backtester:
                         current_drawdown=current_drawdown,
                     )
 
-                    # 换手率
-                    if not current_weights.empty:
-                        turnover = float(
-                            (target_w.reindex(current_weights.index).fillna(0.0)
-                             - current_weights).abs().sum()
-                        )
-                    else:
-                        turnover = float(target_w.abs().sum())
-                    turnover_arr[i] = turnover
-
-                    # CR-007修复: 交易成本计算改为"权重变化绑定"
-                    # - 不再依赖调仓日类型 (rebalance_set), 而是只要 target_w 与
-                    #   current_weights 不相等就计算成本 (覆盖正式调仓 + 事件调仓)
-                    # - 成本在 pending_weights 生效的次日扣除 (见下方 pending_cost 逻辑)
-                    if self.cost_model is not None:
-                        try:
-                            prev = current_weights if not current_weights.empty else pd.Series(dtype=float)
-                            # CR-007: 权重变化非零时才计算成本
-                            if not prev.equals(target_w):
-                                cost_today = float(self.cost_model.estimate_cost(target_w, prev, date))
-                        except Exception as e:
-                            log.warning(f"成本模型估计失败: {type(e).__name__}: {e}")
-
                     # 暂存新权重, 当日收益仍用旧权重
                     pending_weights = target_w
 
@@ -1437,22 +1438,21 @@ class Backtester:
                         signal_list.append(signals)
 
             # --- 每日: 计算组合日收益 (用当日生效的权重) ---
-            if not current_weights.empty and date in daily_returns.index:
-                daily_ret = daily_returns.loc[date].reindex(current_weights.index).fillna(0.0)
-                w_aligned = current_weights.reindex(current_weights.index).fillna(0.0)
-                port_ret = float((w_aligned * daily_ret).sum())
+            if date in daily_returns.index:
+                daily_ret = daily_returns.loc[date].reindex(current_weights.index)
             else:
-                port_ret = 0.0
+                daily_ret = pd.Series(
+                    np.nan, index=current_weights.index, dtype=float
+                )
+
+            effective_trade_cost = float(pending_cost)
+            pending_cost = 0.0
+
+            holding_cost = 0.0
 
             # CR-007修复: 扣除昨日暂存的交易成本 (pending_weights 生效的次日扣除)
             # 这样无论昨日是正式调仓还是事件调仓, 只要权重变化非零, 今日就扣成本.
             # 顺序: 先用当日生效权重算 port_ret, 再扣 pending_cost (来自昨日调仓决策).
-            if pending_cost > 0:
-                port_ret -= pending_cost
-                cost_arr[i] += pending_cost
-                trade_cost_arr[i] += pending_cost
-                pending_cost = 0.0  # 已扣除, 清零避免重复扣
-
             if i > 0 and self.cost_model is not None:
                 holding_estimator = getattr(
                     self.cost_model, "estimate_holding_cost", None
@@ -1463,29 +1463,66 @@ class Backtester:
                         raise RuntimeError(
                             f"invalid daily holding cost at {date}: {holding_cost}"
                         )
-                    port_ret -= holding_cost
-                    cost_arr[i] += holding_cost
-                    holding_cost_arr[i] += holding_cost
+            step = close_marked_step(
+                current_weights,
+                daily_ret,
+                trade_cost=effective_trade_cost,
+                holding_cost=holding_cost,
+            )
+            port_ret = step.net_return
+            gross_returns_arr[i] = step.gross_return
+            cost_arr[i] = step.trade_cost + step.holding_cost
+            trade_cost_arr[i] = step.trade_cost
+            holding_cost_arr[i] = step.holding_cost
+            effective_weights_arr[i, :] = (
+                step.effective_weights.reindex(universe_static).fillna(0.0)
+            )
+            asset_returns_arr[i, :] = (
+                step.asset_returns.reindex(universe_static).fillna(0.0)
+            )
+            contributions_arr[i, :] = (
+                step.contributions.reindex(universe_static).fillna(0.0)
+            )
 
-            # --- 收益计算完成后, 新权重次日生效 ---
-            if pending_weights is not None:
-                current_weights = pending_weights
+            # Rebalance from the post-mark drifted exposure. The new target is
+            # effective for the next bar. A target produced on the final bar is
+            # not treated as an executed trade because it has no holding period.
+            current_weights = step.end_weights
+            if pending_weights is not None and i < n_bt - 1:
+                transition_target, transition_current = align_transition_weights(
+                    pending_weights, step.end_weights
+                )
+                turnover_arr[i] = float(
+                    (transition_target - transition_current).abs().sum()
+                )
+                if self.cost_model is not None:
+                    try:
+                        if not transition_current.equals(transition_target):
+                            cost_today = float(
+                                self.cost_model.estimate_cost(
+                                    transition_target,
+                                    transition_current,
+                                    date,
+                                )
+                            )
+                        if not np.isfinite(cost_today) or cost_today < 0.0:
+                            raise RuntimeError(
+                                f"invalid transition cost at {date}: {cost_today}"
+                            )
+                    except Exception as e:
+                        self._record_failure(
+                            "research_cost", date, e, "abort_backtest"
+                        )
+                        raise RuntimeError(
+                            f"research transaction cost failed at {date}: {e}"
+                        ) from e
+                current_weights = transition_target
                 weights_history.append((date, current_weights))
-                # CR-007: 当日调仓产生的成本在次日 (新权重生效后) 扣除
-                if i < n_bt - 1:
-                    # 非最后一天: 成本在次日扣除 (新权重生效后)
-                    pending_cost = cost_today
-                else:
-                    # 最后一天 (evaluation_end): 次日不在 bt_dates 中 (CR-005 裁剪),
-                    # 在当天扣除成本, 避免成本丢失
-                    if cost_today > 0:
-                        port_ret -= cost_today
-                        cost_arr[i] += cost_today
-                        trade_cost_arr[i] += cost_today
+                pending_cost = cost_today
 
             # 更新 NAV (日度累积)
             if i == 0:
-                nav_arr[i] = self.initial_nav
+                nav_arr[i] = self.initial_nav * (1.0 + port_ret)
             else:
                 nav_arr[i] = nav_arr[i - 1] * (1.0 + port_ret)
 
@@ -1495,16 +1532,84 @@ class Backtester:
         # 日度 NAV → periods_per_year=252 天然正确, 无需手动调整
         nav = pd.Series(nav_arr, index=bt_dates).ffill()
         returns_series = pd.Series(returns_arr, index=bt_dates)
+        gross_returns_series = pd.Series(gross_returns_arr, index=bt_dates)
         turnover_series = pd.Series(turnover_arr, index=bt_dates)
         cost_series = pd.Series(cost_arr, index=bt_dates)
+        asset_returns_frame = pd.DataFrame(
+            asset_returns_arr, index=bt_dates, columns=universe_static
+        )
+        effective_weights_frame = pd.DataFrame(
+            effective_weights_arr, index=bt_dates, columns=universe_static
+        )
+        contributions_frame = pd.DataFrame(
+            contributions_arr, index=bt_dates, columns=universe_static
+        )
 
         # CR-005修复: 防御性裁剪到评估结束日 (bt_dates 已裁剪, 这里再次确保 nav/returns/turnover
         # 不越过配置结束日 evaluation_end; weights_history 也一并裁剪)
         eval_mask = nav.index <= evaluation_end
         nav = nav.loc[eval_mask]
         returns_series = returns_series.loc[eval_mask]
+        gross_returns_series = gross_returns_series.loc[eval_mask]
         turnover_series = turnover_series.loc[eval_mask]
         cost_series = cost_series.loc[eval_mask]
+        asset_returns_frame = asset_returns_frame.loc[eval_mask]
+        effective_weights_frame = effective_weights_frame.loc[eval_mask]
+        contributions_frame = contributions_frame.loc[eval_mask]
+
+        nav_before = nav.shift(1)
+        if not nav_before.empty:
+            nav_before.iloc[0] = self.initial_nav
+        ledger_daily = pd.DataFrame(
+            {
+                "nav_before": nav_before,
+                "nav_after": nav,
+                "gross_return": gross_returns_series,
+                "trade_cost": trade_cost_arr[eval_mask],
+                "holding_cost": holding_cost_arr[eval_mask],
+                "net_return": returns_series,
+                "decision_turnover": turnover_series,
+                "gross_exposure": effective_weights_frame.abs().sum(axis=1),
+                "net_exposure": effective_weights_frame.sum(axis=1),
+                "active_instruments": effective_weights_frame.abs().gt(
+                    1e-12
+                ).sum(axis=1),
+            },
+            index=nav.index,
+        )
+        ledger_metadata = default_research_ledger_metadata()
+        ledger_metadata.update(
+            {
+                "cost_model": (
+                    type(self.cost_model).__name__
+                    if self.cost_model is not None
+                    else "none"
+                ),
+                "cost_stage": str(
+                    getattr(self.cost_model, "cost_stage", "unspecified")
+                ),
+                "periods_per_year": float(
+                    getattr(self.cost_model, "periods_per_year", 252.0)
+                ),
+                "annual_transaction_cost": float(
+                    getattr(self.cost_model, "annual_transaction_cost", 0.0)
+                ),
+                "annual_roll_cost": getattr(
+                    self.cost_model, "annual_roll_cost", None
+                ),
+                "transition_cost_policy": (
+                    "diagnostic_only_not_charged"
+                ),
+            }
+        )
+        research_ledger = ResearchReturnLedger(
+            daily=ledger_daily,
+            asset_returns=asset_returns_frame,
+            effective_weights=effective_weights_frame,
+            contributions=contributions_frame,
+            metadata=ledger_metadata,
+        )
+        research_ledger.validate()
 
         # 日度频率 periods_per_year=252 (默认值, 无需覆盖)
         metrics = compute_all_metrics(nav, returns=returns_series)
@@ -1519,7 +1624,7 @@ class Backtester:
 
         # 样本分段诊断: 前60% / 后40%。不宣称独立样本外验证。
         from backtest.metrics import compute_split_metrics
-        split_metrics = compute_split_metrics(nav, returns_series, train_ratio=0.6)
+        split_metrics = compute_split_metrics(nav, returns_series, train_ratio=0.75)
 
         # 权重历史: 仅调仓日记录 (CR-005: 裁剪到评估结束日, 不超过配置结束日)
         if weights_history:
@@ -1544,6 +1649,7 @@ class Backtester:
             metrics=metrics,
             turnover=turnover_series,
             costs=cost_series,
+            research_ledger=research_ledger,
             split_metrics=split_metrics,
             failure_ledger=list(self._failure_ledger),
         )

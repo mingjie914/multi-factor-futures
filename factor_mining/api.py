@@ -25,7 +25,11 @@ class RunMode(str, Enum):
 
 @dataclass(frozen=True)
 class TargetSpec:
-    """Availability-aware return label in bars at ``decision_frequency``."""
+    """Availability-aware return label in bars at ``decision_frequency``.
+
+    ``cost_bps`` is the fixed annual validation cost in basis points.  It is
+    deliberately not a per-trade or turnover-based charge.
+    """
 
     name: str
     decision_frequency: str = "1min"
@@ -33,7 +37,7 @@ class TargetSpec:
     entry_delay_bars: int = 1
     entry_price: str = "close"
     session_policy: str = "allow_cross_session"
-    cost_bps: float = 0.0
+    cost_bps: float = 2.0
 
     def __post_init__(self) -> None:
         if not self.name:

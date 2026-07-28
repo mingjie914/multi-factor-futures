@@ -114,7 +114,7 @@ class OIChangeRate5D(Factor):
         # 前置 5 日无历史数据, 返回 NaN
         # 除零保护: oi_{t-5}=0 时产生 inf/-inf, 替换为 NaN
         with np.errstate(divide="ignore", invalid="ignore"):
-            change_rate = oi.pct_change(self.WINDOW)
+            change_rate = oi.pct_change(self.WINDOW, fill_method=None)
         # 替换 inf 为 NaN (新合约上市首日 oi 从 0 跳到正值会产生 inf)
         change_rate = change_rate.replace([np.inf, -np.inf], np.nan)
         return change_rate

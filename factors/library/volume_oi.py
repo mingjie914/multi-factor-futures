@@ -21,7 +21,7 @@ class OIChange20D(Factor):
         oi = data.get("oi", dates, universe)
         if oi.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return oi.pct_change(20)
+        return oi.pct_change(20, fill_method=None)
 
 
 @register_factor("volume_change_20d", category="volume_oi")
@@ -38,4 +38,4 @@ class VolumeChange20D(Factor):
         vol = data.get("volume", dates, universe)
         if vol.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return vol.pct_change(20)
+        return vol.pct_change(20, fill_method=None)

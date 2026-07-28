@@ -16,9 +16,8 @@ Usage:
     # 多持有期窗口匹配筛选 (推荐): 5d因子测3/5/10周期, 10d因子测5/10/20周期, 20d因子测10/20/40周期
     python main.py research --all --multi-period
 
-    # 显式指定持有期列表: 所有因子在相同的持有期集合上测试 (周期数语义, 非天数)
-    # 适用场景: "因子应在所有持有期上测试, 找到最优持有期"
-    python main.py research --all --multi-period --periods 1,5,10,20,40
+    # 显式周期仅用于契约完全相同的冻结因子批次（例如同一 GP horizon）
+    python main.py research --factors mined_gp_h4_a,mined_gp_h4_b --multi-period --periods 4
 
     # 指定周期单位；非日频使用真实 bar 索引
     python main.py research --all --multi-period --frequency daily
@@ -59,7 +58,6 @@ from core.period import (
     PeriodContext,
     parse_slug_window,
     parse_holding_periods,
-    holding_periods_for_window,
 )
 
 
@@ -115,7 +113,7 @@ def _joint_ic_ols_statistics(
         return {
             "ic": 0.0, "ic_hac_t": 0.0, "ir_nw": 0.0,
             "ic_pos_ratio": 0.0, "ic_n": 0, "ols_beta": 0.0,
-            "ols_hac_t": 0.0, "ols_n": 0,
+            "ols_hac_t": 0.0, "ols_n": 0, "ols_days": 0,
         }
 
     x = factor.loc[common_dates, common_cols].to_numpy(
@@ -150,7 +148,9 @@ def _joint_ic_ols_statistics(
         out=np.full(len(common_dates), np.nan, dtype=float),
         where=ic_usable,
     )[ic_usable]
-    ic_series = pd.Series(ic_values, dtype=float)
+    ic_series = pd.Series(
+        ic_values, index=pd.DatetimeIndex(common_dates)[ic_usable], dtype=float
+    )
     ir_nw, ic_hac_t = _newey_west_ir(ic_series, forward_period)
 
     ols_usable = (
@@ -165,7 +165,9 @@ def _joint_ic_ols_statistics(
         out=np.full(len(common_dates), np.nan, dtype=float),
         where=ols_usable,
     )[ols_usable]
-    slope_series = pd.Series(slope_values, dtype=float)
+    slope_series = pd.Series(
+        slope_values, index=pd.DatetimeIndex(common_dates)[ols_usable], dtype=float
+    )
     ols_hac_t = _newey_west_t_stat(slope_series, forward_period)
 
     return {
@@ -181,6 +183,7 @@ def _joint_ic_ols_statistics(
         ),
         "ols_hac_t": float(ols_hac_t),
         "ols_n": int(len(slope_values)),
+        "ols_days": int(slope_series.index.normalize().nunique()),
     }
 
 
@@ -233,6 +236,8 @@ def _apply_global_bonferroni(
             "best_ic": 0.0,
             "best_ir": 0.0,
             "best_ic_pos_ratio": 0.0,
+            "best_ols_n": 0,
+            "best_ols_days": 0,
         })
         approved_rows = []
         for label, values in factor_result.get("all_periods", {}).items():
@@ -269,6 +274,8 @@ def _apply_global_bonferroni(
                 "best_ic_pos_ratio": float(
                     best_values.get("ic_pos_ratio", 0.0)
                 ),
+                "best_ols_n": int(best_values.get("ols_n", 0)),
+                "best_ols_days": int(best_values.get("ols_days", 0)),
             })
         factor_result["bonferroni_significant"] = bool(approved_rows)
 
@@ -304,6 +311,8 @@ def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
             "best_ic": 0.0,
             "best_ir": 0.0,
             "best_ic_pos_ratio": 0.0,
+            "best_ols_n": 0,
+            "best_ols_days": 0,
         })
         entries = entries_by_factor[str(result["name"])]
         approved = [
@@ -342,6 +351,8 @@ def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
             "best_ic": float(best.get("ic", 0.0)),
             "best_ir": float(best.get("ir_nw", 0.0)),
             "best_ic_pos_ratio": float(best.get("ic_pos_ratio", 0.0)),
+            "best_ols_n": int(best.get("ols_n", 0)),
+            "best_ols_days": int(best.get("ols_days", 0)),
         })
     return audit
 
@@ -417,7 +428,7 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
         post_available = [
             result
             for result in economically_qualified
-            if "passes_turnover" in result
+            if "turnover_below_reference" in result
         ]
         scenarios[label] = {
             "threshold_multiplier": multiplier,
@@ -431,9 +442,9 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
                 str(result["name"]) for result in economically_qualified
             ),
             "post_metrics_available": len(post_available),
-            "passing_scaled_turnover": sum(
+            "below_scaled_turnover_reference": sum(
                 float(result.get("monthly_turnover", float("inf")))
-                < float(policy.max_monthly_turnover) * multiplier
+                < float(policy.monthly_turnover_reference) * multiplier
                 for result in post_available
             ),
             "passing_scaled_annual_ratios": sum(
@@ -575,15 +586,6 @@ def _load_adaptivity_data(csv_path: str | None = None) -> dict:
             continue
         result[name] = row.to_dict()
     return result
-
-
-def _periods_for_window(window: str) -> list:
-    """窗口对应的持有期列表 (窗口匹配方案).
-
-    委托给 core.period.holding_periods_for_window, 保持向后兼容.
-    持有期为"周期数"语义 (非天数).
-    """
-    return holding_periods_for_window(window)
 
 
 def _run_single_research(runner, factor_names, config_path):
@@ -729,8 +731,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
          - 20d 因子 → 测 10/20/40 周期持有期
          - 其他因子 → 测 1/5/10/20 周期持有期
       2. 显式持有期模式 (periods_override=[1,5,10,20,40]):
-         - 所有因子在相同的持有期集合上测试
-         - 适用场景: "因子应在所有持有期上测试, 找到最优持有期"
+         - 仅允许因子注册契约与显式集合完全一致的同质批次
+         - 不允许用该参数扩大或缩小冻结的因子内假设家族
 
     因子计算从 factor_start 开始 (含1年预热), IC 检验从 ic_start 开始.
     使用 Newey-West HAC 调整 t 统计量.
@@ -744,6 +746,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor
     from data.manager import DataManager, FrequencyDataProvider
+    from core.factor_contract import validate_factor_contract
+    from core.registry import get as registry_get
     from factors.engine import FactorEngine
     from factors.processor import build_processing_context
     from research.governance import factor_family
@@ -752,8 +756,46 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from scipy import stats as _scipy_stats
 
     policy = runner.config.validation_policy
+    from factor_mining.bridge import registered_expected_directions
+
+    mined_directions = registered_expected_directions(tuple(all_factors))
+    if mined_directions:
+        effective_directions = dict(policy.expected_directions or {})
+        conflicts = {
+            name: (effective_directions[name], direction)
+            for name, direction in mined_directions.items()
+            if name in effective_directions
+            and int(effective_directions[name]) != int(direction)
+        }
+        if conflicts:
+            raise ValueError(
+                "mined snapshot expected directions conflict with validation policy: "
+                f"{conflicts}"
+            )
+        effective_directions.update(mined_directions)
+        policy.expected_directions = effective_directions
     validate_policy(policy)
     policy_hash = validation_policy_sha256(policy)
+    minimum_test_bars = int(
+        dict(policy.minimum_test_bars_by_frequency)[
+            PeriodContext.from_string(frequency).unit.value
+        ]
+    )
+    minimum_train_bars = int(
+        dict(policy.minimum_train_bars_by_frequency)[
+            PeriodContext.from_string(frequency).unit.value
+        ]
+    )
+    minimum_test_days = int(
+        dict(policy.minimum_test_days_by_frequency)[
+            PeriodContext.from_string(frequency).unit.value
+        ]
+    )
+    minimum_train_days = int(
+        dict(policy.minimum_train_days_by_frequency)[
+            PeriodContext.from_string(frequency).unit.value
+        ]
+    )
     explicit_family_map = dict(
         getattr(runner.config.factor_governance, "explicit_family_map", {}) or {}
     )
@@ -763,6 +805,38 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         return factor_family(name, explicit_family_map)
     # 构造周期上下文；分钟数据加载后会用实际 bar 数校准年化因子。
     period_ctx = PeriodContext.from_string(frequency)
+
+    # Freeze the exact factor-frequency-horizon contract before any data read.
+    # Formal research must never broaden a factor's hypothesis family through
+    # a CLI or family override that disagrees with its registered contract.
+    factor_horizons: dict[str, tuple[int, ...]] = {}
+    factor_training_bars: dict[str, int] = {}
+    factor_training_days: dict[str, int] = {}
+    factor_requires_training_contract: dict[str, bool] = {}
+    for factor_name in all_factors:
+        factor = registry_get("factor", factor_name)()
+        requested = (
+            tuple(periods_override)
+            if periods_override is not None
+            else tuple(
+                (policy.family_horizons or {}).get(_factor_family(factor_name))
+                or getattr(factor, "validation_horizons", ())
+            )
+        )
+        factor_horizons[factor_name] = validate_factor_contract(
+            factor,
+            provider_frequency=period_ctx.unit.value,
+            requested_horizons=requested,
+        )
+        factor_training_bars[factor_name] = int(
+            getattr(factor, "training_bars", 0) or 0
+        )
+        factor_training_days[factor_name] = int(
+            getattr(factor, "training_days", 0) or 0
+        )
+        factor_requires_training_contract[factor_name] = bool(
+            getattr(factor, "requires_training_sample_contract", False)
+        )
 
     print("=" * 60)
     print(f"因子多持有期窗口匹配筛选 ({len(all_factors)} 个)")
@@ -779,7 +853,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
     # 持有期选取模式
     if periods_override is not None:
-        print(f"  持有期模式: 显式列表 {periods_override} (所有因子测试相同持有期)")
+        print(
+            f"  持有期模式: 冻结显式列表 {periods_override} "
+            "(必须与每个因子契约完全一致)"
+        )
     else:
         print(f"  持有期模式: 窗口匹配 (5d→[3,5,10], 10d→[5,10,20], 20d→[10,20,40])")
 
@@ -805,6 +882,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     print()
 
     base_data_mgr = runner.data_manager
+    if getattr(base_data_mgr.source, "formal_research_safe", True) is False:
+        raise RuntimeError(
+            f"data source {base_data_mgr.source.__class__.__name__} does not provide "
+            "an auditable continuous-contract roll ledger and is not allowed in "
+            "formal research"
+        )
     universe = pd.Index(runner.config.universe) if runner.config.universe else pd.Index([])
 
     if period_ctx.is_daily:
@@ -895,18 +978,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     )
     fwd_returns_by_period: dict[int, pd.DataFrame] = {}
     # 持有期集合: 显式模式 → periods_override; 窗口匹配模式 → 各窗口并集
-    family_horizons = dict(policy.family_horizons or {})
-    if periods_override is not None:
-        all_periods = sorted(set(periods_override))
-    else:
-        all_periods = sorted({
-            period
-            for factor_name in all_factors
-            for period in (
-                family_horizons.get(_factor_family(factor_name))
-                or _periods_for_window(_infer_window(factor_name))
-            )
-        })
+    all_periods = sorted({
+        period
+        for factor_name in all_factors
+        for period in factor_horizons[factor_name]
+    })
     for p in all_periods:
         forward_returns = data_mgr.get_forward_returns(
             calendar, universe, period=p
@@ -966,11 +1042,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             if fname not in factor_batch:
                 return None
             window = _infer_window(fname)
-            periods = (
-                list(periods_override)
-                if periods_override is not None
-                else list(family_horizons.get(_factor_family(fname)) or _periods_for_window(window))
-            )
+            periods = list(factor_horizons[fname])
             all_period_results = {}
             variants = {"neutralized": factor_batch[fname]}
             if fname in raw_variant_batch:
@@ -998,6 +1070,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         )
                         ols_beta = stats["ols_beta"]
                         ols_n = stats["ols_n"]
+                        ols_days = stats["ols_days"]
                         ic_n = stats["ic_n"]
                     except Exception:
                         t_stat = 0.0
@@ -1008,6 +1081,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         ols_p = 1.0
                         ols_beta = 0.0
                         ols_n = 0
+                        ols_days = 0
                         ic_n = 0
 
                     label = f"{variant}_period_{p}"
@@ -1021,6 +1095,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         "ols_hac_t": float(ols_t),
                         "ols_p_value": float(ols_p),
                         "ols_n": int(ols_n),
+                        "ols_days": int(ols_days),
                         "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
                         "ir_nw": float(ir_nw),
                         "ic_pos_ratio": float(ic_pos_ratio),
@@ -1039,6 +1114,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 "best_ic_pos_ratio": 0.0,
                 "all_periods": all_period_results,
                 "n_periods_tested": len(periods),
+                "training_bars": factor_training_bars[fname],
+                "training_days": factor_training_days[fname],
+                "requires_training_sample_contract": (
+                    factor_requires_training_contract[fname]
+                ),
                 "adaptivity_best_sector": _safe_str(adaptivity_data.get(fname, {}).get("best_sector", "")),
                 "adaptivity_valid_sectors": _safe_str(adaptivity_data.get(fname, {}).get("valid_sectors", "")),
                 "adaptivity_n_valid_sectors": _safe_int(adaptivity_data.get(fname, {}).get("n_valid_sectors", 0)),
@@ -1197,14 +1277,17 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
         layered_test = LayeredBacktest(n_groups=policy.n_return_groups)
         turnover_test = TurnoverTest(
-            monthly_threshold=policy.max_monthly_turnover
+            monthly_threshold=policy.monthly_turnover_reference
         )
         scorecard = policy.scorecard
         robustness_test = CalendarYearRobustnessTest(
             min_ic_abs=policy.min_abs_ic,
             direction_ratio=policy.annual_direction_ratio,
             effect_ratio=policy.annual_effect_ratio,
-            minimum_years=policy.minimum_calendar_years,
+            minimum_years=(
+                policy.minimum_calendar_years if period_ctx.is_daily
+                else policy.intraday_minimum_calendar_years
+            ),
             minimum_days_per_year=policy.minimum_year_observations,
             bootstrap_samples=policy.single_instrument_bootstrap_samples,
             scorecard_weights=dict(scorecard.weights),
@@ -1290,13 +1373,13 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 r["turnover_definition"] = (
                     "half_turnover_0.5_sum_abs_delta_weight"
                 )
-                r["passes_turnover"] = bool(
+                r["turnover_below_reference"] = bool(
                     turnover_res.monthly_turnover
-                    < policy.max_monthly_turnover
+                    < policy.monthly_turnover_reference
                 )
             except Exception as exc:
                 r["monthly_turnover"] = 0.0
-                r["passes_turnover"] = False
+                r["turnover_below_reference"] = False
                 failures.append({
                     "stage": "turnover",
                     "error_type": type(exc).__name__,
@@ -1324,32 +1407,72 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                     "message": str(exc),
                 })
 
-            one_way_cost = float(
-                getattr(runner.cost_model, "commission_rate", 0.0)
-                + getattr(runner.cost_model, "slippage", 0.0)
-            )
             cost_coverage = factor_cost_coverage(
                 gross_annual_alpha=float(r.get("layered_ls_return", 0.0))
                 * (1.0 if r["best_ic"] >= 0.0 else -1.0),
                 annual_half_turnover=float(r.get("annual_half_turnover", 0.0)),
-                one_way_cost_rate=one_way_cost,
                 annual_roll_cost=getattr(
                     runner.cost_model, "annual_roll_cost", None
                 ),
-                roll_cost_by_instrument=getattr(
-                    runner.cost_model, "roll_cost_by_instrument", None
-                ),
-                mean_absolute_weights=r.get("mean_absolute_weights", {}),
                 annual_fee=float(
                     getattr(runner.cost_model, "annual_fee", 0.0)
                 ),
                 safety_margin=policy.cost_safety_margin,
-                roll_cost_source=str(
-                    getattr(runner.cost_model, "roll_cost_source", "")
+                annual_transaction_cost=float(
+                    getattr(
+                        runner.cost_model,
+                        "annual_transaction_cost",
+                        0.0002,
+                    )
                 ),
+                include_roll_cost=False,
+                cost_stage="factor_validation",
             )
             r["cost_coverage"] = cost_coverage
             observation_reasons = []
+            r["sample_test_bars"] = int(r.get("best_ols_n", 0))
+            r["minimum_test_bars"] = minimum_test_bars
+            r["sample_test_days"] = int(r.get("best_ols_days", 0))
+            r["minimum_test_days"] = minimum_test_days
+            r["sample_sufficient"] = bool(
+                r["sample_test_bars"] >= minimum_test_bars
+                and r["sample_test_days"] >= minimum_test_days
+            )
+            if not r["sample_sufficient"]:
+                if r["sample_test_bars"] < minimum_test_bars:
+                    observation_reasons.append("insufficient_test_bars")
+                if r["sample_test_days"] < minimum_test_days:
+                    observation_reasons.append("insufficient_test_days")
+            r["minimum_train_bars"] = minimum_train_bars
+            r["minimum_train_days"] = minimum_train_days
+            if (
+                r.get("requires_training_sample_contract", False)
+                and (
+                    int(r.get("training_bars", 0)) <= 0
+                    or int(r.get("training_days", 0)) <= 0
+                )
+            ):
+                r["sample_sufficient"] = False
+                observation_reasons.append("missing_frozen_training_sample")
+            elif int(r.get("training_bars", 0)) > 0:
+                if int(r["training_bars"]) < minimum_train_bars:
+                    r["sample_sufficient"] = False
+                    observation_reasons.append("insufficient_train_bars")
+                if int(r.get("training_days", 0)) < minimum_train_days:
+                    r["sample_sufficient"] = False
+                    observation_reasons.append("insufficient_train_days")
+                ratio = int(r["training_bars"]) / max(r["sample_test_bars"], 1)
+                day_ratio = int(r["training_days"]) / max(r["sample_test_days"], 1)
+                r["train_test_ratio"] = float(ratio)
+                r["train_test_day_ratio"] = float(day_ratio)
+                if ratio < float(policy.minimum_train_test_ratio):
+                    r["sample_sufficient"] = False
+                    observation_reasons.append("insufficient_train_test_ratio")
+                if day_ratio < float(policy.minimum_train_test_ratio):
+                    r["sample_sufficient"] = False
+                    observation_reasons.append(
+                        "insufficient_train_test_day_ratio"
+                    )
             if r.get("observation_channel", False):
                 observation_reasons.append("fewer_than_minimum_calendar_years")
             if not cost_coverage["complete"]:
@@ -1403,22 +1526,32 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         # Training candidates may proceed through the observation channel.
         # Monotonicity is diagnostic; three-group spread and complete costs
         # carry the economic meaning.
-        final_factors = [
+        economically_eligible = [
             r for r in significant
-            if r.get("passes_turnover", False)
-            and r.get("passes_robustness", False)
+            if r.get("passes_robustness", False)
             and (
                 not r.get("cost_coverage", {}).get("complete", False)
                 or r.get("cost_coverage", {}).get("passes", False)
             )
         ]
-        rejected_final = [r for r in significant if r not in final_factors]
+        # Insufficient samples remain visible as observations but cannot enter
+        # the walk-forward capital path.
+        final_factors = [
+            r for r in economically_eligible
+            if r.get("sample_sufficient", False)
+        ]
+        sample_observations = [
+            r for r in economically_eligible
+            if not r.get("sample_sufficient", False)
+        ]
+        rejected_final = [r for r in significant if r not in economically_eligible]
         observations = [
-            r for r in final_factors if r.get("observation_channel", False)
+            r for r in economically_eligible if r.get("observation_channel", False)
         ]
         print(
             f"\n进入WF候选: {len(final_factors)} 个 "
-            f"(其中观察期 {len(observations)} 个，硬门槛淘汰 "
+            f"(样本不足观察 {len(sample_observations)} 个，全部观察标记 "
+            f"{len(observations)} 个，硬门槛淘汰 "
             f"{len(rejected_final)} 个)"
         )
 
@@ -1435,9 +1568,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         ),
         "factors_with_local_fdr_discovery": len(t_significant),
         "factors_passing_ic_t_direction": len(significant),
-        "factors_passing_turnover": sum(
-            bool(row.get("passes_turnover", False)) for row in significant
+        "factors_below_turnover_reference": sum(
+            bool(row.get("turnover_below_reference", False))
+            for row in significant
         ),
+        "turnover_policy": "diagnostic_only_not_an_admission_gate",
         "factors_with_complete_cost_coverage": sum(
             bool(row.get("cost_coverage", {}).get("passes", False))
             for row in significant
@@ -1706,8 +1841,7 @@ def main():
     parser.add_argument(
         "--periods", default=None,
         help="显式指定持有期列表 (逗号分隔, 周期数语义), 如 '1,5,10,20,40'. "
-             "指定后所有因子在相同持有期集合上测试, 覆盖窗口匹配模式. "
-             "适用场景: 因子应在所有持有期上测试, 找到最优持有期. "
+             "仅用于注册 horizon 契约完全相同的冻结因子批次；与任一因子契约不一致即拒绝. "
              "需配合 --multi-period 使用")
     parser.add_argument(
         "--frequency", default="daily",

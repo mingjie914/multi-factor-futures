@@ -67,8 +67,13 @@ class DefensiveTrendRiskParity:
         clean = clean.dropna(axis=1, how="all")
         if len(clean) < max(self.lookbacks) + 2 or clean.shape[1] == 0:
             raise ValueError("insufficient price history for defensive sleeve")
-        returns = clean.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        trend_models = [clean.pct_change(period) for period in self.lookbacks]
+        returns = clean.pct_change(fill_method=None).replace(
+            [np.inf, -np.inf], np.nan
+        ).fillna(0.0)
+        trend_models = [
+            clean.pct_change(period, fill_method=None)
+            for period in self.lookbacks
+        ]
 
         dates = pd.DatetimeIndex(clean.index)
         assets = pd.Index(clean.columns.astype(str))
@@ -160,7 +165,7 @@ class DefensiveTrendRiskParity:
             metrics=metrics,
             turnover=turnover,
             costs=costs,
-            split_metrics=compute_split_metrics(nav, result_returns, train_ratio=0.6),
+            split_metrics=compute_split_metrics(nav, result_returns, train_ratio=0.75),
             failure_ledger=failures,
         )
 

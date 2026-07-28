@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from core.period import PeriodContext, PeriodUnit
 from data.manager import DataManager, FrequencyDataProvider
+from factors.engine import FactorEngine
 
 
 class IntradaySource:
@@ -50,6 +52,45 @@ def test_forward_returns_shift_each_instruments_own_valid_bars():
     assert np.isclose(forward.loc[dates[0], "B"], 0.01)
     assert np.isclose(forward.loc[dates[2], "B"], 204.0 / 202.0 - 1.0)
     assert pd.isna(forward.loc[dates[1], "B"])
+
+
+def test_daily_and_intraday_forward_returns_share_valid_bar_semantics():
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    close = pd.DataFrame({"A": [100.0, np.nan, 102.0, 103.0, 104.0]}, index=dates)
+
+    class DailySource:
+        def fetch_price(self, tickers, start, end, fields):
+            return {"close": close.reindex(columns=tickers)}
+
+    manager = DataManager(DailySource(), config={"cache": {"enabled": False}})
+    forward = manager.get_forward_returns(dates, pd.Index(["A"]), 1)
+
+    assert forward.loc[dates[0], "A"] == (102.0 / 100.0 - 1.0)
+    assert pd.isna(forward.loc[dates[1], "A"])
+
+
+def test_factor_engine_rejects_factor_data_frequency_mismatch():
+    dates = pd.date_range("2024-01-02 09:00", periods=3, freq="5min")
+    close = pd.DataFrame({"A": [1.0, 2.0, 3.0]}, index=dates)
+    manager = DataManager(
+        IntradaySource({"close": close}), config={"cache": {"enabled": False}}
+    )
+    provider = FrequencyDataProvider(
+        manager, "5min", dates.min(), dates.max(), pd.Index(["A"])
+    )
+
+    class DailyFactor:
+        name = "daily_only"
+        frequency = "daily"
+
+        def dependencies(self):
+            return ["close"]
+
+        def compute(self, data, requested_dates, universe):
+            return data.get("close", requested_dates, universe)
+
+    with pytest.raises(ValueError, match="frequency.*incompatible"):
+        FactorEngine(provider).compute_factor(DailyFactor(), dates, pd.Index(["A"]))
 
 
 def test_prefetch_batches_frequency_dependencies():

@@ -82,7 +82,7 @@ from testing.regression import _newey_west_t_stat
 DEFAULT_PERIODS = [1, 3, 5, 10, 20, 40]
 
 # 样本外验证分割比例 (前60%训练, 后40%测试)
-OOS_SPLIT_RATIO = 0.6
+OOS_SPLIT_RATIO = 0.75
 
 # 板块IC有效性门槛
 SECTOR_IC_THRESHOLD = 0.01       # 全市场统一经济量级底线
@@ -685,19 +685,45 @@ def _compute_pooled_ts_fixed_effects_arrays(
     }
 
 
-def _compute_oos_consistency(ic_series: pd.Series, oos_ratio: float = OOS_SPLIT_RATIO) -> dict:
-    """样本外一致性验证: 前oos_ratio找IC方向, 后段验证方向一致性.
+def _compute_oos_consistency(
+    ic_series: pd.Series,
+    oos_ratio: float = OOS_SPLIT_RATIO,
+    *,
+    policy=None,
+    frequency: str = "daily",
+) -> dict:
+    """样本外一致性验证，执行分频率样本下限和至少 3:1 切分.
 
     Returns:
         {"oos_ic": float, "oos_hit_rate": float, "is_consistent": bool}
     """
-    if len(ic_series) < 20:
-        return {"oos_ic": 0.0, "oos_hit_rate": 0.0, "is_consistent": False}
-    split_idx = int(len(ic_series) * oos_ratio)
-    train = ic_series.iloc[:split_idx]
-    test = ic_series.iloc[split_idx:]
-    if len(train) < 10 or len(test) < 10:
-        return {"oos_ic": 0.0, "oos_hit_rate": 0.0, "is_consistent": False}
+    from core.config import ValidationPolicyConfig
+    from research.sample_policy import chronological_split
+
+    policy = policy or ValidationPolicyConfig()
+    required_fraction = float(policy.minimum_train_test_ratio) / (
+        float(policy.minimum_train_test_ratio) + 1.0
+    )
+    if abs(float(oos_ratio) - required_fraction) > 1e-12:
+        raise ValueError(
+            f"OOS split ratio {oos_ratio} violates the frozen minimum-ratio "
+            f"split {required_fraction}"
+        )
+    train, test, assessment = chronological_split(
+        ic_series, policy=policy, frequency=frequency
+    )
+    base = {
+        "sample_assessment": assessment.to_dict(),
+        "observation_channel": not assessment.sufficient,
+        "observation_reasons": list(assessment.reasons),
+        "train_bars": len(train),
+        "test_bars": len(test),
+    }
+    if not assessment.sufficient:
+        return {
+            "oos_ic": 0.0, "oos_hit_rate": 0.0,
+            "is_consistent": False, **base,
+        }
     train_direction = 1 if train.mean() >= 0 else -1
     oos_ic = float(test.mean())
     oos_hit_rate = float((test * train_direction > 0).mean())
@@ -709,6 +735,7 @@ def _compute_oos_consistency(ic_series: pd.Series, oos_ratio: float = OOS_SPLIT_
         "oos_ic": oos_ic,
         "oos_hit_rate": oos_hit_rate,
         "is_consistent": bool(is_consistent),
+        **base,
     }
 
 
@@ -823,8 +850,16 @@ def _analyze_factor_across_periods(
     sector_map: dict,
     single_min_trading_days: int = 750,
     single_bootstrap_samples: int = 399,
+    validation_policy=None,
+    frequency: str = "daily",
 ) -> dict:
     """Evaluate one factor across horizons using read-only shared inputs."""
+    if validation_policy is not None and frequency != "daily":
+        from research.sample_policy import minimum_training_days
+
+        single_min_trading_days = minimum_training_days(
+            validation_policy, frequency
+        )
     result = {
         "best_sector": "",
         "best_period": 0,
@@ -833,6 +868,7 @@ def _analyze_factor_across_periods(
         "best_t": 0.0,
         "valid_sectors": [],
         "sectors": {},
+        "sample_sufficient": False,
     }
     best_t_abs = 0.0
     sector_results = {}
@@ -848,7 +884,10 @@ def _analyze_factor_across_periods(
             single_bootstrap_samples=single_bootstrap_samples,
         )
         for sector, values in sector_ics.items():
-            oos = _compute_oos_consistency(values["ic_series"])
+            oos = _compute_oos_consistency(
+                values["ic_series"], policy=validation_policy,
+                frequency=frequency,
+            )
             entry = {
                 "ic": values["ic_mean"],
                 "ir": values["ir"],
@@ -865,17 +904,31 @@ def _analyze_factor_across_periods(
                 "inference_model": values.get("inference_model", ""),
                 "observation_channel": bool(
                     values.get("observation_channel", False)
+                    or oos.get("observation_channel", False)
                 ),
+                "observation_reasons": sorted(set(
+                    list(oos.get("observation_reasons", []))
+                    + (["insufficient_single_instrument_history"] if values.get(
+                        "observation_channel", False
+                    ) else [])
+                )),
+                "sample_assessment": oos.get("sample_assessment", {}),
                 "sufficient_history": bool(
                     values.get("sufficient_history", True)
                 ),
                 "n_trading_days": int(values.get("n_trading_days", 0)),
                 "passes_thresholds": (
-                    _is_sector_valid(values) and oos["is_consistent"]
+                    _is_sector_valid(values)
+                    and oos["is_consistent"]
+                    and not oos.get("observation_channel", False)
                 ),
                 "is_valid": False,
             }
             sector_results.setdefault(sector, {})[str(period)] = entry
+            result["sample_sufficient"] = bool(
+                result["sample_sufficient"]
+                or not oos.get("observation_channel", False)
+            )
 
             if abs(values["t_stat"]) > best_t_abs:
                 best_t_abs = abs(values["t_stat"])
@@ -1213,6 +1266,24 @@ def run_adaptivity_analysis(
     from research.validation import validate_policy, validation_policy_sha256
 
     validate_policy(policy)
+    from core.factor_contract import validate_factor_contract
+    from core.registry import get as registry_get
+
+    factor_periods: dict[str, tuple[int, ...]] = {}
+    for factor_name in all_factors:
+        factor = registry_get("factor", factor_name)()
+        factor_periods[factor_name] = validate_factor_contract(
+            factor, provider_frequency=period_ctx.unit.value,
+            requested_horizons=getattr(factor, "validation_horizons", ()),
+        )
+    declared_periods = sorted({
+        period for values in factor_periods.values() for period in values
+    })
+    if sorted(set(map(int, periods))) != declared_periods:
+        raise ValueError(
+            f"adaptivity periods {sorted(set(map(int, periods)))} do not match "
+            f"the frozen factor-contract union {declared_periods}"
+        )
     fdr_method = fdr_method or "hierarchical"
     fdr_alpha = (
         float(policy.discovery_q) if fdr_alpha is None else float(fdr_alpha)
@@ -1342,10 +1413,12 @@ def run_adaptivity_analysis(
             factor_result = _analyze_factor_across_periods(
                 analysis_factor,
                 analysis_returns,
-                periods,
+                list(factor_periods[name]),
                 SECTOR_MAP,
                 single_min_trading_days=policy.single_instrument_min_trading_days,
                 single_bootstrap_samples=policy.single_instrument_bootstrap_samples,
+                validation_policy=policy,
+                frequency=period_ctx.unit.value,
             )
             factor_result["preprocessing_variant"] = (
                 (preprocessing_variants or {}).get(name, "neutralized")
@@ -1521,6 +1594,7 @@ def run_adaptivity_analysis(
                 "preprocessing_variant", "neutralized"
             ),
             "observation_channel": observation_channel,
+            "sample_sufficient": bool(res.get("sample_sufficient", False)),
             "weight_cap": weight_cap,
             "promotion_status": (
                 "observation" if observation_channel

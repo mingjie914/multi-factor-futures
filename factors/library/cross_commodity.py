@@ -45,7 +45,7 @@ class CrossSectionMomentum5d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        ret = close.pct_change(self.WINDOW)
+        ret = close.pct_change(self.WINDOW, fill_method=None)
         # 截面排名百分位 (每行跨所有品种)
         result = ret.rank(pct=True, axis=1) - 0.5
         return result
@@ -80,7 +80,7 @@ class SectorMomentum5d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        ret = close.pct_change(self.WINDOW)
+        ret = close.pct_change(self.WINDOW, fill_method=None)
         sectors = _get_sector_series(universe)
 
         # 计算每日每个板块的平均收益
@@ -127,7 +127,7 @@ class RelativeStrengthSector20d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        ret = close.pct_change(self.WINDOW)
+        ret = close.pct_change(self.WINDOW, fill_method=None)
         sectors = _get_sector_series(universe)
 
         result = pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -164,7 +164,7 @@ class SectorRotation5d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        ret = close.pct_change(self.WINDOW)
+        ret = close.pct_change(self.WINDOW, fill_method=None)
         sectors = _get_sector_series(universe)
 
         # 计算每日每个板块的平均收益
@@ -219,7 +219,7 @@ class CrossSectionReversal5d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        ret = close.pct_change(self.WINDOW)
+        ret = close.pct_change(self.WINDOW, fill_method=None)
         # 截面排名百分位, 取反 (反转)
         result = 0.5 - ret.rank(pct=True, axis=1)
         return result

@@ -44,13 +44,34 @@ def validate_policy(policy: Any) -> dict:
         raise ValueError("validation_policy.n_return_groups must be at least 2")
     if int(value["minimum_calendar_years"]) < 1:
         raise ValueError("minimum_calendar_years must be positive")
+    if int(value["intraday_minimum_calendar_years"]) < 1:
+        raise ValueError("intraday_minimum_calendar_years must be positive")
     if int(value["minimum_year_observations"]) < 1:
         raise ValueError("minimum_year_observations must be positive")
     if int(value["single_instrument_min_trading_days"]) < 1:
         raise ValueError("single_instrument_min_trading_days must be positive")
     if int(value["single_instrument_bootstrap_samples"]) < 1:
         raise ValueError("single_instrument_bootstrap_samples must be positive")
-    for key in ("min_abs_ic", "min_abs_t", "max_monthly_turnover", "cost_safety_margin"):
+    if float(value["minimum_train_test_ratio"]) < 3.0:
+        raise ValueError("minimum_train_test_ratio must be at least 3.0")
+    required_frequencies = {"daily", "1min", "5min", "15min", "30min", "hourly"}
+    for key in (
+        "minimum_train_bars_by_frequency", "minimum_test_bars_by_frequency",
+        "minimum_train_days_by_frequency", "minimum_test_days_by_frequency",
+    ):
+        mapping = dict(value.get(key, {}))
+        missing = sorted(required_frequencies - set(mapping))
+        if missing or any(int(item) < 1 for item in mapping.values()):
+            raise ValueError(
+                f"validation_policy.{key} must contain positive values for all "
+                f"frequencies; missing={missing}"
+            )
+    for key in (
+        "min_abs_ic",
+        "min_abs_t",
+        "monthly_turnover_reference",
+        "cost_safety_margin",
+    ):
         if float(value[key]) < 0.0:
             raise ValueError(f"validation_policy.{key} must be non-negative")
     directions = value.get("expected_directions", {})

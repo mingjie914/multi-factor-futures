@@ -401,8 +401,9 @@ class PipelineRunner:
         try:
             self.cost_model = create("cost_model", costs_cfg.type, **costs_params)
         except Exception as e:
-            logger.warning(f"成本模型创建失败: {e}", exc_info=True)
-            self.cost_model = None
+            raise RuntimeError(
+                f"成本模型创建失败，拒绝在无成本模型下继续: {e}"
+            ) from e
 
         logger.info(f"优化器: {opt_cfg.type}, {len(self.constraints)} 约束")
 
@@ -931,7 +932,7 @@ class PipelineRunner:
                 "result": result,
             })
             # 提取日收益率用于元优化器
-            sub_returns[sp_cfg.name] = result.nav.pct_change().dropna()
+            sub_returns[sp_cfg.name] = result.nav.pct_change(fill_method=None).dropna()
 
         # === 元优化器: walk-forward 动态资本权重分配 ===
         meta_cfg = self.config.meta_optimizer
@@ -1024,7 +1025,9 @@ class PipelineRunner:
             for config in sub_configs
         ]
         sub_returns = {
-            config.name: base_result.sub_results[config.name].nav.pct_change().dropna()
+            config.name: base_result.sub_results[
+                config.name
+            ].nav.pct_change(fill_method=None).dropna()
             for config in sub_configs
         }
         meta_cfg = copy.deepcopy(self.config.meta_optimizer)

@@ -16,6 +16,21 @@ from factor_mining.validation import ValidationConfig, prepare_signal
 
 
 SNAPSHOT_ENV = "MF_MINED_CANDIDATE_SNAPSHOT"
+_REGISTERED_EXPECTED_DIRECTIONS: dict[str, int] = {}
+
+
+def registered_expected_directions(
+    names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, int]:
+    """Return frozen directions for bridge outputs, which are train-oriented."""
+    if names is None:
+        return dict(_REGISTERED_EXPECTED_DIRECTIONS)
+    selected = set(map(str, names))
+    return {
+        name: direction
+        for name, direction in _REGISTERED_EXPECTED_DIRECTIONS.items()
+        if name in selected
+    }
 
 
 def _load_panels(candidate: CandidateSpec, data, dates, universe) -> dict[str, pd.DataFrame]:
@@ -61,9 +76,23 @@ def compute_symbolic_candidate(
         )
     except KeyError:
         return pd.DataFrame(np.nan, index=dates, columns=universe)
-    raw = ExpressionEvaluator(features).evaluate(expression, copy=False)
+    eligibility = getattr(data, "_factor_eligibility", None)
+    eligibility_values = None
+    if eligibility is not None:
+        eligibility_values = eligibility.reindex(
+            index=features.index,
+            columns=features.symbols,
+            fill_value=False,
+        ).fillna(False).to_numpy(dtype=bool)
+    raw = ExpressionEvaluator(
+        features, cross_section_mask=eligibility_values
+    ).evaluate(expression, copy=False)
+    if eligibility_values is not None:
+        raw = np.where(eligibility_values, raw, np.nan)
     if postprocess.get("neutralize_volatility") and volatility_name:
         volatility = features.values.get(str(volatility_name))
+        if volatility is not None and eligibility_values is not None:
+            volatility = np.where(eligibility_values, volatility, np.nan)
     validation = ValidationConfig(
         # The framework's forward return starts at the factor row.  Shift by
         # both lags so it matches PreparedTarget's delayed entry exactly.
@@ -86,6 +115,8 @@ def compute_symbolic_candidate(
         volatility=volatility,
         group_labels=group_labels,
     )
+    if eligibility_values is not None:
+        signal = np.where(eligibility_values, signal, np.nan)
     return pd.DataFrame(signal, index=features.index, columns=features.symbols).reindex(
         index=dates, columns=universe
     )
@@ -98,6 +129,13 @@ def make_factor_class(candidate: CandidateSpec):
         name = candidate.framework_name
         category = candidate.category
         frequency = candidate.frequency
+        validation_horizons = (candidate.target.horizon_bars,)
+        horizon_unit = "bars"
+        training_bars = int(candidate.metrics.get("training_bars", 0) or 0)
+        training_days = int(candidate.metrics.get("training_days", 0) or 0)
+        training_start = str(candidate.metrics.get("training_start", ""))
+        training_end = str(candidate.metrics.get("training_end", ""))
+        requires_training_sample_contract = True
         description = (
             f"Auto-mined symbolic factor {candidate.candidate_id}; "
             f"snapshot content {candidate.calculated_hash()[:12]}"
@@ -130,6 +168,9 @@ def register_snapshot(path: str | Path) -> tuple[str, ...]:
         register_user_factor(
             candidate.framework_name, category=candidate.category
         )(factor_class)
+        # compute_symbolic_candidate multiplies raw values by the training
+        # orientation, so the registered factor's frozen expected sign is +1.
+        _REGISTERED_EXPECTED_DIRECTIONS[candidate.framework_name] = 1
         names.append(candidate.framework_name)
     return tuple(names)
 

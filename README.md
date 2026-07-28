@@ -1,7 +1,7 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-07-27）仍为 `NO_TRADE`：`config/default.yaml` 没有获批因子，
+（2026-07-28）仍为 `NO_TRADE`：`config/default.yaml` 没有获批因子，
 `config/trading.yaml` 也保持关闭。挖掘结果只会进入候选池，不会自动进入组合或交易。
 
 ## 架构
@@ -21,7 +21,7 @@
   -> SHA-256 不可变 JSON 快照 -> 主框架 Factor registry
 ```
 
-审查时不加载 mined 快照的动态注册表共有 3,487 个因子。这个数字是发现范围，
+审查时不加载 mined 快照的动态注册表共有 3,475 个因子。这个数字是发现范围，
 不是已通过检验或可交易的数量。注册表由 `factors.library` 导入触发；主工作流会负责
 导入，单独使用 Python API 时应显式 `import factors.library`。
 
@@ -65,7 +65,7 @@ $PY = '.\.venv\Scripts\python.exe'
 & $PY -X utf8 -B main.py summarize --help
 & $PY -X utf8 -B main.py backtest --help
 & $PY -X utf8 -B main.py multi --help
-& $PY -X utf8 -B main.py close --as-of 2026-07-27
+& $PY -X utf8 -B main.py close --as-of YYYY-MM-DD
 ```
 
 挖掘、冻结候选、挂载快照和正式筛选的最短流程见
@@ -89,18 +89,17 @@ $PY = '.\.venv\Scripts\python.exe'
 会记录检验配置、完整假设数和逐因子结果；编写表达式、合成数据调试和单元测试不要求
 执行完整流程。
 
-GP 搜索期的 IC/IR、分层、换手和成本只是优化适应度，不是正式入围证据。SQLite 只
-管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过历史筛选，也必须继续
+GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手仅作诊断，二者都不是正式
+入围证据。SQLite 只管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过筛选，也必须继续
 经过相关性、容量、成本、风险和新 OOS 审核。
 
-历史 3,111 因子全量研究及其零 Bonferroni 通过结果仍是旧方法下的有效历史证据，但不是当前
-注册表清单。详见 [`最新因子与组合表现说明.md`](最新因子与组合表现说明.md) 顶部的
-历史快照说明和 [`多因子框架研究手册.md`](多因子框架研究手册.md)。
-
-2026-07-27 的 1 分钟 GP 候选六周期当前口径复核见
-[`docs/factor_mining_validation_20260727.md`](docs/factor_mining_validation_20260727.md)。
-当前正式门槛、观察期和主框架接入顺序以
+成本口径分两阶段：筛选期按总暴露摊销年化 0.02%；因子通过后的研究回测再加入年化
+0.105% 移仓成本。换手率和换手次数不产生费用，也不作为因子准入门槛。当前状态见
+[`最新因子与组合表现说明.md`](最新因子与组合表现说明.md)，正式门槛、观察期和接入顺序以
 [`docs/factor_validation_pipeline.md`](docs/factor_validation_pipeline.md) 的 v2 策略为准。
+
+本次政策升级前生成的本地结果和日期化报告已经清除；它们不得再作为当前结论引用。
+新的正式研究必须使用新目录重新生成完整 bundle。
 
 ## 验证与保留
 
@@ -112,7 +111,8 @@ $PY = '.\.venv\Scripts\python.exe'
 ```
 
 - 保留 `cache/` 中的本地行情缓存，除非明确执行缓存重建。
-- 保留 `runs/locked_oos/` 和 `runs/factor_research/` 中的证据及 holdout ledger。
+- 永久保留 `runs/factor_research/holdout_ledger.jsonl`，防止已消费 OOS 被重新标成未见样本。
+- `runs/` 中的普通结果可在政策失效或结论被替代后清理；重要证据应先外部只读归档。
 - `_work/`、`.pytest_cache/`、`__pycache__/` 是可再生内容，不进入版本控制。
 - 实验工作流位于 `workflows/experiments/`，不属于正式命令入口。
 

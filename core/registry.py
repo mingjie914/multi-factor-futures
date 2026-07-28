@@ -84,6 +84,9 @@ def register_factor(name: str, category: str = "custom") -> Any:
     """
 
     def decorator(cls: type) -> type:
+        from core.factor_contract import bind_factor_contract
+
+        bind_factor_contract(cls, name)
         return register("factor", name)(cls)
 
     return decorator

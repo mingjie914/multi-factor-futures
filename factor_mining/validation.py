@@ -11,10 +11,24 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from core.period import PeriodContext
 from factor_mining.api import TargetSpec
 
 
 _EPS = 1e-12
+
+
+def _fixed_annual_cost_per_target(spec: TargetSpec) -> float:
+    """Prorate the fixed annual validation cost over one target holding span."""
+    bars_per_year = PeriodContext.from_string(
+        spec.decision_frequency
+    ).bars_per_year
+    return (
+        float(spec.cost_bps)
+        / 10_000.0
+        * float(spec.horizon_bars)
+        / float(bars_per_year)
+    )
 
 
 @dataclass(frozen=True)
@@ -76,7 +90,6 @@ class ValidationConfig:
     long_short_fraction: float = 0.2
     layer_count: int = 5
     time_segments: int = 4
-    turnover_penalty: float = 0.002
     complexity_penalty: float = 0.0005
     coverage_penalty: float = 0.0
     segment_floor_weight: float = 0.0
@@ -97,7 +110,6 @@ class ValidationConfig:
         if not 0.0 <= self.economic_fitness_weight <= 1.0:
             raise ValueError("economic_fitness_weight must be in [0, 1]")
         if any(value < 0.0 for value in (
-            self.turnover_penalty,
             self.complexity_penalty,
             self.coverage_penalty,
             self.segment_floor_weight,
@@ -564,16 +576,51 @@ def evaluate_candidate(
     complexity: int = 1,
     volatility: np.ndarray | None = None,
     group_labels: Sequence[str] | None = None,
+    eligibility: np.ndarray | None = None,
+    processing_eligibility: np.ndarray | None = None,
     full_diagnostics: bool = True,
 ) -> CandidateResult:
-    if np.asarray(signal).shape != target.values.shape:
+    raw_signal = np.asarray(signal)
+    if raw_signal.shape != target.values.shape:
         raise ValueError("signal and target shapes differ")
+    eligible = None
+    processing_eligible = None
+    prepared_volatility = volatility
+    if eligibility is not None:
+        eligible = np.asarray(eligibility)
+        if eligible.shape != raw_signal.shape:
+            raise ValueError("eligibility shape differs from candidate signal")
+        if eligible.dtype != np.bool_:
+            raise TypeError("eligibility must be a boolean array")
+    if processing_eligibility is not None:
+        processing_eligible = np.asarray(processing_eligibility)
+        if processing_eligible.shape != raw_signal.shape:
+            raise ValueError(
+                "processing_eligibility shape differs from candidate signal"
+            )
+        if processing_eligible.dtype != np.bool_:
+            raise TypeError("processing_eligibility must be a boolean array")
+    elif eligible is not None:
+        processing_eligible = eligible
+    if processing_eligible is not None:
+        # Use the full computation-period universe before cross-sectional
+        # transforms.  The evaluation mask is applied separately below so
+        # warm-up observations remain available to lag/rolling operations.
+        raw_signal = np.where(processing_eligible, raw_signal, np.nan)
+        if volatility is not None:
+            prepared_volatility = np.where(
+                processing_eligible, volatility, np.nan
+            )
     prepared = prepare_signal(
-        signal,
+        raw_signal,
         config,
-        volatility=volatility,
+        volatility=prepared_volatility,
         group_labels=group_labels,
     )
+    if eligible is not None:
+        prepared = np.where(eligible, prepared, np.nan)
+    elif processing_eligible is not None:
+        prepared = np.where(processing_eligible, prepared, np.nan)
     ic, signal_rank = _rank_ic(
         prepared, target.rank_values, config.min_cross_section
     )
@@ -596,6 +643,10 @@ def evaluate_candidate(
     hit_rate = float(np.mean(np.sign(valid_ic) == direction))
     finite_target = np.isfinite(target.values)
     eligible_target = finite_target.copy()
+    if eligible is not None:
+        eligible_target &= eligible
+    elif processing_eligible is not None:
+        eligible_target &= processing_eligible
     if config.neutralize_volatility and volatility is not None:
         eligible_target &= np.isfinite(
             shift_signal(volatility, config.decision_lag_bars)
@@ -612,11 +663,10 @@ def evaluate_candidate(
         rebalance_every_bars=config.rebalance_every_bars,
         minimum=config.min_cross_section,
     )
+    fixed_cost_per_target = _fixed_annual_cost_per_target(target.spec)
     rank_net = np.where(
-        np.isfinite(rank_turnover),
-        rank_gross - rank_turnover * (
-            2.0 * target.spec.cost_bps / 10_000.0
-        ),
+        np.isfinite(rank_gross),
+        rank_gross - fixed_cost_per_target,
         np.nan,
     )
     rank_net_mean = (
@@ -643,10 +693,8 @@ def evaluate_candidate(
             rebalance_every_bars=config.rebalance_every_bars,
         )
         net = np.where(
-            np.isfinite(turnover),
-            gross - turnover * (
-                2.0 * target.spec.cost_bps / 10_000.0
-            ),
+            np.isfinite(gross),
+            gross - fixed_cost_per_target,
             np.nan,
         )
         layers, monotonicity = _layer_diagnostics(
@@ -690,7 +738,6 @@ def evaluate_candidate(
         + 0.01 * stable_fraction
         + config.segment_floor_weight * oriented_segment_floor
         - config.coverage_penalty * (1.0 - coverage)
-        - config.turnover_penalty * turnover_mean
         - config.complexity_penalty * max(0, complexity - 1)
     )
     return CandidateResult(
@@ -732,7 +779,10 @@ def evaluate_candidate(
             "cost_adjusted_return_score": cost_adjusted_return_score,
             "economic_fitness_weight": economic_weight,
             "mining_cost_definition": (
-                "half_turnover_times_two_times_one_way_cost_bps"
+                "fixed_annual_cost_prorated_by_target_holding_bars"
             ),
+            "annual_transaction_cost_bps": float(target.spec.cost_bps),
+            "cost_per_target_observation": float(fixed_cost_per_target),
+            "cost_uses_turnover": False,
         },
     )

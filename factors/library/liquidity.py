@@ -22,6 +22,6 @@ class AmihudIlliquidity(Factor):
         volume = data.get("volume", dates, universe)
         if close.empty or volume.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret = close.pct_change().abs()
+        ret = close.pct_change(fill_method=None).abs()
         illiq = ret / (volume + 1e-8)
         return illiq.rolling(20).mean()

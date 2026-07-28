@@ -40,6 +40,32 @@ SLOW_OPTIONAL_OPERATORS = (
 )
 
 
+def infer_economic_category(terminals: Sequence[str]) -> str:
+    """Assign deterministic family metadata from actually used terminals."""
+    names = tuple(map(str, terminals))
+    if any(name.startswith("curve_") for name in names):
+        return "term_structure"
+    if any(
+        name.startswith(("macd_", "return_", "close_ma_gap_", "close_ema_gap_"))
+        for name in names
+    ):
+        return "momentum"
+    if any("oi" in name or name.startswith(("volume_", "amount_")) for name in names):
+        return "volume_oi"
+    if any(
+        token in name
+        for name in names
+        for token in ("vol", "variance", "skew", "kurt", "atr_")
+    ):
+        return "volatility"
+    if any(
+        name.startswith(("open_gap_", "intrabar_", "range_", "body_", "upper_shadow_", "lower_shadow_", "close_location_"))
+        for name in names
+    ):
+        return "intraday"
+    return "auto_mined"
+
+
 @dataclass(frozen=True)
 class GPConfig:
     population_size: int = 160
@@ -63,6 +89,7 @@ class GPConfig:
     max_candidates: int = 30
     min_abs_ic: float = 0.0
     correlation_limit: float = 0.85
+    required_terminal_prefixes: tuple[str, ...] = ()
     seed: int = 17
 
     def __post_init__(self) -> None:
@@ -90,6 +117,8 @@ class GPConfig:
         unknown = sorted(set(self.operators) - set(OPERATOR_SPECS))
         if unknown:
             raise ValueError(f"unknown GP operators: {unknown}")
+        if any(not str(prefix) for prefix in self.required_terminal_prefixes):
+            raise ValueError("required terminal prefixes cannot be empty")
 
 
 @dataclass(frozen=True)
@@ -153,6 +182,19 @@ class GPSearch:
         )
         if not self.terminals:
             raise ValueError("no usable terminal features")
+        self.required_terminals = tuple(
+            terminal
+            for terminal in self.terminals
+            if any(
+                terminal.startswith(prefix)
+                for prefix in self.config.required_terminal_prefixes
+            )
+        )
+        if self.config.required_terminal_prefixes and not self.required_terminals:
+            raise ValueError(
+                "no usable terminals match required_terminal_prefixes="
+                f"{self.config.required_terminal_prefixes}"
+            )
         self._numeric_ops = tuple(
             op for op in self.config.operators
             if OPERATOR_SPECS[op].output_type == NUMERIC
@@ -204,12 +246,38 @@ class GPSearch:
         return Expr.operation(op, *args, window=window)
 
     def _valid(self, expression: Expr) -> bool:
+        terminals = expression.terminals()
         return (
             expression.output_type == NUMERIC
             and expression.depth <= self.config.max_depth
             and expression.complexity <= self.config.max_complexity
-            and bool(expression.terminals())
+            and bool(terminals)
+            and (
+                not self.config.required_terminal_prefixes
+                or any(
+                    terminal.startswith(prefix)
+                    for terminal in terminals
+                    for prefix in self.config.required_terminal_prefixes
+                )
+            )
         )
+
+    def _ensure_required_terminal(self, expression: Expr) -> Expr:
+        if not self.required_terminals or any(
+            terminal.startswith(prefix)
+            for terminal in expression.terminals()
+            for prefix in self.config.required_terminal_prefixes
+        ):
+            return expression
+        terminal_paths = [
+            path for path in expression.paths()
+            if expression.subtree(path).op == "terminal"
+        ]
+        if not terminal_paths:
+            return expression
+        path = terminal_paths[int(self.rng.integers(0, len(terminal_paths)))]
+        required = str(self.rng.choice(self.required_terminals))
+        return expression.replace(path, Expr.terminal(required))
 
     def _evaluator(self) -> ExpressionEvaluator:
         evaluator = getattr(self._thread_local, "evaluator", None)
@@ -304,7 +372,9 @@ class GPSearch:
         attempts = 0
         limit = self.config.population_size * 30
         while len(population) < self.config.population_size and attempts < limit:
-            expression = self._random_expression(self.config.initialization_depth)
+            expression = self._ensure_required_terminal(
+                self._random_expression(self.config.initialization_depth)
+            )
             attempts += 1
             if self._valid(expression):
                 population.setdefault(expression.sha256, expression)
@@ -338,7 +408,9 @@ class GPSearch:
             if self._valid(child):
                 next_by_hash.setdefault(child.sha256, child)
         while len(next_by_hash) < self.config.population_size:
-            child = self._random_expression(self.config.initialization_depth)
+            child = self._ensure_required_terminal(
+                self._random_expression(self.config.initialization_depth)
+            )
             if self._valid(child):
                 next_by_hash.setdefault(child.sha256, child)
         return list(next_by_hash.values())
@@ -447,7 +519,7 @@ class GPSearch:
                 candidate_id=candidate_id,
                 framework_name=f"mined_{candidate_id}",
                 kind="symbolic",
-                category="auto_mined",
+                category=infer_economic_category(expression.terminals()),
                 frequency=self.feature_config.decision_frequency,
                 target=self.target.spec,
                 dependencies=dependencies,

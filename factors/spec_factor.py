@@ -292,7 +292,7 @@ def compute_base_df(
     volume = ohlcv["volume"].astype(float, copy=False)
     ret = ohlcv.get("_return_1d")
     if ret is None:
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
     w = int(params.get("window", 20))
 
     # --- 震荡类 (Oscillator) ---
@@ -429,7 +429,7 @@ def compute_base_df(
         t1 = _ema_df(close, w)
         t2 = _ema_df(t1, w)
         t3 = _ema_df(t2, w)
-        return t3.pct_change()
+        return t3.pct_change(fill_method=None)
 
     if base == "dpo":
         # DPO 去趋势价格: close - MA(shifted)
@@ -543,7 +543,7 @@ def compute_base_df(
 
     if base == "trend_strength":
         # 夏普式趋势强度: close.pct_change(w) / std(ret, w)
-        ret_w = close.pct_change(w)
+        ret_w = close.pct_change(w, fill_method=None)
         vol = ret.rolling(w, min_periods=_minp(w)).std(ddof=0)
         return ret_w / vol.replace(0, np.nan)
 
@@ -555,16 +555,16 @@ def compute_base_df(
 
     if base == "return":
         # 收益率: close.pct_change(w)
-        return close.pct_change(w)
+        return close.pct_change(w, fill_method=None)
 
     if base == "skip_return":
         # 跳期动量: close.shift(w//2).pct_change(w), 规避短期反转
         skip = max(1, w // 2)
-        return close.shift(skip).pct_change(w)
+        return close.shift(skip).pct_change(w, fill_method=None)
 
     if base == "reversal":
         # 反转: 负收益率
-        return -close.pct_change(w)
+        return -close.pct_change(w, fill_method=None)
 
     if base == "breakout":
         # 上轨突破: close / max(high.shift(1).rolling(w).max()) - 1
@@ -618,7 +618,7 @@ def compute_base_df(
 
     if base == "price_volume_corr":
         # 量价相关: ret.rolling(w).corr(volume.pct_change())
-        vol_ret = volume.pct_change()
+        vol_ret = volume.pct_change(fill_method=None)
         return ret.rolling(w, min_periods=_minp(w)).corr(vol_ret)
 
     if base == "ts_rank_close":
@@ -683,7 +683,7 @@ def apply_transform_df(
     if transform == "vol_scaled":
         ret = ohlcv.get("_return_1d")
         if ret is None:
-            ret = ohlcv["close"].pct_change()
+            ret = ohlcv["close"].pct_change(fill_method=None)
         vol = ret.rolling(norm, min_periods=_minp(norm)).std(ddof=0)
         return signal / vol.replace(0, np.nan)
     if transform == "stability":

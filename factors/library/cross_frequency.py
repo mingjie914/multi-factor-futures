@@ -123,7 +123,7 @@ class DailyMomXIntradayVol5d(CrossFrequencyFactorBase):
     intraday_field = "intraday_volatility"
 
     def _compute_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pct_change(self.WINDOW)
+        return df.pct_change(self.WINDOW, fill_method=None)
 
 
 @register_factor("daily_mom_x_intraday_vol_20d", category="cross_frequency")
@@ -152,7 +152,7 @@ class DailyMomXTailMomentum5d(CrossFrequencyFactorBase):
     intraday_field = "tail_momentum"
 
     def _compute_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pct_change(self.WINDOW)
+        return df.pct_change(self.WINDOW, fill_method=None)
 
 
 @register_factor("daily_mom_x_tail_momentum_20d", category="cross_frequency")
@@ -181,7 +181,7 @@ class DailyMomXOvernightGap5d(CrossFrequencyFactorBase):
     intraday_field = "overnight_gap"
 
     def _compute_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pct_change(self.WINDOW)
+        return df.pct_change(self.WINDOW, fill_method=None)
 
 
 @register_factor("daily_mom_x_overnight_gap_20d", category="cross_frequency")
@@ -210,7 +210,7 @@ class DailyMomXVwapDev5d(CrossFrequencyFactorBase):
     intraday_field = "close_to_vwap"
 
     def _compute_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pct_change(self.WINDOW)
+        return df.pct_change(self.WINDOW, fill_method=None)
 
 
 @register_factor("daily_mom_x_vwap_dev_20d", category="cross_frequency")
@@ -375,7 +375,7 @@ class DailyMomXAmihud5d(CrossFrequencyFactorBase):
     intraday_field = "amihud_illiquidity"
 
     def _compute_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pct_change(self.WINDOW)
+        return df.pct_change(self.WINDOW, fill_method=None)
 
 
 @register_factor("daily_mom_x_amihud_20d", category="cross_frequency")

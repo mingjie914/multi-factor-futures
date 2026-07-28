@@ -334,7 +334,9 @@ class DDBSource(DataSource):
         close_pivot: pd.DataFrame,
         dominant_map: Dict[str, "pd.Series"],
     ) -> Dict[str, "pd.Series"]:
-        """Build forward-only ratio scales for T-1 dominant-contract rolls."""
+        """Build ratio scales from the latest common close, failing closed."""
+        from data.continuous_contract import RolloverAdjustmentError
+
         scales: Dict[str, pd.Series] = {}
         for root, dominant in dominant_map.items():
             columns = [
@@ -353,25 +355,34 @@ class DDBSource(DataSource):
                 if pd.isna(contract) or contract not in prices.columns:
                     previous_date = date
                     continue
-                current_price = prices.at[date, contract]
                 if previous_contract is None:
                     current_scale = 1.0
                 elif contract == previous_contract:
                     current_scale = previous_scale
                 else:
-                    previous_adjusted = np.nan
-                    new_previous_price = np.nan
-                    if previous_date is not None:
-                        old_previous_price = prices.at[previous_date, previous_contract]
-                        new_previous_price = prices.at[previous_date, contract]
-                        if np.isfinite(old_previous_price):
-                            previous_adjusted = old_previous_price * previous_scale
-                    if np.isfinite(previous_adjusted) and np.isfinite(new_previous_price) and new_previous_price > 0:
-                        current_scale = previous_adjusted / new_previous_price
-                    elif np.isfinite(previous_adjusted) and np.isfinite(current_price) and current_price > 0:
-                        current_scale = previous_adjusted / current_price
-                    else:
-                        current_scale = previous_scale
+                    cutoff = pd.Timestamp(previous_date or date)
+                    old_values = pd.to_numeric(
+                        prices.loc[:cutoff, previous_contract], errors="coerce"
+                    )
+                    new_values = pd.to_numeric(
+                        prices.loc[:cutoff, contract], errors="coerce"
+                    )
+                    common = old_values.dropna().index.intersection(
+                        new_values.dropna().index
+                    )
+                    if not len(common):
+                        raise RolloverAdjustmentError(
+                            f"no common close at or before {cutoff.date()} for "
+                            f"{previous_contract}->{contract}"
+                        )
+                    overlap_date = common.max()
+                    old_value = float(old_values.loc[overlap_date])
+                    new_value = float(new_values.loc[overlap_date])
+                    if not np.isfinite(old_value) or not np.isfinite(new_value) or new_value <= 0:
+                        raise RolloverAdjustmentError(
+                            f"invalid common close for {previous_contract}->{contract}"
+                        )
+                    current_scale = previous_scale * old_value / new_value
                 scale.at[date] = current_scale
                 previous_contract = contract
                 previous_scale = current_scale
@@ -480,11 +491,13 @@ class DDBSource(DataSource):
             .unstack("InstrumentID")
         )
         schedule_rows = []
+        dominant_map = {}
         for root, root_volume in daily_volume.groupby(level="root", sort=False):
             root_volume = root_volume.droplevel("root")
             raw = root_volume.fillna(-1.0).idxmax(axis=1)
             raw = raw.where(~root_volume.isna().all(axis=1))
             effective = raw.shift(self._dominant_lag_days)
+            dominant_map[root] = effective
             schedule_rows.append(pd.DataFrame({
                 "root": root,
                 "TradeDate": effective.index,
@@ -492,9 +505,32 @@ class DDBSource(DataSource):
             }))
         if not schedule_rows:
             return pd.DataFrame()
+        daily_close = (
+            df.sort_values(["TradeDate", "Time"])
+            .groupby(["TradeDate", "InstrumentID"], sort=True)["close"]
+            .last()
+            .unstack("InstrumentID")
+        )
+        roll_scales = self._build_roll_scales(daily_close, dominant_map)
         schedule = pd.concat(schedule_rows, ignore_index=True)
         df = df.merge(schedule, on=["root", "TradeDate"], how="left", validate="many_to_one")
         df = df[df["InstrumentID"] == df["selected_contract"]]
+        scale_rows = []
+        for root, scale in roll_scales.items():
+            scale_rows.append(pd.DataFrame({
+                "root": root,
+                "TradeDate": scale.index,
+                "roll_scale": scale.to_numpy(),
+            }))
+        if scale_rows:
+            scales = pd.concat(scale_rows, ignore_index=True)
+            df = df.merge(
+                scales, on=["root", "TradeDate"], how="left", validate="many_to_one"
+            )
+            if df["roll_scale"].isna().any():
+                raise ValueError("selected minute contract has no roll scale")
+            for field in ("open", "high", "low", "close"):
+                df[field] = pd.to_numeric(df[field], errors="coerce") * df["roll_scale"]
         df = df[
             (df["TradeDate"] >= requested_start) & (df["TradeDate"] <= requested_end)
         ]

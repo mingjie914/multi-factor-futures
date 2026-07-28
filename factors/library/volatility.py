@@ -21,5 +21,5 @@ class VolatilityRealized(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         return ret.rolling(60).std() * np.sqrt(252)

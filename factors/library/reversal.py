@@ -21,4 +21,4 @@ class Reversal5D(Factor):
         close = data.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        return -close.pct_change(5)  # 负号: 过去跌的多 → 预期涨 (反转)
+        return -close.pct_change(5, fill_method=None)  # 负号: 过去跌的多 → 预期涨 (反转)

@@ -237,7 +237,8 @@ class OptimizationConfig(StrictConfigModel):
 class CostConfig(BaseModel):
     """Transaction cost model."""
     type: str = "simple_futures"
-    # Allow arbitrary extra fields (commission_rate, slippage, margin_rate, ...)
+    # Cost models have different constructor contracts, so their parameters
+    # remain model-specific extras and are passed through by PipelineRunner.
     if _PYDANTIC_V2:
         model_config = ConfigDict(extra="allow")
     else:
@@ -289,7 +290,7 @@ class BacktestConfig(StrictConfigModel):
     benchmark: str = "csi300"
     plot: bool = True
     report_dir: str = "./reports"
-    training_window: int = 504    # 训练窗口 ~2年
+    training_window: int = 750    # 日频正式训练窗口下限 ~3年
     retrain_freq: int = 10        # 重训频率 (交易日)
     holding_period: int = 5       # 持有期 (周期数, 非天数; daily频率下1周期=1交易日)
 
@@ -315,7 +316,7 @@ class SubPortfolioConfig(StrictConfigModel):
     rebalance_freq: str = "weekly"   # daily / weekly / monthly
     holding_period: int = 5          # 持有期 (周期数, 非天数)
     retrain_freq: int = 10           # 重训频率 (交易日)
-    training_window: int = 504       # 训练窗口
+    training_window: int = 750       # 日频正式训练窗口下限
     capital_weight: float = 0.5      # 资本占比 (0~1, 所有子组合之和应为1.0)
     # 子组合内部约束 (更宽松; 为空时使用默认宽松约束)
     sub_constraints: List[dict] = []
@@ -421,9 +422,35 @@ class ValidationPolicyConfig(StrictConfigModel):
     annual_direction_ratio: float = 0.60
     annual_effect_ratio: float = 0.65
     minimum_calendar_years: int = 5
+    intraday_minimum_calendar_years: int = 1
     minimum_year_observations: int = 20
+    minimum_train_bars_by_frequency: Dict[str, int] = {
+        "daily": 750,
+        "1min": 14400,
+        "5min": 2880,
+        "15min": 960,
+        "30min": 480,
+        "hourly": 240,
+    }
+    minimum_test_bars_by_frequency: Dict[str, int] = {
+        "daily": 250,
+        "1min": 4800,
+        "5min": 960,
+        "15min": 320,
+        "30min": 160,
+        "hourly": 80,
+    }
+    minimum_train_days_by_frequency: Dict[str, int] = {
+        "daily": 750, "1min": 60, "5min": 60,
+        "15min": 60, "30min": 60, "hourly": 60,
+    }
+    minimum_test_days_by_frequency: Dict[str, int] = {
+        "daily": 250, "1min": 20, "5min": 20,
+        "15min": 20, "30min": 20, "hourly": 20,
+    }
+    minimum_train_test_ratio: float = 3.0
     n_return_groups: int = 3
-    max_monthly_turnover: float = 0.50
+    monthly_turnover_reference: float = 0.50
     cost_safety_margin: float = 1.50
     single_instrument_min_trading_days: int = 750
     single_instrument_bootstrap_samples: int = 399

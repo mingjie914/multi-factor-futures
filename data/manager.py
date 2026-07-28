@@ -3,6 +3,7 @@ import logging
 
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from core.interfaces import DataProvider, DataSource
@@ -10,6 +11,23 @@ from core.types import *
 from data.cache import Cache
 
 logger = logging.getLogger(__name__)
+
+
+def _forward_returns_on_valid_bars(
+    close: pd.DataFrame, period: int
+) -> pd.DataFrame:
+    """Compute horizons on each instrument's own observed-bar clock."""
+    period = int(period)
+    if period < 1:
+        raise ValueError("forward-return period must be positive")
+    result = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
+    for ticker in close.columns:
+        series = pd.to_numeric(close[ticker], errors="coerce").dropna()
+        if series.empty:
+            continue
+        forward = series.shift(-period) / series - 1.0
+        result.loc[forward.index, ticker] = forward
+    return result
 
 
 class DataManager(DataProvider):
@@ -464,8 +482,7 @@ class DataManager(DataProvider):
         close = self.get("close", dates, universe)
         if close.empty:
             return pd.DataFrame(index=dates, columns=universe)
-        fwd = close.shift(-period) / close - 1
-        return fwd
+        return _forward_returns_on_valid_bars(close, period)
 
     def get_calendar(self, start: Date, end: Date) -> DateIndex:
         """获取交易日历."""
@@ -633,14 +650,7 @@ class FrequencyDataProvider(DataProvider):
         self, dates: DateIndex, universe: Universe, period: int = 1
     ) -> ReturnMatrix:
         close = self.get("close", dates, universe)
-        result = pd.DataFrame(np.nan, index=dates, columns=universe, dtype=float)
-        for ticker in universe:
-            series = close[ticker].dropna()
-            if series.empty:
-                continue
-            forward = series.shift(-int(period)) / series - 1.0
-            result.loc[forward.index, ticker] = forward
-        return result
+        return _forward_returns_on_valid_bars(close, period)
 
     def get_industry(
         self, dates: DateIndex, universe: Universe

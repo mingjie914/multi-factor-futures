@@ -245,14 +245,14 @@ optimization:
 
 costs:
   type: simple_futures
-  commission_rate: 0.0002
-  slippage: 0.0
+  # Two-stage research policy. Screening uses only the annual 2 bp rate;
+  # post-screen backtests add the annual 10.5 bp roll allowance.
   margin_rate: 0.12
-  annual_fee: 0.00105
-  # Filled only from a versioned realized dominant-contract roll ledger.
-  annual_roll_cost: null
-  roll_cost_by_instrument: {}
-  roll_cost_source: ''
+  annual_transaction_cost: 0.0002
+  annual_fee: 0.0
+  annual_roll_cost: 0.00105
+  periods_per_year: 252
+  cost_stage: post_screen_backtest
 
 signals:
   mode: trend_following
@@ -310,7 +310,7 @@ backtest:
   benchmark: csi300
   plot: true
   report_dir: ./reports
-  training_window: 504
+  training_window: 750
   retrain_freq: 10
   holding_period: 5
 
@@ -321,21 +321,21 @@ sub_portfolios:
     rebalance_freq: weekly
     holding_period: 5
     retrain_freq: 5
-    training_window: 504
+    training_window: 750
     capital_weight: 0.34
   - name: mid_term
     factors: []
     rebalance_freq: weekly
     holding_period: 10
     retrain_freq: 10
-    training_window: 504
+    training_window: 750
     capital_weight: 0.33
   - name: long_term
     factors: []
     rebalance_freq: weekly
     holding_period: 40
     retrain_freq: 20
-    training_window: 504
+    training_window: 750
     capital_weight: 0.33
 
 meta_optimizer:
@@ -390,9 +390,40 @@ validation_policy:
   annual_direction_ratio: 0.60
   annual_effect_ratio: 0.65
   minimum_calendar_years: 5
+  intraday_minimum_calendar_years: 1
   minimum_year_observations: 20
+  minimum_train_bars_by_frequency:
+    daily: 750
+    1min: 14400
+    5min: 2880
+    15min: 960
+    30min: 480
+    hourly: 240
+  minimum_test_bars_by_frequency:
+    daily: 250
+    1min: 4800
+    5min: 960
+    15min: 320
+    30min: 160
+    hourly: 80
+  minimum_train_days_by_frequency:
+    daily: 750
+    1min: 60
+    5min: 60
+    15min: 60
+    30min: 60
+    hourly: 60
+  minimum_test_days_by_frequency:
+    daily: 250
+    1min: 20
+    5min: 20
+    15min: 20
+    30min: 20
+    hourly: 20
+  minimum_train_test_ratio: 3.0
   n_return_groups: 3
-  max_monthly_turnover: 0.50
+  # Diagnostic reference only; turnover is not a cost or admission gate.
+  monthly_turnover_reference: 0.50
   cost_safety_margin: 1.50
   single_instrument_min_trading_days: 750
   single_instrument_bootstrap_samples: 399
