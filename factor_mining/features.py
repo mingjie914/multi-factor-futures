@@ -70,6 +70,13 @@ class FeatureEngine:
     def __init__(self, config: FeatureConfig | None = None):
         self.config = config or FeatureConfig()
 
+    def build_all_terminals(
+        self, panels: Mapping[str, pd.DataFrame]
+    ) -> FeatureSet:
+        """Build the complete configured terminal vocabulary for a GP run."""
+
+        return self.build(panels, required_features=None)
+
     def build(
         self,
         panels: Mapping[str, pd.DataFrame],

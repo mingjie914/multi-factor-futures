@@ -31,6 +31,12 @@ from factor_mining.data import (
 from factor_mining.features import FeatureEngine
 from factor_mining.gp import GPConfig, GPSearch
 from factor_mining.repository import CandidateRepository
+from factor_mining.runtime.static_context import (
+    METADATA_FILE,
+    StaticResearchContext,
+    snapshot_cache_key,
+    source_data_fingerprint,
+)
 from factor_mining.screening import ScreeningConfig, screen_candidates
 from factor_mining.validation import PreparedTarget, ValidationConfig
 from core.sectors import sector_for
@@ -116,18 +122,6 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         entry_delay_bars=args.entry_delay_bars,
         cost_bps=args.cost_bps,
     )
-    features = FeatureEngine(feature_config).build(panels)
-    close = panels["close"].reindex(index=features.index, columns=features.symbols)
-    valid_bars = close.notna().sum(axis=0)
-    positive_counts = valid_bars.loc[valid_bars.gt(0)]
-    training_bars = int(positive_counts.median()) if not positive_counts.empty else 0
-    valid_days = pd.Series({
-        symbol: int(close[symbol].dropna().index.normalize().nunique())
-        for symbol in close.columns
-    })
-    positive_days = valid_days.loc[valid_days.gt(0)]
-    training_days = int(positive_days.median()) if not positive_days.empty else 0
-    target = PreparedTarget.from_close(close, target_spec)
     validation = ValidationConfig(
         decision_lag_bars=args.decision_lag_bars,
         min_cross_section=args.min_cross_section,
@@ -156,8 +150,107 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         required_terminal_prefixes=args.required_terminal_prefixes,
         operators=args.operators or GPConfig().operators,
         allow_conditionals=args.allow_conditionals,
+        accelerator_mode=args.accelerator_mode,
+        accelerator_block_rows=args.accelerator_block_rows,
+        accelerator_chunk_size=args.accelerator_chunk_size,
+        use_fast_rolling=args.use_fast_rolling,
         seed=args.seed,
     )
+    group_labels = (
+        tuple(sector_for(str(symbol)) for symbol in panels["close"].columns)
+        if args.sector_neutralization else None
+    )
+    context = None
+    if args.accelerator_mode == "off":
+        features = FeatureEngine(feature_config).build_all_terminals(panels)
+        close = panels["close"].reindex(
+            index=features.index, columns=features.symbols
+        )
+        target = PreparedTarget.from_close(close, target_spec)
+    else:
+        fingerprint = source_data_fingerprint(panels)
+        taxonomy = {
+            "group_labels": list(group_labels) if group_labels is not None else None
+        }
+        key = snapshot_cache_key(
+            feature_config=feature_config,
+            target_spec=target_spec,
+            taxonomy=taxonomy,
+            source_fingerprint=fingerprint,
+            decision_lag_bars=validation.decision_lag_bars,
+            neutralize_volatility=validation.neutralize_volatility,
+        )
+        cache_root = (
+            args.accelerator_cache_dir
+            or Path("runs/factor_mining/runtime_cache")
+        )
+        cache_dir = Path(cache_root) / key
+        if (cache_dir / METADATA_FILE).exists():
+            context = StaticResearchContext.load(
+                cache_dir,
+                expected_feature_config=feature_config,
+                expected_target_spec=target_spec,
+                expected_taxonomy=taxonomy,
+                expected_source_fingerprint=fingerprint,
+                expected_decision_lag_bars=validation.decision_lag_bars,
+                expected_neutralize_volatility=(
+                    validation.neutralize_volatility
+                ),
+            )
+        else:
+            built_features = FeatureEngine(
+                feature_config
+            ).build_all_terminals(panels)
+            built_close = panels["close"].reindex(
+                index=built_features.index, columns=built_features.symbols
+            )
+            built_target = PreparedTarget.from_close(
+                built_close, target_spec
+            )
+            volatility = None
+            if validation.neutralize_volatility:
+                for name in (
+                    "realized_vol_60p",
+                    "realized_vol_30p",
+                    "realized_vol_15p",
+                ):
+                    if name in built_features.values:
+                        volatility = built_features.values[name]
+                        break
+                if volatility is None:
+                    raise ValueError(
+                        "volatility neutralization requires a "
+                        "15/30/60-bar realized-vol feature"
+                    )
+            context = StaticResearchContext.create(
+                cache_dir,
+                features=built_features,
+                target=built_target,
+                feature_config=feature_config,
+                source_fingerprint=fingerprint,
+                taxonomy=taxonomy,
+                volatility=volatility,
+                group_labels=group_labels,
+                decision_lag_bars=validation.decision_lag_bars,
+                block_rows=args.accelerator_block_rows,
+            )
+            del built_features, built_target, built_close, volatility
+        features = context.features
+        target = context.target
+        close = panels["close"].reindex(
+            index=features.index, columns=features.symbols
+        )
+        group_labels = context.group_labels
+
+    valid_bars = close.notna().sum(axis=0)
+    positive_counts = valid_bars.loc[valid_bars.gt(0)]
+    training_bars = int(positive_counts.median()) if not positive_counts.empty else 0
+    valid_days = pd.Series({
+        symbol: int(close[symbol].dropna().index.normalize().nunique())
+        for symbol in close.columns
+    })
+    positive_days = valid_days.loc[valid_days.gt(0)]
+    training_days = int(positive_days.median()) if not positive_days.empty else 0
     outcome = GPSearch(
         features,
         target,
@@ -165,10 +258,8 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
         validation_config=validation,
         gp_config=gp_config,
         run_id=run_id,
-        group_labels=(
-            [sector_for(str(symbol)) for symbol in features.symbols]
-            if args.sector_neutralization else None
-        ),
+        group_labels=group_labels,
+        context=context,
     ).run()
     outcome = replace(
         outcome,
@@ -247,6 +338,10 @@ def _mine(args) -> int:
         ),
         "economic_fitness_weight": args.economic_fitness_weight,
         "annual_transaction_cost_bps": args.cost_bps,
+        "accelerator_mode": args.accelerator_mode,
+        "accelerator_block_rows": args.accelerator_block_rows,
+        "accelerator_chunk_size": args.accelerator_chunk_size,
+        "use_fast_rolling": args.use_fast_rolling,
     }
     run_id = args.run_id or (
         datetime.now(timezone.utc).strftime("mine_%Y%m%dT%H%M%SZ_")
@@ -281,6 +376,10 @@ def _mine(args) -> int:
             "required_terminal_prefixes": list(args.required_terminal_prefixes),
             "allow_conditionals": args.allow_conditionals,
             "sector_neutralization": args.sector_neutralization,
+            "accelerator_mode": args.accelerator_mode,
+            "accelerator_block_rows": args.accelerator_block_rows,
+            "accelerator_chunk_size": args.accelerator_chunk_size,
+            "use_fast_rolling": args.use_fast_rolling,
             "validation_config": {
                 "time_segments": args.time_segments,
                 "complexity_penalty": args.complexity_penalty,
@@ -636,6 +735,42 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--feature-memory-mb", type=int, default=4096)
     parser.add_argument("--evaluator-cache-mb", type=int, default=128)
+    parser.add_argument(
+        "--accelerator-mode",
+        choices=("off", "context", "batch", "dag", "chunk", "v2-lite"),
+        default="off",
+        help=(
+            "opt-in GP acceleration level; off preserves the legacy path "
+            "(default: off)"
+        ),
+    )
+    parser.add_argument(
+        "--use-accelerator",
+        action="store_const",
+        const="dag",
+        dest="accelerator_mode",
+        help="alias for --accelerator-mode dag",
+    )
+    parser.add_argument(
+        "--accelerator-block-rows", type=int, default=2500
+    )
+    parser.add_argument(
+        "--accelerator-chunk-size",
+        type=int,
+        default=50,
+        help="factor expressions per ThreadPool task in chunk/v2-lite mode",
+    )
+    parser.add_argument(
+        "--accelerator-cache-dir", type=Path, default=None
+    )
+    parser.add_argument(
+        "--use-fast-rolling",
+        action="store_true",
+        help=(
+            "use optional Bottleneck for verified mean/std/min/max; "
+            "all other rolling operators remain on Pandas"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=17)
     if synthetic:
         parser.add_argument("--periods", type=int, default=600)

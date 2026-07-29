@@ -169,3 +169,78 @@ from factor_mining.validation import PreparedTarget, ValidationConfig
 
 `CandidateSpec` 是挖掘、SQLite 和桥接器之间的唯一候选契约；表达式是结构化 AST，
 不执行任意代码。
+
+## GP Accelerator（可选）
+
+GP 加速层默认关闭，只作用于 `mining mine` / `mining dev-smoke` 的
+population evaluation，不替换 P0、单因子研究、自有因子库或
+BacktestEngine。
+
+```powershell
+& $PY -B main.py mining dev-smoke `
+  --periods 600 --symbols 12 --population 80 --generations 4 `
+  --use-accelerator --use-fast-rolling
+```
+
+- `--accelerator-mode off`：旧路径，默认值。
+- `--accelerator-mode context`：只使用只读 terminal snapshot。
+- `--accelerator-mode batch`：增加分块批量 MAD、中性化、rank IC 和
+  fitness。
+- `--accelerator-mode dag` / `--use-accelerator`：增加 population DAG。
+- `--accelerator-mode chunk`：保留 v1 batch fitness，只把 expression
+  evaluation 按 factor chunk 交给现有 ThreadPool，用于隔离调度收益。
+- `--accelerator-mode v2-lite`：在 chunk 路径上增加在线 fitness 统计并降低
+  block 峰值内存；默认仍不启用。
+- `--accelerator-chunk-size`：每个 expression task 的因子数，默认 50；
+  worker 数继续使用 `--jobs`，应以本机 benchmark 选择。
+- `--use-fast-rolling`：仅在兼容探针通过时使用可选 Bottleneck；
+  不可用或不等价时自动回退 Pandas。Bottleneck 不是硬依赖。
+
+snapshot 将 FeatureEngine 已生成的完整 terminal vocabulary 以只读
+`.npy` 保存。物理布局为 `(F,T,N)`，以便每个 `(T,N)` terminal 是连续
+零拷贝 view；运行时同时提供逻辑 `(T,N,F)` view。metadata 绑定
+FeatureConfig、TargetSpec、taxonomy、source fingerprint 和所有 snapshot
+artifact 的 SHA-256。Windows 下继续使用现有 ThreadPool，不传递大型
+DataFrame/ndarray，也不假设 `fork`。v2-lite worker 只计算共享只读 view
+上的表达式；主线程按完成的 factor chunk 执行 MAD、中性化、rank-IC 和
+portfolio fitness，不创建整代 `(M_all,T,N)` tensor。
+
+`scripts/benchmark_gp_accelerator.py` 固定同一批至少 100 棵 AST，比较
+baseline、Accelerator v1、v1+FactorChunk 和 v2-lite，同时输出 JSON/CSV。
+benchmark 会保存固定 AST、raw factor memmap、worker/chunk 调优、各 kernel
+计时和 RSS，并硬断言 NaN mask、factor 容差、IC、direction、candidate
+集合和排序。
+
+NumPy stable-argsort rank 曾通过 ties/NaN 等价探针，但在完整 12,000×47
+benchmark 上慢于现有 SciPy `rankdata`，因此未进入生产路径；rank 仍使用 v1
+已验证的 SciPy/Pandas fallback。
+
+v2-lite 使用算子能力白名单。`ts_ema`、`ts_corr`、`ts_cov`、横截面有状态/
+边界敏感算子及未知算子在计算前直接进入 legacy evaluator；不会在完整运行后因误差
+再重复计算。
+
+### 2026-07-29 固定 100 AST 基准
+
+环境为 Windows、12,000×47、`block_T=2500`，每条正式路径重复三次并取中位数：
+
+| 路径 | 中位耗时 | 相对 baseline | 峰值 RSS |
+| --- | ---: | ---: | ---: |
+| Baseline | 10.415s | 1.00× | 0.74GB |
+| Accelerator v1 | 7.382s | 1.41× | 2.01GB |
+| v1 + FactorChunk（75×2） | 6.964s | 1.50× | 1.84GB |
+| v2-lite（75×2） | 6.974s | 1.49× | 1.84GB |
+
+四条路径的 NaN mask、factor value、IC、direction、candidate ID/集合和 fitness
+排序全部通过硬断言，fallback 为 0。Factor Chunk 提供了确定性耗时收益；在线
+accumulator 的主要收益是避免整代状态常驻并将 RSS 控制在 2GB 内，不能把它描述成
+额外数量级加速。完整 JSON/CSV 位于本地
+`runs/factor_mining/benchmarks/v2_lite_12000x47_final_20260729/`。
+
+同一形状扩展到 220 population 后，Baseline、v1、FactorChunk、v2-lite 分别为
+23.313s、16.331s、15.540s、15.493s；最佳调度是 `chunk_size=50`、
+`workers=4`，v2-lite 峰值 RSS 为 1.61GB。目标 7–9 秒未达成，原因是表达式阶段
+已经降至约 0.98s，剩余时间主要是主线程 MAD、neutralization 和 rank-IC。继续增加
+expression worker 不能解决这部分瓶颈。220 规模报告位于本地
+`runs/factor_mining/benchmarks/v2_lite_220x12000x47_20260729/`；该扩展测试复用
+同一生成规则并检查 candidate 结果，但为控制耗时没有重复 raw factor value 断言，
+raw value 的正式硬验收仍以固定 100 AST 报告为准。

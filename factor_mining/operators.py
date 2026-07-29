@@ -11,6 +11,7 @@ import pandas as pd
 
 from factor_mining.api import canonical_json
 from factor_mining.features import FeatureSet
+from factor_mining.runtime.rolling_backend import rolling as _rolling_backend
 
 
 NUMERIC = "numeric"
@@ -198,26 +199,14 @@ def _frame(value: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(np.asarray(value, dtype=float))
 
 
-def _rolling(value: np.ndarray, window: int, method: str) -> np.ndarray:
-    min_periods = max(2, min(window, max(3, window // 2)))
-    rolling = _frame(value).rolling(window, min_periods=min_periods)
-    if method == "sum":
-        return rolling.sum().to_numpy()
-    if method == "mean":
-        return rolling.mean().to_numpy()
-    if method == "std":
-        return rolling.std().to_numpy()
-    if method == "min":
-        return rolling.min().to_numpy()
-    if method == "max":
-        return rolling.max().to_numpy()
-    if method == "median":
-        return rolling.median().to_numpy()
-    if method == "skew":
-        return rolling.skew().to_numpy()
-    if method == "kurt":
-        return rolling.kurt().to_numpy()
-    raise ValueError(method)
+def _rolling(
+    value: np.ndarray,
+    window: int,
+    method: str,
+    *,
+    backend: str = "pandas",
+) -> np.ndarray:
+    return _rolling_backend(value, window, method, backend=backend)
 
 
 def _cross_section_rank(value: np.ndarray) -> np.ndarray:
@@ -259,9 +248,13 @@ class ExpressionEvaluator:
         *,
         cache_max_bytes: int = 128 * 1024 * 1024,
         cross_section_mask: np.ndarray | None = None,
+        rolling_backend: str = "pandas",
     ):
         self.features = features
         self.cache_max_bytes = max(0, int(cache_max_bytes))
+        if rolling_backend not in {"pandas", "fast"}:
+            raise ValueError(f"unknown rolling backend: {rolling_backend}")
+        self.rolling_backend = rolling_backend
         self.cross_section_mask = None
         if cross_section_mask is not None:
             mask = np.asarray(cross_section_mask)
@@ -331,28 +324,56 @@ class ExpressionEvaluator:
             if op == "reciprocal": return _protected_divide(np.ones_like(args[0]), args[0])
             if op == "delay": return _frame(args[0]).shift(window).to_numpy()
             if op == "delta": return _frame(args[0]).diff(window).to_numpy()
-            if op == "ts_sum": return _rolling(args[0], window, "sum")
-            if op == "ts_mean": return _rolling(args[0], window, "mean")
+            if op == "ts_sum":
+                return _rolling(
+                    args[0], window, "sum", backend=self.rolling_backend
+                )
+            if op == "ts_mean":
+                return _rolling(
+                    args[0], window, "mean", backend=self.rolling_backend
+                )
             if op == "ts_ema":
                 return _frame(args[0]).ewm(
                     span=window,
                     adjust=False,
                     min_periods=max(2, window // 2),
                 ).mean().to_numpy()
-            if op == "ts_std": return _rolling(args[0], window, "std")
-            if op == "ts_min": return _rolling(args[0], window, "min")
-            if op == "ts_max": return _rolling(args[0], window, "max")
-            if op == "ts_median": return _rolling(args[0], window, "median")
-            if op == "ts_skew": return _rolling(args[0], window, "skew")
-            if op == "ts_kurt": return _rolling(args[0], window, "kurt")
+            if op == "ts_std":
+                return _rolling(
+                    args[0], window, "std", backend=self.rolling_backend
+                )
+            if op == "ts_min":
+                return _rolling(
+                    args[0], window, "min", backend=self.rolling_backend
+                )
+            if op == "ts_max":
+                return _rolling(
+                    args[0], window, "max", backend=self.rolling_backend
+                )
+            if op == "ts_median":
+                return _rolling(
+                    args[0], window, "median", backend=self.rolling_backend
+                )
+            if op == "ts_skew":
+                return _rolling(
+                    args[0], window, "skew", backend=self.rolling_backend
+                )
+            if op == "ts_kurt":
+                return _rolling(
+                    args[0], window, "kurt", backend=self.rolling_backend
+                )
             if op == "ts_rank":
                 min_periods = max(2, window // 2)
                 return _frame(args[0]).rolling(
                     window, min_periods=min_periods
                 ).rank(method="average", pct=True).to_numpy()
             if op == "ts_zscore":
-                mean = _rolling(args[0], window, "mean")
-                std = _rolling(args[0], window, "std")
+                mean = _rolling(
+                    args[0], window, "mean", backend=self.rolling_backend
+                )
+                std = _rolling(
+                    args[0], window, "std", backend=self.rolling_backend
+                )
                 return _protected_divide(args[0] - mean, std)
             if op == "ts_corr":
                 return _frame(args[0]).rolling(

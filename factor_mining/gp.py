@@ -19,6 +19,8 @@ from factor_mining.operators import (
     Expr,
     ExpressionEvaluator,
 )
+from factor_mining.runtime.population_executor import PopulationExecutor
+from factor_mining.runtime.static_context import StaticResearchContext
 from factor_mining.validation import (
     CandidateResult,
     PreparedTarget,
@@ -90,6 +92,10 @@ class GPConfig:
     min_abs_ic: float = 0.0
     correlation_limit: float = 0.85
     required_terminal_prefixes: tuple[str, ...] = ()
+    accelerator_mode: str = "off"
+    accelerator_block_rows: int = 2500
+    accelerator_chunk_size: int = 50
+    use_fast_rolling: bool = False
     seed: int = 17
 
     def __post_init__(self) -> None:
@@ -119,6 +125,17 @@ class GPConfig:
             raise ValueError(f"unknown GP operators: {unknown}")
         if any(not str(prefix) for prefix in self.required_terminal_prefixes):
             raise ValueError("required terminal prefixes cannot be empty")
+        if self.accelerator_mode not in {
+            "off", "context", "batch", "dag", "chunk", "v2-lite",
+        }:
+            raise ValueError(
+                "accelerator_mode must be off, context, batch, dag, "
+                "chunk, or v2-lite"
+            )
+        if self.accelerator_block_rows < 1:
+            raise ValueError("accelerator_block_rows must be positive")
+        if self.accelerator_chunk_size < 1:
+            raise ValueError("accelerator_chunk_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -161,6 +178,7 @@ class GPSearch:
         gp_config: GPConfig | None = None,
         run_id: str = "gp_run",
         group_labels: Sequence[str] | None = None,
+        context: StaticResearchContext | None = None,
     ):
         if features.shape != target.values.shape:
             raise ValueError("feature and target shapes differ")
@@ -173,8 +191,19 @@ class GPSearch:
         self.config = gp_config or GPConfig()
         self.run_id = str(run_id)
         self.group_labels = group_labels
+        self.context = context
+        self._last_accelerator_stats: dict[str, object] = {}
         if group_labels is not None and len(group_labels) != len(features.symbols):
             raise ValueError("group_labels must contain one label per feature symbol")
+        if self.config.accelerator_mode != "off":
+            if context is None:
+                raise ValueError(
+                    "accelerator_mode requires a StaticResearchContext"
+                )
+            if context.features.shape != features.shape:
+                raise ValueError("accelerator context feature shape mismatch")
+            if context.target.values.shape != target.values.shape:
+                raise ValueError("accelerator context target shape mismatch")
         self.rng = np.random.default_rng(self.config.seed)
         self.terminals = tuple(
             name for name in features.feature_names
@@ -288,6 +317,9 @@ class GPSearch:
                     self.config.evaluator_cache_mb * 1024 * 1024
                     // self._worker_count()
                 ),
+                rolling_backend=(
+                    "fast" if self.config.use_fast_rolling else "pandas"
+                ),
             )
             self._thread_local.evaluator = evaluator
         return evaluator
@@ -320,11 +352,60 @@ class GPSearch:
         return result
 
     def _score_population(self, population: Sequence[Expr]) -> list[CandidateResult]:
+        if self.config.accelerator_mode in {
+            "batch", "dag", "chunk", "v2-lite",
+        }:
+            return self._score_population_accelerated(population)
         workers = self._worker_count()
         if workers == 1:
             return [self._score(expression) for expression in population]
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="factor-gp") as pool:
             return list(pool.map(self._score, population))
+
+    def _score_population_accelerated(
+        self, population: Sequence[Expr]
+    ) -> list[CandidateResult]:
+        results: list[CandidateResult | None] = [None] * len(population)
+        pending_indices = []
+        pending = []
+        for index, expression in enumerate(population):
+            cached = self._fitness_cache.get(expression.sha256)
+            if cached is not None:
+                results[index] = cached
+            else:
+                pending_indices.append(index)
+                pending.append(expression)
+        if pending:
+            if self.context is None:
+                raise RuntimeError("accelerator context is unavailable")
+            executor = PopulationExecutor(
+                self.context,
+                self.validation_config,
+                block_rows=self.config.accelerator_block_rows,
+                use_dag=self.config.accelerator_mode in {
+                    "dag", "chunk", "v2-lite",
+                },
+                use_fast_rolling=self.config.use_fast_rolling,
+                evaluator_cache_mb=self.config.evaluator_cache_mb,
+                legacy_score=self._score,
+                factor_chunk_size=(
+                    self.config.accelerator_chunk_size
+                    if self.config.accelerator_mode in {"chunk", "v2-lite"}
+                    else 0
+                ),
+                factor_workers=self._worker_count(),
+                online_fitness=self.config.accelerator_mode == "v2-lite",
+            )
+            pending_results = executor.run(pending)
+            self._last_accelerator_stats = dict(executor.stats)
+            for index, expression, result in zip(
+                pending_indices, pending, pending_results
+            ):
+                self._fitness_cache[expression.sha256] = result
+                results[index] = result
+        if any(result is None for result in results):
+            raise RuntimeError("accelerated population scoring is incomplete")
+        return [result for result in results if result is not None]
 
     def _worker_count(self) -> int:
         if self.config.n_jobs == -1:
