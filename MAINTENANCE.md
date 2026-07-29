@@ -32,6 +32,11 @@ $PY = '.\.venv\Scripts\python.exe'
   不是首版瓶颈；训练 XGBoost、神经网络等黑箱模型时再增加独立 GPU 后端。
 - `--jobs 1` 是稳定默认值。多线程可在本机基准后使用；表达式缓存总预算会按 worker
   数量拆分，不会为每个 worker 重复分配完整预算。
+- GP Accelerator v2-lite 仍为显式 opt-in。线程只计算只读 terminal view 上的
+  expression block；MAD、中性化、rank-IC 和 fitness 继续由主线程按 factor chunk
+  处理。`ts_ema`、`ts_corr`、`ts_cov` 和未进入能力白名单的算子直接走 legacy。
+- 修改 accelerator 后必须复用同一份固定 AST，比较 baseline、v1、factor chunk 和
+  v2-lite，并核对 NaN mask、factor value、IC、direction、candidate 集合和排序。
 - 分钟数据按明确训练区间加载，超过特征内存预算时失败关闭，不用交换分区硬撑。
 - 本地 Parquet 的 selected-contract 和 curve cache 可以复用；源文件指纹变化时会失效。
 - 因子批量计算依赖预取和 SPEC 按 base 分组，不要在单因子中重复读取相同字段。
@@ -86,8 +91,9 @@ SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle
 
 ## Git 与远程仓库
 
-Git 已经是必需工具，不建议改用另一套源码管理系统。当前仓库没有 remote，建议增加
-私有 GitHub、GitLab 或公司 Gitea 远程仓库：
+Git 是本地版本历史和可回滚边界；当前 `origin` 是 Gitee 仓库
+`mingjiec/multi-factor-futures`。推送前必须确认没有把行情、SQLite、普通 runs、
+本机配置或凭据加入暂存区：
 
 1. 日常开发使用短分支和 pull request，不直接在 `main` 上累积大批改动。
 2. `main` 启用保护：完整测试通过、至少一次审阅、禁止 force push。

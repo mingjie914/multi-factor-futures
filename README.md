@@ -1,7 +1,7 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-07-28）仍为 `NO_TRADE`：`config/default.yaml` 没有获批因子，
+（2026-07-29）仍为 `NO_TRADE`：`config/default.yaml` 没有获批因子，
 `config/trading.yaml` 也保持关闭。挖掘结果只会进入候选池，不会自动进入组合或交易。
 
 ## 架构
@@ -60,6 +60,12 @@ $PY = '.\.venv\Scripts\python.exe'
 & $PY -X utf8 -B main.py mining dev-smoke `
   --periods 600 --symbols 12 --population 80 --generations 4
 
+# 显式启用 GP Accelerator v2-lite；默认仍为 off
+& $PY -X utf8 -B main.py mining dev-smoke `
+  --periods 600 --symbols 12 --population 80 --generations 4 `
+  --accelerator-mode v2-lite --accelerator-chunk-size 50 --jobs 4 `
+  --use-fast-rolling
+
 # 冻结验证、回测与关闭决策
 & $PY -X utf8 -B main.py walkforward --help
 & $PY -X utf8 -B main.py summarize --help
@@ -81,6 +87,11 @@ $PY = '.\.venv\Scripts\python.exe'
 
 本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 或 `config/local.yaml` 提供。因子挖掘适配器
 明确传入 `mysql_config=None`，不会因本地缺字段自动查询阿里云。
+
+配置为 MySQL/RDS 的 5 分钟读取路径会先检查本地
+`ths_data_5minute.db` 镜像；可用 `MF_THS_5MINUTE_DB` 或
+`local_ths_5minute_db` 覆盖位置。本地文件不存在或只读查询失败时才沿用原有 RDS
+endpoint failover，其他表和其他数据源不受影响。
 
 ## 研究治理
 
@@ -116,4 +127,5 @@ $PY = '.\.venv\Scripts\python.exe'
 - `_work/`、`.pytest_cache/`、`__pycache__/` 是可再生内容，不进入版本控制。
 - 实验工作流位于 `workflows/experiments/`，不属于正式命令入口。
 
-维护、性能基线和版本控制建议见 [`MAINTENANCE.md`](MAINTENANCE.md)。
+总体研究方法见 [`多因子框架研究手册.md`](多因子框架研究手册.md)；维护、性能基线和
+版本控制建议见 [`MAINTENANCE.md`](MAINTENANCE.md)。
