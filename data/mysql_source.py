@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sqlite3
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -67,6 +70,17 @@ class MySQLSource(DataSource):
             self._config.get("tables", {}) if self._config else {}
         )
         self._contract_pair_cache: Dict[tuple, Dict[str, pd.DataFrame]] = {}
+        self._local_ths_5minute_db = Path(
+            os.environ.get(
+                "MF_THS_5MINUTE_DB",
+                str(
+                    self._config.get(
+                        "local_ths_5minute_db",
+                        r"E:\程明杰公司内容\期货行情数据\本地表\ths_data\ths_data_5minute.db",
+                    )
+                ),
+            )
+        )
 
     @staticmethod
     def _normalise_endpoints(config: dict) -> List[dict]:
@@ -182,6 +196,14 @@ class MySQLSource(DataSource):
 
     def _read_sql(self, sql: str) -> pd.DataFrame:
         """Execute read-only SQL with ordered endpoint failover and one retry each."""
+        if self._should_read_local_ths_5minute(sql):
+            try:
+                return self._read_local_ths_5minute(sql)
+            except Exception:
+                logger.warning(
+                    "Local ths_data_5minute mirror query failed; falling back to RDS",
+                    exc_info=True,
+                )
         self._raise_if_circuit_open()
         if not self._endpoints:
             raise ValueError("no MySQL endpoint is configured")
@@ -213,6 +235,54 @@ class MySQLSource(DataSource):
                     self._engine = None
         self._open_circuit()
         raise ConnectionError("MySQL query failed on all endpoints (" + "; ".join(failures) + ")")
+
+    def _should_read_local_ths_5minute(self, sql: str) -> bool:
+        if not self._local_ths_5minute_db.is_file():
+            return False
+        table_config = self._get_table_config("intraday_5m") or {}
+        table_name = str(table_config.get("table_name", "ths_data_5minute"))
+        lowered = sql.lower()
+        return "select" in lowered and table_name.lower() in lowered
+
+    @staticmethod
+    def _sqlite_regexp(pattern: str, value: object) -> int:
+        if value is None:
+            return 0
+        return 1 if re.search(pattern, str(value)) else 0
+
+    def _read_local_ths_5minute(self, sql: str) -> pd.DataFrame:
+        read_only_uri = (
+            f"file:{self._local_ths_5minute_db.as_posix()}?mode=ro"
+        )
+        with sqlite3.connect(read_only_uri, uri=True) as connection:
+            connection.create_function("REGEXP", 2, self._sqlite_regexp)
+            return pd.read_sql_query(
+                self._optimise_local_ths_5minute_sql(sql),
+                connection,
+            )
+
+    def _optimise_local_ths_5minute_sql(self, sql: str) -> str:
+        table_config = self._get_table_config("intraday_5m") or {}
+        ticker_column = str(
+            (table_config.get("columns") or {}).get("ticker", "code")
+        )
+        quoted_ticker = re.escape(self._quote_identifier(ticker_column))
+        regexp_clause = re.compile(
+            rf"{quoted_ticker}\s+REGEXP\s+'\^\((?P<roots>[A-Z|]+)\)\[0-9\]\+\$'",
+            re.IGNORECASE,
+        )
+
+        def _replace(match: re.Match) -> str:
+            roots = [root for root in match.group("roots").split("|") if root]
+            if not roots:
+                return match.group(0)
+            clauses = [
+                f"{self._quote_identifier(ticker_column)} GLOB '{root}[0-9]*'"
+                for root in roots
+            ]
+            return "(" + " OR ".join(clauses) + ")"
+
+        return regexp_clause.sub(_replace, sql)
 
     def _open_circuit(self) -> None:
         self._circuit_open_until = time.monotonic() + self._failure_cooldown

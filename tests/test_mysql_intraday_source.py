@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import numpy as np
 import pandas as pd
 
@@ -111,3 +113,65 @@ def test_mysql_night_bar_maps_to_next_trading_day(monkeypatch):
         pd.Timestamp("2024-01-05"),
         pd.Timestamp("2024-01-08"),
     ]
+
+
+def test_mysql_five_minute_reads_local_mirror_before_rds(tmp_path):
+    db_path = tmp_path / "ths_data_5minute.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "create table ths_data_5minute "
+            "(time text, code text, open real, high real, low real, close real, volume real, amt real, oi real)"
+        )
+        connection.execute(
+            "insert into ths_data_5minute values "
+            "('2024-01-02 09:05:00', 'RB2405', 1, 2, 0.5, 1.5, 10, 15, 100)"
+        )
+
+    source = MySQLSource({
+        "local_ths_5minute_db": str(db_path),
+        "tables": {"intraday_5m": {"table_name": "ths_data_5minute"}},
+    })
+
+    frame = source._read_sql(
+        "select code, close from ths_data_5minute where code REGEXP '^RB[0-9]+$'"
+    )
+
+    assert frame.to_dict("records") == [{"code": "RB2405", "close": 1.5}]
+
+
+def test_mysql_five_minute_missing_local_mirror_uses_existing_endpoint_path(tmp_path):
+    source = MySQLSource({
+        "local_ths_5minute_db": str(tmp_path / "missing.db"),
+        "tables": {"intraday_5m": {"table_name": "ths_data_5minute"}},
+    })
+
+    try:
+        source._read_sql("select code from ths_data_5minute")
+    except ValueError as exc:
+        assert "no MySQL endpoint" in str(exc)
+    else:
+        raise AssertionError("expected original endpoint configuration error")
+
+
+def test_mysql_five_minute_local_sql_uses_glob_for_root_filter(tmp_path):
+    source = MySQLSource({
+        "local_ths_5minute_db": str(tmp_path / "ths_data_5minute.db"),
+        "tables": {
+            "intraday_5m": {
+                "table_name": "ths_data_5minute",
+                "columns": {"ticker": "code"},
+            }
+        },
+    })
+
+    sql = (
+        "SELECT `code` FROM `ths_data_5minute` "
+        "WHERE `time` >= '2024-01-01' "
+        "AND `code` REGEXP '^(RB|HC)[0-9]+$'"
+    )
+
+    optimised = source._optimise_local_ths_5minute_sql(sql)
+
+    assert "REGEXP" not in optimised
+    assert "`code` GLOB 'RB[0-9]*'" in optimised
+    assert "`code` GLOB 'HC[0-9]*'" in optimised
