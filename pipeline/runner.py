@@ -13,6 +13,7 @@ import numpy as np
 
 from core.types import *
 from core.config import load_config, FrameworkConfig
+from core.period import PeriodContext
 from core.registry import create, list_registered
 from data.manager import DataManager
 from data.cache import Cache
@@ -38,13 +39,16 @@ class PipelineRunner:
         print(result.summary())
     """
 
-    def __init__(self, config_path: str = None, config: FrameworkConfig = None):
+    def __init__(self, config_path: str = None, config: FrameworkConfig = None,
+                 *, frequency: str = "daily"):
         """初始化 PipelineRunner.
 
         CR-024: 支持直接传入 config 对象, 允许 CLI 覆盖在 Runner 创建前生效.
         Args:
             config_path: 配置文件路径 (与 config 二选一)
             config: 已加载的 FrameworkConfig 对象 (优先于 config_path)
+            frequency: 周期单位 ("daily"/"1min"/"5min"/"15min"/"30min"/"hourly").
+                       默认为 daily, 传入后全流程所有 bar 计数和年化均以此为基准.
         """
         if config is not None:
             self.config = config
@@ -52,6 +56,7 @@ class PipelineRunner:
             self.config: FrameworkConfig = load_config(config_path)
         else:
             raise ValueError("必须提供 config_path 或 config 参数")
+        self.period_ctx = PeriodContext.from_string(frequency)
         self._setup_logging()
         self.research_artifacts = None
         self._adaptivity_artifact_df = None
@@ -398,6 +403,9 @@ class PipelineRunner:
         costs_cfg = self.config.costs
         costs_params = {k: v for k, v in self._to_dict(costs_cfg).items()
                         if k != "type"}
+        costs_params.setdefault("periods_per_year", getattr(
+            self, "period_ctx", PeriodContext()
+        ).bars_per_year)
         try:
             self.cost_model = create("cost_model", costs_cfg.type, **costs_params)
         except Exception as e:
@@ -418,6 +426,9 @@ class PipelineRunner:
 
         sizer_params = (self._to_dict(sig_cfg.position_sizer_params)
                         if hasattr(sig_cfg, 'position_sizer_params') else {})
+        sizer_params.setdefault("periods_per_year", getattr(
+            self, "period_ctx", PeriodContext()
+        ).bars_per_year)
         try:
             from signals import position_sizing  # noqa: F401
             self.position_sizer = create("position_sizer", sig_cfg.position_sizer,

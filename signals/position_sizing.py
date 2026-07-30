@@ -29,9 +29,11 @@ class FixedFractionSizer(PositionSizer):
 
 @register("position_sizer", "atr_based")
 class ATRBasedSizer(PositionSizer):
-    def __init__(self, target_volatility: float = 0.15, atr_period: int = 20):
+    def __init__(self, target_volatility: float = 0.15, atr_period: int = 20,
+                 periods_per_year: float = 252.0):
         self.target_vol = target_volatility
         self.atr_period = atr_period
+        self.periods_per_year = float(periods_per_year)
 
     def size(
         self,
@@ -45,15 +47,16 @@ class ATRBasedSizer(PositionSizer):
         contract_vol = price * atr * point_value
         if contract_vol <= 0:
             return 0
-        target_risk = account_value * self.target_vol / np.sqrt(252)
+        target_risk = account_value * self.target_vol / np.sqrt(self.periods_per_year)
         contracts = int(target_risk / contract_vol)
         return max(1, contracts) if target_weight != 0 else 0
 
 
 @register("position_sizer", "volatility_inverse")
 class VolatilityInverseSizer(PositionSizer):
-    def __init__(self, target_vol: float = 0.15):
+    def __init__(self, target_vol: float = 0.15, periods_per_year: float = 252.0):
         self.target_vol = target_vol
+        self.periods_per_year = float(periods_per_year)
 
     def size(
         self,
@@ -67,6 +70,6 @@ class VolatilityInverseSizer(PositionSizer):
         if price <= 0 or vol <= 0:
             return 0
         risk_per_unit = price * vol * point_value
-        target_risk = account_value * self.target_vol / np.sqrt(252)
+        target_risk = account_value * self.target_vol / np.sqrt(self.periods_per_year)
         contracts = int(target_risk / risk_per_unit)
         return max(1, contracts) if target_weight != 0 else 0

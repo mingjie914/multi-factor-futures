@@ -313,6 +313,7 @@ def _build_fold_bundle(
     candidate_factors: list[str],
     build_correlation: bool,
     fdr_method: str,
+    frequency: str = "daily",
 ):
     from workflows.factor_adaptivity import run_adaptivity_analysis
     from workflows.research import _run_multi_period_screening
@@ -340,7 +341,7 @@ def _build_fold_bundle(
         pd.Timestamp(train_start),
         pd.Timestamp(train_end),
         periods_override=periods,
-        frequency="daily",
+        frequency=frequency,
         output_dir=str(output_dir),
         adaptivity_file=None,
     )
@@ -571,6 +572,7 @@ def walk_forward_4fold(
     fold_numbers: list[int] = None,
     fdr_method: str = "hierarchical",
     reuse_artifacts: bool = False,
+    frequency: str = "daily",
 ):
     """Nested walk-forward with unique, non-overlapping annual test folds."""
     configured_end = pd.Timestamp(base_config.date_range.end)
@@ -627,7 +629,7 @@ def walk_forward_4fold(
         sample_assessment = assess_sample_counts(
             len(train_dates), len(test_dates),
             policy=base_config.validation_policy,
-            frequency="daily",
+            frequency=frequency,
             train_days=len(train_dates), test_days=len(test_dates),
         )
         if not sample_assessment.sufficient:
@@ -664,6 +666,7 @@ def walk_forward_4fold(
                     candidate_factors=candidate_factors,
                     build_correlation=build_correlation,
                     fdr_method=fdr_method,
+                    frequency=frequency,
                 )
             cfg = copy.deepcopy(base_config)
             cfg.date_range.start = test_start
@@ -1049,6 +1052,11 @@ def main():
     )
     parser.add_argument("--cache-only", action="store_true", help="严格仅使用本地缓存")
     parser.add_argument(
+        "--frequency", default="daily",
+        choices=["daily", "1min", "5min", "15min", "30min", "hourly"],
+        help="周期单位 (默认 daily). 非日度研究使用数据源的真实 bar 索引",
+    )
+    parser.add_argument(
         "--candidate-factors", default=None,
         help="候选因子逗号分隔；默认使用全部已注册因子",
     )
@@ -1124,6 +1132,7 @@ def main():
             fold_numbers=fold_numbers,
             fdr_method=args.fdr_method,
             reuse_artifacts=args.reuse_artifacts,
+            frequency=args.frequency,
         )
         all_results["walk_forward"] = wf_results
         all_results["factor_fold_survival"] = summarize_factor_fold_survival(
