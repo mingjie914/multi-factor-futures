@@ -21,7 +21,7 @@
   -> SHA-256 不可变 JSON 快照 -> 主框架 Factor registry
 ```
 
-审查时不加载 mined 快照的动态注册表共有 3,475 个因子。这个数字是发现范围，
+审查时不加载 mined 快照的动态注册表共有 3,490 个因子。这个数字是发现范围，
 不是已通过检验或可交易的数量。注册表由 `factors.library` 导入触发；主工作流会负责
 导入，单独使用 Python API 时应显式 `import factors.library`。
 
