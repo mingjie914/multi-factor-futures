@@ -107,6 +107,7 @@ class PeriodContext:
             "60m": "hourly",
             "60min": "hourly",
             "1h": "hourly",
+            "daily_intraday": "daily",
         }
         normalised = aliases.get(str(freq).lower(), str(freq).lower())
         try:

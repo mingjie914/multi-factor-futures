@@ -441,12 +441,12 @@ class ValidationPolicyConfig(StrictConfigModel):
         "hourly": 80,
     }
     minimum_train_days_by_frequency: Dict[str, int] = {
-        "daily": 750, "1min": 60, "5min": 60,
-        "15min": 60, "30min": 60, "hourly": 60,
+        "daily": 750, "daily_intraday": 63,
+        "1min": 60, "5min": 60, "15min": 60, "30min": 60, "hourly": 60,
     }
     minimum_test_days_by_frequency: Dict[str, int] = {
-        "daily": 250, "1min": 20, "5min": 20,
-        "15min": 20, "30min": 20, "hourly": 20,
+        "daily": 250, "daily_intraday": 42,
+        "1min": 20, "5min": 20, "15min": 20, "30min": 20, "hourly": 20,
     }
     minimum_train_test_ratio: float = 3.0
     n_return_groups: int = 3

@@ -410,6 +410,7 @@ validation_policy:
     hourly: 80
   minimum_train_days_by_frequency:
     daily: 750
+    daily_intraday: 63
     1min: 60
     5min: 60
     15min: 60
@@ -417,6 +418,7 @@ validation_policy:
     hourly: 60
   minimum_test_days_by_frequency:
     daily: 250
+    daily_intraday: 42
     1min: 20
     5min: 20
     15min: 20

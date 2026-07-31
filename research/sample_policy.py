@@ -44,13 +44,14 @@ class SampleAssessment:
         }
 
 
-def _minimum(mapping: object, frequency: str, label: str) -> int:
+def _minimum(mapping: object, original: str, canonical: str, label: str) -> int:
     values = dict(mapping or {})
-    if frequency not in values:
-        raise ValueError(f"sample policy has no {label} for frequency {frequency!r}")
-    value = int(values[frequency])
+    key = original if original in values else canonical
+    if key not in values:
+        raise ValueError(f"sample policy has no {label} for frequency {key!r}")
+    value = int(values[key])
     if value < 1:
-        raise ValueError(f"sample policy {label}[{frequency!r}] must be positive")
+        raise ValueError(f"sample policy {label}[{key!r}] must be positive")
     return value
 
 
@@ -63,18 +64,19 @@ def assess_sample_counts(
     train_days: int | None = None,
     test_days: int | None = None,
 ) -> SampleAssessment:
+    original_freq = frequency
     frequency = normalise_frequency(frequency)
     minimum_train = _minimum(
-        policy.minimum_train_bars_by_frequency, frequency, "minimum_train_bars"
+        policy.minimum_train_bars_by_frequency, original_freq, frequency, "minimum_train_bars"
     )
     minimum_test = _minimum(
-        policy.minimum_test_bars_by_frequency, frequency, "minimum_test_bars"
+        policy.minimum_test_bars_by_frequency, original_freq, frequency, "minimum_test_bars"
     )
     minimum_train_days = _minimum(
-        policy.minimum_train_days_by_frequency, frequency, "minimum_train_days"
+        policy.minimum_train_days_by_frequency, original_freq, frequency, "minimum_train_days"
     )
     minimum_test_days = _minimum(
-        policy.minimum_test_days_by_frequency, frequency, "minimum_test_days"
+        policy.minimum_test_days_by_frequency, original_freq, frequency, "minimum_test_days"
     )
     ratio = float(train_bars) / float(test_bars) if test_bars > 0 else 0.0
     day_ratio = (
@@ -119,7 +121,7 @@ def minimum_training_days(policy, frequency: str) -> int:
     canonical = normalise_frequency(frequency)
     return _minimum(
         policy.minimum_train_days_by_frequency,
-        canonical,
+        canonical, canonical,
         "minimum_train_days",
     )
 

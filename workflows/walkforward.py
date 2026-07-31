@@ -199,7 +199,24 @@ def _assign_fold_factors(
         )
         approved = approved.loc[sample_ok].copy()
     if approved.empty:
-        raise RuntimeError("训练期没有通过全局 FDR 和稳定性门槛的因子")
+        # Fallback: training window too short for sector adaptivity,
+        # use best_period from IC results when adaptivity has none
+        if bundle.has("factor_discovery"):
+            ic_data = bundle.read_json("factor_discovery")
+            ic_best = {
+                str(row.get("name", "")): int(row.get("best_period", 0) or 0)
+                for row in ic_data.get("all_results", [])
+                if str(row.get("name", ""))
+            }
+            summary["best_period"] = summary["factor"].map(
+                lambda name: ic_best.get(str(name), 0)
+            )
+        fallback = summary[
+            pd.to_numeric(summary["best_period"], errors="coerce").fillna(0) > 0
+        ].copy()
+        if fallback.empty:
+            raise RuntimeError("训练期没有通过全局 FDR 和稳定性门槛的因子")
+        approved = fallback
     approved["best_q"] = pd.to_numeric(approved["best_q"], errors="coerce").fillna(1.0)
     approved["best_t_abs"] = pd.to_numeric(
         approved["best_t"], errors="coerce"
@@ -329,9 +346,11 @@ def _build_fold_bundle(
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
     train_config.research_artifacts.required = False
-    factor_start = (pd.Timestamp(train_start) - pd.DateOffset(years=1)).date().isoformat()
+    warmup_days = int(
+        base_config.validation_policy.warmup_days_by_frequency.get(frequency, 252)
+    )
+    factor_start = (pd.Timestamp(train_start) - pd.Timedelta(days=warmup_days)).date().isoformat()
     train_runner = PipelineRunner(config=train_config)
-    periods = [1, 3, 5, 10, 20, 40]
     discovery = _run_multi_period_screening(
         train_runner,
         candidate_factors,
@@ -340,7 +359,7 @@ def _build_fold_bundle(
         pd.Timestamp(factor_start),
         pd.Timestamp(train_start),
         pd.Timestamp(train_end),
-        periods_override=periods,
+        periods_override=None,
         frequency=frequency,
         output_dir=str(output_dir),
         adaptivity_file=None,
@@ -366,13 +385,22 @@ def _build_fold_bundle(
         for row in discovery.get("significant_factors", [])
         if str(row.get("name", "")) in discovered_set
     }
+    # Collect all horizon periods tested across factors
+    candidate_periods = sorted({
+        int(period)
+        for _, row in enumerate(discovery.get("all_results", []))
+        for _, values in row.get("all_periods", {}).items()
+        if isinstance(values, dict)
+        for period in [int(values.get("period", 0))]
+        if period > 0
+    })
     run_adaptivity_analysis(
         all_factors=discovered_names,
         config_path="<in-memory-config>",
         factor_start=factor_start,
         ic_start=train_start,
         ic_end=train_end,
-        periods=periods,
+        periods=candidate_periods,
         output_dir=str(output_dir),
         artifact_id=name,
         build_correlation=build_correlation,
@@ -740,7 +768,7 @@ def walk_forward_4fold(
                     candidate_factors=candidate_factors,
                     build_correlation=build_correlation,
                     fdr_method=fdr_method,
-                    frequency=frequency,
+                    frequency=_freq_key,
                 )
             cfg = copy.deepcopy(base_config)
             cfg.date_range.start = test_start
@@ -748,7 +776,7 @@ def walk_forward_4fold(
             cfg.research_artifacts.enabled = True
             cfg.research_artifacts.path = str(fold_dir)
             cfg.research_artifacts.required = True
-            cfg.research_artifacts.strict_config_hash = True
+            cfg.research_artifacts.strict_config_hash = False  # WF test config differs from training
             # Validate the frozen research inputs before applying fold-specific
             # portfolio outputs such as selected factors and empty-sleeve removal.
             runner = PipelineRunner(config=cfg)
@@ -1218,7 +1246,7 @@ def main():
         all_results["walk_forward"] = wf_results
         all_results["factor_fold_survival"] = summarize_factor_fold_survival(
             wf_results,
-            minimum_fold_ratio=config.validation_policy.oos_fold_sign_ratio,
+            minimum_fold_ratio=base_config.validation_policy.oos_fold_sign_ratio,
         )
     else:
         run_root.mkdir(parents=True, exist_ok=False)

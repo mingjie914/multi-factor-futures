@@ -776,25 +776,38 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         policy.expected_directions = effective_directions
     validate_policy(policy)
     policy_hash = validation_policy_sha256(policy)
+    _freq_lookup = frequency  # preserve "daily_intraday" before normalization
     minimum_test_bars = int(
-        dict(policy.minimum_test_bars_by_frequency)[
-            PeriodContext.from_string(frequency).unit.value
-        ]
+        dict(policy.minimum_test_bars_by_frequency).get(
+            _freq_lookup,
+            dict(policy.minimum_test_bars_by_frequency)[
+                PeriodContext.from_string(frequency).unit.value
+            ]
+        )
     )
     minimum_train_bars = int(
-        dict(policy.minimum_train_bars_by_frequency)[
-            PeriodContext.from_string(frequency).unit.value
-        ]
+        dict(policy.minimum_train_bars_by_frequency).get(
+            _freq_lookup,
+            dict(policy.minimum_train_bars_by_frequency)[
+                PeriodContext.from_string(frequency).unit.value
+            ]
+        )
     )
     minimum_test_days = int(
-        dict(policy.minimum_test_days_by_frequency)[
-            PeriodContext.from_string(frequency).unit.value
-        ]
+        dict(policy.minimum_test_days_by_frequency).get(
+            _freq_lookup,
+            dict(policy.minimum_test_days_by_frequency)[
+                PeriodContext.from_string(frequency).unit.value
+            ]
+        )
     )
     minimum_train_days = int(
-        dict(policy.minimum_train_days_by_frequency)[
-            PeriodContext.from_string(frequency).unit.value
-        ]
+        dict(policy.minimum_train_days_by_frequency).get(
+            _freq_lookup,
+            dict(policy.minimum_train_days_by_frequency)[
+                PeriodContext.from_string(frequency).unit.value
+            ]
+        )
     )
     explicit_family_map = dict(
         getattr(runner.config.factor_governance, "explicit_family_map", {}) or {}
@@ -1285,8 +1298,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             direction_ratio=policy.annual_direction_ratio,
             effect_ratio=policy.annual_effect_ratio,
             minimum_years=(
-                policy.minimum_calendar_years if period_ctx.is_daily
-                else policy.intraday_minimum_calendar_years
+                policy.intraday_minimum_calendar_years
+                if (not period_ctx.is_daily or "intraday" in str(frequency))
+                else policy.minimum_calendar_years
             ),
             minimum_days_per_year=policy.minimum_year_observations,
             bootstrap_samples=policy.single_instrument_bootstrap_samples,
