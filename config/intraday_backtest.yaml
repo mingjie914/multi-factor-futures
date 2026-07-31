@@ -14,32 +14,79 @@ universe:
   - A
   - AG
   - AL
+  - AO
+  - AP
   - AU
+  - B
+  - BB
+  - BC
+  - BR
+  - BU
+  - C
+  - CF
+  - CJ
+  - CS
   - CU
+  - CY
+  - EB
+  - EC
+  - EG
+  - FB
+  - FG
   - FU
   - HC
   - I
-  - J
-  - JM
-  - M
-  - MA
-  - NI
-  - P
-  - RB
-  - RM
-  - RU
-  - SA
-  - SN
-  - SR
-  - TA
-  - Y
-  - ZN
   - IC
   - IF
   - IH
+  - IM
+  - J
+  - JD
+  - JM
+  - L
+  - LC
+  - LG
+  - LH
+  - LU
+  - M
+  - MA
+  - NI
+  - NR
+  - OI
+  - P
+  - PB
+  - PF
+  - PG
+  - PK
+  - PP
+  - PR
+  - PS
+  - PX
+  - RB
+  - RM
+  - RR
+  - RS
+  - RU
+  - SA
+  - SC
+  - SF
+  - SH
+  - SI
+  - SM
+  - SN
+  - SP
+  - SR
+  - SS
   - T
+  - TA
+  - TF
   - TL
   - TS
+  - UR
+  - V
+  - WR
+  - Y
+  - ZN
 
 universe_selection:
   enabled: false

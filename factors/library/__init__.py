@@ -24,6 +24,8 @@ from . import (
     basis_momentum,
     intraday,
     cross_frequency,
+    microstructure_batch,
+    effective_variants,
 )
 
 # === SPEC-driven factors; the runtime log is the authoritative count ===
