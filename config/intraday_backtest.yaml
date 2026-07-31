@@ -1,110 +1,93 @@
 extends: default.yaml
-
 data:
   source: parquet_futures
   cache:
     enabled: false
-
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'
-
-# Exclude tickers with known data gaps in backtest
 universe:
-  - A
-  - AG
-  - AL
-  - AO
-  - AP
-  - AU
-  - B
-  - BC
-  - BR
-  - BU
-  - C
-  - CF
-  - CJ
-  - CS
-  - CU
-  - CY
-  - EB
-  - EC
-  - EG
-  - FB
-  - FG
-  - FU
-  - HC
-  - I
-  - IC
-  - IF
-  - IH
-  - IM
-  - J
-  - JD
-  - JM
-  - L
-  - LC
-  - LG
-  - LH
-  - LU
-  - M
-  - MA
-  - NI
-  - NR
-  - OI
-  - P
-  - PB
-  - PF
-  - PG
-  - PK
-  - PP
-  - PR
-  - PS
-  - PX
-  - RB
-  - RM
-  - RR
-  - RS
-  - RU
-  - SA
-  - SC
-  - SF
-  - SH
-  - SI
-  - SM
-  - SN
-  - SP
-  - SR
-  - SS
-  - T
-  - TA
-  - TF
-  - TL
-  - TS
-  - UR
-  - V
-  - WR
-  - Y
-  - ZN
-
+- A
+- AG
+- AL
+- AP
+- AU
+- B
+- BU
+- C
+- CF
+- CJ
+- CS
+- CU
+- CY
+- EB
+- EG
+- FB
+- FG
+- FU
+- HC
+- I
+- IC
+- IF
+- IH
+- IM
+- J
+- JD
+- JM
+- L
+- LH
+- M
+- MA
+- NI
+- OI
+- P
+- PB
+- PF
+- PG
+- PK
+- PP
+- RB
+- RM
+- RR
+- RU
+- SA
+- SF
+- SI
+- SM
+- SN
+- SP
+- SR
+- SS
+- T
+- TA
+- TF
+- TL
+- TS
+- UR
+- V
+- WR
+- Y
+- ZN
 universe_selection:
   enabled: false
-
 processing:
-  - type: winsorize
-    params: {method: mad, n_sigma: 3}
-  - type: standardize
-    params: {method: zscore, by_date: true}
-
+- type: winsorize
+  params:
+    method: mad
+    n_sigma: 3
+- type: standardize
+  params:
+    method: zscore
+    by_date: true
 factors:
-  - intraday_jump_intensity_20d
-  - intraday_price_peak_count_20d
-  - intraday_realised_skewness_20d
-  - intraday_dtws_20d
-  - intraday_drip_stone_20d
-  - intraday_peak_ridge_ratio_20d
-  - intraday_price_volume_elasticity_20d
-  - intraday_roll_spread_20d
-  - intraday_parkinson_vol_ratio_20d
-  - intraday_kyle_lambda_20d
-  - intraday_open_close_volume_ratio_20d
+- intraday_jump_intensity_20d
+- intraday_price_peak_count_20d
+- intraday_realised_skewness_20d
+- intraday_dtws_20d
+- intraday_drip_stone_20d
+- intraday_peak_ridge_ratio_20d
+- intraday_price_volume_elasticity_20d
+- intraday_roll_spread_20d
+- intraday_parkinson_vol_ratio_20d
+- intraday_kyle_lambda_20d
+- intraday_open_close_volume_ratio_20d
