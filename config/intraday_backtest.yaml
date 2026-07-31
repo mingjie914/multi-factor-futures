@@ -1,0 +1,59 @@
+extends: default.yaml
+
+data:
+  source: parquet_futures
+  cache:
+    enabled: false
+
+date_range:
+  start: '2025-01-01'
+  end: '2026-05-31'
+
+# Exclude tickers with known data gaps in backtest
+universe:
+  - A
+  - AG
+  - AL
+  - AU
+  - CU
+  - FU
+  - HC
+  - I
+  - J
+  - JM
+  - M
+  - MA
+  - NI
+  - P
+  - RB
+  - RM
+  - RU
+  - SA
+  - SN
+  - SR
+  - TA
+  - Y
+  - ZN
+  - IC
+  - IF
+  - IH
+  - T
+  - TL
+  - TS
+
+universe_selection:
+  enabled: false
+
+processing:
+  - type: winsorize
+    params: {method: mad, n_sigma: 3}
+  - type: standardize
+    params: {method: zscore, by_date: true}
+
+factors:
+  - intraday_jump_intensity_20d
+  - intraday_price_peak_count_20d
+  - intraday_realised_skewness_20d
+  - intraday_dtws_20d
+  - intraday_drip_stone_20d
+  - intraday_peak_ridge_ratio_20d
