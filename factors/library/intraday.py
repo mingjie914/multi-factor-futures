@@ -1402,13 +1402,15 @@ class IntradayUpperLowerVolumeRatio20d(Factor):
             for col in grp_close.columns:
                 c = grp_close[col].dropna()
                 a = grp_amt[col].dropna()
-                if len(c) < 20:
+                common_idx = c.index.intersection(a.index)
+                if len(common_idx) < 20:
                     continue
+                c, a = c.loc[common_idx], a.loc[common_idx]
                 mid = (c.max() + c.min()) / 2.0
                 upper_mask = c > mid
                 lower_mask = c < mid
-                upper_vol = a[upper_mask.values].sum()
-                lower_vol = a[lower_mask.values].sum()
+                upper_vol = a[upper_mask].sum()
+                lower_vol = a[lower_mask].sum()
                 vals[col] = float(upper_vol / lower_vol) if lower_vol > 1e-12 else 1.0
             if vals:
                 ratios[dt] = pd.Series(vals)
@@ -3104,10 +3106,12 @@ class IntradaySeasonalityResidual20d(Factor):
                         profiles.append(rg.values[:n_bars])
                 if len(profiles) < 3:
                     continue
-                avg_profile = np.mean(np.array(profiles), axis=0)
-                std_profile = np.std(np.array(profiles), axis=0, ddof=0)
+                # Align to shortest day to avoid broadcast errors
+                min_bars = min(len(v_today), min(len(p) for p in profiles))
+                avg_profile = np.mean(np.array([p[:min_bars] for p in profiles]), axis=0)
+                std_profile = np.std(np.array([p[:min_bars] for p in profiles]), axis=0, ddof=0)
                 std_profile[std_profile < 1e-12] = 1.0
-                v_arr = v_today.values[:n_bars]
+                v_arr = v_today.values[:min_bars]
                 deviation = np.mean(np.abs(v_arr - avg_profile) / std_profile)
                 vals[col] = float(deviation)
             if vals:

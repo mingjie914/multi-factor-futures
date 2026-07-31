@@ -57,3 +57,8 @@ factors:
   - intraday_dtws_20d
   - intraday_drip_stone_20d
   - intraday_peak_ridge_ratio_20d
+  - intraday_price_volume_elasticity_20d
+  - intraday_roll_spread_20d
+  - intraday_parkinson_vol_ratio_20d
+  - intraday_kyle_lambda_20d
+  - intraday_open_close_volume_ratio_20d
