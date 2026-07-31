@@ -450,6 +450,18 @@ class ValidationPolicyConfig(StrictConfigModel):
     }
     minimum_train_test_ratio: float = 3.0
     n_return_groups: int = 3
+    wf_train_bars_by_frequency: Dict[str, int] = {
+        "daily": 500, "daily_intraday": 126, "1min": 6000,
+    }
+    wf_test_bars_by_frequency: Dict[str, int] = {
+        "daily": 125, "daily_intraday": 42, "1min": 2000,
+    }
+    wf_step_bars_by_frequency: Dict[str, int] = {
+        "daily": 125, "daily_intraday": 42, "1min": 2000,
+    }
+    warmup_days_by_frequency: Dict[str, int] = {
+        "daily": 252, "daily_intraday": 90, "1min": 60,
+    }
     monthly_turnover_reference: float = 0.50
     cost_safety_margin: float = 1.50
     single_instrument_min_trading_days: int = 750

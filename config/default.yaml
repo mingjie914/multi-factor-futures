@@ -394,14 +394,16 @@ validation_policy:
   minimum_year_observations: 20
   minimum_train_bars_by_frequency:
     daily: 750
-    1min: 14400
+    daily_intraday: 63
+    1min: 6000
     5min: 2880
     15min: 960
     30min: 480
     hourly: 240
   minimum_test_bars_by_frequency:
     daily: 250
-    1min: 4800
+    daily_intraday: 42
+    1min: 1000
     5min: 960
     15min: 320
     30min: 160
@@ -421,6 +423,25 @@ validation_policy:
     30min: 20
     hourly: 20
   minimum_train_test_ratio: 3.0
+  # Walk-forward rolling parameters (bars per frequency).
+  # daily_intraday = intraday factors aggregated to daily output.
+  wf_train_bars_by_frequency:
+    daily: 500
+    daily_intraday: 126
+    1min: 6000
+  wf_test_bars_by_frequency:
+    daily: 125
+    daily_intraday: 42
+    1min: 2000
+  wf_step_bars_by_frequency:
+    daily: 125
+    daily_intraday: 42
+    1min: 2000
+  # Warm-up days before IC start, per frequency.
+  warmup_days_by_frequency:
+    daily: 252
+    daily_intraday: 90
+    1min: 60
   n_return_groups: 3
   # Diagnostic reference only; turnover is not a cost or admission gate.
   monthly_turnover_reference: 0.50

@@ -562,6 +562,61 @@ def summarize_factor_fold_survival(
     return summary
 
 
+def _build_rolling_folds(
+    calendar: pd.DatetimeIndex,
+    train_bars: int,
+    test_bars: int,
+    step_bars: int,
+    *,
+    frequency: str = "daily",
+) -> list[tuple]:
+    """Generate rolling WF fold segments from a calendar index and bar counts.
+
+    Each fold is ``(name, train_start, train_end, test_start, test_end)``.
+    Test windows are non-overlapping; training windows are fixed-length rolling.
+
+    If fewer than 3 folds can be built, ``step_bars`` is shortened to
+    ``test_bars // 2`` as a fallback (with a warning).
+    """
+    min_len = train_bars + test_bars
+    if len(calendar) < min_len:
+        return []
+    folds: list[tuple] = []
+    fold_idx = 1
+    cursor = 0
+    while cursor + min_len <= len(calendar):
+        train_start_dt = pd.Timestamp(calendar[cursor]).date().isoformat()
+        train_end_idx = cursor + train_bars - 1
+        train_end_dt = pd.Timestamp(calendar[train_end_idx]).date().isoformat()
+        test_start_idx = train_end_idx + 1
+        test_end_idx = test_start_idx + test_bars - 1
+        if test_end_idx >= len(calendar):
+            break
+        test_start_dt = pd.Timestamp(calendar[test_start_idx]).date().isoformat()
+        test_end_dt = pd.Timestamp(calendar[test_end_idx]).date().isoformat()
+        folds.append((
+            f"折{fold_idx}",
+            train_start_dt,
+            train_end_dt,
+            test_start_dt,
+            test_end_dt,
+        ))
+        cursor += step_bars
+        fold_idx += 1
+    # Fallback: if too few folds, retry with shorter step
+    if len(folds) < 3 and step_bars > test_bars // 2:
+        logger = logging.getLogger("multi_factor")
+        logger.warning(
+            "walk-forward 仅生成 %d 个折叠（最少需要3个），"
+            "将 step_bars 从 %d 缩短至 %d 重试",
+            len(folds), step_bars, test_bars // 2,
+        )
+        return _build_rolling_folds(
+            calendar, train_bars, test_bars, test_bars // 2, frequency=frequency,
+        )
+    return folds
+
+
 def walk_forward_4fold(
     base_config,
     *,
@@ -573,20 +628,39 @@ def walk_forward_4fold(
     fdr_method: str = "hierarchical",
     reuse_artifacts: bool = False,
     frequency: str = "daily",
+    is_intraday: bool = False,
 ):
-    """Nested walk-forward with unique, non-overlapping annual test folds."""
+    """Nested walk-forward with rolling test folds sized by bar counts.
+
+    Fold segments are generated from the configured calendar + per-frequency
+    WF parameters (train/test/step bars).  Daily factors can use separate
+    ``daily_intraday`` sizing when ``is_intraday=True``.
+    """
+    from core.period import PeriodContext
+
+    policy = base_config.validation_policy
+    ctx = PeriodContext.from_string(frequency)
+    _freq_key = (
+        "daily_intraday"
+        if is_intraday and ctx.unit.value == "daily"
+        else ctx.unit.value
+    )
+    train_bars = int(policy.wf_train_bars_by_frequency.get(_freq_key, 500))
+    test_bars = int(policy.wf_test_bars_by_frequency.get(_freq_key, 125))
+    step_bars = int(policy.wf_step_bars_by_frequency.get(_freq_key, 125))
+
     configured_end = pd.Timestamp(base_config.date_range.end)
     configured_start = pd.Timestamp(base_config.date_range.start).date().isoformat()
-    segments = [
-        ("段1", configured_start, "2022-06-30", "2022-07-01", "2023-06-30"),
-        ("段2", configured_start, "2023-06-30", "2023-07-01", "2024-06-30"),
-        ("段3", configured_start, "2024-06-30", "2024-07-01", "2025-06-30"),
-    ]
-    if configured_end >= pd.Timestamp("2025-07-01"):
-        segments.append((
-            "段4", configured_start, "2025-06-30", "2025-07-01",
-            configured_end.date().isoformat(),
-        ))
+    calendar = pd.bdate_range(configured_start, configured_end.date().isoformat())
+    segments = _build_rolling_folds(
+        calendar, train_bars, test_bars, step_bars,
+        frequency=_freq_key,
+    )
+    if not segments:
+        raise RuntimeError(
+            "walk-forward 无法生成任何折叠段；"
+            f"日历={len(calendar)}天, train={train_bars}, test={test_bars}, step={step_bars}"
+        )
     if fold_numbers is not None:
         requested = list(dict.fromkeys(int(value) for value in fold_numbers))
         invalid = [value for value in requested if value < 1 or value > len(segments)]
@@ -629,7 +703,7 @@ def walk_forward_4fold(
         sample_assessment = assess_sample_counts(
             len(train_dates), len(test_dates),
             policy=base_config.validation_policy,
-            frequency=frequency,
+            frequency=_freq_key,
             train_days=len(train_dates), test_days=len(test_dates),
         )
         if not sample_assessment.sufficient:
@@ -769,14 +843,16 @@ def walk_forward_4fold(
     print("\n" + "-" * 70)
     print(f"{'段':<6} {'测试期':<25} {'年化':>8} {'夏普':>6} {'回撤':>8} {'波动':>8}")
     print("-" * 70)
-    valid = [r for r in results if "error" not in r]
+    valid = [r for r in results if "error" not in r and not r.get("observation_channel")]
     for r in results:
         if "error" in r:
             print(f"{r['segment']:<6} {r['test_start']}~{r['test_end']:<12} 失败: {r['error']}")
+        elif r.get("observation_channel"):
+            print(f"{r['segment']:<6} {r['test_start']}~{r['test_end']:<12} (观察通道, 样本不足)")
         else:
             print(f"{r['segment']:<6} {r['test_start']}~{r['test_end']:<12} "
-                  f"{r['annual_return']:>8.2%} {r['sharpe']:>6.2f} "
-                  f"{r['max_drawdown']:>8.2%} {r['volatility']:>8.2%}")
+                  f"{r.get('annual_return', 0):>8.2%} {r.get('sharpe', 0):>6.2f} "
+                  f"{r.get('max_drawdown', 0):>8.2%} {r.get('volatility', 0):>8.2%}")
 
     if valid:
         sharpes = [r["sharpe"] for r in valid]
@@ -1052,6 +1128,10 @@ def main():
     )
     parser.add_argument("--cache-only", action="store_true", help="严格仅使用本地缓存")
     parser.add_argument(
+        "--is-intraday", action="store_true",
+        help="使用 daily_intraday 参数进行 WF（适用于日内聚合为日频的因子）",
+    )
+    parser.add_argument(
         "--frequency", default="daily",
         choices=["daily", "1min", "5min", "15min", "30min", "hourly"],
         help="周期单位 (默认 daily). 非日度研究使用数据源的真实 bar 索引",
@@ -1133,6 +1213,7 @@ def main():
             fdr_method=args.fdr_method,
             reuse_artifacts=args.reuse_artifacts,
             frequency=args.frequency,
+            is_intraday=args.is_intraday,
         )
         all_results["walk_forward"] = wf_results
         all_results["factor_fold_survival"] = summarize_factor_fold_survival(

@@ -293,6 +293,7 @@ def _read_local_minute(dates, universe, freq="1min"):
     """从本地 Parquet 读取分钟/日度 OHLCV 面板, 按根代码聚合."""
     import logging
     log = logging.getLogger("multi_factor")
+    dates = pd.DatetimeIndex(dates)
     subdir = _FREQ_DIR_MAP.get(freq)
     if subdir is None:
         return {}
@@ -321,12 +322,14 @@ def _read_local_minute(dates, universe, freq="1min"):
     all_data = pd.concat(frames, ignore_index=True)
     if all_data.empty:
         return {}
-    universe_set = set(str(u) for u in universe)
-    # 为每个合约分配根代码 (前缀匹配)
+    universe_set = set(str(u).upper() for u in universe)
+    # 为每个合约分配根代码 (前缀匹配)，统一转大写并优先匹配长代码避免前缀碰撞
+    universe_sorted = sorted(universe_set, key=len, reverse=True)
     symbol_root: dict[str, str] = {}
     for sym in all_data["symbol"].unique():
-        for ut in universe_set:
-            if sym.startswith(ut):
+        sym_upper = str(sym).upper()
+        for ut in universe_sorted:
+            if sym_upper.startswith(ut):
                 symbol_root[sym] = ut
                 break
     if not symbol_root:
@@ -367,6 +370,7 @@ def _get_minute_panel(data, dates, universe, freq="1min"):
     """
     import logging
     log = logging.getLogger("multi_factor")
+    dates = pd.DatetimeIndex(dates)
     # 1) 本地 Parquet
     try:
         panel = _read_local_minute(dates, universe, freq=freq)
@@ -394,7 +398,7 @@ def _get_minute_panel(data, dates, universe, freq="1min"):
             ) or {}
         except Exception:
             log.debug("DDB 获取失败", exc_info=True)
-
+    return {}
 
 def _safe_div(a, b):
     import numpy as np

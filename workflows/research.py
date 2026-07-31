@@ -1947,7 +1947,14 @@ def main():
     # 日期范围
     ic_start = pd.Timestamp(args.start) if args.start else pd.Timestamp(runner.config.date_range.start)
     ic_end = pd.Timestamp(args.end) if args.end else pd.Timestamp(runner.config.date_range.end)
-    factor_start = pd.Timestamp(args.factor_start) if args.factor_start else (ic_start - pd.Timedelta(days=365))
+    warmup_days = int(
+        runner.config.validation_policy.warmup_days_by_frequency.get(
+            args.frequency, 252
+        )
+    )
+    factor_start = pd.Timestamp(args.factor_start) if args.factor_start else (
+        ic_start - pd.Timedelta(days=warmup_days)
+    )
     if ic_start > ic_end:
         parser.error("--start 必须早于或等于 --end")
     runner.config.date_range.start = str(ic_start.date())
