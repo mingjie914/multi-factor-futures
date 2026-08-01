@@ -1,20 +1,19 @@
-"""combined — 融合策略模块 (最终固化版).
+"""combined — 融合策略模块 (最终固化版, ERC 升级).
 
-方案: 6因子打分选池 + 池内风险平价 (多空, 周度调仓)
+方案: 6因子打分选池 + 池内 ERC 风险平价 (多空, 周度调仓)
   - 品种池: manual29 (流动性适中、数据完整, 见 docs/策略基准记录.md)
   - 信号: 6个已验证因子等权打分 → Top10做多 / Bottom10做空
-  - 权重: 池内波动率倒数 (风险平价近似)
-  - 调仓: 周度 (W-FRI)
+  - 权重: 池内 ERC (等风险贡献, 协方差 shrinkage=0.3), 可回退到逆波动率
+  - 调仓: 周度 (每周五收盘生成信号, 下周一~周五持有)
 
 验证数据 (2025-01~2026-05 / OOS 2026-03~05):
-  全量夏普 0.96, 回撤 -5.32%
-  OOS 夏普 0.92, 回撤 -3.11%
-  月换手 18%
+  逆波动率版: 全量夏普 0.96, OOS 夏普 0.92, 月换手 18%
+  ERC 版: 待验证 (预期 OOS 回撤进一步收窄)
 
 用法:
     from strategies.combined import CombinedStrategy
-    strat = CombinedStrategy(config_path="config/intraday_backtest.yaml")
-    weights = strat.signal(date="2026-05-29")   # 返回 {品种: 权重}
+    strat = CombinedStrategy()
+    weights = strat.signal("2026-05-29")   # pd.Series: 品种 → 净权重 (多空抵消)
 """
 from __future__ import annotations
 
@@ -33,6 +32,7 @@ from core.config import load_config
 from factors.engine import FactorEngine
 
 # 6 个已验证有效因子 + 方向 (+1=高暴露看多, -1=高暴露看空)
+# 注意: 固定 6 因子, 不做任何时序因子择时 (无动态回退逻辑).
 FACTORS = {
     "intraday_jump_intensity_20d": -1,
     "intraday_price_peak_count_20d": 1,
@@ -51,9 +51,17 @@ MANUAL29 = [
 
 _DEFAULT_TOP_N = 10
 
+# 权重引擎开关: False = ERC (协方差), True = 简化逆波动率 (回退用)
+USE_SIMPLE_RP = False
+# 协方差收缩系数
+COV_SHRINKAGE = 0.30
+# 单品种权重硬限制
+MAX_WEIGHT = 0.20
+MIN_WEIGHT = 0.005
+
 
 class CombinedStrategy:
-    """6因子打分选池 + 池内风险平价 融合策略."""
+    """6因子打分选池 + 池内 ERC 风险平价 融合策略."""
 
     def __init__(self, config_path: str = "config/intraday_backtest.yaml",
                  top_n: int = _DEFAULT_TOP_N):
@@ -83,54 +91,80 @@ class CombinedStrategy:
             score = score.add(oriented, fill_value=0)
         return score.div(len(names))
 
-    def signal(self, date: str) -> dict[str, float]:
-        """给定交易日, 返回目标持仓权重 {品种: 权重} (做多>0, 做空<0).
+    def _pool_weights(self, pool: list[str], date: pd.Timestamp) -> pd.Series:
+        """池内权重: ERC (默认) 或逆波动率 (USE_SIMPLE_RP=True)."""
+        if not pool:
+            return pd.Series(dtype=float)
+        ret = self._recent_returns(date, pool)
+        if ret.shape[1] < 2 or ret.shape[0] < 10:
+            # 数据不足: 回退到等权
+            return pd.Series(1.0 / len(pool), index=pool)
 
-        内部: 取最近一周的因子打分 → Top N / Bottom N → 池内风险平价权重.
+        if USE_SIMPLE_RP:
+            vol = ret.std(ddof=0)
+            w = 1.0 / vol.replace(0, np.nan)
+            w = w / w.sum()
+            return w
+
+        # 协方差 ERC (框架正式 _erc_weights)
+        from optimization.risk_budgeting import RiskBudgetingOptimizer
+        cov_raw = ret.cov().values
+        target = np.diag(np.diag(cov_raw))
+        cov = (1.0 - COV_SHRINKAGE) * cov_raw + COV_SHRINKAGE * target
+        try:
+            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(len(pool)))
+        except (RuntimeError, ValueError):
+            # ERC 求解失败: 回退到逆波动率
+            vol = ret.std(ddof=0)
+            w = (1.0 / vol.replace(0, np.nan)).values
+            w = w / w.sum()
+        w = pd.Series(w, index=pool)
+
+        # 极值保护: 单品种权重上限/下限
+        w = w.clip(lower=MIN_WEIGHT, upper=MAX_WEIGHT)
+        return w / w.sum()
+
+    def _recent_returns(self, date: pd.Timestamp, symbols: list[str]) -> pd.DataFrame:
+        """最近 60 日收益率 (截至于 date, 用于协方差估计)."""
+        start = date - pd.Timedelta(days=90)
+        cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(start, date))
+        close = self.runner.data_manager.get("close", cal, symbols)
+        if close is None or close.empty:
+            return pd.DataFrame()
+        return close.pct_change().dropna(how="all")
+
+    def signal(self, date: str) -> pd.Series:
+        """给定交易日, 返回净持仓权重 Series (索引=品种, 值=多空抵消后净权重).
+
+        - 调仓日: 最近一个周五 (W-FRI) 的因子打分生成信号
+        - 异常处理: 无数据品种自动跳过, 不报错
         """
         end = pd.Timestamp(date)
         start = end - pd.Timedelta(days=40)
         score = self.factor_scores(start.strftime("%Y-%m-%d"), date)
         if score.empty:
-            return {}
+            return pd.Series(dtype=float)
+        # 跳过无数据品种
         row = score.iloc[-1].dropna()
         if len(row) < 2 * self.top_n:
             row = score.dropna(axis=1).iloc[-1]
         if len(row) < 2:
-            return {}
+            return pd.Series(dtype=float)
 
         ranked = row.rank(ascending=False)
         long_pool = ranked[ranked <= self.top_n].index.tolist()
         short_pool = ranked[ranked > len(ranked) - self.top_n].index.tolist()
 
-        # 池内风险平价权重 (波动率倒数)
-        weights = {}
-        close = self.runner.data_manager.get(
-            "close", pd.DatetimeIndex([end]), self._universe)
-        vol = self._rolling_vol(end)
-        for pool, sign in [(long_pool, 1.0), (short_pool, -1.0)]:
-            if not pool:
-                continue
-            v = vol.reindex(pool).replace(0, np.nan).dropna()
-            if v.empty:
-                continue
-            w = (1.0 / v)
-            total = w.sum()
-            if not np.isfinite(total) or total <= 0:
-                continue
-            w = w / total * sign
-            for sym, wi in w.items():
-                weights[sym] = float(wi)
-        return weights
+        w_long = self._pool_weights(long_pool, end)
+        w_short = self._pool_weights(short_pool, end)
 
-    def _rolling_vol(self, date: pd.Timestamp) -> pd.Series:
-        """品种 20 日滚动波动率 (截至于 date)."""
-        start = date - pd.Timedelta(days=60)
-        cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(start, date))
-        close = self.runner.data_manager.get("close", cal, self._universe)
-        ret = close.pct_change()
-        vol = ret.rolling(20, min_periods=10).std(ddof=0)
-        return vol.iloc[-1] if not vol.empty else pd.Series(dtype=float)
+        # 净权重: 多头 +, 空头 -
+        net = pd.Series(0.0, index=self._universe)
+        if not w_long.empty:
+            net = net.add(w_long, fill_value=0)
+        if not w_short.empty:
+            net = net.sub(w_short, fill_value=0)
+        return net[net.abs() > 1e-12]
 
 
 if __name__ == "__main__":
@@ -143,11 +177,11 @@ if __name__ == "__main__":
 
     strat = CombinedStrategy(args.config, args.topn)
     w = strat.signal(args.date)
-    if not w:
+    if w.empty:
         print("无有效信号")
     else:
         print(f"信号日期 {args.date}: {len(w)} 个持仓")
-        long = {k: v for k, v in w.items() if v > 0}
-        short = {k: v for k, v in w.items() if v < 0}
-        print(f"  多头: {', '.join(f'{k}({v*100:.1f}%)' for k, v in sorted(long.items(), key=lambda x:-x[1]))}")
-        print(f"  空头: {', '.join(f'{k}({v*100:.1f}%)' for k, v in sorted(short.items(), key=lambda x:x[1]))}")
+        long = w[w > 0].sort_values(ascending=False)
+        short = w[w < 0].sort_values()
+        print(f"  多头: {', '.join(f'{k}({v*100:.1f}%)' for k, v in long.items())}")
+        print(f"  空头: {', '.join(f'{k}({v*100:.1f}%)' for k, v in short.items())}")
