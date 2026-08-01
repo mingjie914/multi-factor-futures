@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--strategy", default="score", choices=["score", "hybrid"])
     parser.add_argument("--weight-scheme", default="equal",
                         choices=["equal", "rp", "half_rp", "ic", "floored", "confirm2w"])
+    parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
     parser.add_argument("--topn", type=int, default=10)
     parser.add_argument("--output", default="runs/scan")
     args = parser.parse_args()
@@ -127,8 +128,8 @@ def main():
         mean_ic_std = rolling_ic.std()
         print(f"IC均值={mean_ic.mean():.4f} IC标准差均值={mean_ic_std.mean():.3f}")
 
-    # 周度调仓
-    rebal = score.resample("W-FRI").last()
+    # 调仓频率
+    rebal = score.resample(args.rebalance).last()
     topn = args.topn
 
     rets, turnovers = [], []
@@ -198,6 +199,11 @@ def main():
         prev_long, prev_short = set(long_pool), set(short_pool)
 
         week_dates = calendar[(calendar >= t) & (calendar < t + pd.Timedelta(days=7))]
+        if args.rebalance != "W-FRI":
+            # 非周度: 用下一个调仓点界定持有期
+            idx = rebal.index.get_indexer([t], method="bfill")
+            nxt = rebal.index[idx[0] + 1] if idx[0] + 1 < len(rebal.index) else rebal.index[-1] + pd.Timedelta(days=1)
+            week_dates = calendar[(calendar >= t) & (calendar < nxt)]
         for d in week_dates:
             if d not in fwd.index:
                 continue
