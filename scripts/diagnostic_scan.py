@@ -68,8 +68,10 @@ def main():
     parser.add_argument("--start", default="2025-01-01")
     parser.add_argument("--end", default="2026-05-31")
     parser.add_argument("--universe-mode", default="all61",
-                        choices=["all61", "liq45", "liq29"])
+                        choices=["all61", "liq45", "liq29", "manual29"])
     parser.add_argument("--strategy", default="score", choices=["score", "hybrid"])
+    parser.add_argument("--factor-subset", default="all11",
+                        choices=["all11", "six"], help="all11=11因子, six=原6因子")
     parser.add_argument("--weight-scheme", default="equal",
                         choices=["equal", "rp", "half_rp", "ic", "floored", "confirm2w"])
     parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
@@ -85,8 +87,21 @@ def main():
         pd.Timestamp(args.start), pd.Timestamp(args.end)))
     universe = list(cfg.universe)
 
+    # 因子子集
+    if args.factor_subset == "six":
+        FACTORS_SUB = {k: v for k, v in FACTORS.items()
+                       if k in ("intraday_jump_intensity_20d", "intraday_price_peak_count_20d",
+                                "intraday_realised_skewness_20d", "intraday_dtws_20d",
+                                "intraday_drip_stone_20d", "intraday_peak_ridge_ratio_20d")}
+    else:
+        FACTORS_SUB = FACTORS
+
     # 口径筛选: 按日均成交额排序
-    if args.universe_mode != "all61":
+    if args.universe_mode == "manual29":
+        universe = ['A','AG','AL','AU','CU','FU','HC','I','IC','IF','IH','J','JM',
+                    'M','MA','NI','P','RB','RM','RU','SA','SN','SR','T','TA','TL','TS','Y','ZN']
+        print(f"[universe=manual29] 手动核心品种 {len(universe)}")
+    elif args.universe_mode != "all61":
         amount = runner.data_manager.get("amount", calendar, universe)
         daily_amount = amount.mean(skipna=True).sort_values(ascending=False)
         n = 45 if args.universe_mode == "liq45" else 29
@@ -94,10 +109,10 @@ def main():
         print(f"[universe={args.universe_mode}] 按日均成交额取前 {len(universe)}")
 
     # 因子暴露 + 打分
-    names = list(FACTORS)
+    names = list(FACTORS_SUB)
     computed = engine.compute_factors(names, calendar.tolist(), universe, parallel=False)
     score = pd.DataFrame(index=calendar, columns=universe, dtype=float)
-    for name, direction in FACTORS.items():
+    for name, direction in FACTORS_SUB.items():
         rank = computed[name].rank(axis=1, pct=True)
         oriented = rank if direction == 1 else (1 - rank)
         score = score.add(oriented, fill_value=0)
@@ -228,6 +243,11 @@ def main():
     print(f"[{tag}] 年化={m.get('annual_return', 0):.2%} 夏普={m.get('sharpe', 0):.2f} "
           f"回撤={m.get('max_drawdown', 0):.2%} 波动={m.get('volatility', 0):.2%} "
           f"月换手={monthly_turn:.0%} 超标周占比={over80:.0%}")
+
+    # 月度分解 (诊断辅助)
+    if not ret_s.empty:
+        monthly = ret_s.groupby(ret_s.index.to_period('M')).mean() * 21  # 月收益近似
+        print(f"  月度收益: " + ", ".join(f"{k}={v*100:.2f}%" for k, v in monthly.items()))
 
 
 if __name__ == "__main__":
