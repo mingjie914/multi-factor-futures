@@ -1,28 +1,19 @@
 from __future__ import annotations
 
 # === Hand-authored factor library ===
+# 组织结构:
+#   intraday.py                   自创日内高频因子 (224个, intraday_advanced)
+#   technical_factors.py          日度技术面 (动量/反转/偏度/趋势/波动率)
+#   term_structure_factors.py     期限结构与基差
+#   volume_oi_factors.py          量价与持仓
+#   cross_commodity.py            跨品种 (含 SECTOR_MAP, 被其他模块引用)
+#   cross_frequency.py            跨频率
 from . import (
-    liquidity,
-    momentum,
-    reversal,
-    term_structure,
-    term_structure_slope,
-    volatility,
-    volume_oi,
-    volume_oi_ratio,
-    skewness,
-    volume_price,
-    oi_momentum,
-    intraday_range,
-    overnight_return,
-    settle_close_basis,
-    vstd_normalized,
-    trend_strength,
-    skewness_long,
-    short_period,
-    cross_commodity,
-    basis_momentum,
     intraday,
+    technical_factors,
+    term_structure_factors,
+    volume_oi_factors,
+    cross_commodity,
     cross_frequency,
 )
 
