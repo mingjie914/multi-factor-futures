@@ -51,8 +51,9 @@ def metrics(ret: pd.Series) -> dict:
     ret = ret.dropna()
     if len(ret) < 5:
         return {}
-    ann = ret.mean() * 52
-    vol = ret.std(ddof=0) * np.sqrt(52)
+    # 收益为日度序列, 年化用 252 (此前误用 52 周度年化, 导致夏普低估 2.2 倍)
+    ann = ret.mean() * 252
+    vol = ret.std(ddof=0) * np.sqrt(252)
     nav = (1 + ret).cumprod()
     return {
         "annual_return": ann,
@@ -71,7 +72,7 @@ def main():
                         choices=["all61", "liq45", "liq29", "manual29"])
     parser.add_argument("--strategy", default="score", choices=["score", "hybrid"])
     parser.add_argument("--factor-subset", default="all11",
-                        choices=["all11", "six", "seven"], help="all11=11因子, six=原6因子, seven=6+vwap_crossings")
+                        choices=["all11", "six", "seven", "nine", "ten", "fifteen"], help="all11=11因子, six=6因子, ten=6+OI最强4, fifteen=6+OI9")
     parser.add_argument("--weight-scheme", default="equal",
                         choices=["equal", "rp", "half_rp", "ic", "floored", "confirm2w"])
     parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
@@ -99,6 +100,18 @@ def main():
                                 "intraday_realised_skewness_20d", "intraday_dtws_20d",
                                 "intraday_drip_stone_20d", "intraday_peak_ridge_ratio_20d",
                                 "intraday_vwap_crossings_20d")}
+    elif args.factor_subset == "fifteen":
+        FACTORS_SUB = {k: v for k, v in FACTORS.items()
+                       if k in ("intraday_jump_intensity_20d", "intraday_price_peak_count_20d",
+                                "intraday_realised_skewness_20d", "intraday_dtws_20d",
+                                "intraday_drip_stone_20d", "intraday_peak_ridge_ratio_20d")}
+        FACTORS_SUB.update({
+            "intraday_oi_time_centroid_20d": -1, "intraday_settle_position_20d": -1,
+            "intraday_term_vol_spread_20d": -1, "intraday_big_bar_ratio_20d": -1,
+            "intraday_oi_ma_cross_20d": 1, "intraday_oi_trend_20d": 1,
+            "intraday_oi_vol_price_corr_20d": -1, "intraday_term_breakout_20d": -1,
+            "intraday_term_oi_ratio_20d": 1,
+        })
     else:
         FACTORS_SUB = FACTORS
 
