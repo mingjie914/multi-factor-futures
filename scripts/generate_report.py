@@ -22,6 +22,9 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+# 中文字体支持
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 import numpy as np
 import pandas as pd
 
@@ -62,17 +65,17 @@ def chart_ic_ranking(ic_path: str, output_dir: str, factor_filter: set | None = 
     axes[0].barh(names, ics, color=colors_ic)
     axes[0].axvline(0, color="gray", linewidth=0.5)
     axes[0].set_xlabel("IC (Pearson)")
-    axes[0].set_title("Factor IC Ranking")
+    axes[0].set_title("因子IC排序")
 
     axes[1].barh(names, ts, color="#3498db")
     axes[1].axvline(2.0, color="red", linestyle="--", label="|t|=2.0")
     axes[1].legend()
-    axes[1].set_xlabel("|HAC t-statistic|")
-    axes[1].set_title("Factor t-Statistics")
+    axes[1].set_xlabel("|HAC t统计量|")
+    axes[1].set_title("因子t统计量")
 
     axes[2].barh(names, irs, color="#9b59b6")
-    axes[2].set_xlabel("|IR (NW)|")
-    axes[2].set_title("Factor Information Ratio")
+    axes[2].set_xlabel("|IR (Newey-West)|")
+    axes[2].set_title("因子信息比率")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "02_因子IC排序.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -93,16 +96,16 @@ def chart_layered(ic_path: str, output_dir: str, factor_filter: set | None = Non
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     x = range(len(names))
     w = 0.25
-    axes[0].bar([i - w for i in x], ls_ret, w, color="#2ecc71", label="Long-Short Ann. %")
-    axes[0].bar(x, mono, w, color="#e67e22", label="|Monotonicity|")
+    axes[0].bar([i - w for i in x], ls_ret, w, color="#2ecc71", label="多空年化(%)")
+    axes[0].bar(x, mono, w, color="#e67e22", label="|单调性|")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(names, rotation=45, ha="right")
     axes[0].legend()
-    axes[0].set_title("Layered Backtest Metrics")
+    axes[0].set_title("分层回测指标")
 
     axes[1].bar(names, turnover, color="#3498db")
-    axes[1].set_ylabel("Monthly Turnover")
-    axes[1].set_title("Turnover")
+    axes[1].set_ylabel("月换手率")
+    axes[1].set_title("换手率")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "03_分层回测指标.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -126,7 +129,7 @@ def chart_oos(ic_path: str, output_dir: str, factor_filter: set | None = None, t
                 f"{ic:.3f}", va="center", fontsize=9)
     ax.axvline(0, color="gray", linewidth=0.5)
     ax.set_xlabel("IC (Pearson)")
-    ax.set_title(f"Factor IC — {title}")
+    ax.set_title(f"因子IC — {title}")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "05_OOS因子IC.png"), dpi=150, bbox_inches="tight")
     plt.close()

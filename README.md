@@ -27,15 +27,7 @@
 
 ## 环境
 
-要求 Python 3.10+。Windows 可直接运行：
-
-```powershell
-.\setup.bat
-$PY = '.\.venv\Scripts\python.exe'
-& $PY main.py --help
-```
-
-手动安装时按用途选择：
+要求 Python 3.10+。手动安装按用途选择：
 
 ```powershell
 python -m pip install -r requirements-minimal.txt  # 本地 Parquet、挖掘、研究、回测
@@ -45,6 +37,16 @@ python -m pip install -r requirements-dev.txt      # 最小运行时 + 测试工
 
 `python` 必须指向安装了项目依赖的解释器。Windows Store 的占位 `python.exe` 不能
 运行本项目，可先用 `Get-Command python` 和 `python -m pip check` 核对。
+
+## 文档导航
+
+- **[框架工作流程与使用方法.md](框架工作流程与使用方法.md)** — 标准工作流程（因子层可变/组合层固化）+ 快速上手（主入口）
+- **docs/多因子框架研究手册.md** — 总体研究方法与四层架构
+- **docs/factor_validation_pipeline.md** — 因子检验与准入流程（v2 策略）
+- **docs/factor_creation_methodology.md** — 日内因子创造方法论与 170 因子参考
+- **docs/策略基准记录.md** — 所有基准方案（B1/B2/B3）
+- **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
+- **MAINTENANCE.md** — 维护、性能与版本控制
 
 ## 常用入口
 

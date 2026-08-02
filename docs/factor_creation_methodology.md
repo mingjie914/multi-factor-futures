@@ -1,0 +1,615 @@
+# 日内因子（intraday_advanced）创造方法论与完整参考
+
+> **文档目的**：让后续研究员或 agent 在阅读本文档后，能够快速、精准、无误地掌握本系列日内因子的创造方法、代码规范与设计思路，并立即上手创造新因子，且不与已有 170 个因子重复。
+>
+> **适用范围**：`factors/library/intraday.py` 中 `intraday_advanced` 类别的全部因子。
+> **当前状态**：已有 **170 个**因子（编号 #1–#170），全库注册 `intraday_advanced` 共 190 个（另 20 个来自 `microstructure_batch.py` 与 `effective_variants.py`，见 §11）。
+
+---
+
+## 1. 背景与数据基础
+
+### 1.1 数据源
+
+所有因子基于 **1 分钟 OHLCV 面板**（open/high/low/close/volume/amount），通过统一入口获取：
+
+```python
+panel = _get_minute_panel(data, dates, universe, freq="1min")
+# 返回 dict[str, DataFrame]: keys = open/high/low/close/volume/amount
+```
+
+读取优先级：本地 Parquet → `data.get_at_frequency()` → `DDBSource`。任一成功即返回。
+
+### 1.2 核心思想
+
+> **"高频挖、低频用"**：用 1 分钟微观结构信息提炼**日频**信号，最终输出为日度因子值（`frequency="daily"`）。因子预测的是未来 5/10/20 个交易日的收益（`validation_horizons=(5,10,20)`）。
+
+---
+
+## 2. 框架契约（必须遵守，违反会导致检验失败或未来函数）
+
+| 契约项 | 要求 | 说明 |
+|--------|------|------|
+| `frequency` | `"daily"` | 与数据频率一致；`core/factor_contract.py` 会强制校验，不一致直接 `raise ValueError` |
+| `validation_horizons` | `(5, 10, 20)` | 注册时冻结、去重排序；持有期是 **bar 数语义**（daily 下 1 bar = 1 交易日） |
+| `description` | 必填 | 用于注册表展示 |
+| 防未来函数 | 输出前 `shift(1)` | 因子值只能使用 T 日及以前的信息，`shift(1)` 后 T 日值才可用于预测 T+1 收益 |
+| `compute` 调用 | 一次性接收整个研究期 | `factors/engine.py:80` 传入 `full_dates`；**跨日 rolling/状态 dict 完全受支持** |
+| 预热期 | 滚动窗口前的观测为 NaN | 有效值从预热期（`ic_start`）后开始，属预期行为；回测引擎自动预留 1.5× 训练窗口 |
+
+---
+
+## 3. 标准代码模板（直接复制使用）
+
+```python
+# ═══════════════════════════════════════════════════════════════════════════════
+# 171. intraday_xxx — 一句话名称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_xxx_20d", category="intraday_advanced")
+class IntradayXxx20d(Factor):
+    """因子描述.
+
+    计算步骤说明...
+    方向: 正向/负向 (经济学直觉).
+    """
+    name = "intraday_xxx_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "一句话描述"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:  # 数据缺失时返回全 NaN，不抛异常
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        # 1) 计算分钟级序列 (如 ret_1m = panel["close"].pct_change())
+        # 2) 按日聚合: day = ret_1m.index.normalize(); 逐日 groupby 计算日度值
+        # 3) 时间聚合: daily.rolling(20, min_periods=5).mean()
+        # 4) 防未来: .reindex(dates).shift(1).reindex(columns=universe)
+        ...
+```
+
+### 3.1 四种标准时间聚合模式（选择其一）
+
+| 模式 | 代码 | 适用场景 |
+|------|------|----------|
+| 滚动均值 | `daily.rolling(20, min_periods=5).mean()` | 大多数因子（占比最高） |
+| 滚动求和 | `daily.rolling(20, min_periods=3).sum()` | 计数类（如 #13 price_peak_count） |
+| 截面增强 | `_roll20_mean_std(_mean_distance(daily))` | 需横截面标准化的因子（#4/#9/#17/#30） |
+| 直接输出 | 无滚动，仅 `shift(1)` | 已含跨日对比的因子（#116/#142/#145） |
+
+### 3.2 辅助函数（复用，勿重复实现）
+
+| 函数 | 作用 |
+|------|------|
+| `_get_minute_panel(data, dates, universe, freq)` | 获取 1min OHLCV 面板（三级回退） |
+| `_cs_zscore(frame)` | 截面 z-score（每行减均值除标准差，ddof=0） |
+| `_mean_distance(frame)` | `\|cs_zscore\|`：截面偏离度，忽略方向 |
+| `_roll20_mean_std(frame)` | `roll20_mean + roll20_std`：均值叠加波动增强 |
+| `_safe_div(a, b)` | 防除零除法 |
+
+---
+
+## 4. 设计方法论
+
+### 4.1 思路来源（五大来源，缺一不可）
+
+1. **学术文献**（最可靠）：已实现方差家族（Barndorff-Nielsen & Shephard）、微观结构（Kyle 1985 / Roll 1984 / Corwin-Schultz 2012 / Amihud 2002 / VPIN）、分形（MF-DFA）、行为金融（处置效应 / MAX 效应 / 锚定）。**先搜文献确认标准公式，再做工程化变体。**
+2. **市场微观结构**：订单流不平衡、价格冲击、流动性、支撑阻力、收盘竞价。
+3. **行为金融**：羊群、过度自信、处置效应、博彩偏好、注意力。
+4. **统计/信息论**：熵、分形维度、自相关、方差比、频谱。
+5. **经验路径分析**：路径形状（V 形/回撤/锯齿）、时段结构（开盘/尾盘）、跨日比较。
+
+### 4.2 主题框架（从 170 个因子归纳的 20+ 主题）
+
+设计新因子时先定位到新主题，或为既有主题补充**不同维度**的变体：
+
+- 量价关系：vp_corr / realized_covariance / ret_vol_coupling
+- 趋势与效率：trend_efficiency / hurst / variance_ratio / adx / choppiness
+- 跳跃与波动分解：jump_intensity / jump_ratio / bipower / quarticity
+- 时间位置：dtws / volume_time_centroid / highest_time / low_before_high
+- 时段结构：overnight_* / first_hour / last15min / morning_afternoon
+- 量形态：peak_ridge / volume_dispersion / drip_stone / volume_tail_conc
+- 流动性：cs_spread / roll_spread / kyle_lambda / depth_proxy / amihud_*
+- 订单流：vpin / order_flow_imbalance / informed_trading / signed_volume
+- 行为：overconfidence / herding / disposition / gambling / lottery / panic
+- K 线形态：body_ratio / wick_* / hammer / shooting_star
+- 波动结构：volatility_smile / parkinson / vol_of_vol / vol_persistence
+- 分形信息：mfdfa / spectral_slope / permutation_entropy / fractal_dimension
+- 尾部极值：tail_ratio / kurtosis / extreme_conc / profit_loss_ratio
+- 回归结构：regression_curvature / ols_rsquared / residual_skew
+- 冲击恢复：shock_continuation / volatility_cooling / recovery_speed
+- 支撑阻力：support_test / resistance_test / breakout_retest
+- 频率统计：up_minute_ratio / zero_ret_freq / tick_activity
+- 跨日比较：volatility_breakout / vol_compression / volume_momentum / vs_prev_*
+
+### 4.3 低相关设计原则（核心要求）
+
+> 用户明确要求"与现有因子相关性不高才有价值"。设计每个新因子时必须回答：**它与已有 170 个因子的区分维度是什么？**
+
+**判重检查表**（设计时逐项对照）：
+1. 同一输入序列的同类统计（如 mean vs std vs skew 是同一维度的不同阶）→ 易高相关
+2. 不同阈值同一概念（如 >2σ vs >3σ 的频率）→ 相关度高，慎用
+3. 数学上互为函数关系的两个因子（如 R² 与 1-R²、`up_vol/dn_vol` 与 `up_vol/(up+dn)`）→ **严格禁止**同时存在
+4. 概念相同粒度不同（分钟级 vs 浪级涨跌量比）→ 必须确实改变分析粒度
+
+**历史修正案例**（务必吸取）：
+- #101 原实现"逐分钟符号切换"与 #18 reversal_intensity 重复 → 改为**摆动转折点检测**（局部极值，过滤微小噪声）
+- #127 原实现"分钟涨跌量比"与 #29 up_down_volume_asymmetry 数学近似 → 改为**摆动分浪的浪级量比**
+- #95 原"常数序列相关"逻辑无意义 → 重写为**开盘价格发现份额**
+
+### 4.4 方向设定的经济学直觉
+
+每个因子必须明确预期方向（正/负），并给出经济解释，例如：
+- 高波动/厚尾/跳跃 → 博彩型特征 → 负向
+- 放量上涨确认/趋势清晰 → 正向
+- 流动性差/价差大/冲击高 → 负向
+- 买方主导/探底回升/高位收盘 → 正向
+
+> 注意：方向是**先验预期**，真实 IC 方向以框架实证结果为准（可能反转，如原 #8 的方向在样本外有翻转案例）。
+
+---
+
+## 5. 自审阅清单（每批因子交付前必做）
+
+1. **逻辑正确性**：公式推导无错误、边界条件（除零、空数据、NaN）已处理
+2. **无未来函数**：所有输出 `shift(1)`；跨日状态（prev_close 等）只读历史
+3. **无重复**：对照 §4.3 判重表 + 全库名称查重
+4. **标注完整**：name / category / frequency / description / validation_horizons 五属性齐全
+5. **编译验证**：`py -B -c "import factors.library"` 通过
+6. **编号连续**：注释编号 `# N. 因子名` 与注册一一对应、无缺号
+7. **性能合理**：避免 O(n²) 逐分钟循环（可用 numpy 向量化则用）
+
+---
+
+## 6. 完整因子参考（170 个）
+
+> 表格为：编号 | 注册名 | 方向 | 核心公式。方向为设计预期，需实证确认。
+> 所有因子：`frequency="daily"`, `validation_horizons=(5,10,20)`, 1min 数据 → 日聚合 → roll20 → shift(1)。
+
+### 批次一 原始因子 (1–15)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 1 | vp_corr_intraday | 负向 | 分钟ret×volume相关 → roll20mean |
+| 2 | vp_corr_intraday_eod | 负向 | 滚动10min ret×vol相关取eod |
+| 3 | intraday_trend_efficiency_20d | 负向 | \|位移\|/总路程 |
+| 4 | intraday_realised_skewness_20d | 正向 | 分钟ret偏度→\|zscore\|→roll20 mean+std |
+| 5 | intraday_cvar_20d | 负向 | 成交量加权CVaR→\|zscore\|→roll20 |
+| 6 | intraday_overconfidence_20d | 负向 | 日内极端涨跌时序错位 |
+| 7 | intraday_herding_20d | 负向 | 极端跟随量/趋势资金量 |
+| 8 | intraday_jump_intensity_20d | 负向 | \|ret_simple - ret_log\|→日均→roll20 |
+| 9 | intraday_dtws_20d | 负向 | 负收益时间加权重心→\|zscore\|→roll20 |
+| 10 | intraday_peak_ridge_ratio_20d | 正向 | 峰(孤立脉冲)/岭(持续放量)成交额比 |
+| 11 | intraday_blowup_position_20d | 负向 | 异常放量的相对价格位置 |
+| 12 | intraday_volume_vol_20d | 负向 | 日内量波动变异系数 |
+| 13 | intraday_price_peak_count_20d | 正向 | 孤立无缺口价格跳跃计数→roll20sum |
+| 14 | intraday_torrent_20d | 负向 | 放量下跌中的买入强度 |
+| 15 | intraday_drip_stone_20d | 正向 | FFT频谱 2-5分钟成交量能量占比 |
+
+### 批次二 (16–27)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 16 | intraday_volume_time_centroid_20d | 正向 | -Σ(tw×amt)/Σ(amt), tw∈[0,1] |
+| 17 | intraday_close_position_20d | 正向 | (close-low)/(high-low)→\|zscore\|→roll20 |
+| 18 | intraday_reversal_intensity_20d | 负向 | diff(sign(ret))切换次数/(n-1) |
+| 19 | intraday_upper_lower_volume_ratio_20d | 正向 | 中位价二分: 上/下成交额比 |
+| 20 | intraday_early_late_divergence_20d | 负向 | -sign(ret_early)×ret_late |
+| 21 | intraday_volume_dispersion_20d | 正向 | Gini(volume) |
+| 22 | intraday_open_vp_corr_20d | 正向 | Spearman(\|ret\|,vol)前30分钟 |
+| 23 | intraday_open_close_volume_ratio_20d | 正向 | 开盘N分成交额/尾盘N分成交额 |
+| 24 | intraday_amplitude_volume_corr_20d | 正向 | Spearman((high-low)/close,vol) |
+| 25 | intraday_ret_vol_coupling_20d | 正向 | 放量分钟中 max(涨比,跌比) |
+| 26 | intraday_price_volume_elasticity_20d | 负向 | mean(\|ret\|/vol_norm) |
+| 27 | intraday_open_gap_persistence_20d ⚠ | 正向 | sign(跳空)==sign(日内收益)?1:0 |
+
+### 批次三 (28–37)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 28 | intraday_overnight_absorption_20d ⚠ | 正向 | 日内振幅/(open×\|跳空\|) |
+| 29 | intraday_up_down_volume_asymmetry_20d | 正向 | mean(vol_up)/mean(vol_down) |
+| 30 | intraday_vwap_deviation_20d | 负向 | std(close-VWAP)→\|zscore\|→roll20 |
+| 31 | intraday_hurst_20d | 正向 | R/S法Hurst |
+| 32 | intraday_cs_spread_20d | 负向 | Corwin-Schultz(2012)简化HL价差 |
+| 33 | intraday_tail_acceleration_20d | 正向 | ret_late_tail - ret_early_tail |
+| 34 | intraday_volatility_smile_20d | 正向 | (早vol+尾vol)/(2×午vol) |
+| 35 | intraday_opening_range_breakout_20d | 正向 | 收盘>开盘区间上轨=+1, <下轨=-1 |
+| 36 | intraday_large_order_impact_20d | 正向 | 量突变(>μ+2σ)后5分钟方向均值 |
+| 37 | intraday_volume_price_entropy_20d | 正向 | -Σp(r,v)log(p) 5×5直方图 |
+
+### 批次四 微观结构/流动性/分形 (38–47)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 38 | intraday_signed_volume_ratio_20d | 正向 | (buy_vol-sell_vol)/total (tick test) |
+| 39 | intraday_semivariance_ratio_20d | 正向 | Σ(ret²[ret>0])/Σ(ret²[ret<0]) |
+| 40 | intraday_micro_leverage_20d | 正向 | -corr(ret_t, amp_{t+1}) |
+| 41 | intraday_price_run_duration_20d | 正向 | 最长同向run/总分钟数 |
+| 42 | intraday_parkinson_vol_ratio_20d | 正向 | -Parkinson/CloseClose |
+| 43 | intraday_level_clustering_20d | 正向 | -整数位±0.05聚集比例 |
+| 44 | intraday_kyle_lambda_20d | 负向 | \|ret\|/signed_vol |
+| 45 | intraday_roll_spread_20d | 负向 | 2√(-cov(Δp_t,Δp_{t-1})) |
+| 46 | intraday_realized_covariance_20d | 正向 | Σ(ret_dev×logvol_dev)/n |
+| 47 | intraday_seasonality_residual_20d | 正向 | mean(\|v_t-avg_profile\|/std) |
+
+### 批次五 A. 已实现方差家族 (48–53)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 48 | intraday_jump_ratio_20d | 负向 | (RV-BV)/RV, BV=(π/2)Σ\|r_t\|\|r_{t-2}\| |
+| 49 | intraday_continuous_vol_20d | 正向 | -sqrt(BV) |
+| 50 | intraday_realized_quarticity_20d | 负向 | (M/3)Σr⁴ |
+| 51 | intraday_downside_semivariance_20d | 负向 | Σr²·1[r<0] |
+| 52 | intraday_signed_jump_20d | 负向 | (RS⁻-RS⁺)/RV |
+| 53 | intraday_realized_kurtosis_20d | 负向 | M·Σr⁴/RV² |
+
+### 批次五 B. 自相关可预测性 (54–58)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 54 | intraday_autocorr_ret_20d | 正向 | corr(ret_t, ret_{t-1}) |
+| 55 | intraday_volatility_clustering_20d | 负向 | corr(\|ret_t\|, \|ret_{t-1}\|) |
+| 56 | intraday_variance_ratio_5m_20d | 正向 | VR(5)-1 |
+| 57 | intraday_variance_ratio_30m_20d | 正向 | VR(30)-1 |
+| 58 | intraday_direction_persistence_20d | 正向 | corr(sign(ret_t), sign(ret_{t-1})) |
+
+### 批次五 C. 订单流与信息不对称 (59–63)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 59 | intraday_vpin_20d | 负向 | 5分钟桶BVC不平衡 (需scipy) |
+| 60 | intraday_order_flow_imbalance_20d | 正向 | (Σbuy-Σsell)/Σvol |
+| 61 | intraday_informed_trading_20d | 负向 | sign(ret)·vol序列自相关 |
+| 62 | intraday_amihud_trend_20d | 正向 | \|ret\|/amount 前半-后半 |
+| 63 | intraday_impact_asymmetry_20d | 负向 | 涨/跌的\|ret\|/vol冲击差 |
+
+### 批次五 D. 日内时段行为 (64–68)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 64 | intraday_overnight_return_20d ⚠ | 正向 | (今开-昨收)/昨收 |
+| 65 | intraday_intraday_return_20d | 正向 | (收-开)/开 |
+| 66 | intraday_overnight_share_20d ⚠ | 负向 | \|隔夜\|/(\|隔夜\|+\|日内\|) |
+| 67 | intraday_first_hour_volume_20d | 正向 | 首60分量/全天量 |
+| 68 | intraday_noon_lull_20d | 正向 | -午间量占比 |
+
+### 批次五 E. 多尺度与分形 (69–73)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 69 | intraday_mfdfa_width_20d | 负向 | MF-DFA Δh=h(-2)-h(+2) |
+| 70 | intraday_mfdfa_h2_20d | 正向 | DFA h(2) |
+| 71 | intraday_spectral_slope_20d | 正向 | rFFT功率谱log-log斜率 |
+| 72 | intraday_permutation_entropy_20d | 正向 | -3连序模式熵 (用math.factorial) |
+| 73 | intraday_fractal_dimension_20d | 负向 | Higuchi盒维数 |
+
+### 批次五 F. K线形态 (74–79)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 74 | intraday_body_ratio_20d | 正向 | \|c-o\|/(h-l)均值 |
+| 75 | intraday_upper_wick_ratio_20d | 负向 | (h-max(o,c))/(h-l) |
+| 76 | intraday_lower_wick_ratio_20d | 正向 | (min(o,c)-l)/(h-l) |
+| 77 | intraday_wick_symmetry_20d | 负向 | (上影-下影)/(h-l) |
+| 78 | intraday_hammer_freq_20d | 正向 | 锤子线频率 (下影≥2×实体) |
+| 79 | intraday_shooting_star_freq_20d | 负向 | 射击之星频率 (上影≥2×实体) |
+
+### 批次五 G. 波动结构动态 (80–84)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 80 | intraday_vol_ratio_5_30_20d | 负向 | 5分钟/30分钟段波动比 |
+| 81 | intraday_vol_segment_consistency_20d | 正向 | 前半/后半\|ret\|相关 |
+| 82 | intraday_range_asymmetry_20d | 正向 | -(h-c)/(c-l) |
+| 83 | intraday_vol_persistence_20d | 负向 | \|ret\| AR(1)系数 |
+| 84 | intraday_vol_of_vol_20d | 负向 | 分钟波动率变异系数 |
+
+### 批次五 H. 流动性动态 (85–89)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 85 | intraday_liquidity_dryup_20d | 负向 | 极低量(≤1%分位)占比 |
+| 86 | intraday_volume_skew_20d | 正向 | skew(分钟量) |
+| 87 | intraday_depth_proxy_20d | 正向 | 平均额/平均振幅 |
+| 88 | intraday_turnover_velocity_20d | 正向 | 均量/量std |
+| 89 | intraday_liquidity_spike_freq_20d | 负向 | 量>μ+3σ占比 |
+
+### 批次五 I. 行为金融 (90–94)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 90 | intraday_disposition_proxy_20d | 负向 | 贴近VWAP放量比 |
+| 91 | intraday_anchoring_20d ⚠ | 负向 | 贴近昨收比例 |
+| 92 | intraday_attention_20d | 负向 | 量>μ+2σ频率 |
+| 93 | intraday_gambling_20d | 负向 | 波动/总量 |
+| 94 | intraday_lottery_max_20d | 负向 | -max(分钟收益) (MAX效应) |
+
+### 批次五 J. 市场机制 (95–97)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 95 | intraday_price_delay_20d | 正向 | 开盘30分收益占比 (价格发现份额) |
+| 96 | intraday_market_efficiency_20d | 正向 | \|Hurst-0.5\| |
+| 97 | intraday_trend_continuation_20d | 正向 | sign(早)==sign(晚)?1:-1 |
+
+### 批次六 G1. 路径形状 (98–102)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 98 | intraday_highest_time_20d | 正向 | 日内最高价出现时间(归一化) |
+| 99 | intraday_lowest_time_20d | 正向 | -最低价出现时间 |
+| 100 | intraday_max_drawdown_20d | 负向 | 累计收益最大峰谷回撤 |
+| 101 | intraday_zigzag_ratio_20d | 负向 | 摆动转折点(局部极值)/分钟数 |
+| 102 | intraday_trend_occupancy_20d | 正向 | 与主导方向一致的大波动分钟占比 |
+
+### 批次六 G2. 冲击与恢复 (103–107)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 103 | intraday_shock_continuation_20d | 正向 | \|ret\|>3σ后5分钟同向比例 |
+| 104 | intraday_volatility_cooling_20d | 正向 | -冲击后波动回落时长 |
+| 105 | intraday_drawdown_speed_20d | 负向 | 最大回撤/持续分钟 |
+| 106 | intraday_recovery_speed_20d | 正向 | 谷底到收盘回升速度 |
+| 107 | intraday_shock_asymmetry_20d | 正向 | 正冲击均值-负冲击均值 |
+
+### 批次六 G3. 时段结构 (108–112)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 108 | intraday_morning_afternoon_ratio_20d | 正向 | 上午收益/(\|上午\|+\|下午\|) |
+| 109 | intraday_close_drift_20d | 正向 | 最后30分钟收益 |
+| 110 | intraday_open_surge_20d | 负向 | 开盘30分波动/全天 |
+| 111 | intraday_last15min_volume_20d | 负向 | 最后15分钟量占比 |
+| 112 | intraday_third_share_20d | 正向 | 尾盘1/3收益占比 |
+
+### 批次六 G4. 回归结构 (113–117)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 113 | intraday_regression_curvature_20d | 正向 | 路径二次回归系数(凸度) |
+| 114 | intraday_ols_rsquared_20d | 正向 | 路径线性R² |
+| 115 | intraday_residual_skew_20d | 正向 | 去趋势残差偏度 |
+| 116 | intraday_volatility_breakout_20d ⚠ | 负向 | 今波动/近10日均值 |
+| 117 | intraday_ma_cross_20d | 正向 | (MA5-MA20)/MA20收盘 |
+
+### 批次六 G5. 尾部极值 (118–122)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 118 | intraday_tail_ratio_20d | 负向 | \|ret\|>3σ占比 |
+| 119 | intraday_abs_ret_ratio_20d | 负向 | mean\|ret\|/median\|ret\| |
+| 120 | intraday_extreme_conc_20d | 负向 | max\|ret\|/Σ\|ret\| |
+| 121 | intraday_profit_loss_ratio_20d | 正向 | 涨分钟均值/跌分钟均值 |
+| 122 | intraday_kurtosis_tail_20d | 负向 | p99\|ret\|/p90\|ret\| |
+
+### 批次六 G6. 量价时序 (123–127)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 123 | intraday_volume_trend_20d | 正向 | 量对时间回归斜率 |
+| 124 | intraday_new_high_volume_20d | 正向 | 创新高分钟均量/全日均量 |
+| 125 | intraday_obv_slope_20d | 正向 | OBV累积趋势斜率 |
+| 126 | intraday_path_above_vwap_20d | 正向 | 价格在VWAP上方时间占比 |
+| 127 | intraday_rally_volume_ratio_20d | 正向 | 摆动分浪: 上涨浪均量/下跌浪均量 |
+
+### 批次六 G7. 市场质量 (128–132)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 128 | intraday_choppiness_20d | 负向 | -CHOP指数 |
+| 129 | intraday_adx_20d | 正向 | 简化ADX |
+| 130 | intraday_liquidity_vol_ratio_20d | 正向 | 成交额/波动率 |
+| 131 | intraday_amihud_stability_20d | 正向 | Amihud均值/标准差 |
+| 132 | intraday_depth_trend_20d | 正向 | 后半段深度/前半段 |
+
+### 批次六 G8. 行为动态 (133–137)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 133 | intraday_zero_volume_run_20d | 负向 | -极低量最长连续run |
+| 134 | intraday_panic_strength_20d | 负向 | 最长连跌run×跌幅 |
+| 135 | intraday_euphoria_strength_20d | 正向 | 最长连涨run×涨幅 |
+| 136 | intraday_wash_trade_20d | 负向 | 快跌(5分>0.5%)后快收次数 |
+| 137 | intraday_close_auction_pressure_20d | 正向 | 最后5分钟收益 |
+
+### 批次六 G9. 支撑阻力 (138–142)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 138 | intraday_support_test_20d | 负向 | 触及低点±2%次数 |
+| 139 | intraday_resistance_test_20d | 负向 | 触及高点±2%次数 |
+| 140 | intraday_range_crossing_20d | 负向 | 穿越中位价线次数 |
+| 141 | intraday_breakout_retest_20d | 正向 | 突破前高后回踩不破次数 |
+| 142 | intraday_vol_compression_20d ⚠ | 正向 | -今日振幅/近10日均值 |
+
+### 批次六 G10. 综合 (143–147)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 143 | intraday_risk_adj_momentum_20d | 正向 | 日内收益/波动率 |
+| 144 | intraday_session_consistency_20d | 正向 | 4时段方向一致段数 |
+| 145 | intraday_volume_momentum_20d ⚠ | 正向 | 今日量/昨日量 |
+| 146 | intraday_order_flow_variability_20d | 负向 | 不平衡序列变异系数 |
+| 147 | intraday_vwap_position_20d | 正向 | (close-vwap)/std |
+
+### 批次七 H1. 频率统计 (148–152)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 148 | intraday_up_minute_ratio_20d | 正向 | 上涨分钟数/总分钟数 |
+| 149 | intraday_high_low_break_ratio_20d | 正向 | 创新高/(创新高+创新低) |
+| 150 | intraday_zero_ret_freq_20d | 负向 | 零收益分钟占比 |
+| 151 | intraday_signed_run_balance_20d | 正向 | 上涨总时长-下跌总时长 |
+| 152 | intraday_extreme_freq_balance_20d | 正向 | \|ret\|>2σ中上涨占比 |
+
+### 批次七 H2. 参考点与路径 (153–157)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 153 | intraday_vs_prev_high_20d ⚠ | 负向 | (close-prev_high)/prev_high |
+| 154 | intraday_vs_prev_low_20d ⚠ | 正向 | (close-prev_low)/prev_low |
+| 155 | intraday_low_before_high_20d | 正向 | 低点先于高点?1:-1 (V形) |
+| 156 | intraday_mid_line_time_20d | 正向 | 中位价线上方时间占比 |
+| 157 | intraday_drawdown_recover_ratio_20d | 正向 | (close-谷底)/(峰值-谷底) |
+
+### 批次七 H3. 波动结构 (158–162)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 158 | intraday_vol_ratio_2h_20d | 负向 | 前2小时/后2小时波动比 |
+| 159 | intraday_vol_quarter_trend_20d | 负向 | 4段波动率线性斜率 |
+| 160 | intraday_volatility_drift_20d | 负向 | \|ret\|二次回归凸度 |
+| 161 | intraday_rv_half_life_20d | 负向 | 波动自相关衰减到0.5的滞后数 |
+| 162 | intraday_vol_upside_20d | 负向 | 后半段/前半段波动 |
+
+### 批次七 H4. 信息与市场微观 (163–167)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 163 | intraday_tick_activity_20d | 正向 | ret≠0分钟占比 |
+| 164 | intraday_volume_tail_conc_20d | 负向 | top5%量分钟的量占比 |
+| 165 | intraday_price_volume_divergence_20d | 负向 | 新高但量缩(顶背离)占比 |
+| 166 | intraday_imbalance_acceleration_20d | 负向 | 买卖不平衡二阶差分 |
+| 167 | intraday_ret_distribution_peak_20d | 正向 | p50\|ret\|/p25\|ret\| |
+
+### 批次七 H5. 综合 (168–170)
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 168 | intraday_trend_follow_score_20d | 正向 | 顺趋势收益贡献占比 |
+| 169 | intraday_momentum_consistency_20d | 正向 | 5/10/30/60分动量同向数 |
+| 170 | intraday_session_symmetry_20d | 正向 | 前后半段路径相关 |
+
+### 批次八 动态结构 (171–190) — 检验驱动改进
+
+> 依据：全量检验显示单点统计量已饱和，此批聚焦动态过程/分布形状/组合形态。
+
+| # | 注册名 | 方向 | 核心公式 |
+|---|--------|------|----------|
+| 171 | intraday_vwap_reversion_speed_20d | 正向 | VWAP距离序列平均衰减率 |
+| 172 | intraday_vwap_crossings_20d | 负向 | 价格穿越VWAP次数 |
+| 173 | intraday_run_length_median_20d | 正向 | 同向run长度中位数 |
+| 174 | intraday_run_length_skew_20d | 负向 | run长度偏度 |
+| 175 | intraday_volume_half_life_20d | 负向 | 量自相关半衰期 |
+| 176 | intraday_vol_regime_switches_20d | 负向 | 高/低波动状态切换次数 |
+| 177 | intraday_vol_regime_duration_ratio_20d | 负向 | 高波动状态时长占比 |
+| 178 | intraday_skew_stability_20d | 正向 | 4段偏度符号一致数 |
+| 179 | intraday_quantile_skew_20d | 正向 | (Q3+Q1-2Q2)/(Q3-Q1) |
+| 180 | intraday_temporal_consistency_20d | 正向 | -\|σ5m/(√5·σ1m)-1\| |
+| 181 | intraday_morning_star_freq_20d | 正向 | 阴-星-阳三bar组合频率 |
+| 182 | intraday_engulfing_freq_20d | 负向 | 吞没形态频率 |
+| 183 | intraday_lz_complexity_20d | 负向 | LZ76符号序列复杂度 |
+| 184 | intraday_or_retention_20d | 负向 | 收盘仍在开盘区间内?1:0 |
+| 185 | intraday_vol_volume_regime_20d | 负向 | 高波动+放量分钟占比 |
+| 186 | intraday_body_consistency_20d | 正向 | 相邻K线实体方向相关 |
+| 187 | intraday_tail_cluster_20d | 负向 | 极端分钟(>2σ)平均间隔取负 |
+| 188 | intraday_extreme_timing_20d | 正向 | -最大\|ret\|分钟时间位置 |
+| 189 | intraday_volume_pareto_tail_20d | 正向 | Hill估计 1/mean(log(v/thr)) |
+| 190 | intraday_close_slope_r2_20d | 正向 | 尾盘30分路径R² |
+
+---
+
+## 7. 跨日因子专章（⚠ 标记的 10 个）
+
+> 这些因子依赖**跨交易日**数据，非纯日内。框架支持（`compute` 一次性接收全研究期），但使用时需注意预热期。代码注释块均已标注 `⚠ 跨日因子`。
+
+| # | 因子 | 跨日依赖 | 所需历史 |
+|---|------|----------|----------|
+| 27 | open_gap_persistence | 昨收 (prev_close) | ≥2 交易日 |
+| 28 | overnight_absorption | 昨收 (prev_close) | ≥2 交易日 |
+| 64 | overnight_return | 昨收 (prev_close) | ≥2 交易日 |
+| 66 | overnight_share | 昨收 (prev_close) | ≥2 交易日 |
+| 91 | anchoring | 昨收 (prev_close) | ≥2 交易日 |
+| 116 | volatility_breakout | 前10日波动率 (rolling(10,min_periods=3)) | ≥4 交易日 |
+| 142 | vol_compression | 前10日振幅 | ≥4 交易日 |
+| 145 | volume_momentum | 昨日量 (prev_total) | ≥2 交易日 |
+| 153 | vs_prev_high | 前日高点 (prev_high) | ≥2 交易日 |
+| 154 | vs_prev_low | 前日低点 (prev_low) | ≥2 交易日 |
+
+**跨日实现模式**（prev_xxx dict 追踪）：
+```python
+prev_close: dict = {}
+for dt in sorted(set(day)):
+    ...
+    prev_c = prev_close.get(col)
+    if prev_c is None or prev_c < 1e-12:   # 首日无历史 → 跳过，输出NaN
+        prev_close[col] = c.iloc[-1]
+        continue
+    vals[col] = ...                          # 用 prev_c 计算
+    prev_close[col] = c.iloc[-1]             # 更新状态
+```
+
+---
+
+## 8. 命名与编号规范
+
+- **注册名**：`intraday_<描述>_20d`（全部 20d 后缀，与 validation_horizons 兼容）
+- **类名**：`Intraday<CamelCase>20d`
+- **编号**：注释块 `# N. 注册名 — 中文名`，N 必须连续、与注册一一对应（当前 #1–#170）
+- **注释格式**：
+  ```
+  # ════...
+  # 171. intraday_xxx — 中文名
+  # ════...
+  ```
+- **跨日因子**：注释标题下加一行 `# ⚠ 跨日因子: 依赖... 需≥N日历史; 首日为NaN`
+
+---
+
+## 9. 验证与交付流程（框架内）
+
+```powershell
+# 1) 编译检查
+py -B -c "import factors.library"
+
+# 2) 编号连续性 + 去重检查
+#    正则: ^# (\d+)\. 应得到 1..N 连续; @register_factor 名称应无重复
+
+# 3) 正式研究验证 (冻结协议)
+py -X utf8 -B main.py research --config config/parquet_research.yaml ...
+
+# 4) 相关性去重: 与既有因子 |corr|>0.7 的需二选一
+# 5) 换手/成本/容量审核 → 组合层
+```
+
+> 研究手册 `多因子框架研究手册.md` 规定：正式查看 IC/HAC t 值前必须冻结公式/频率/日期/假设数；当前正式门槛为层级 FDR q=0.10、|IC|≥0.01、|HAC t|≥2。
+
+---
+
+## 10. 已知问题与注意事项（历史踩坑）
+
+1. **numpy 2.x 移除了 `np.math`**：`#72` 必须用 `import math as _math; _math.factorial()`，否则 AttributeError
+2. **scipy 依赖**：`#59 vpin` 使用 `scipy.stats.norm`，需确认 scipy 已安装（requirements 已含）
+3. **#95 修复**：原"常数序列相关"逻辑无意义，已重写为开盘价格发现份额
+4. **#101/#127 重复修正**：见 §4.3 历史修正案例
+5. **1分钟零收益分钟**（停牌/涨跌停）：会让 bipower 类因子（#48/#49）乘积项归零，学术上应剔除或降频处理
+6. **跨日状态在单次 compute 内维护**：引擎按 dates+universe 缓存（engine.py:42-77），跨调用无状态，prev_xxx dict 必须每次 compute 从零开始
+7. **检验驱动的迭代改进（重要经验）**：全量检验显示"单点统计量"（均值/方差/偏度/频率/占比）已高度饱和——80 个通过 FDR 的因子中 66 个与 6 个核心因子冗余。新增因子应优先设计**动态过程**（回归速度/状态切换/穿越次数）、**分布形状**（中位数/偏度/尾部指数）、**组合形态**（多 bar 模式），这些维度更可能提供正交增量（见批次八 #171–#190）
+
+---
+
+## 11. 与其他文件的边界
+
+全库注册 `intraday_advanced` 共 **210 个**：
+- `intraday.py`: 190 个（本文档范围，编号 #1–#190）
+- `microstructure_batch.py`: 10 个（realized_kurtosis_20d、intraday_amihud_20d、signed_volume_pressure_20d 等，既有）
+- `effective_variants.py`: 10 个（jump_intensity_rank_20d、kyle_lambda_stability_20d 等，既有）
+
+**注意**：后两者与 intraday.py 部分因子概念相近（如 `realized_kurtosis_20d` vs `intraday_realized_kurtosis_20d`），名称不同但可能高相关，组合层做相关性去重时需一并纳入。**当前暂不改动**（用户决定）。
+
+---
+
+## 12. 上手速查（新 agent 创建因子的最短路径）
+
+1. 读本文档 §2（契约）、§3（模板）、§4.3（判重表）
+2. 从 §6 选定一个**未被占据的主题**，或为已有主题补充**不同维度**（均值→方差→偏度→尾部分位数、日内→跨日、分钟级→浪级）
+3. 用 §3 模板写代码，注意：数据缺失返回全 NaN、`shift(1)`、`rolling(20, min_periods=5)`
+4. 逐条过 §5 自审阅清单
+5. 编译验证 + 编号连续性检查
+6. 向用户交付时说明：方向为**先验预期**，需框架实证确认；跨日因子需预热期
