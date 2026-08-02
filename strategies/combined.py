@@ -83,7 +83,7 @@ class CombinedStrategy:
             pd.Timestamp(start), pd.Timestamp(end)))
         names = list(FACTORS)
         computed = self.engine.compute_factors(
-            names, calendar.tolist(), self._universe, parallel=False)
+            names, calendar.tolist(), self._universe, parallel=True)
         score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
         for name, direction in FACTORS.items():
             rank = computed[name].rank(axis=1, pct=True)

@@ -1036,7 +1036,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             batch_names,
             calendar,
             universe,
-            parallel=False,
+            parallel=True,
             chunk_size=research_chunk_size,
         )
         factor_batch = runner.processor.process_batch(
@@ -1282,7 +1282,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             post_names,
             calendar,
             universe,
-            parallel=False,
+            parallel=True,
             chunk_size=max(len(post_names), 1),
         )
         factor_matrices = runner.processor.process_batch(
@@ -1793,7 +1793,7 @@ def _run_correlation_analysis(
     t0 = time.time()
     engine = FactorEngine(data_mgr)
     factor_matrices = engine.compute_factors(
-        factor_names, calendar, universe, parallel=False, chunk_size=100
+        factor_names, calendar, universe, parallel=True, chunk_size=100
     )
     from factors.processor import build_processing_context
 

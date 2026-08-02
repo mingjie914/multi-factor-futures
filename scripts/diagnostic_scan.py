@@ -110,7 +110,7 @@ def main():
 
     # 因子暴露 + 打分
     names = list(FACTORS_SUB)
-    computed = engine.compute_factors(names, calendar.tolist(), universe, parallel=False)
+    computed = engine.compute_factors(names, calendar.tolist(), universe, parallel=True)
     score = pd.DataFrame(index=calendar, columns=universe, dtype=float)
     for name, direction in FACTORS_SUB.items():
         rank = computed[name].rank(axis=1, pct=True)
