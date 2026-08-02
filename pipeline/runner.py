@@ -227,12 +227,8 @@ class PipelineRunner:
         # 注册内置因子
         try:
             from factors.library import (  # noqa: F401
-                momentum, reversal, volatility, volume_oi,
-                term_structure, liquidity,
-                skewness, volume_price, oi_momentum,
-                intraday_range, overnight_return, settle_close_basis,
-                vstd_normalized, trend_strength, skewness_long,
-                short_period)
+                technical_factors, term_structure_factors,
+                volume_oi_factors, cross_commodity, cross_frequency)
         except Exception as e:
             logger.warning(f"内置因子注册失败: {e}", exc_info=True)
 

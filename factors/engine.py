@@ -96,7 +96,7 @@ class FactorEngine:
         dates: DateIndex,
         universe: Universe,
         parallel: bool = False,
-        max_workers: int = 8,
+        max_workers: int = 4,
         chunk_size: int = 100,
     ) -> Dict[str, FactorMatrix]:
         """批量计算多个因子.

@@ -71,7 +71,7 @@ def main():
                         choices=["all61", "liq45", "liq29", "manual29"])
     parser.add_argument("--strategy", default="score", choices=["score", "hybrid"])
     parser.add_argument("--factor-subset", default="all11",
-                        choices=["all11", "six"], help="all11=11因子, six=原6因子")
+                        choices=["all11", "six", "seven"], help="all11=11因子, six=原6因子, seven=6+vwap_crossings")
     parser.add_argument("--weight-scheme", default="equal",
                         choices=["equal", "rp", "half_rp", "ic", "floored", "confirm2w"])
     parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
@@ -93,6 +93,12 @@ def main():
                        if k in ("intraday_jump_intensity_20d", "intraday_price_peak_count_20d",
                                 "intraday_realised_skewness_20d", "intraday_dtws_20d",
                                 "intraday_drip_stone_20d", "intraday_peak_ridge_ratio_20d")}
+    elif args.factor_subset == "seven":
+        FACTORS_SUB = {k: v for k, v in FACTORS.items()
+                       if k in ("intraday_jump_intensity_20d", "intraday_price_peak_count_20d",
+                                "intraday_realised_skewness_20d", "intraday_dtws_20d",
+                                "intraday_drip_stone_20d", "intraday_peak_ridge_ratio_20d",
+                                "intraday_vwap_crossings_20d")}
     else:
         FACTORS_SUB = FACTORS
 
