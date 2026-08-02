@@ -67,10 +67,10 @@ SQLite candidate catalog -> immutable JSON snapshot
 - 已删除被三层结构取代的 `hierarchical_sector` 注册入口。ERC 数值核心仍由
   `risk_budgeting` 复用，不应作为遗留代码删除。
 - 更改默认优化器、目标波动率、换手诊断或杠杆限制时，必须同步更新
-  `docs/three_layer_portfolio.md` 及对应测试。
+  `docs/三层资产配置流程.md` 及对应测试。
 
 因子统计准入、板块适配、后置交易属性检验与 Ridge 的完整先后关系见
-`docs/factor_validation_pipeline.md`。修改任何正式门槛或多重检验方法时必须同步更新
+`docs/因子检验与准入流程.md`。修改任何正式门槛或多重检验方法时必须同步更新
 该文档及研究结果中的方法元数据。研究 bundle 同时绑定验证策略 SHA-256 与 taxonomy
 SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle 在完成必要外部归档后
 应从工作区删除。
