@@ -20,6 +20,8 @@
 - 依赖前10日 (rolling(10, min_periods=3), 需≥4日): #116 volatility_breakout, #142 vol_compression
 - 依赖昨日量 (prev_total 追踪, 需≥2日): #145 volume_momentum
 - 依赖前日高低 (需≥2日): #153 vs_prev_high, #154 vs_prev_low
+- 补充批次 (K/V 系列): #K2 overnight_intraday_vol (相邻日收盘, 需≥2日);
+  V 系列 rolling/diff 变体基于日度因子值变换, 预热期由基因子覆盖, 无需额外跨日标注
 
 框架支持: compute 一次性接收整个研究期 (含预热期), rolling/跨日 dict 为标准模式;
 滚动窗口前的观测为 NaN, 有效值从预热期 (ic_start) 后开始. 各因子注释处均有 ⚠ 标注.
@@ -11362,6 +11364,7 @@ class RealizedKurtosis20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════
 # K2. overnight_intraday_vol — 隔夜/日内波动比
 #     = 隔夜跳空波动 / 日内实现波动. 高 → 隔夜信息主导.
+# ⚠ 跨日因子: 依赖相邻交易日收盘 (daily_close.pct_change), 需≥2个交易日历史; 首日为NaN
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("overnight_intraday_vol_20d", category="intraday_advanced")
 class OvernightIntradayVol20d(Factor):
@@ -11753,6 +11756,7 @@ def _v_v_cs_zscore(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("jump_intensity_rank_20d", category="intraday_advanced")
 class JumpIntensityRank20d(_VariantBase):
+    """跳跃强度截面排名变体 (基于 intraday_jump_intensity_20d)."""
     name = "jump_intensity_rank_20d"
     description = "跳跃强度截面排名"
     BASE = IntradayJumpIntensity20d
@@ -11766,6 +11770,7 @@ class JumpIntensityRank20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("peak_count_zscore_20d", category="intraday_advanced")
 class PeakCountZscore20d(_VariantBase):
+    """价峰计数截面标准化变体 (基于 intraday_price_peak_count_20d)."""
     name = "peak_count_zscore_20d"
     description = "价峰计数截面标准化"
     BASE = IntradayPricePeakCount20d
@@ -11780,6 +11785,7 @@ class PeakCountZscore20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("skewness_delta_10d", category="intraday_advanced")
 class SkewnessDelta10d(_VariantBase):
+    """已实现偏度10日差分变体 (基于 intraday_realised_skewness_20d)."""
     name = "skewness_delta_10d"
     description = "已实现偏度10日差分"
     BASE = IntradayRealisedSkewness20d
@@ -11793,6 +11799,7 @@ class SkewnessDelta10d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("dtws_smooth_3d", category="intraday_advanced")
 class DTWSSmooth3d(_VariantBase):
+    """跌幅时间重心3日平滑变体 (基于 intraday_dtws_20d)."""
     name = "dtws_smooth_3d"
     description = "跌幅时间重心3日平滑"
     BASE = IntradayDTWS20d
@@ -11807,6 +11814,7 @@ class DTWSSmooth3d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("roll_spread_vol_scaled_20d", category="intraday_advanced")
 class RollSpreadVolScaled20d(_VariantBase):
+    """Roll价差波动率缩放变体 (基于 intraday_roll_spread_20d)."""
     name = "roll_spread_vol_scaled_20d"
     description = "Roll价差波动率缩放"
     BASE = IntradayRollSpread20d
@@ -11822,6 +11830,7 @@ class RollSpreadVolScaled20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("kyle_lambda_stability_20d", category="intraday_advanced")
 class KyleLambdaStability20d(_VariantBase):
+    """Kyle冲击稳定性变体 (均值/标准差, 基于 intraday_kyle_lambda_20d)."""
     name = "kyle_lambda_stability_20d"
     description = "Kyle冲击稳定性 (均值/标准差)"
     BASE = IntradayKyleLambda20d
@@ -11837,6 +11846,7 @@ class KyleLambdaStability20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("open_close_vol_rank_20d", category="intraday_advanced")
 class OpenCloseVolRank20d(_VariantBase):
+    """开盘尾盘量比截面排名变体 (基于 intraday_open_close_volume_ratio_20d)."""
     name = "open_close_vol_rank_20d"
     description = "开盘尾盘量比截面排名"
     BASE = IntradayOpenCloseVolumeRatio20d
@@ -11851,6 +11861,7 @@ class OpenCloseVolRank20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("parkinson_over_rv_20d", category="intraday_advanced")
 class ParkinsonOverRV20d(_VariantBase):
+    """Parkinson/已实现波动比变体 (基于 intraday_parkinson_vol_ratio_20d)."""
     name = "parkinson_over_rv_20d"
     description = "Parkinson/已实现波动比"
     BASE = IntradayParkinsonVolRatio20d
@@ -11867,6 +11878,7 @@ class ParkinsonOverRV20d(_VariantBase):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("jump_times_skew_20d", category="intraday_advanced")
 class JumpTimesSkew20d(Factor):
+    """跳跃×偏度交互因子: 高跳跃低偏度→恐慌抛售信号增强."""
     name = "jump_times_skew_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11889,6 +11901,7 @@ class JumpTimesSkew20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("peak_count_delta_20d", category="intraday_advanced")
 class PeakCountDelta20d(_VariantBase):
+    """价峰计数10日差分变体 (基于 intraday_price_peak_count_20d)."""
     name = "peak_count_delta_20d"
     description = "价峰计数10日差分"
     BASE = IntradayPricePeakCount20d
