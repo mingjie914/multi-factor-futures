@@ -23,6 +23,7 @@ import pandas as pd
 from core.interfaces import Factor
 from core.registry import register_factor
 from factors.library.intraday import (
+    _roll_mean, _roll_std,
     IntradayJumpIntensity20d,
     IntradayPricePeakCount20d,
     IntradayRealisedSkewness20d,
@@ -130,7 +131,7 @@ class RollSpreadVolScaled20d(_VariantBase):
     BASE = IntradayRollSpread20d
 
     def _transform(self, base):
-        rv = base.rolling(20, min_periods=5).std(ddof=0).replace(0, np.nan)
+        rv = _roll_std(base, 20, 5).replace(0, np.nan)
         return base / rv
 
 
@@ -145,8 +146,8 @@ class KyleLambdaStability20d(_VariantBase):
     BASE = IntradayKyleLambda20d
 
     def _transform(self, base):
-        rm = base.rolling(20, min_periods=5).mean()
-        rs = base.rolling(20, min_periods=5).std(ddof=0).replace(0, np.nan)
+        rm = _roll_mean(base, 20, 5)
+        rs = _roll_std(base, 20, 5).replace(0, np.nan)
         return rm / rs
 
 
@@ -175,7 +176,7 @@ class ParkinsonOverRV20d(_VariantBase):
 
     def _transform(self, base):
         # 用基因子自身rolling std作为已实现波动代理
-        rv = base.rolling(20, min_periods=5).std(ddof=0).replace(0, np.nan)
+        rv = _roll_std(base, 20, 5).replace(0, np.nan)
         return base / rv
 
 

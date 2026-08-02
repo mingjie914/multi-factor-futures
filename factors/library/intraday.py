@@ -35,6 +35,45 @@ import pandas as pd
 from core.interfaces import Factor
 from core.registry import register_factor
 
+# ────────────────────────────────────────────────────────────────────────────
+# Bottleneck 加速的 rolling 薄封装 (可选加速, 数值等价已验证).
+# 仅用于最热的模式: rolling(20, min_periods=X).mean()/.std(ddof=0)/.sum().
+# bottleneck 缺失或 window > len 时自动回退 pandas, 保证任何环境数值一致.
+# 验证: bn.move_mean/move_std(ddof=0)/move_sum 与 pandas 对应操作
+#       在含 NaN/全NaN/短序列场景下逐元素一致 (差异 <= 1e-15).
+# ────────────────────────────────────────────────────────────────────────────
+try:
+    import bottleneck as _bn
+except ImportError:  # pragma: no cover
+    _bn = None
+
+
+def _roll_mean(df: pd.DataFrame, window: int = 20, min_periods: int = 5) -> pd.DataFrame:
+    if _bn is None or df.size == 0 or len(df) < window:
+        return df.rolling(window, min_periods=min_periods).mean()
+    return pd.DataFrame(
+        _bn.move_mean(df.values, window=window, min_count=min_periods, axis=0),
+        index=df.index, columns=df.columns,
+    )
+
+
+def _roll_std(df: pd.DataFrame, window: int = 20, min_periods: int = 5) -> pd.DataFrame:
+    if _bn is None or df.size == 0 or len(df) < window:
+        return df.rolling(window, min_periods=min_periods).std(ddof=0)
+    return pd.DataFrame(
+        _bn.move_std(df.values, window=window, min_count=min_periods, axis=0),
+        index=df.index, columns=df.columns,
+    )
+
+
+def _roll_sum(df: pd.DataFrame, window: int = 20, min_periods: int = 3) -> pd.DataFrame:
+    if _bn is None or df.size == 0 or len(df) < window:
+        return df.rolling(window, min_periods=min_periods).sum()
+    return pd.DataFrame(
+        _bn.move_sum(df.values, window=window, min_count=min_periods, axis=0),
+        index=df.index, columns=df.columns,
+    )
+
 
 class IntradayFactorBase(Factor):
     """日内因子基类: 封装通用逻辑.
@@ -446,8 +485,8 @@ def _mean_distance(frame):
     return _cs_zscore(frame).abs()
 
 def _roll20_mean_std(frame):
-    rm = frame.rolling(20, min_periods=5).mean()
-    rs = frame.rolling(20, min_periods=5).std(ddof=0)
+    rm = _roll_mean(frame, 20, 5)
+    rs = _roll_std(frame, 20, 5)
     return rm.add(rs, fill_value=0)
     return {}
 
@@ -494,7 +533,7 @@ class VpCorrIntraday(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(results).T
         daily.index = pd.DatetimeIndex(daily.index)
-        smoothed = daily.rolling(20, min_periods=5).mean()
+        smoothed = _roll_mean(daily, 20, 5)
         return smoothed.reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -542,7 +581,7 @@ class VpCorrIntradayEod(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(results)
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -588,7 +627,7 @@ class IntradayTrendEfficiency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(results).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -739,8 +778,8 @@ class IntradayOverconfidence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(cp_results).T
         daily.index = pd.DatetimeIndex(daily.index)
-        roll_mean = daily.rolling(20, min_periods=5).mean()
-        roll_std = daily.rolling(20, min_periods=5).std(ddof=0)
+        roll_mean = _roll_mean(daily, 20, 5)
+        roll_std = _roll_std(daily, 20, 5)
         rank_mean = roll_mean.rank(axis=1, ascending=True, pct=True)
         rank_std = roll_std.rank(axis=1, ascending=False, pct=True)
         return (rank_mean + rank_std).reindex(dates).shift(1).reindex(columns=universe)
@@ -799,7 +838,7 @@ class IntradayHerding20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(herding).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -838,7 +877,7 @@ class IntradayJumpIntensity20d(Factor):
         if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -943,7 +982,7 @@ class IntradayPeakRidgeRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1039,8 +1078,8 @@ class IntradayVolumeVol20d(Factor):
         if daily_vol.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily_vol.index = pd.DatetimeIndex(daily_vol.index)
-        roll_std = daily_vol.rolling(20, min_periods=5).std(ddof=0)
-        roll_mean = daily_vol.rolling(20, min_periods=5).mean()
+        roll_std = _roll_std(daily_vol, 20, 5)
+        roll_mean = _roll_mean(daily_vol, 20, 5)
         return (roll_std / roll_mean.replace(0, np.nan)).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -1105,7 +1144,7 @@ class IntradayPricePeakCount20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(counts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=3).sum().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_sum(daily, 20, 3).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1229,7 +1268,7 @@ class IntradayDripStone20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(band_ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1386,7 +1425,7 @@ class IntradayReversalIntensity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(intensities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1448,7 +1487,7 @@ class IntradayUpperLowerVolumeRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1504,7 +1543,7 @@ class IntradayEarlyLateDivergence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(divergences).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1561,7 +1600,7 @@ class IntradayVolumeDispersion20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ginis).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1619,7 +1658,7 @@ class IntradayOpenVpCorr20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(corrs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1673,7 +1712,7 @@ class IntradayOpenCloseVolumeRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1731,7 +1770,7 @@ class IntradayAmplitudeVolumeCorr20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(corrs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1794,7 +1833,7 @@ class IntradayRetVolCoupling20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(couplings).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1853,7 +1892,7 @@ class IntradayPriceVolumeElasticity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(elasticities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1917,7 +1956,7 @@ class IntradayOpenGapPersistence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(persistence).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1985,7 +2024,7 @@ class IntradayOvernightAbsorption20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(absorptions).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2043,7 +2082,7 @@ class IntradayUpDownVolumeAsymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(asymmetries).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2184,7 +2223,7 @@ class IntradayHurst20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(hursts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2257,7 +2296,7 @@ class IntradayCSSpread20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(spreads).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2315,7 +2354,7 @@ class IntradayTailAcceleration20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(accelerations).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2376,7 +2415,7 @@ class IntradayVolatilitySmile20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(smiles).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2445,7 +2484,7 @@ class IntradayOpeningRangeBreakout20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(breakouts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2516,7 +2555,7 @@ class IntradayLargeOrderImpact20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(impacts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2584,7 +2623,7 @@ class IntradayVolumePriceEntropy20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(entropies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2643,7 +2682,7 @@ class IntradaySignedVolumeRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2693,7 +2732,7 @@ class IntradaySemivarianceRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(semivars).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2752,7 +2791,7 @@ class IntradayMicroLeverage20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(leverages).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2810,7 +2849,7 @@ class IntradayPriceRunDuration20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(durations).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2874,7 +2913,7 @@ class IntradayParkinsonVolRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2925,7 +2964,7 @@ class IntradayLevelClustering20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(clusterings).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2981,7 +3020,7 @@ class IntradayKyleLambda20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(lambdas).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3030,7 +3069,7 @@ class IntradayRollSpread20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(spreads).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3087,7 +3126,7 @@ class IntradayRealizedCovariance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(covariances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3152,7 +3191,7 @@ class IntradaySeasonalityResidual20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(residuals).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3206,7 +3245,7 @@ class IntradayJumpRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3254,7 +3293,7 @@ class IntradayContinuousVol20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(vols).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3302,7 +3341,7 @@ class IntradayRealizedQuarticity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(quartics).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3349,7 +3388,7 @@ class IntradayDownsideSemivariance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(downside).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3399,7 +3438,7 @@ class IntradaySignedJump20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(signed_jumps).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3450,7 +3489,7 @@ class IntradayRealizedKurtosis20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(kurtosis).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3502,7 +3541,7 @@ class IntradayAutocorrRet20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(autocorrs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3555,7 +3594,7 @@ class IntradayVolatilityClustering20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(clusters).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3621,7 +3660,7 @@ class IntradayVarianceRatio5m20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(vrs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3685,7 +3724,7 @@ class IntradayVarianceRatio30m20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(vrs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3737,7 +3776,7 @@ class IntradayDirectionPersistence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(persist).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3810,7 +3849,7 @@ class IntradayVPIN20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(vpins).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3866,7 +3905,7 @@ class IntradayOrderFlowImbalance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(imbalances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3922,7 +3961,7 @@ class IntradayInformedTrading20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(informed).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3983,7 +4022,7 @@ class IntradayAmihudTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(trends).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4042,7 +4081,7 @@ class IntradayImpactAsymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(asym).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4100,7 +4139,7 @@ class IntradayOvernightReturn20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(overnight).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4152,7 +4191,7 @@ class IntradayIntradayReturn20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(intraday).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4212,7 +4251,7 @@ class IntradayOvernightShare20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(shares).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4264,7 +4303,7 @@ class IntradayFirstHourVolume20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(first_hour).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4318,7 +4357,7 @@ class IntradayNoonLull20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(lulls).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4410,7 +4449,7 @@ class IntradayMfdfaWidth20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(widths).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4488,7 +4527,7 @@ class IntradayMfdfaH220d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(h2s).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4547,7 +4586,7 @@ class IntradaySpectralSlope20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(slopes).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4613,7 +4652,7 @@ class IntradayPermutationEntropy20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(entropies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4690,7 +4729,7 @@ class IntradayFractalDimension20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(dims).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4753,7 +4792,7 @@ class IntradayBodyRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(bodies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4813,7 +4852,7 @@ class IntradayUpperWickRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(wicks).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4873,7 +4912,7 @@ class IntradayLowerWickRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(wicks).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4935,7 +4974,7 @@ class IntradayWickSymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(sym).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4999,7 +5038,7 @@ class IntradayHammerFreq20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(hammers).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5063,7 +5102,7 @@ class IntradayShootingStarFreq20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(stars).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5125,7 +5164,7 @@ class IntradayVolRatio53020d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5187,7 +5226,7 @@ class IntradayVolSegmentConsistency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(consistencies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5246,7 +5285,7 @@ class IntradayRangeAsymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(asym).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5300,7 +5339,7 @@ class IntradayVolPersistence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(persist).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5356,7 +5395,7 @@ class IntradayVolOfVol20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(vov).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5405,7 +5444,7 @@ class IntradayLiquidityDryup20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(dryups).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5455,7 +5494,7 @@ class IntradayVolumeSkew20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(skews).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5520,7 +5559,7 @@ class IntradayDepthProxy20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(depths).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5569,7 +5608,7 @@ class IntradayTurnoverVelocity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(velocities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5620,7 +5659,7 @@ class IntradayLiquiditySpikeFreq20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(spikes).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5684,7 +5723,7 @@ class IntradayDispositionProxy20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(proxies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5749,7 +5788,7 @@ class IntradayAnchoring20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(anchors).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5800,7 +5839,7 @@ class IntradayAttention20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(attention).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5857,7 +5896,7 @@ class IntradayGambling20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(gamblings).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5904,7 +5943,7 @@ class IntradayLotteryMax20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(maxs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5961,7 +6000,7 @@ class IntradayPriceDelay20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(shares).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6012,7 +6051,7 @@ class IntradayMarketEfficiency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(efficiencies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6071,7 +6110,7 @@ class IntradayTrendContinuation20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(continuations).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6119,7 +6158,7 @@ class IntradayHighestTime20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(times).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6167,7 +6206,7 @@ class IntradayLowestTime20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(times).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6217,7 +6256,7 @@ class IntradayMaxDrawdown20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(dd).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6285,7 +6324,7 @@ class IntradayZigzagRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(zigzags).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6338,7 +6377,7 @@ class IntradayTrendOccupancy20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(occupancies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6397,7 +6436,7 @@ class IntradayShockContinuation20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(continuations).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6458,7 +6497,7 @@ class IntradayVolatilityCooling20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(coolings).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6515,7 +6554,7 @@ class IntradayDrawdownSpeed20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(speeds).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6572,7 +6611,7 @@ class IntradayRecoverySpeed20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(recoveries).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6627,7 +6666,7 @@ class IntradayShockAsymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(asym).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6679,7 +6718,7 @@ class IntradayMorningAfternoonRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6729,7 +6768,7 @@ class IntradayCloseDrift20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(drifts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6783,7 +6822,7 @@ class IntradayOpenSurge20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(surges).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6835,7 +6874,7 @@ class IntradayLast15minVolume20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(shares).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6888,7 +6927,7 @@ class IntradayThirdShare20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(shares).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6938,7 +6977,7 @@ class IntradayRegressionCurvature20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(curvatures).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6993,7 +7032,7 @@ class IntradayOlsRsquared20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(r2s).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7044,7 +7083,7 @@ class IntradayResidualSkew20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(skews).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7147,7 +7186,7 @@ class IntradayMaCross20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(crosses).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7198,7 +7237,7 @@ class IntradayTailRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(tails).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7250,7 +7289,7 @@ class IntradayAbsRetRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7299,7 +7338,7 @@ class IntradayExtremeConc20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(concs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7350,7 +7389,7 @@ class IntradayProfitLossRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7399,7 +7438,7 @@ class IntradayKurtosisTail20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(tails).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7449,7 +7488,7 @@ class IntradayVolumeTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(trends).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7509,7 +7548,7 @@ class IntradayNewHighVolume20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(confirms).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7566,7 +7605,7 @@ class IntradayObvSlope20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(slopes).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7619,7 +7658,7 @@ class IntradayPathAboveVwap20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(above).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7703,7 +7742,7 @@ class IntradayRallyVolumeRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7764,7 +7803,7 @@ class IntradayChoppiness20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(chops).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7824,7 +7863,7 @@ class IntradayADX20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(adxs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7885,7 +7924,7 @@ class IntradayLiquidityVolRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7941,7 +7980,7 @@ class IntradayAmihudStability20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(stabilities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8006,7 +8045,7 @@ class IntradayDepthTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(trends).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8060,7 +8099,7 @@ class IntradayZeroVolumeRun20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(runs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8118,7 +8157,7 @@ class IntradayPanicStrength20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(panics).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8176,7 +8215,7 @@ class IntradayEuphoriaStrength20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(euphorias).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8236,7 +8275,7 @@ class IntradayWashTrade20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(washes).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8284,7 +8323,7 @@ class IntradayCloseAuctionPressure20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(pressures).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8341,7 +8380,7 @@ class IntradaySupportTest20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(tests).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8396,7 +8435,7 @@ class IntradayResistanceTest20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(tests).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8452,7 +8491,7 @@ class IntradayRangeCrossing20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(crossings).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8514,7 +8553,7 @@ class IntradayBreakoutRetest20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(confirms).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8627,7 +8666,7 @@ class IntradayRiskAdjMomentum20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(rarms).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8683,7 +8722,7 @@ class IntradaySessionConsistency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(consistencies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8738,7 +8777,7 @@ class IntradayVolumeMomentum20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(moments).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8791,7 +8830,7 @@ class IntradayOrderFlowVariability20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(variabilities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8849,7 +8888,7 @@ class IntradayVwapPosition20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(positions).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8899,7 +8938,7 @@ class IntradayUpMinuteRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8951,7 +8990,7 @@ class IntradayHighLowBreakRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8998,7 +9037,7 @@ class IntradayZeroRetFreq20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(freqs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9048,7 +9087,7 @@ class IntradaySignedRunBalance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(balances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9104,7 +9143,7 @@ class IntradayExtremeFreqBalance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(balances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9160,7 +9199,7 @@ class IntradayVsPrevHigh20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(distances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9216,7 +9255,7 @@ class IntradayVsPrevLow20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(distances).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9269,7 +9308,7 @@ class IntradayLowBeforeHigh20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(shapes).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9323,7 +9362,7 @@ class IntradayMidLineTime20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(times).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9383,7 +9422,7 @@ class IntradayDrawdownRecoverRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(recoveries).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9434,7 +9473,7 @@ class IntradayVolRatio2h20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9489,7 +9528,7 @@ class IntradayVolQuarterTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(trends).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9539,7 +9578,7 @@ class IntradayVolatilityDrift20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(drifts).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9599,7 +9638,7 @@ class IntradayRvHalfLife20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(half_lives).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9650,7 +9689,7 @@ class IntradayVolUpside20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(upsides).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9697,7 +9736,7 @@ class IntradayTickActivity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(activities).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9749,7 +9788,7 @@ class IntradayVolumeTailConc20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(concs).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9809,7 +9848,7 @@ class IntradayPriceVolumeDivergence20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(divergences).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9865,7 +9904,7 @@ class IntradayImbalanceAcceleration20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(accelerations).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9914,7 +9953,7 @@ class IntradayRetDistributionPeak20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(peaks).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9968,7 +10007,7 @@ class IntradayTrendFollowScore20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(scores).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10025,7 +10064,7 @@ class IntradayMomentumConsistency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(consistencies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10087,4 +10126,1175 @@ class IntradaySessionSymmetry20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(symmetries).T
         daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 171. intraday_vwap_reversion_speed — VWAP 回归速度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_reversion_speed_20d", category="intraday_advanced")
+class IntradayVwapReversionSpeed20d(Factor):
+    """VWAP 回归速度因子.
+
+    价格偏离 VWAP 后向其回归的速度: 相邻分钟 |close - vwap| 的平均衰减率.
+    与 #30 偏离幅度/#147 收盘位置互补 (这里是回归的动态过程).
+    快回归 → 价格锚定公允价 → 市场有序 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_vwap_reversion_speed_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "VWAP回归速度 (偏离后回归速率, 快=有序=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        speeds: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                vwap = float((c_c * v_c).sum() / v_c.sum()) if v_c.sum() > 1e-12 else c_c.mean()
+                dist = (c_c - vwap).abs()
+                # 距离序列的自衰减: 相邻距离的均值变化率
+                d_t = dist.values[1:]
+                d_tm1 = dist.values[:-1]
+                mask = d_tm1 > 1e-12
+                if mask.sum() < 10:
+                    vals[col] = 0.0
+                    continue
+                decay = float(np.mean(1.0 - d_t[mask] / d_tm1[mask]))
+                vals[col] = decay  # 正=距离在缩小=回归快
+            if vals:
+                speeds[dt] = pd.Series(vals)
+        if not speeds:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(speeds).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 172. intraday_vwap_crossings — VWAP 穿越次数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_crossings_20d", category="intraday_advanced")
+class IntradayVwapCrossings20d(Factor):
+    """VWAP 穿越次数因子.
+
+    价格上穿/下穿 VWAP 的次数 (VWAP 附近的震荡频率).
+    与 #126 上方时间占比互补: 那里看停留, 这里看穿越.
+    频繁穿越 → 多空反复拉锯 → 无方向 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_vwap_crossings_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "VWAP穿越次数 (多空拉锯=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        crossings: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                vwap = float((c_c * v_c).sum() / v_c.sum()) if v_c.sum() > 1e-12 else c_c.mean()
+                above = (c_c > vwap).astype(int).values
+                crosses = int(np.sum(np.diff(above) != 0))
+                vals[col] = -float(crosses)
+            if vals:
+                crossings[dt] = pd.Series(vals)
+        if not crossings:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(crossings).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 173. intraday_run_length_median — 同向run长度中位数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_run_length_median_20d", category="intraday_advanced")
+class IntradayRunLengthMedian20d(Factor):
+    """同向run长度中位数因子.
+
+    同向连续涨/跌 run 长度的中位数 (分布形状, 与 #41 最大run/#151 总时长互补).
+    中位run长 → 趋势惯性大 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_run_length_median_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "同向run中位长度 (趋势惯性=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        medians: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 20:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 20:
+                    continue
+                runs = []
+                cur = 0
+                for x in r:
+                    if abs(x) > 1e-12:
+                        cur += 1
+                    else:
+                        if cur > 0:
+                            runs.append(cur)
+                        cur = 0
+                if cur > 0:
+                    runs.append(cur)
+                vals[col] = float(np.median(runs)) if runs else 1.0
+            if vals:
+                medians[dt] = pd.Series(vals)
+        if not medians:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(medians).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 174. intraday_run_length_skew — 同向run长度偏度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_run_length_skew_20d", category="intraday_advanced")
+class IntradayRunLengthSkew20d(Factor):
+    """同向run长度偏度因子.
+
+    run 长度分布的偏度 (大多数短run + 少数超长run = 右偏).
+    高右偏 → 趋势靠偶发长run驱动 → 不稳定 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_run_length_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "同向run长度偏度 (右偏=偶发长run=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 30:
+                    continue
+                runs = []
+                cur = 0
+                for x in r:
+                    if abs(x) > 1e-12:
+                        cur += 1
+                    else:
+                        if cur > 0:
+                            runs.append(cur)
+                        cur = 0
+                if cur > 0:
+                    runs.append(cur)
+                if len(runs) >= 5:
+                    vals[col] = -float(pd.Series(runs).skew())  # 右偏=负向
+                else:
+                    vals[col] = 0.0
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 175. intraday_volume_half_life — 成交量记忆半衰期
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_half_life_20d", category="intraday_advanced")
+class IntradayVolumeHalfLife20d(Factor):
+    """成交量记忆半衰期因子.
+
+    分钟成交量自相关从1衰减到0.5的滞后数 (量记忆时长, 与 #161 波动半衰期互补).
+    量记忆长 → 放量惯性持续 → 不稳定 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_volume_half_life_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量记忆半衰期 (量自相关衰减滞后数, 长=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        half_lives: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 60:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna().values
+                if len(v) < 60:
+                    continue
+                max_lag = min(20, len(v) // 4)
+                hl = max_lag
+                for lag in range(1, max_lag + 1):
+                    x, y = v[:-lag], v[lag:]
+                    if x.std(ddof=0) < 1e-12 or y.std(ddof=0) < 1e-12:
+                        continue
+                    rho = float(np.corrcoef(x, y)[0, 1])
+                    if rho <= 0.5:
+                        hl = lag
+                        break
+                vals[col] = -float(hl)
+            if vals:
+                half_lives[dt] = pd.Series(vals)
+        if not half_lives:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(half_lives).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 176. intraday_vol_regime_switches — 波动状态切换次数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_regime_switches_20d", category="intraday_advanced")
+class IntradayVolRegimeSwitches20d(Factor):
+    """波动状态切换次数因子.
+
+    日内分钟波动(滚动窗口|ret|)在高/低两个状态间切换的次数 (regime 动态).
+    与 #116 跨日突破/#84 变异系数互补: 这里是状态切换频率.
+    切换频繁 → 波动环境不稳 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_vol_regime_switches_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "波动状态切换次数 (高/低波动切换, 频繁=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        switches: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 60:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 60:
+                    continue
+                ar = pd.Series(np.abs(r))
+                win = max(5, min(15, len(ar) // 6))
+                vol_series = ar.rolling(win).mean().dropna().values
+                if len(vol_series) < 20:
+                    continue
+                med = np.median(vol_series)
+                state = vol_series > med
+                sw = int(np.sum(np.diff(state.astype(int)) != 0))
+                vals[col] = -float(sw)
+            if vals:
+                switches[dt] = pd.Series(vals)
+        if not switches:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(switches).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 177. intraday_vol_regime_duration_ratio — 高波动状态时长占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_regime_duration_ratio_20d", category="intraday_advanced")
+class IntradayVolRegimeDurationRatio20d(Factor):
+    """高波动状态时长占比因子.
+
+    分钟波动处于高状态(>中位)的时长占比 (regime 时长, 与 #176 切换频率互补).
+    高波动主导 → 风险环境持续 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_vol_regime_duration_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "高波动状态时长占比 (风险持续=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        durations: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 60:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 60:
+                    continue
+                ar = pd.Series(np.abs(r))
+                win = max(5, min(15, len(ar) // 6))
+                vol_series = ar.rolling(win).mean().dropna().values
+                if len(vol_series) < 20:
+                    continue
+                med = np.median(vol_series)
+                vals[col] = -float((vol_series > med).mean())  # 高波动多=负向
+            if vals:
+                durations[dt] = pd.Series(vals)
+        if not durations:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(durations).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 178. intraday_skew_stability — 分段偏度一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_skew_stability_20d", category="intraday_advanced")
+class IntradaySkewStability20d(Factor):
+    """分段偏度一致性因子.
+
+    日内4等分段各自的收益偏度符号一致性 (与 #4 整体偏度互补: 这里看分段间的稳定性).
+    全段同向偏 → 偏度结构稳定 → 有序 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_skew_stability_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "分段偏度一致 (4段偏度同向数, 稳定=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        stabilities: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            n = len(grp)
+            if n < 60:
+                continue
+            q = n // 4
+            if q < 8:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna()
+                if len(r) < 60:
+                    continue
+                segs = [r.iloc[i * q:(i + 1) * q] for i in range(4)]
+                signs = []
+                for s in segs:
+                    if len(s) < 5 or s.std(ddof=0) < 1e-12:
+                        continue
+                    sk = float(pd.Series(s).skew())
+                    if abs(sk) > 0.05:  # 显著的偏度符号
+                        signs.append(np.sign(sk))
+                if not signs:
+                    vals[col] = 0.0
+                    continue
+                dom = np.sign(sum(signs))
+                consistent = sum(1 for sg in signs if sg == dom)
+                vals[col] = float(consistent / len(signs))
+            if vals:
+                stabilities[dt] = pd.Series(vals)
+        if not stabilities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(stabilities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 179. intraday_quantile_skew — 分位数偏度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_quantile_skew_20d", category="intraday_advanced")
+class IntradayQuantileSkew20d(Factor):
+    """分位数偏度因子.
+
+    Q3+Q1-2·Q2 / (Q3-Q1) — 稳健的分位数偏度 (互补于 #4 矩偏度).
+    稳健右偏 → 上行占优 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_quantile_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "分位数偏度 ((Q3+Q1-2Q2)/(Q3-Q1), 稳健偏度)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        qskews: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 30:
+                    continue
+                q1, q2, q3 = np.percentile(r, [25, 50, 75])
+                denom = q3 - q1
+                vals[col] = float((q3 + q1 - 2.0 * q2) / denom) if denom > 1e-12 else 0.0
+            if vals:
+                qskews[dt] = pd.Series(vals)
+        if not qskews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(qskews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 180. intraday_temporal_consistency — 时间聚合一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_temporal_consistency_20d", category="intraday_advanced")
+class IntradayTemporalConsistency20d(Factor):
+    """时间聚合一致性因子.
+
+    5分钟收益与1分钟收益的关系稳定性: std(5min_ret) / sqrt(5·std(1min_ret)).
+    比值接近1 → 收益可加性成立 → 无微观结构噪声干扰 → 正向.
+    偏离1 → 噪声主导 (买卖反弹) → 负向. 输出 -|ratio-1|.
+    方向: 正向.
+    """
+    name = "intraday_temporal_consistency_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "时间聚合一致 (-|σ5m/(√5·σ1m)-1|, 噪声=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        ret_1m = close.pct_change()
+        day = ret_1m.index.normalize()
+        consistencies: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_r = ret_1m.loc[day == dt]
+            if len(grp_c) < 60:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                r = grp_r[col].dropna()
+                if len(c) < 60 or len(r) < 60:
+                    continue
+                sigma_1m = r.std(ddof=0)
+                if sigma_1m < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                # 5分钟非重叠收益
+                c_v = c.values
+                n5 = len(c_v) // 5
+                if n5 < 10:
+                    vals[col] = 0.0
+                    continue
+                ret5 = []
+                for i in range(n5):
+                    seg = c_v[i * 5:(i + 1) * 5]
+                    if seg[0] > 1e-12:
+                        ret5.append(seg[-1] / seg[0] - 1.0)
+                if len(ret5) < 5:
+                    vals[col] = 0.0
+                    continue
+                sigma_5m = np.std(ret5, ddof=0)
+                ratio = sigma_5m / (np.sqrt(5.0) * sigma_1m)
+                vals[col] = -abs(ratio - 1.0)
+            if vals:
+                consistencies[dt] = pd.Series(vals)
+        if not consistencies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(consistencies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 181. intraday_morning_star_freq — 早晨之星频率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_morning_star_freq_20d", category="intraday_advanced")
+class IntradayMorningStarFreq20d(Factor):
+    """早晨之星形态频率因子 (双bar组合形态).
+
+    阴线 → 小实体星线 → 阳线 的三bar组合 (探底反转信号).
+    与 #74-79 单bar形态互补: 这里是多bar组合形态.
+    高频率 → 反复探底反转 → 承接活跃 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_morning_star_freq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "早晨之星频率 (阴-星-阳三bar反转组合)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        freqs: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                common = o.index.intersection(c.index)
+                if len(common) < 30:
+                    continue
+                o_c, c_c = (x.loc[common].values for x in (o, c))
+                n = len(o_c)
+                cnt = 0
+                for i in range(1, n - 1):
+                    rng1 = max(abs(c_c[i - 1] - o_c[i - 1]), 1e-12)
+                    body1 = (c_c[i - 1] - o_c[i - 1]) / rng1  # <0 阴线
+                    body2 = abs(c_c[i] - o_c[i]) / max(abs(c_c[i] - o_c[i]) + abs(c_c[i - 1] - o_c[i - 1]) + 1e-12, 1e-12)
+                    rng3 = max(abs(c_c[i + 1] - o_c[i + 1]), 1e-12)
+                    body3 = (c_c[i + 1] - o_c[i + 1]) / rng3  # >0 阳线
+                    # 阴线 + 小实体 + 阳线
+                    if body1 < -0.5 and body2 < 0.3 and body3 > 0.5:
+                        cnt += 1
+                vals[col] = float(cnt / n)
+            if vals:
+                freqs[dt] = pd.Series(vals)
+        if not freqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(freqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 182. intraday_engulfing_freq — 吞没形态频率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_engulfing_freq_20d", category="intraday_advanced")
+class IntradayEngulfingFreq20d(Factor):
+    """吞没形态频率因子 (双bar反转组合).
+
+    阳线实体完全吞没前一根阴线实体 (看涨吞没) 或反向 (看跌吞没).
+    频繁吞没 → 多空快速反转 → 方向不稳定 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_engulfing_freq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "吞没形态频率 (反转组合频繁=方向不稳=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        freqs: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                common = o.index.intersection(c.index)
+                if len(common) < 30:
+                    continue
+                o_c, c_c = (x.loc[common].values for x in (o, c))
+                n = len(o_c)
+                cnt = 0
+                for i in range(1, n):
+                    prev_body = c_c[i - 1] - o_c[i - 1]
+                    cur_body = c_c[i] - o_c[i]
+                    if prev_body == 0 or cur_body == 0:
+                        continue
+                    # 看涨吞没: 前阴后阳, 阳实体包住阴实体
+                    if prev_body < 0 < cur_body and o_c[i] <= c_c[i - 1] and c_c[i] >= o_c[i - 1]:
+                        cnt += 1
+                    # 看跌吞没: 前阳后阴
+                    elif prev_body > 0 > cur_body and o_c[i] >= c_c[i - 1] and c_c[i] <= o_c[i - 1]:
+                        cnt += 1
+                vals[col] = -float(cnt / n)
+            if vals:
+                freqs[dt] = pd.Series(vals)
+        if not freqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(freqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 183. intraday_lz_complexity — LZ 复杂度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lz_complexity_20d", category="intraday_advanced")
+class IntradayLzComplexity20d(Factor):
+    """LZ 复杂度因子.
+
+    将收益符号序列(涨/跌/平)用 LZ78 算法压缩, 复杂度=模式数/长度 (归一化).
+    与 #72 排列熵互补 (不同算法度量序列可预测性).
+    高复杂度 → 序列随机 → 不可预测 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_lz_complexity_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "LZ复杂度 (符号序列模式数/长度, 高=随机=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    @staticmethod
+    def _lz76(seq):
+        """LZ76 复杂度 (模式计数)."""
+        n = len(seq)
+        if n == 0:
+            return 0.0
+        i, c = 0, 1
+        while i < n - 1:
+            j = 0
+            while j < i + 1 and i + j < n:
+                k = 0
+                while k < i + 1 and i + j + k < n and seq[k] == seq[i + j + k]:
+                    k += 1
+                j = max(j + 1, k)
+            c += 1
+            i += j
+        return float(c)
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        complexities: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 40:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 40:
+                    continue
+                seq = [1 if x > 0 else (0 if x < 0 else 2) for x in r]
+                c = self._lz76(seq)
+                vals[col] = -float(c / max(1, len(seq)))
+            if vals:
+                complexities[dt] = pd.Series(vals)
+        if not complexities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(complexities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 184. intraday_or_retention — 开盘区间维持度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_or_retention_20d", category="intraday_advanced")
+class IntradayOrRetention20d(Factor):
+    """开盘区间维持度因子.
+
+    收盘仍在开盘区间 [OR_low, OR_high] 内时记1否则0 (与 #35 突破互补: #35看突破, 这里看未突破的维持).
+    收盘未突破开盘区间 → 全天被开盘框定 → 缺乏方向性 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_or_retention_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "开盘区间维持 (收盘未突破开盘区间=缺乏方向=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        retentions: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            n = len(grp_c)
+            if n < 30:
+                continue
+            n_or = max(10, n // 4)
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                if len(h) < n_or or len(c) < 20:
+                    continue
+                or_high = h.iloc[:n_or].max()
+                or_low = l.iloc[:n_or].min()
+                c_end = c.iloc[-1]
+                retained = 1.0 if (or_low <= c_end <= or_high) else 0.0
+                vals[col] = -retained
+            if vals:
+                retentions[dt] = pd.Series(vals)
+        if not retentions:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(retentions).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 185. intraday_vol_volume_regime — 量价状态联合占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_volume_regime_20d", category="intraday_advanced")
+class IntradayVolVolumeRegime20d(Factor):
+    """量价状态联合占比因子.
+
+    高波动且放量的分钟占比 (风险与活跃的联合状态).
+    高频风险+活跃 → 情绪化交易主导 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_vol_volume_regime_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量价联合状态 (高波动+放量占比, 情绪化=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        ret_1m = close.pct_change().abs()
+        day = ret_1m.index.normalize()
+        regimes: dict = {}
+        for dt in sorted(set(day)):
+            grp_r = ret_1m.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_r) < 30:
+                continue
+            vals = {}
+            for col in grp_r.columns:
+                r = grp_r[col].dropna()
+                v = grp_v[col].dropna()
+                common = r.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                r_c = r.loc[common]
+                v_c = v.loc[common]
+                high_vol = r_c > r_c.median()
+                high_vol_vol = v_c > v_c.median()
+                joint = (high_vol & high_vol_vol).sum()
+                vals[col] = -float(joint / len(r_c))
+            if vals:
+                regimes[dt] = pd.Series(vals)
+        if not regimes:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(regimes).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 186. intraday_body_consistency — 实体方向一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_body_consistency_20d", category="intraday_advanced")
+class IntradayBodyConsistency20d(Factor):
+    """实体方向一致性因子.
+
+    相邻分钟 K 线实体方向 (收>开=阳) 的序列相关 (与 #74 实体占比均值互补).
+    实体方向持续 → 多头/空头排列整齐 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_body_consistency_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "实体方向一致 (相邻K线实体方向相关)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        consistencies: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                common = o.index.intersection(c.index)
+                if len(common) < 30:
+                    continue
+                body = np.sign(c.loc[common].values - o.loc[common].values)
+                body = body[body != 0]
+                if len(body) < 10:
+                    vals[col] = 0.0
+                    continue
+                s_t, s_tm1 = body[1:], body[:-1]
+                corr_val = float(np.corrcoef(s_t, s_tm1)[0, 1]) if s_t.std() > 1e-12 and s_tm1.std() > 1e-12 else 0.0
+                vals[col] = corr_val if not np.isnan(corr_val) else 0.0
+            if vals:
+                consistencies[dt] = pd.Series(vals)
+        if not consistencies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(consistencies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 187. intraday_tail_cluster — 极端收益时间聚集
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tail_cluster_20d", category="intraday_advanced")
+class IntradayTailCluster20d(Factor):
+    """极端收益时间聚集因子.
+
+    |ret|>2σ 的极端分钟之间的平均间隔 (时间聚集度, 与 #118 频率/#103 冲击互补).
+    间隔短 → 极端事件扎堆 → 风险集中 → 负向. 输出 -平均间隔.
+    方向: 负向.
+    """
+    name = "intraday_tail_cluster_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "极端收益聚集 (极端分钟间隔, 扎堆=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        clusters: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 30:
+                    continue
+                sigma = r.std(ddof=0)
+                if sigma < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                idx = np.where(np.abs(r) > 2.0 * sigma)[0]
+                if len(idx) < 2:
+                    vals[col] = 0.0
+                    continue
+                gaps = np.diff(idx)
+                vals[col] = -float(np.mean(gaps))
+            if vals:
+                clusters[dt] = pd.Series(vals)
+        if not clusters:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(clusters).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 188. intraday_extreme_timing — 极端收益时间位置
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_extreme_timing_20d", category="intraday_advanced")
+class IntradayExtremeTiming20d(Factor):
+    """极端收益时间位置因子.
+
+    |ret| 最大的分钟出现的时间位置 (与 #98/#99 高低点时间互补: 这里用收益幅度).
+    极端波动偏尾盘 → 尾盘情绪化异动 → 负向. 输出 -时间位置.
+    方向: 正向 (早盘极端=已释放=正向).
+    """
+    name = "intraday_extreme_timing_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "极端收益时间位置 (-最大|ret|分钟时间, 早=已释放=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        timings: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 20:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna().values
+                if len(r) < 20:
+                    continue
+                idx = int(np.argmax(np.abs(r)))
+                vals[col] = -float(idx / max(1, len(r) - 1))
+            if vals:
+                timings[dt] = pd.Series(vals)
+        if not timings:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(timings).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 189. intraday_volume_pareto_tail — 成交量 Pareto 尾部指数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_pareto_tail_20d", category="intraday_advanced")
+class IntradayVolumeParetoTail20d(Factor):
+    """成交量 Pareto 尾部指数因子.
+
+    Hill 估计量: 尾部指数的倒数 α = 1/(mean(log(v/top_threshold))).
+    高 α → 薄尾 → 量分布温和 → 正向. 低 α → 厚尾 → 大单依赖 → 负向.
+    方向: 正向.
+    """
+    name = "intraday_volume_pareto_tail_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量Pareto尾部指数 (Hill估计, 厚尾=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        alphas: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 60:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna().values
+                if len(v) < 60:
+                    continue
+                v_pos = v[v > 0]
+                if len(v_pos) < 20:
+                    continue
+                k = max(3, len(v_pos) // 10)
+                sorted_v = np.sort(v_pos)[::-1]
+                top = sorted_v[:k]
+                if top[-1] < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                hill = float(np.mean(np.log(top / top[-1])))
+                vals[col] = float(1.0 / hill) if hill > 1e-12 else 10.0
+            if vals:
+                alphas[dt] = pd.Series(vals)
+        if not alphas:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(alphas).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 190. intraday_close_slope_r2 — 尾盘趋势清晰度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_close_slope_r2_20d", category="intraday_advanced")
+class IntradayCloseSlopeR220d(Factor):
+    """尾盘趋势清晰度因子.
+
+    最后30分钟价格路径线性回归的 R² (与 #114 全天R²/#109 尾盘漂移互补).
+    尾盘 R² 高 → 收盘段单边清晰 → 方向确认 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_close_slope_r2_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "尾盘趋势清晰度 (最后30分路径R², 单边=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        r2s: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            n = len(grp)
+            if n < 40:
+                continue
+            n_tail = max(10, min(30, n // 4))
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 40:
+                    continue
+                tail = c.iloc[-n_tail:]
+                y = tail.values
+                t = np.arange(len(y))
+                slope, intercept = np.polyfit(t, y, 1)
+                fitted = slope * t + intercept
+                ss_res = np.sum((y - fitted) ** 2)
+                ss_tot = np.sum((y - y.mean()) ** 2)
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+                vals[col] = float(max(0.0, r2))
+            if vals:
+                r2s[dt] = pd.Series(vals)
+        if not r2s:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(r2s).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
