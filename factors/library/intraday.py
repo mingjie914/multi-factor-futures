@@ -11908,3 +11908,578 @@ class PeakCountDelta20d(_VariantBase):
 
     def _transform(self, base):
         return base.diff(10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 191. intraday_open_price_crossings — 穿越开盘价次数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_price_crossings_20d", category="intraday_advanced")
+class IntradayOpenPriceCrossings20d(Factor):
+    """穿越开盘价次数因子.
+
+    价格上穿/下穿当日开盘价的次数 (开盘价作为锚点, 与 #172 VWAP穿越互补).
+    频繁穿越 → 多空拉锯 → 无方向 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_open_price_crossings_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "穿越开盘价次数 (开盘锚振荡=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        crossings: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                common = o.index.intersection(c.index)
+                if len(common) < 30:
+                    continue
+                o_first = o.loc[common].iloc[0]
+                if o_first < 1e-12:
+                    continue
+                above = (c.loc[common] > o_first).astype(int).values
+                crosses = int(np.sum(np.diff(above) != 0))
+                vals[col] = -float(crosses)
+            if vals:
+                crossings[dt] = pd.Series(vals)
+        if not crossings:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(crossings).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 192. intraday_prev_close_crossings — 穿越昨收次数
+# ⚠ 跨日因子: 依赖昨日收盘 (prev_close 跨日追踪), 需≥2个交易日历史; 首日为NaN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_prev_close_crossings_20d", category="intraday_advanced")
+class IntradayPrevCloseCrossings20d(Factor):
+    """穿越昨收次数因子.
+
+    价格上穿/下穿昨日收盘价的次数 (昨收作为心理锚点).
+    频繁穿越昨收 → 多空在昨收附近拉锯 → 无明确方向 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_prev_close_crossings_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "穿越昨收次数 (昨收锚振荡=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        crossings: dict = {}
+        prev_close: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                prev_c = prev_close.get(col)
+                if prev_c is None or prev_c < 1e-12:
+                    prev_close[col] = c.iloc[-1]
+                    continue
+                above = (c > prev_c).astype(int).values
+                crosses = int(np.sum(np.diff(above) != 0))
+                vals[col] = -float(crosses)
+                prev_close[col] = c.iloc[-1]
+            if vals:
+                crossings[dt] = pd.Series(vals)
+        if not crossings:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(crossings).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 193. intraday_vwap_band_retention — VWAP 带内停留占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_band_retention_20d", category="intraday_advanced")
+class IntradayVwapBandRetention20d(Factor):
+    """VWAP 带内停留占比因子.
+
+    价格停留在 VWAP±1σ(close) 带内的时间占比 (与 #172 穿越/#126 单线上方互补).
+    带内停留多 → 价格收敛于公允价 → 有序 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_vwap_band_retention_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "VWAP带内停留占比 (收敛于公允价=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        retentions: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                vwap = float((c_c * v_c).sum() / v_c.sum()) if v_c.sum() > 1e-12 else c_c.mean()
+                sigma = c_c.std(ddof=0)
+                if sigma < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                in_band = ((c_c - vwap).abs() <= sigma).sum()
+                vals[col] = float(in_band / len(c_c))
+            if vals:
+                retentions[dt] = pd.Series(vals)
+        if not retentions:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(retentions).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 194. intraday_range_position_avg — 日内区间平均位置
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_range_position_avg_20d", category="intraday_advanced")
+class IntradayRangePositionAvg20d(Factor):
+    """日内区间平均位置因子.
+
+    每分钟价格在日内区间(high-low)位置的均值 (时间积分, 与 #17 收盘单点互补).
+    平均位置高 → 多数时间在上半区间 → 买方主导 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_range_position_avg_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "日内区间平均位置 (时间积分, 上方主导=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        positions: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                common = h.index.intersection(l.index).intersection(c.index)
+                if len(common) < 30:
+                    continue
+                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
+                rng = h_c.max() - l_c.min()
+                if rng < 1e-12:
+                    vals[col] = 0.5
+                    continue
+                pos = (c_c - l_c.min()) / rng
+                vals[col] = float(pos.mean())
+            if vals:
+                positions[dt] = pd.Series(vals)
+        if not positions:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(positions).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 195. intraday_path_bandwidth — 路径带宽集中度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_path_bandwidth_20d", category="intraday_advanced")
+class IntradayPathBandwidth20d(Factor):
+    """路径带宽集中度因子.
+
+    close 序列的 (p90-p10) / (high-low) — 价格路径实际占据的带宽.
+    窄带宽 → 价格集中在小范围 → 收敛稳定 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_path_bandwidth_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "路径带宽 ((p90-p10)/区间, 窄=收敛=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        bandwidths: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                common = h.index.intersection(l.index).intersection(c.index)
+                if len(common) < 30:
+                    continue
+                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
+                rng = h_c.max() - l_c.min()
+                if rng < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                p10, p90 = np.percentile(c_c.values, [10, 90])
+                vals[col] = float((p90 - p10) / rng)
+            if vals:
+                bandwidths[dt] = pd.Series(vals)
+        if not bandwidths:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(bandwidths).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 196. intraday_edge_touch_ratio — 触边时间占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_edge_touch_ratio_20d", category="intraday_advanced")
+class IntradayEdgeTouchRatio20d(Factor):
+    """触边时间占比因子.
+
+    价格停留在日内区间上下 10% 内的时间占比 (触边行为).
+    触边多 → 价格反复冲边界 → 情绪化/拉锯 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_edge_touch_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "触边时间占比 (反复触边界=拉锯=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        touches: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                common = h.index.intersection(l.index).intersection(c.index)
+                if len(common) < 30:
+                    continue
+                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
+                rng = h_c.max() - l_c.min()
+                if rng < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                pos = (c_c - l_c.min()) / rng
+                touch = ((pos <= 0.1) | (pos >= 0.9)).sum()
+                vals[col] = -float(touch / len(c_c))
+            if vals:
+                touches[dt] = pd.Series(vals)
+        if not touches:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(touches).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 197. intraday_vwap_above_run — VWAP 上方最长停留
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_above_run_20d", category="intraday_advanced")
+class IntradayVwapAboveRun20d(Factor):
+    """VWAP 上方最长停留因子.
+
+    连续在 VWAP 上方的最长分钟数 (与 #172 穿越/#126 占比互补: 这里是单次停留时长).
+    长停留 → 买方持续主导 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_vwap_above_run_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "VWAP上方最长停留 (买方持续主导=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        runs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                vwap = float((c_c * v_c).sum() / v_c.sum()) if v_c.sum() > 1e-12 else c_c.mean()
+                above = (c_c > vwap).astype(int).values
+                max_run = 0
+                cur = 0
+                for a in above:
+                    cur = cur + 1 if a else 0
+                    max_run = max(max_run, cur)
+                vals[col] = float(max_run / len(c_c))
+            if vals:
+                runs[dt] = pd.Series(vals)
+        if not runs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(runs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 198. intraday_open_side_retention — 开盘价上方时间占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_side_retention_20d", category="intraday_advanced")
+class IntradayOpenSideRetention20d(Factor):
+    """开盘价上方时间占比因子.
+
+    价格在开盘价上方的时间占比 (开盘锚定, 与 #191 穿越互补).
+    上方时间长 → 开盘后买方主导 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_open_side_retention_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "开盘价上方时间占比 (开盘后买方主导=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        retentions: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                common = o.index.intersection(c.index)
+                if len(common) < 30:
+                    continue
+                o_first = o.loc[common].iloc[0]
+                if o_first < 1e-12:
+                    continue
+                vals[col] = float((c.loc[common] > o_first).sum() / len(c.loc[common]))
+            if vals:
+                retentions[dt] = pd.Series(vals)
+        if not retentions:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(retentions).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 199. intraday_midline_direction — 中位线穿越方向平衡
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_midline_direction_20d", category="intraday_advanced")
+class IntradayMidlineDirection20d(Factor):
+    """中位线穿越方向平衡因子.
+
+    穿越日内中位线时向上穿越次数 / 总穿越次数 (方向平衡, 与 #140 总次数互补).
+    向上穿越占优 → 突破方向偏多 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_midline_direction_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "中位线穿越方向平衡 (向上穿越占比)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        balances: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                common = h.index.intersection(l.index).intersection(c.index)
+                if len(common) < 30:
+                    continue
+                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
+                mid = (h_c.max() + l_c.min()) / 2.0
+                above = (c_c > mid).astype(int).values
+                diff = np.diff(above)
+                up_cross = int(np.sum(diff == 1))
+                dn_cross = int(np.sum(diff == -1))
+                total = up_cross + dn_cross
+                vals[col] = float(up_cross / total) if total > 0 else 0.5
+            if vals:
+                balances[dt] = pd.Series(vals)
+        if not balances:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(balances).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 200. intraday_anchor_distance — 价格距日内极值平均距离
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_anchor_distance_20d", category="intraday_advanced")
+class IntradayAnchorDistance20d(Factor):
+    """价格距日内极值平均距离因子.
+
+    每分钟价格距最近极值(高点或低点)的平均距离 (极值锚定, 与 #194 位置互补).
+    距离大 → 价格远离两端 → 居中的犹豫 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_anchor_distance_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "距日内极值平均距离 (居中犹豫=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        day = close.index.normalize()
+        distances: dict = {}
+        for dt in sorted(set(day)):
+            grp_h = high.loc[day == dt]
+            grp_l = low.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                h = grp_h[col].dropna()
+                l = grp_l[col].dropna()
+                c = grp_c[col].dropna()
+                common = h.index.intersection(l.index).intersection(c.index)
+                if len(common) < 30:
+                    continue
+                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
+                rng = h_c.max() - l_c.min()
+                if rng < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                dist_to_high = (h_c.max() - c_c) / rng
+                dist_to_low = (c_c - l_c.min()) / rng
+                min_dist = np.minimum(dist_to_high, dist_to_low)
+                vals[col] = -float(min_dist.mean())
+            if vals:
+                distances[dt] = pd.Series(vals)
+        if not distances:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(distances).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
