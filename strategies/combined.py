@@ -114,9 +114,9 @@ class CombinedStrategy:
     def _capped_picks(self, row: pd.Series, ascending: bool, cap: int) -> list[str]:
         """按得分排序取 top_n 个, 但每板块最多 cap 个 (全市场排名 + 板块配额).
 
-        ascending=True 取得分最高 (多头), False 取得分最低 (空头).
+        ascending=True 按升序取 (得分最低, 用于空头), False 按降序取 (得分最高, 用于多头).
         """
-        order = row.sort_values(ascending=ascending).index.tolist()
+        order = row.sort_values(ascending=not ascending).index.tolist()
         picks, counts = [], {}
         for s in order:
             sec = next((k for k, mem in SECTOR_MAP.items() if s in mem), "其他")
