@@ -1,88 +1,62 @@
-# ============================================================
-# 已验证因子库 (Validated Factor Library)
-# ============================================================
-# 日期: 2026-07-31
-# 验证流程: FDR(q=0.10) → |IC|≥0.01, |t|≥2.0 → 分层单调性 → 换手诊断
-# 数据: 2025-01~2026-05, 29品种, Parquet 1分钟数据源
-# 因子频率: daily (日频信号), 底层数据: 1分钟bar
-# 持有期: 20日, validation_horizons=(5,10,20)
-#
-# 11个因子通过全部门槛:
-#   Batch 1 (6个): 跳跃异常/分布形态/频谱结构
-#   Batch 2 (5个): 微观结构/流动性/量价
-# ============================================================
-
 extends: default.yaml
-
 data:
   source: parquet_futures
   cache:
     enabled: false
-
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'
-
 universe:
-  - A
-  - AG
-  - AL
-  - AU
-  - CU
-  - FU
-  - HC
-  - I
-  - J
-  - JM
-  - M
-  - MA
-  - NI
-  - P
-  - RB
-  - RM
-  - RU
-  - SA
-  - SN
-  - SR
-  - TA
-  - Y
-  - ZN
-  - IC
-  - IF
-  - IH
-  - T
-  - TL
-  - TS
-
+- A
+- AG
+- AL
+- AU
+- CU
+- FU
+- HC
+- I
+- J
+- JM
+- M
+- MA
+- NI
+- P
+- RB
+- RM
+- RU
+- SA
+- SN
+- SR
+- TA
+- Y
+- ZN
+- IC
+- IF
+- IH
+- T
+- TL
+- TS
 universe_selection:
   enabled: false
-
 processing:
-  - type: winsorize
-    params: {method: mad, n_sigma: 3}
-  - type: standardize
-    params: {method: zscore, by_date: true}
-
-# ============================================================
-# 验证通过因子 (11个, 4簇)
-# ============================================================
-
+- type: winsorize
+  params:
+    method: mad
+    n_sigma: 3
+- type: standardize
+  params:
+    method: zscore
+    by_date: true
 factors:
-  # 簇1: 跳跃异常 + 微观结构 + 流动性 (6因子)
-  - intraday_price_peak_count_20d       # 价峰分钟数, 正向, IC=0.24, t=3.84
-  - intraday_jump_intensity_20d         # 跳跃强度, 负向, IC=-0.18, t=-3.76
-  - intraday_price_volume_elasticity_20d # 量价弹性, 负向, IC=-0.17, t=-3.88
-  - intraday_roll_spread_20d            # Roll有效价差, 负向, IC=-0.18, t=-3.34
-  - intraday_parkinson_vol_ratio_20d    # Parkinson波动比, 负向, IC=-0.18, t=-3.08
-  - intraday_kyle_lambda_20d            # Kyle信息冲击, 负向, IC=-0.10, t=-3.06
-
-  # 簇2: 分布形态 (2因子)
-  - intraday_dtws_20d                   # DTW成交量分布, 正向, IC=0.18, t=3.86
-  - intraday_realised_skewness_20d      # 已实现偏度, 正向, IC=0.20, t=3.85
-
-  # 簇3: 频谱结构 (2因子)
-  - intraday_drip_stone_20d             # 滴水穿石FFT, 负向, IC=-0.11, t=-3.43
-  - intraday_peak_ridge_ratio_20d       # 峰脊比, 负向, IC=-0.09, t=-3.78
-
-  # 簇4: 量价结构 (1因子)
-  - intraday_open_close_volume_ratio_20d # 开盘/尾盘量比, 负向, IC=-0.08, t=-2.79
+- intraday_price_peak_count_20d
+- intraday_jump_intensity_20d
+- intraday_price_volume_elasticity_20d
+- intraday_roll_spread_20d
+- intraday_parkinson_vol_ratio_20d
+- intraday_kyle_lambda_20d
+- intraday_dtws_20d
+- intraday_realised_skewness_20d
+- intraday_drip_stone_20d
+- intraday_peak_ridge_ratio_20d
+- intraday_open_close_volume_ratio_20d
+- intraday_seat_long_short_seat_ratio_20d
