@@ -815,6 +815,84 @@ def _seat_to_panel(all_data, field, agg="last"):
     return pivot
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 跨品种/板块辅助: 板块映射 + 板块内截面 z-score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SECTOR_MAP = {
+    # 黑色系
+    "RB": "black", "HC": "black", "I": "black", "J": "black", "JM": "black",
+    "SF": "black", "SM": "black", "FG": "black",
+    # 能化
+    "MA": "chem", "TA": "chem", "PP": "chem", "L": "chem", "V": "chem",
+    "EG": "chem", "FU": "chem", "BU": "chem", "SC": "chem", "RU": "chem",
+    "EB": "chem", "PG": "chem", "UR": "chem",
+    # 有色
+    "CU": "metal", "AL": "metal", "ZN": "metal", "NI": "metal",
+    "SN": "metal", "PB": "metal", "SS": "metal",
+    # 贵金属
+    "AU": "precious", "AG": "precious",
+    # 农产品
+    "A": "agri", "M": "agri", "Y": "agri", "P": "agri", "C": "agri",
+    "CS": "agri", "CF": "agri", "SR": "agri", "OI": "agri", "RM": "agri",
+    "JD": "agri", "AP": "agri",
+    # 股指
+    "IF": "index", "IC": "index", "IH": "index", "IM": "index",
+    # 国债
+    "T": "bond", "TF": "bond", "TL": "bond", "TS": "bond",
+    # 生猪
+    "LH": "agri",
+}
+
+
+def _sector_zscore(df):
+    """按板块分组的截面 z-score (板块内≥2个品种才计算, 否则全 NaN)."""
+    out = pd.DataFrame(index=df.index, columns=df.columns, dtype=float)
+    sectors: dict = {}
+    for col in df.columns:
+        sec = _SECTOR_MAP.get(str(col).upper(), "other")
+        sectors.setdefault(sec, []).append(col)
+    for sec, cols in sectors.items():
+        if len(cols) < 2:
+            continue
+        sub = df[cols]
+        std = sub.std(axis=1, ddof=0).replace(0, np.nan)
+        z = sub.sub(sub.mean(axis=1), axis=0).div(std, axis=0)
+        out[cols] = z
+    return out
+
+
+def _sector_mean(df):
+    """板块内其他品种的均值 (排除自身, 板块内≥2个品种)."""
+    out = pd.DataFrame(index=df.index, columns=df.columns, dtype=float)
+    sectors: dict = {}
+    for col in df.columns:
+        sec = _SECTOR_MAP.get(str(col).upper(), "other")
+        sectors.setdefault(sec, []).append(col)
+    for sec, cols in sectors.items():
+        if len(cols) < 2:
+            continue
+        for col in cols:
+            others = [c for c in cols if c != col]
+            out[col] = df[others].mean(axis=1)
+    return out
+
+
+def _sector_rank(row):
+    """按板块内 percentile rank (单日截面, 板块内≥2个品种)."""
+    out = pd.Series(index=row.index, dtype=float)
+    sectors: dict = {}
+    for col in row.index:
+        sec = _SECTOR_MAP.get(str(col).upper(), "other")
+        sectors.setdefault(sec, []).append(col)
+    for sec, cols in sectors.items():
+        if len(cols) < 2:
+            continue
+        vals = row[cols]
+        out[cols] = vals.rank(pct=True)
+    return out
+
+
 def _safe_div(a, b):
     import numpy as np
     return a / b.where(np.abs(b) > 1e-12, np.nan)
@@ -20840,3 +20918,475 @@ class IntradayPathSmoothness20d(Factor):
         daily = pd.DataFrame(interactions).T
         daily.index = pd.DatetimeIndex(daily.index)
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 371. intraday_sector_strength — 板块内相对强度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_strength_20d", category="intraday_advanced")
+class IntradaySectorStrength20d(Factor):
+    """板块内相对强度因子 (跨品种: 板块内截面).
+
+    品种日内收益在所属板块内的截面 z-score (比 #341 全市场更精细: 板块内相对强弱).
+    板块内领涨 → 品种相对板块最强 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_sector_strength_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块内相对强度 (日内收益板块内z)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        daily_ret: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 5:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                if len(o) < 1 or len(c) < 5:
+                    continue
+                o_first = o.iloc[0]
+                if o_first < 1e-12:
+                    continue
+                vals[col] = float(c.iloc[-1] / o_first - 1.0)
+            if vals:
+                daily_ret[dt] = pd.Series(vals)
+        if not daily_ret:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_ret).T
+        df.index = pd.DatetimeIndex(df.index)
+        z = _sector_zscore(df.reindex(index=dates))
+        return z.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 372. intraday_sector_momentum — 板块内相对动量
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_momentum_20d", category="intraday_advanced")
+class IntradaySectorMomentum20d(Factor):
+    """板块内相对动量因子 (跨品种: 板块内截面).
+
+    品种5日收益在所属板块内的截面 z-score (板块内相对动量).
+    板块内动量领先 → 品种趋势领跑板块 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_sector_momentum_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块内相对动量 (5日收益板块内z)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        mom5 = close.pct_change(5)
+        z = _sector_zscore(mom5.reindex(index=pd.DatetimeIndex(dates)))
+        return z.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 373. intraday_sector_sync — 板块同步性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_sync_20d", category="intraday_advanced")
+class IntradaySectorSync20d(Factor):
+    """板块同步性因子 (跨品种: 板块联动).
+
+    品种分钟收益与板块内其他品种平均收益的相关 (该品种与板块的同步程度).
+    高同步 → 板块联动强 → 系统性驱动 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_sector_sync_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块同步性 (品种收益与板块其他均值相关)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        syncs: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            sub = grp.dropna(how="all")
+            if sub.shape[1] < 2:
+                continue
+            other_mean = _sector_mean(sub)
+            vals = {}
+            for col in sub.columns:
+                r_i = sub[col]
+                r_o = other_mean[col]
+                common = r_i.notna() & r_o.notna()
+                if common.sum() < 20:
+                    continue
+                a = r_i[common].values
+                b = r_o[common].values
+                if a.std(ddof=0) < 1e-12 or b.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                else:
+                    corr_val = float(np.corrcoef(a, b)[0, 1])
+                    vals[col] = corr_val if not np.isnan(corr_val) else 0.0
+            if vals:
+                syncs[dt] = pd.Series(vals)
+        if not syncs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(syncs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 374. intraday_sector_dispersion — 板块内分化度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_dispersion_20d", category="intraday_advanced")
+class IntradaySectorDispersion20d(Factor):
+    """板块内分化度因子 (跨品种: 板块结构).
+
+    品种日内收益偏离板块均值的绝对 z-score (板块内分化程度).
+    分化大 → 板块无共识 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_sector_dispersion_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块内分化 (偏离板块均值绝对z, 无共识=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        daily_ret: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 5:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                if len(o) < 1 or len(c) < 5:
+                    continue
+                o_first = o.iloc[0]
+                if o_first < 1e-12:
+                    continue
+                vals[col] = float(c.iloc[-1] / o_first - 1.0)
+            if vals:
+                daily_ret[dt] = pd.Series(vals)
+        if not daily_ret:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_ret).T
+        df.index = pd.DatetimeIndex(df.index)
+        z = _sector_zscore(df.reindex(index=dates))
+        return (-z.abs()).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 375. intraday_sector_vol_spill — 板块波动溢出
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_vol_spill_20d", category="intraday_advanced")
+class IntradaySectorVolSpill20d(Factor):
+    """板块波动溢出因子 (跨品种: 波动传导).
+
+    板块内其他品种的平均日内波动 (波动从板块其他品种溢出到本品种的风险).
+    板块其他品种高波动 → 传染风险 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_sector_vol_spill_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块波动溢出 (板块其他品种波动, 传染=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        daily_vol: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 20:
+                continue
+            vals = {}
+            for col in grp.columns:
+                r = grp[col].dropna()
+                if len(r) < 20:
+                    continue
+                vals[col] = float(r.std(ddof=0))
+            if vals:
+                daily_vol[dt] = pd.Series(vals)
+        if not daily_vol:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_vol).T
+        df.index = pd.DatetimeIndex(df.index)
+        spill = _sector_mean(df.reindex(index=dates))
+        return (-spill).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 376. intraday_cross_spread — 跨品种价格位置
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_cross_spread_20d", category="intraday_advanced")
+class IntradayCrossSpread20d(Factor):
+    """跨品种价格位置因子.
+
+    品种 log 价格相对全部品种均值的偏离 (对数价格截面位置, 跨品种价差).
+    相对高位 → 品种截面内最贵 → 均值回归压力 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_cross_spread_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "跨品种价格位置 (log价格截面偏离, 高位=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        log_close = np.log(close.replace(0, np.nan))
+        spread = log_close.sub(log_close.mean(axis=1), axis=0).div(log_close.std(axis=1, ddof=0).replace(0, np.nan), axis=0)
+        return (-spread).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 377. intraday_sector_rotation — 板块内轮动
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_sector_rotation_20d", category="intraday_advanced")
+class IntradaySectorRotation20d(Factor):
+    """板块内轮动因子 (跨品种: 板块结构动态).
+
+    品种在板块内的相对强度排名变化 (板块内资金轮动速度).
+    排名快速变化 → 板块内轮动剧烈 → 不稳定 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_sector_rotation_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "板块内轮动 (板块内强度排名变化, 剧烈=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        daily_ret: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 5:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                if len(o) < 1 or len(c) < 5:
+                    continue
+                o_first = o.iloc[0]
+                if o_first < 1e-12:
+                    continue
+                vals[col] = float(c.iloc[-1] / o_first - 1.0)
+            if vals:
+                daily_ret[dt] = pd.Series(vals)
+        if not daily_ret:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_ret).T
+        df.index = pd.DatetimeIndex(df.index)
+        # 板块内排名变化: 先算板块内每日百分位排名, 再跨日差
+        rank = df.apply(lambda row: _sector_rank(row), axis=1)
+        rank_chg = rank - rank.shift(1)
+        return (-rank_chg).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 378. intraday_cross_lead_lag — 跨品种领先滞后
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_cross_lead_lag_20d", category="intraday_advanced")
+class IntradayCrossLeadLag20d(Factor):
+    """跨品种领先滞后因子 (跨品种: 信息传导).
+
+    品种分钟收益与板块其他品种平均收益的领先相关差:
+    corr(ret_i, other_{t+1}) - corr(other_t, ret_{i,t+1}) (该品种领先还是跟随板块).
+    品种领先板块 → 定价者 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_cross_lead_lag_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "跨品种领先滞后 (品种领先板块=定价者=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret_1m = panel["close"].pct_change()
+        day = ret_1m.index.normalize()
+        leads: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 40:
+                continue
+            sub = grp.dropna(how="all")
+            if sub.shape[1] < 2:
+                continue
+            other_mean = _sector_mean(sub)
+            vals = {}
+            for col in sub.columns:
+                r_i = sub[col].values
+                r_o = other_mean[col].values
+                mask = np.isfinite(r_i) & np.isfinite(r_o)
+                if mask.sum() < 30:
+                    continue
+                ri, ro = r_i[mask], r_o[mask]
+                # 品种领先: corr(ret_i_t, other_{t+1})
+                c1 = float(np.corrcoef(ri[:-1], ro[1:])[0, 1]) if ri[:-1].std() > 1e-12 and ro[1:].std() > 1e-12 else 0.0
+                # 板块领先: corr(other_t, ret_i_{t+1})
+                c2 = float(np.corrcoef(ro[:-1], ri[1:])[0, 1]) if ro[:-1].std() > 1e-12 and ri[1:].std() > 1e-12 else 0.0
+                vals[col] = c1 - c2 if not np.isnan(c1) and not np.isnan(c2) else 0.0
+            if vals:
+                leads[dt] = pd.Series(vals)
+        if not leads:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(leads).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 379. intraday_cross_rank_momentum — 全市场排名动量
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_cross_rank_momentum_20d", category="intraday_advanced")
+class IntradayCrossRankMomentum20d(Factor):
+    """全市场排名动量因子 (跨品种: 排名动态).
+
+    品种在全市场截面强度排名的变化 (排名动量, 5日排名变化).
+    排名持续上升 → 品种相对走强 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_cross_rank_momentum_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "全市场排名动量 (截面强度排名5日变化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        ret5 = close.pct_change(5)
+        rank = ret5.rank(axis=1, pct=True)
+        chg = rank - rank.shift(5)
+        return chg.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 380. intraday_cross_reversion — 截面均值回归
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_cross_reversion_20d", category="intraday_advanced")
+class IntradayCrossReversion20d(Factor):
+    """截面均值回归因子 (跨品种: 截面反转).
+
+    品种日内收益的全市场截面 z-score 的5日滚动均值 (截面强弱的时间均值, 反向).
+    持续截面强势 → 均值回归压力 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_cross_reversion_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "截面均值回归 (截面z的5日均, 强势回归=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close = panel["open"], panel["close"]
+        day = close.index.normalize()
+        daily_ret: dict = {}
+        for dt in sorted(set(day)):
+            grp_o = open_px.loc[day == dt]
+            grp_c = close.loc[day == dt]
+            if len(grp_c) < 5:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                o = grp_o[col].dropna()
+                c = grp_c[col].dropna()
+                if len(o) < 1 or len(c) < 5:
+                    continue
+                o_first = o.iloc[0]
+                if o_first < 1e-12:
+                    continue
+                vals[col] = float(c.iloc[-1] / o_first - 1.0)
+            if vals:
+                daily_ret[dt] = pd.Series(vals)
+        if not daily_ret:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_ret).T
+        df.index = pd.DatetimeIndex(df.index)
+        z = _cs_zscore(df.reindex(index=dates))
+        z5 = z.rolling(5, min_periods=3).mean()
+        return (-z5).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
