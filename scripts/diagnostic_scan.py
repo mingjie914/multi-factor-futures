@@ -9,6 +9,7 @@
       half_rp   50%等权 + 50%风险平价
       ic        1个月滚动IC加权
       floored   风险平价 + 单品种下限0.5%
+      erc       等风险贡献 (协方差 shrinkage=0.3, 框架默认, 默认权重方案)
       confirm2w 连续两周确认信号 + 等权
 
 输出: 每组合的 年化/夏普/回撤/波动/月换手/换手超标周占比
@@ -72,9 +73,9 @@ def main():
                         choices=["all61", "liq45", "liq29", "manual29"])
     parser.add_argument("--strategy", default="score", choices=["score", "hybrid"])
     parser.add_argument("--factor-subset", default="all11",
-                        choices=["all11", "six", "seven", "nine", "ten", "fifteen"], help="all11=11因子, six=6因子, ten=6+OI最强4, fifteen=6+OI9")
-    parser.add_argument("--weight-scheme", default="equal",
-                        choices=["equal", "rp", "half_rp", "ic", "floored", "confirm2w"])
+                        choices=["all11", "six", "seven", "nine", "ten", "eleven", "fifteen"], help="all11=11因子, six=6因子, ten=6+OI最强4, fifteen=6+OI9")
+    parser.add_argument("--weight-scheme", default="erc",
+                        choices=["equal", "rp", "erc", "half_rp", "ic", "floored", "confirm2w"])
     parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
     parser.add_argument("--topn", type=int, default=10)
     parser.add_argument("--output", default="runs/scan")
@@ -197,30 +198,57 @@ def main():
             w = {c: max(mean_ic[c], 0.01) for c in pool}
             s = sum(w.values())
             return {c: v / s for c, v in w.items()}
+        def erc_w(pool):
+            """池内 ERC: 近60日协方差 shrinkage=0.3, 与 strategies/combined.py 一致."""
+            if pool is None or len(pool) < 2:
+                return None
+            from optimization.risk_budgeting import RiskBudgetingOptimizer
+            start = t - pd.Timedelta(days=90)
+            cal = pd.DatetimeIndex(runner.data_manager.get_calendar(start, t))
+            ret_sub = close.pct_change().reindex(cal)[list(pool)].dropna()
+            if ret_sub.shape[0] < 10:
+                return None
+            cov_raw = ret_sub.cov().values
+            target = np.diag(np.diag(cov_raw))
+            cov = 0.7 * cov_raw + 0.3 * target
+            try:
+                w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(len(pool)))
+            except (RuntimeError, ValueError):
+                v = ret_sub.std(ddof=0).replace(0, np.nan).dropna()
+                if v.empty:
+                    return None
+                w = (1.0 / v).values
+                w = w / w.sum()
+            w = pd.Series(w, index=pool).clip(lower=0.005, upper=0.20)
+            return (w / w.sum()).to_dict()
 
         scheme = args.weight_scheme
         if args.strategy == "score":
             w_long = {c: 1.0 / len(long_pool) for c in long_pool} if long_pool else None
             w_short = {c: 1.0 / len(short_pool) for c in short_pool} if short_pool else None
-        elif scheme in ("rp", "half_rp", "floored"):
-            rl, rs = rp_w(long_pool), rp_w(short_pool)
-            if scheme == "half_rp":
-                eq = {c: 1.0 / len(long_pool) for c in long_pool} if long_pool else None
-                if rl and eq:
-                    w_long = {c: 0.5 * eq[c] + 0.5 * rl[c] for c in rl}
-                else:
-                    w_long = rl or eq
-                eqs = {c: 1.0 / len(short_pool) for c in short_pool} if short_pool else None
-                w_short = {c: 0.5 * eqs[c] + 0.5 * rs[c] for c in rs} if (rs and eqs) else (rs or eqs)
-            elif scheme == "floored" and rl:
-                w_long = {c: max(v, 0.005) for c, v in rl.items()}
-                s = sum(w_long.values())
-                w_long = {c: v / s for c, v in w_long.items()}
-                w_short = {c: max(v, 0.005) for c, v in rs.items()}
-                s = sum(w_short.values())
-                w_short = {c: v / s for c, v in w_short.items()}
+        elif scheme in ("rp", "half_rp", "floored", "erc"):
+            if scheme == "erc":
+                w_long = erc_w(long_pool)
+                w_short = erc_w(short_pool)
             else:
-                w_long, w_short = rl, rs
+                rl, rs = rp_w(long_pool), rp_w(short_pool)
+                if scheme == "half_rp":
+                    eq = {c: 1.0 / len(long_pool) for c in long_pool} if long_pool else None
+                    if rl and eq:
+                        w_long = {c: 0.5 * eq[c] + 0.5 * rl[c] for c in rl}
+                    else:
+                        w_long = rl or eq
+                    eqs = {c: 1.0 / len(short_pool) for c in short_pool} if short_pool else None
+                    w_short = {c: 0.5 * eqs[c] + 0.5 * rs[c] for c in rs} if (rs and eqs) else (rs or eqs)
+                elif scheme == "floored" and rl:
+                    w_long = {c: max(v, 0.005) for c, v in rl.items()}
+                    s = sum(w_long.values())
+                    w_long = {c: v / s for c, v in w_long.items()}
+                    w_short = {c: max(v, 0.005) for c, v in rs.items()}
+                    s = sum(w_short.values())
+                    w_short = {c: v / s for c, v in w_short.items()}
+                else:
+                    w_long, w_short = rl, rs
         elif scheme == "ic":
             w_long = ic_w(long_pool)
             w_short = ic_w(short_pool)
