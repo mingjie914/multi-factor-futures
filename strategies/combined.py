@@ -59,6 +59,19 @@ COV_SHRINKAGE = 0.30
 MAX_WEIGHT = 0.20
 MIN_WEIGHT = 0.005
 
+# 板块配额: 每板块最多 SECTOR_CAP 个多头/空头 (0 = 不限制, 全市场 Top10/Bottom10)
+# 2026-08 验证: cap=3 夏普 2.64 vs 无配额 2.01, 回撤 -3.4% vs -7.3% (见 docs/策略基准记录.md)
+SECTOR_CAP = 3
+
+# manual29 板块映射 (含金融板块; 用于配额选池, 不用于中性化)
+SECTOR_MAP = {
+    "有色": ["CU", "AL", "ZN", "NI", "SN", "AG", "AU"],
+    "黑色": ["RB", "HC", "I", "J", "JM"],
+    "能化": ["FU", "MA", "RU", "SA", "TA"],
+    "农产品": ["A", "M", "P", "RM", "Y", "SR"],
+    "金融": ["IC", "IF", "IH", "T", "TL", "TS"],
+}
+
 
 class CombinedStrategy:
     """6因子打分选池 + 池内 ERC 风险平价 融合策略."""
@@ -90,6 +103,23 @@ class CombinedStrategy:
             oriented = rank if direction == 1 else (1 - rank)
             score = score.add(oriented, fill_value=0)
         return score.div(len(names))
+
+    def _capped_picks(self, row: pd.Series, ascending: bool, cap: int) -> list[str]:
+        """按得分排序取 top_n 个, 但每板块最多 cap 个 (全市场排名 + 板块配额).
+
+        ascending=True 取得分最高 (多头), False 取得分最低 (空头).
+        """
+        order = row.sort_values(ascending=ascending).index.tolist()
+        picks, counts = [], {}
+        for s in order:
+            sec = next((k for k, mem in SECTOR_MAP.items() if s in mem), "其他")
+            if counts.get(sec, 0) >= cap:
+                continue
+            picks.append(s)
+            counts[sec] = counts.get(sec, 0) + 1
+            if len(picks) >= self.top_n:
+                break
+        return picks
 
     def _pool_weights(self, pool: list[str], date: pd.Timestamp) -> pd.Series:
         """池内权重: ERC (默认) 或逆波动率 (USE_SIMPLE_RP=True)."""
@@ -152,8 +182,12 @@ class CombinedStrategy:
             return pd.Series(dtype=float)
 
         ranked = row.rank(ascending=False)
-        long_pool = ranked[ranked <= self.top_n].index.tolist()
-        short_pool = ranked[ranked > len(ranked) - self.top_n].index.tolist()
+        if SECTOR_CAP > 0:
+            long_pool = self._capped_picks(row, ascending=True, cap=SECTOR_CAP)
+            short_pool = self._capped_picks(row, ascending=False, cap=SECTOR_CAP)
+        else:
+            long_pool = ranked[ranked <= self.top_n].index.tolist()
+            short_pool = ranked[ranked > len(ranked) - self.top_n].index.tolist()
 
         w_long = self._pool_weights(long_pool, end)
         w_short = self._pool_weights(short_pool, end)
