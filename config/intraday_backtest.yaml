@@ -5,7 +5,7 @@ data:
     enabled: false
 date_range:
   start: '2025-01-01'
-  end: '2026-05-31'
+  end: '2026-05-15'   # 研究终点: 数据更新时保持不变, 新数据仅用于实盘观测
 universe:
 - A
 - AG
