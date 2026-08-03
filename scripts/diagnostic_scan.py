@@ -76,7 +76,7 @@ def main():
                         choices=["all11", "six", "seven", "nine", "ten", "eleven", "fifteen"], help="all11=11因子, six=6因子, ten=6+OI最强4, fifteen=6+OI9")
     parser.add_argument("--weight-scheme", default="erc",
                         choices=["equal", "rp", "erc", "half_rp", "ic", "floored", "confirm2w"])
-    parser.add_argument("--rebalance", default="W-FRI", help="调仓频率 (W-FRI=周度, D=日度, BM=月度)")
+    parser.add_argument("--rebalance", default="D", help="调仓频率 (D=日度默认, W-FRI=周度, BM=月度)")
     parser.add_argument("--topn", type=int, default=10)
     parser.add_argument("--output", default="runs/scan")
     args = parser.parse_args()
