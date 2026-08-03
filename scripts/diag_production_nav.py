@@ -55,7 +55,6 @@ def main():
     score = score.div(len(F7))
     close = runner.data_manager.get("close", cal, univ)
     daily_ret = close.pct_change()
-    fwd = daily_ret.shift(-1)
     vol20 = close.pct_change().rolling(20, min_periods=10).std(ddof=0)
     sector_of = {}
     for sec, mem in SECTORS.items():
@@ -106,13 +105,13 @@ def main():
                 return dict(zip(pool, w / w.sum()))
 
         wl, ws = erc_w(top), erc_w(bot)
-        nxt = cal[(cal > t) & (cal <= t + pd.Timedelta(days=1))]
-        for d in nxt:
-            if d in fwd.index:
-                r = fwd.loc[d]
-                lr = sum(r[c] * wi for c, wi in wl.items()) if wl else 0
-                sr = sum(r[c] * wi for c, wi in ws.items()) if ws else 0
-                rets.append((d, lr - sr))
+        # 正确时序: 因子T日值已shift(1) (基于≤T-1数据) → T-1收盘可生成权重
+        # → T日持有, 赚T日收益 (即 T-1信号 × T日价格变动)
+        if t in daily_ret.index:
+            r = daily_ret.loc[t].fillna(0.0)
+            lr = sum(r[c] * wi for c, wi in wl.items()) if wl else 0
+            sr = sum(r[c] * wi for c, wi in ws.items()) if ws else 0
+            rets.append((t, lr - sr))
     s = pd.Series({d: v for d, v in rets}).sort_index().dropna()
     nav = (1 + s).cumprod()
 
