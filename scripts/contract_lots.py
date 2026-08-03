@@ -66,12 +66,14 @@ def lots_for(weights: dict, capital: float, closes: dict):
         raw_lots = abs(notional) / (price * mult)
         lots = int(raw_lots)  # 向下取整 (保守)
         actual_notional = lots * price * mult * (1 if w > 0 else -1)
+        margin = spec.get('margin')
         rows.append({
             'symbol': sym, 'direction': '多' if w > 0 else '空',
             'weight': w, 'notional': notional, 'price': price,
             'multiplier': mult, 'unit': spec['unit'],
             'raw_lots': raw_lots, 'lots': lots,
             'actual_notional': actual_notional,
+            'margin': margin,
         })
     return rows
 
@@ -97,19 +99,24 @@ def main():
     rows = lots_for(weights, args.capital, closes)
     print(f'\n资金 {args.capital:,.0f} 元 | 总杠杆 {sum(abs(w) for w in weights.values()):.2f}\n')
     print(f'{"品种":<4} {"向":<2} {"权重":>7} {"名义(元)":>12} {"价格":>10} {"乘数":>7} '
-          f'{"单位":<6} {"理论手":>7} {"实手":>4} {"实际名义":>12} {"偏差%":>7}')
-    print('-' * 105)
+          f'{"单位":<6} {"理论手":>7} {"实手":>4} {"保证金率":>6} {"保证金(元)":>11} {"偏差%":>7}')
+    print('-' * 120)
     total_notional = 0
+    total_margin = 0
     for r in rows:
         if 'note' in r:
             print(f"{r['symbol']:<4}  {r['note']}")
             continue
         dev = (r['actual_notional'] - r['notional']) / r['notional'] * 100 if r['notional'] else 0
-        total_notional += r['actual_notional']
+        total_notional += abs(r['actual_notional'])
+        margin_amt = abs(r['actual_notional']) * r['margin'] if r['margin'] and r['lots'] > 0 else 0
+        total_margin += margin_amt
         print(f"{r['symbol']:<4} {r['direction']:<2} {r['weight']:>7.4f} {r['notional']:>12,.0f} "
               f"{r['price']:>10.2f} {r['multiplier']:>7,.0f} {r['unit']:<6} "
-              f"{r['raw_lots']:>7.2f} {r['lots']:>4} {r['actual_notional']:>12,.0f} {dev:>6.1f}%")
-    print(f"\n实际总名义: {total_notional:,.0f} 元 (目标 {args.capital * sum(abs(w) for w in weights.values()):,.0f})")
+              f"{r['raw_lots']:>7.2f} {r['lots']:>4} {r['margin'] or 0:>5.1%} "
+              f"{margin_amt:>11,.0f} {dev:>6.1f}%")
+    print(f"\n实际总名义(多空绝对值): {total_notional:,.0f} 元 (目标 {args.capital * sum(abs(w) for w in weights.values()):,.0f})")
+    print(f"实际保证金占用: {total_margin:,.0f} 元 (占总资金 {total_margin/args.capital:.1%})")
 
 
 if __name__ == '__main__':
