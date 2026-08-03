@@ -1,10 +1,11 @@
 """combined — 融合策略模块 (最终固化版, ERC 升级).
 
-方案: 6因子打分选池 + 池内 ERC 风险平价 (多空, 周度调仓)
-  - 品种池: manual29 (流动性适中、数据完整, 见 docs/策略基准记录.md)
-  - 信号: 6个已验证因子等权打分 → Top10做多 / Bottom10做空
+方案: 7因子打分选池 + 池内 ERC 风险平价 (多空, 日度调仓)
+  - 品种池: 38 (manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR, 见 docs/策略基准记录.md)
+  - 信号: 7个已验证因子等权打分 → Top10做多 / Bottom10做空
   - 权重: 池内 ERC (等风险贡献, 协方差 shrinkage=0.3), 可回退到逆波动率
-  - 调仓: 周度 (每周五收盘生成信号, 下周一~周五持有)
+  - 选池: 板块配额 cap=3 (每板块最多3个多头/空头)
+  - 调仓: 日度 (每天收盘生成信号, 次日持有)
 
 验证数据 (2025-01~2026-05 / OOS 2026-03~05):
   逆波动率版: 全量夏普 0.96, OOS 夏普 0.92, 月换手 18%
@@ -44,12 +45,16 @@ FACTORS = {
     "intraday_seat_long_short_seat_ratio_20d": 1,
 }
 
-# manual29 品种池
-MANUAL29 = [
+# 品种池 38 (2026-08-03 升级: manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR)
+UNIVERSE38 = [
     "A", "AG", "AL", "AU", "CU", "FU", "HC", "I", "IC", "IF", "IH", "J", "JM",
     "M", "MA", "NI", "P", "RB", "RM", "RU", "SA", "SN", "SR", "T", "TA", "TL",
     "TS", "Y", "ZN",
+    # 2026-08-03 新增 9 个
+    "IM", "TF", "CF", "OI", "LH", "JD", "SC", "V", "UR",
 ]
+# 兼容旧名
+MANUAL29 = UNIVERSE38
 
 _DEFAULT_TOP_N = 10
 
@@ -65,18 +70,18 @@ MIN_WEIGHT = 0.005
 # 2026-08 验证: cap=3 夏普 2.64 vs 无配额 2.01, 回撤 -3.4% vs -7.3% (见 docs/策略基准记录.md)
 SECTOR_CAP = 3
 
-# manual29 板块映射 (含金融板块; 用于配额选池, 不用于中性化)
+# 38 品种板块映射 (含金融板块; 用于配额选池, 不用于中性化)
 SECTOR_MAP = {
     "有色": ["CU", "AL", "ZN", "NI", "SN", "AG", "AU"],
     "黑色": ["RB", "HC", "I", "J", "JM"],
-    "能化": ["FU", "MA", "RU", "SA", "TA"],
-    "农产品": ["A", "M", "P", "RM", "Y", "SR"],
-    "金融": ["IC", "IF", "IH", "T", "TL", "TS"],
+    "能化": ["FU", "MA", "RU", "SA", "TA", "SC", "V", "UR"],
+    "农产品": ["A", "M", "P", "RM", "Y", "SR", "CF", "OI", "LH", "JD"],
+    "金融": ["IC", "IF", "IH", "T", "TL", "TS", "IM", "TF"],
 }
 
 
 class CombinedStrategy:
-    """6因子打分选池 + 池内 ERC 风险平价 融合策略."""
+    """7因子打分选池 + 池内 ERC 风险平价 融合策略 (38品种, cap=3, 日度)."""
 
     def __init__(self, config_path: str = "config/intraday_backtest.yaml",
                  top_n: int = _DEFAULT_TOP_N):

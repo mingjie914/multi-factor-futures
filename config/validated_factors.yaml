@@ -15,6 +15,9 @@ universe:
 - FU
 - HC
 - I
+- IC
+- IF
+- IH
 - J
 - JM
 - M
@@ -27,15 +30,21 @@ universe:
 - SA
 - SN
 - SR
-- TA
-- Y
-- ZN
-- IC
-- IF
-- IH
 - T
+- TA
 - TL
 - TS
+- Y
+- ZN
+- IM
+- TF
+- CF
+- OI
+- LH
+- JD
+- SC
+- V
+- UR
 universe_selection:
   enabled: false
 processing:
