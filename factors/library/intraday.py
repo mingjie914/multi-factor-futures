@@ -334,7 +334,7 @@ _LOCAL_MINUTE_ROOT = r"E:\程明杰公司内容\期货行情数据\本地表"
 
 _FREQ_DIR_MAP = {
     "1min": "futureshistoryprices1m",
-    "5min": "futureshistoryprices1m",
+    "5min": "futureshistoryprices5m",
     "15min": "futureshistoryprices15m",
     "30min": "futureshistoryprices15m",
     "daily": "futureshistoryprices1d",
@@ -363,7 +363,11 @@ def _read_local_raw(dates, universe, freq="1min"):
     frames = []
     for month in months:
         partition = "year_month=" + month.strftime("%Y-%m")
-        parquet_path = os.path.join(base, partition, "data_0.parquet")
+        pdir = os.path.join(base, partition)
+        # 兼容两种分区文件命名: data_0.parquet (1m/15m/1d) / part.parquet (5m)
+        parquet_path = os.path.join(pdir, "data_0.parquet")
+        if not os.path.exists(parquet_path):
+            parquet_path = os.path.join(pdir, "part.parquet")
         if not os.path.exists(parquet_path):
             continue
         try:
