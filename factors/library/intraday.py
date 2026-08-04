@@ -397,7 +397,11 @@ def _read_local_raw(dates, universe, freq="1min"):
         return None
     all_data = all_data[all_data["symbol"].isin(symbol_root)]
     all_data["root"] = all_data["symbol"].map(symbol_root)
-    all_data["_ts"] = pd.to_datetime(all_data["trade_datetime"])
+    ts = pd.to_datetime(all_data["trade_datetime"])
+    # 交易日归属: 仅凌晨段 (00:00-07:59, 即前一夜盘尾) 归入前一交易日
+    # 例: 周五夜盘 21:00-周六 02:30 的 bar (自然日周六 00:00-02:30) 归入周五
+    # 日盘 (08:00 后) 保持当天; 与 1d 表 trade_date 对齐
+    all_data["_ts"] = ts.where(ts.dt.hour >= 8, ts - pd.Timedelta(hours=8))
     return all_data
 
 
@@ -561,7 +565,7 @@ def _get_term_structure_panel(data, dates, universe, freq="1min"):
 _FIELD_TO_1D_COL = {"settle": "settle_price", "oi": "position"}
 
 
-def _get_daily_ths_panel(data, dates, universe, field="settle"):
+def _read_local_daily(data, dates, universe, field="settle"):
     """获取日度结算/持仓面板, 从 futureshistoryprices1d 读取.
 
     settle 对应 1d 的 settle_price (结算价, 日度概念), oi 对应 position.
@@ -611,7 +615,7 @@ _SEAT_FIELDS = ["total_long", "total_short", "net_position", "long_change", "sho
 _SEAT_CACHE: dict = {}
 
 
-def _read_seat_panel(dates, universe):
+def _read_local_seat(dates, universe):
     """读取席位日度面板 (品种级多空汇总), 返回 {field: DataFrame(dates×universe)}.
 
     席位数据仅日度频率, 每交易日每条 (2020-03 起). 数据不可得时字段缺失.
@@ -674,7 +678,7 @@ def _get_seat_panel(data, dates, universe):
     if cache_key in _SEAT_CACHE:
         return _SEAT_CACHE[cache_key]
     try:
-        panel = _read_seat_panel(dates, universe)
+        panel = _read_local_seat(dates, universe)
         if panel:
             if len(_SEAT_CACHE) >= _MAX_PANEL_CACHE_ENTRIES:
                 _SEAT_CACHE.pop(next(iter(_SEAT_CACHE)))
@@ -701,7 +705,7 @@ _SEAT_TABLE_DIRS = {
 _SEAT_DETAIL_CACHE: dict = {}
 
 
-def _read_seat_table(dates, universe, table):
+def _read_local_seat_table(dates, universe, table):
     """通用读取席位表, 返回过滤+root映射后的原始 DataFrame (含 _ts/_root).
 
     delivery 表日期列用 delivery_date, 其余用 trade_date.
@@ -763,7 +767,7 @@ def _get_seat_table(data, dates, universe, table):
     if cache_key in _SEAT_DETAIL_CACHE:
         return _SEAT_DETAIL_CACHE[cache_key]
     try:
-        df = _read_seat_table(dates, universe, table)
+        df = _read_local_seat_table(dates, universe, table)
         if df is not None:
             if len(_SEAT_DETAIL_CACHE) >= _MAX_PANEL_CACHE_ENTRIES * 2:
                 _SEAT_DETAIL_CACHE.pop(next(iter(_SEAT_DETAIL_CACHE)))
@@ -13733,7 +13737,7 @@ class IntradaySettleDrift20d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         if close is None or settle is None or close.empty or settle.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         drift = (close - settle) / settle.replace(0, np.nan)
@@ -13762,7 +13766,7 @@ class IntradaySettlePosition20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         high = data.get("high", dates, universe)
         low = data.get("low", dates, universe)
         if settle is None or settle.empty or high is None or low is None:
@@ -13796,8 +13800,8 @@ class IntradaySettleOiChange20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
-        oi = _get_daily_ths_panel(data, dates, universe, "oi")
+        settle = _read_local_daily(data, dates, universe, "settle")
+        oi = _read_local_daily(data, dates, universe, "oi")
         if settle is None or oi is None or settle.empty or oi.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         settle_chg = settle.diff()
@@ -13832,7 +13836,7 @@ class IntradaySettleGap20d(Factor):
 
     def compute(self, data, dates, universe):
         open_px = data.get("open", dates, universe)
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         if open_px is None or settle is None or open_px.empty or settle.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         prev_settle = settle.shift(1)
@@ -14939,7 +14943,7 @@ class IntradaySettleVolRatio20d(Factor):
 
     def compute(self, data, dates, universe):
         close = data.get("close", dates, universe)
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         high = data.get("high", dates, universe)
         low = data.get("low", dates, universe)
         if close is None or settle is None or high is None or low is None:
@@ -16193,7 +16197,7 @@ class IntradaySettleCloseBasis20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         close = data.get("close", dates, universe)
         if settle is None or settle.empty or close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -16453,7 +16457,7 @@ class IntradaySettleBasisMomentum20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         close = data.get("close", dates, universe)
         if settle is None or settle.empty or close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -16583,8 +16587,8 @@ class IntradaySettleOiSignal20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
-        oi = _get_daily_ths_panel(data, dates, universe, "oi")
+        settle = _read_local_daily(data, dates, universe, "settle")
+        oi = _read_local_daily(data, dates, universe, "oi")
         close = data.get("close", dates, universe)
         if settle is None or oi is None or close is None:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -17590,7 +17594,7 @@ class IntradaySettleBasisRank20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         close = data.get("close", dates, universe)
         if settle is None or settle.empty or close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -17622,7 +17626,7 @@ class IntradaySettleBasisZ20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         close = data.get("close", dates, universe)
         if settle is None or settle.empty or close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -17655,7 +17659,7 @@ class IntradaySettleDiffRank20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         close = data.get("close", dates, universe)
         if settle is None or settle.empty or close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
@@ -17687,7 +17691,7 @@ class IntradaySettleSurgeZ20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        settle = _get_daily_ths_panel(data, dates, universe, "settle")
+        settle = _read_local_daily(data, dates, universe, "settle")
         if settle is None or settle.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret = settle.pct_change().replace([np.inf, -np.inf], np.nan)
@@ -18274,16 +18278,17 @@ class IntradayVolumeTimeShape20d(Factor):
             n = len(grp)
             if n < 30:
                 continue
-            third = max(8, n // 3)
             vals = {}
             for col in grp.columns:
-                v = grp[col].dropna()
+                v = grp[col].dropna().reset_index(drop=True)
                 if len(v) < 30:
                     continue
+                # 三段切片基于品种自身长度 (面板长度可能含其他品种夜盘, 不能作基准)
+                third = max(8, len(v) // 3)
                 early = v.iloc[:third].mean()
                 midday = v.iloc[third:2 * third].mean()
                 late = v.iloc[2 * third:].mean()
-                if midday < 1e-12:
+                if midday < 1e-12 or pd.isna(midday):
                     vals[col] = 0.0
                     continue
                 vals[col] = float((early + late) / (2.0 * midday))
