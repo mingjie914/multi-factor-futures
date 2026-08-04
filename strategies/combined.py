@@ -32,9 +32,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 from core.config import load_config
 from factors.engine import FactorEngine
 
-# 7 个已验证有效因子 + 方向 (+1=高暴露看多, -1=高暴露看空)
-# 2026-08-03: 新增 intraday_seat_long_short_seat_ratio_20d (#326, 席位结构)
-#   证据: FDR t=2.84, 与6因子 corr<0.3, 与旧席位 corr 0.19, 实盘段 IC 增强
+# 6 个已验证有效因子 + 方向 (+1=高暴露看多, -1=高暴露看空)
+# 2026-08-04: 时序 bug 修正后 6因子(夏普2.04) > 7因子(1.73), 席位因子 #326 不再增益
 FACTORS = {
     "intraday_jump_intensity_20d": -1,
     "intraday_price_peak_count_20d": 1,
@@ -42,7 +41,6 @@ FACTORS = {
     "intraday_dtws_20d": 1,
     "intraday_drip_stone_20d": -1,
     "intraday_peak_ridge_ratio_20d": -1,
-    "intraday_seat_long_short_seat_ratio_20d": 1,
 }
 
 # 品种池 38 (2026-08-03 升级: manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR)
