@@ -554,68 +554,51 @@ def _get_term_structure_panel(data, dates, universe, freq="1min"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 日度 ths 数据 (结算价 settle / 持仓 oi): 从 ths_data_daily.db 读取
+# 日度结算/持仓数据: 从 futureshistoryprices1d 读取 (ths_data_daily.db 已弃用)
+# settle → 1d 的 settle_price 字段; oi → 1d 的 position 字段
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_THS_DAILY_DB = os.path.join(_LOCAL_MINUTE_ROOT, "ths_data", "ths_data_daily.db")
+_FIELD_TO_1D_COL = {"settle": "settle_price", "oi": "position"}
 
 
 def _get_daily_ths_panel(data, dates, universe, field="settle"):
-    """获取日度 ths 面板 (settle/oi), 优先 data.get(field), 兜底 ths_data_daily.db.
+    """获取日度结算/持仓面板, 从 futureshistoryprices1d 读取.
 
-    对每个 (date, root) 取持仓(oi)最大的主力合约的 field 值 (与 position 主力语义一致).
+    settle 对应 1d 的 settle_price (结算价, 日度概念), oi 对应 position.
+    对每个 (date, root) 取持仓(oi)最大的主力合约的字段值.
     数据不可得时返回全 NaN (因子自动降级).
     """
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    # 1) 数据源优先
+    col = _FIELD_TO_1D_COL.get(field)
+    if col is None:
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    # 1) 数据源优先 (未来数据源支持 settle_price/position 时自动生效)
     try:
-        frame = data.get(field, dates, universe)
+        frame = data.get(col, dates, universe)
         if frame is not None and not frame.empty and frame.notna().any().any():
             return frame.reindex(index=dates, columns=universe)
     except Exception:
         pass
-    # 2) 本地 ths_data_daily.db 兜底
-    if not os.path.exists(_THS_DAILY_DB):
-        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    # 2) 本地 1d Parquet (futureshistoryprices1d)
     try:
-        import sqlite3
-        start = dates.min().strftime("%Y-%m-%d")
-        end = dates.max().strftime("%Y-%m-%d")
-        conn = sqlite3.connect(f"file:{_THS_DAILY_DB}?mode=ro", uri=True)
-        df = pd.read_sql_query(
-            "SELECT time, code, oi, settle FROM ths_data_daily "
-            "WHERE date(time) BETWEEN ? AND ?",
-            conn, params=(start, end))
-        conn.close()
+        raw = _read_local_raw(dates, universe, freq="daily")
+        if raw is None or raw.empty or col not in raw.columns:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = raw[["_ts", "root", "position", col]].copy()
+        df["_ts"] = pd.to_datetime(df["_ts"]).dt.normalize()
+        df = df.dropna(subset=["position"])
         if df.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df["time"] = pd.to_datetime(df["time"])
-        # root 前缀映射 (与 _read_local_raw 一致)
-        universe_sorted = sorted({str(u).upper() for u in universe}, key=len, reverse=True)
-        root_map: dict[str, str] = {}
-        for sym in df["code"].unique():
-            sym_upper = str(sym).upper()
-            for ut in universe_sorted:
-                if sym_upper.startswith(ut):
-                    root_map[sym] = ut
-                    break
-        df = df[df["code"].isin(root_map)]
-        if df.empty:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df["root"] = df["code"].map(root_map)
-        # 取主力合约 (oi 最大) 的 field 值
-        df = df.dropna(subset=["oi"])
-        if df.empty:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        idx = df.groupby(["time", "root"])["oi"].idxmax()
+        # 取每 (date, root) 持仓最大的主力合约的字段值
+        idx = df.groupby(["_ts", "root"])["position"].idxmax()
         main = df.loc[idx]
-        pivot = main.pivot(index="time", columns="root", values=field)
+        pivot = main.pivot(index="_ts", columns="root", values=col)
         pivot.index = pd.DatetimeIndex(pivot.index)
         return pivot.reindex(index=dates, columns=universe)
     except Exception:
-        log.debug("ths_data_daily %s 读取失败", field, exc_info=True)
+        log.debug("1d %s 读取失败", col, exc_info=True)
         return pd.DataFrame(np.nan, index=dates, columns=universe)
 
 
@@ -13735,7 +13718,7 @@ class IntradaySettleDrift20d(Factor):
     """收盘结算价偏离因子.
 
     (close - settle) / settle — 收盘价相对当日结算价的偏离.
-    需要日度 settle 字段 (ths_data_daily 已有, 待接入管道; 缺失时因子返回 NaN 自动降级).
+    需要日度 settle 字段 (从 futureshistoryprices1d 的 settle_price 读取; 缺失时因子返回 NaN 自动降级).
     收盘强于结算 → 尾盘买方主导 → 正向.
     方向: 正向.
     """
