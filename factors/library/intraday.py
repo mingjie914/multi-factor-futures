@@ -21394,3 +21394,723 @@ class IntradayCrossReversion20d(Factor):
         z = _cs_zscore(df.reindex(index=dates))
         z5 = z.rolling(5, min_periods=3).mean()
         return (-z5).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 381. intraday_amihud_cross_z — Amihud 全市场截面 z-score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_cross_z_20d", category="intraday_advanced")
+class IntradayAmihudCrossZ20d(Factor):
+    """Amihud 全市场截面 z-score 因子.
+
+    品种日内 Amihud 在全部品种截面中的 z-score (跨品种比流动性).
+    截面 z 高 → 相对全市场流动性差 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_cross_z_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud全市场截面z (相对流动性差=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        z = _cs_zscore(df.reindex(index=dates))
+        return (-z).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 382. intraday_amihud_sector_z — Amihud 板块内截面 z-score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_sector_z_20d", category="intraday_advanced")
+class IntradayAmihudSectorZ20d(Factor):
+    """Amihud 板块内截面 z-score 因子.
+
+    品种日内 Amihud 在所属板块内的截面 z-score (板块内相对流动性, 比 #381 更精细).
+    板块内 z 高 → 板块中流动性最差 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_sector_z_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud板块内截面z (板块内流动性差=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        z = _sector_zscore(df.reindex(index=dates))
+        return (-z).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 383. intraday_amihud_cross_rank — Amihud 全市场截面分位
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_cross_rank_20d", category="intraday_advanced")
+class IntradayAmihudCrossRank20d(Factor):
+    """Amihud 全市场截面分位因子.
+
+    品种日内 Amihud 在全部品种截面中的 rank (百分位, 截面排序).
+    rank 高 → 相对全市场流动性差 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_cross_rank_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud全市场截面分位 (流动性排名靠后=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        rank = df.reindex(index=dates).rank(axis=1, pct=True)
+        return (-rank).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 384. intraday_amihud_sector_relative — Amihud 相对板块均值
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_sector_relative_20d", category="intraday_advanced")
+class IntradayAmihudSectorRelative20d(Factor):
+    """Amihud 相对板块均值因子.
+
+    品种日内 Amihud / 板块其他品种 Amihud 均值 (相对板块流动性比值).
+    比值高 → 本品种相对板块流动性差 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_sector_relative_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud相对板块 (品种/板块其他均值, 差=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        sector_mean = _sector_mean(df.reindex(index=dates))
+        ratio = df.reindex(index=dates) / sector_mean.replace(0, np.nan)
+        return (-ratio).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 385. intraday_amihud_vol_partial — Amihud-成交量偏相关 (控制波动)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_vol_partial_20d", category="intraday_advanced")
+class IntradayAmihudVolPartial20d(Factor):
+    """Amihud-成交量偏相关因子 (控制波动后).
+
+    corr(Amihud_resid, volume_resid | 控制 |ret|) — 将 Amihud 与 volume 分别对 |ret| 回归取残差再相关.
+    偏相关为正 → 放量时非流动性反升 → 异常 → 负向.
+    偏相关为负 → 放量改善流动性 → 正常 → 正向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_vol_partial_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud量偏相关 (控制波动, 正偏=异常=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount, volume = panel["close"], panel["amount"], panel["volume"]
+        ret_1m = close.pct_change()
+        ret_abs = ret_1m.abs()
+        amihud = ret_abs / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        partials: dict = {}
+        for dt in sorted(set(day)):
+            grp_a = amihud.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            grp_r = ret_abs.loc[day == dt]
+            if len(grp_a) < 20:
+                continue
+            vals = {}
+            for col in grp_a.columns:
+                a = grp_a[col].dropna()
+                v = grp_v[col].dropna()
+                r = grp_r[col].dropna()
+                common = a.index.intersection(v.index).intersection(r.index)
+                if len(common) < 20:
+                    continue
+                a_c = a.loc[common].values
+                v_c = v.loc[common].values
+                r_c = r.loc[common].values
+                a_c = a_c[a_c < 10.0]
+                # 过滤后对齐 (先按同掩码过滤 v/r)
+                mask = a.loc[common].values < 10.0
+                if mask.sum() < 15:
+                    continue
+                a_c = a.loc[common].values[mask]
+                v_c = v_c[mask]
+                r_c = r_c[mask]
+                if a_c.std(ddof=0) < 1e-12 or v_c.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                x = np.column_stack([np.ones(len(r_c)), r_c])
+                try:
+                    b_a = np.linalg.lstsq(x, a_c, rcond=None)[0]
+                    b_v = np.linalg.lstsq(x, v_c, rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                resid_a = a_c - x @ b_a
+                resid_v = v_c - x @ b_v
+                if resid_a.std(ddof=0) < 1e-12 or resid_v.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                else:
+                    corr_val = float(np.corrcoef(resid_a, resid_v)[0, 1])
+                    vals[col] = -corr_val if not np.isnan(corr_val) else 0.0
+            if vals:
+                partials[dt] = pd.Series(vals)
+        if not partials:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(partials).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 386. intraday_amihud_resid_skew — Amihud 去波动残差偏度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_resid_skew_20d", category="intraday_advanced")
+class IntradayAmihudResidSkew20d(Factor):
+    """Amihud 去波动残差偏度因子.
+
+    Amihud 对 |ret| 回归残差的偏度 (去除波动后, 非流动性的偶发大冲击程度).
+    正偏 → 偶发极端流动性枯竭 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_resid_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud去波动残差偏度 (偶发枯竭=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change()
+        ret_abs = ret_1m.abs()
+        amihud = ret_abs / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp_a = amihud.loc[day == dt]
+            grp_r = ret_abs.loc[day == dt]
+            if len(grp_a) < 20:
+                continue
+            vals = {}
+            for col in grp_a.columns:
+                a = grp_a[col].dropna()
+                r = grp_r[col].dropna()
+                common = a.index.intersection(r.index)
+                if len(common) < 20:
+                    continue
+                a_c = a.loc[common].values
+                r_c = r.loc[common].values
+                mask = a_c < 10.0
+                if mask.sum() < 15:
+                    continue
+                a_c = a_c[mask]
+                r_c = r_c[mask]
+                x = np.column_stack([np.ones(len(r_c)), r_c])
+                try:
+                    b_a = np.linalg.lstsq(x, a_c, rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                resid = a_c - x @ b_a
+                n = len(resid)
+                if n < 10 or resid.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                # 标准偏度 (三阶矩/σ³)
+                skew_val = float(np.mean((resid - resid.mean()) ** 3) / resid.std(ddof=0) ** 3)
+                vals[col] = -skew_val  # 正偏=偶发枯竭=负向
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 387. intraday_amihud_vol_conditional — 成交量条件 Amihud 比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_vol_conditional_20d", category="intraday_advanced")
+class IntradayAmihudVolConditional20d(Factor):
+    """成交量条件 Amihud 比因子 (控制波动后).
+
+    高成交量分钟(>中位)的 Amihud 均值 / 低成交量分钟(<中位)的 Amihud 均值.
+    比值高 → 放量时冲击反而大 → 量能未改善流动性 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_vol_conditional_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量条件Amihud比 (高量Amihud/低量, 放量仍冲击=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount, volume = panel["close"], panel["amount"], panel["volume"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_a = amihud.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_a) < 20:
+                continue
+            vals = {}
+            for col in grp_a.columns:
+                a = grp_a[col].dropna()
+                v = grp_v[col].dropna()
+                common = a.index.intersection(v.index)
+                if len(common) < 20:
+                    continue
+                a_c = a.loc[common]
+                v_c = v.loc[common]
+                a_c = a_c[a_c < 10.0]
+                v_c = v_c.loc[a_c.index]
+                if len(a_c) < 15:
+                    continue
+                v_med = v_c.median()
+                if v_med < 1e-12:
+                    continue
+                high_vol = a_c[v_c >= v_med]
+                low_vol = a_c[v_c < v_med]
+                h_mean = high_vol.mean()
+                l_mean = low_vol.mean()
+                if l_mean < 1e-12:
+                    vals[col] = 1.0
+                else:
+                    vals[col] = float(h_mean / l_mean)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 388. intraday_amihud_resid_vol — Amihud 去波动残差波动
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_resid_vol_20d", category="intraday_advanced")
+class IntradayAmihudResidVol20d(Factor):
+    """Amihud 去波动残差波动因子.
+
+    Amihud 对 |ret| 回归残差的标准差 (去除波动后, 纯流动性冲击的不稳定性).
+    残差波动高 → 流动性状态反复 → 不可预测 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_resid_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud去波动残差波动 (流动性反复=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change()
+        ret_abs = ret_1m.abs()
+        amihud = ret_abs / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        vols: dict = {}
+        for dt in sorted(set(day)):
+            grp_a = amihud.loc[day == dt]
+            grp_r = ret_abs.loc[day == dt]
+            if len(grp_a) < 20:
+                continue
+            vals = {}
+            for col in grp_a.columns:
+                a = grp_a[col].dropna()
+                r = grp_r[col].dropna()
+                common = a.index.intersection(r.index)
+                if len(common) < 20:
+                    continue
+                a_c = a.loc[common].values
+                r_c = r.loc[common].values
+                mask = a_c < 10.0
+                if mask.sum() < 15:
+                    continue
+                a_c = a_c[mask]
+                r_c = r_c[mask]
+                x = np.column_stack([np.ones(len(r_c)), r_c])
+                try:
+                    b_a = np.linalg.lstsq(x, a_c, rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                resid = a_c - x @ b_a
+                resid_std = float(resid.std(ddof=0))
+                vals[col] = -resid_std  # 残差波动高=负向
+            if vals:
+                vols[dt] = pd.Series(vals)
+        if not vols:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(vols).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 389. intraday_amihud_rank — Amihud 时间序列分位
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_rank_20d", category="intraday_advanced")
+class IntradayAmihudRank20d(Factor):
+    """Amihud 时间序列分位因子.
+
+    品种日内 Amihud 在自身 20 日分布中的百分位 (时间序列排序).
+    rank 高 → 自身流动性处历史低位 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_rank_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud时间序列分位 (自身流动性历史低位=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        rank = df.reindex(index=dates).rolling(20, min_periods=5).apply(
+            lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
+        return (-rank).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 390. intraday_amihud_rank_z — Amihud 时间序列 z-score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_rank_z_20d", category="intraday_advanced")
+class IntradayAmihudRankZ20d(Factor):
+    """Amihud 时间序列 z-score 因子.
+
+    品种日内 Amihud 的 20 日 z-score (自身历史偏离程度).
+    z 高 → 流动性异常恶化 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_rank_z_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud时间序列z (流动性异常恶化=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        mean = df.reindex(index=dates).rolling(20, min_periods=5).mean()
+        std = df.reindex(index=dates).rolling(20, min_periods=5).std().replace(0, np.nan)
+        z = (df.reindex(index=dates) - mean) / std
+        return (-z).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 391. intraday_amihud_rank_change — Amihud 时间序列分位变化
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_rank_change_20d", category="intraday_advanced")
+class IntradayAmihudRankChange20d(Factor):
+    """Amihud 时间序列分位变化因子.
+
+    品种 Amihud 的 20 日分位的跨日变化 (流动性排名恶化/改善).
+    rank 上升 → 流动性恶化趋势 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_rank_change_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud分位变化 (rank升=流动性恶化=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        rank = df.reindex(index=dates).rolling(20, min_periods=5).apply(
+            lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
+        rank_chg = rank.diff()
+        return (-rank_chg).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 392. intraday_amihud_rank_ma — Amihud 时间序列分位平滑
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amihud_rank_ma_20d", category="intraday_advanced")
+class IntradayAmihudRankMa20d(Factor):
+    """Amihud 时间序列分位平滑因子.
+
+    品种 Amihud 的 20 日分位的 5 日均 (持续性流动性状态, 平滑掉单日噪声).
+    rank 持续高位 → 流动性持续低迷 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_amihud_rank_ma_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "Amihud分位5日均 (持续低迷=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        ret_1m = close.pct_change().abs()
+        amihud = ret_1m / (amount + 1e-12)
+        amihud = amihud.replace([np.inf, -np.inf], np.nan)
+        day = amihud.index.normalize()
+        daily_amihud: dict = {}
+        for dt in sorted(set(day)):
+            grp = amihud.loc[day == dt]
+            if len(grp) < 10:
+                continue
+            vals = {}
+            for col in grp.columns:
+                a = grp[col].dropna()
+                a = a[a < 10.0]
+                if len(a) < 10:
+                    continue
+                vals[col] = float(a.mean())
+            if vals:
+                daily_amihud[dt] = pd.Series(vals)
+        if not daily_amihud:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(daily_amihud).T
+        df.index = pd.DatetimeIndex(df.index)
+        rank = df.reindex(index=dates).rolling(20, min_periods=5).apply(
+            lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
+        rank_ma = rank.rolling(5, min_periods=3).mean()
+        return (-rank_ma).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
