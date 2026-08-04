@@ -36,7 +36,6 @@ F7 = {
     "intraday_jump_intensity_20d": -1, "intraday_price_peak_count_20d": 1,
     "intraday_realised_skewness_20d": 1, "intraday_dtws_20d": 1,
     "intraday_drip_stone_20d": -1, "intraday_peak_ridge_ratio_20d": -1,
-    "intraday_seat_long_short_seat_ratio_20d": 1,
 }
 
 
@@ -124,7 +123,7 @@ def main():
         vol = x.std(ddof=0) * np.sqrt(252)
         return ann, ann / vol if vol > 0 else 0, (n / n.cummax() - 1).min()
 
-    print("=== 当前生产方案 (7因子+38池+cap3+ERC+日度) ===")
+    print("=== 当前生产方案 (6因子+38池+cap3+ERC+日度) ===")
     full = seg("2025-01-01", "2026-07-31")
     print(f"全段: 年化={full[0]:.1%} 夏普={full[1]:.2f} 回撤={full[2]:.1%}")
     oos = seg("2026-03-01", "2026-05-15")
@@ -138,7 +137,7 @@ def main():
     ax.axvline(pd.Timestamp("2026-05-16"), color="red", linestyle="--", alpha=0.8, label="实盘起点 2026-05-16")
     ax.fill_between([pd.Timestamp("2026-03-01"), pd.Timestamp("2026-05-15")],
                     ax.get_ylim()[0], ax.get_ylim()[1], color="gray", alpha=0.08)
-    ax.set_title("生产方案净值 (7因子+38品种+cap3+ERC+日度, 2025-01~2026-07)")
+    ax.set_title("生产方案净值 (6因子+38品种+cap3+ERC+日度, 2025-01~2026-07)")
     ax.set_ylabel("净值")
     ax.legend()
     ax.grid(alpha=0.3)
