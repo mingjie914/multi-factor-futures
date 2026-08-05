@@ -47,3 +47,6 @@ Thumbs.db
 /.test_tmp/
 .reasonix/
 weights/
+
+# kanyanbao scripts (contains account credentials handling)
+/kanyanbao/
