@@ -58,6 +58,11 @@ _DEFAULT_TOP_N = 10
 
 # 权重引擎开关: False = ERC (协方差), True = 简化逆波动率 (回退用)
 USE_SIMPLE_RP = False
+# 因子合成方式: True = IC_IR 动态加权 (60日滚动 Ledoit-Wolf), False = 等权
+# 2026-08-05 升级: 6f-IC_IR (夏普 2.56/实盘+2.24) > 6f-等权 (1.96/-0.19), 见 docs/策略基准记录.md
+IC_IR_WEIGHT = True
+# IC_IR 滚动窗口 (60日最优, 见 prod_snapshot_12f_icir/技术说明.md 6.1 敏感性)
+IC_IR_WINDOW = 60
 # 协方差收缩系数
 COV_SHRINKAGE = 0.30
 # 单品种权重硬限制
@@ -96,18 +101,79 @@ class CombinedStrategy:
         return list(self._universe)
 
     def factor_scores(self, start: str, end: str) -> pd.DataFrame:
-        """计算 6 因子等权打分矩阵 (索引=日期, 列=品种, 0~1)."""
+        """计算因子打分矩阵 (索引=日期, 列=品种, 0~1).
+
+        - IC_IR_WEIGHT=True: IC_IR 动态加权合成 (60日滚动 Ledoit-Wolf)
+        - IC_IR_WEIGHT=False: 等权合成
+        """
         calendar = pd.DatetimeIndex(self.runner.data_manager.get_calendar(
             pd.Timestamp(start), pd.Timestamp(end)))
         names = list(FACTORS)
         computed = self.engine.compute_factors(
             names, calendar.tolist(), self._universe, parallel=True)
-        score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
+        # 各因子截面排名 (方向已调整: 高=好)
+        ranks = {}
         for name, direction in FACTORS.items():
             rank = computed[name].rank(axis=1, pct=True)
-            oriented = rank if direction == 1 else (1 - rank)
-            score = score.add(oriented, fill_value=0)
-        return score.div(len(names))
+            ranks[name] = rank if direction == 1 else (1 - rank)
+
+        if not IC_IR_WEIGHT:
+            score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
+            for name in names:
+                score = score.add(ranks[name], fill_value=0)
+            return score.div(len(names))
+
+        # IC_IR 动态加权: 60日滚动 IC → Ledoit-Wolf 收缩协方差 → w* = Σ⁻¹·mean(IC)
+        fwd_ret = self.runner.data_manager.get("close", calendar, self._universe)
+        if fwd_ret is None or fwd_ret.empty:
+            fwd_rank = pd.DataFrame(0.5, index=calendar, columns=self._universe)
+        else:
+            fwd_rank = fwd_ret.pct_change().rank(axis=1)
+        ic = pd.DataFrame(
+            {n: ranks[n].corrwith(fwd_rank, axis=1) for n in names},
+            index=calendar)
+        score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
+        for t in calendar:
+            hist = ic.loc[:t].iloc[-IC_IR_WINDOW:]
+            if len(hist) < max(10, IC_IR_WINDOW // 2):
+                # 冷启动: 等权
+                w = pd.Series(1.0 / len(names), index=names)
+            else:
+                ic_mean = hist.mean()
+                lw_cov = self._lw_cov(hist)
+                try:
+                    wi = np.linalg.inv(lw_cov) @ ic_mean.values
+                except np.linalg.LinAlgError:
+                    wi = ic_mean.abs().values
+                wi = np.abs(wi)
+                w = pd.Series(wi / wi.sum(), index=names)
+            row = pd.Series(0.0, index=self._universe)
+            for name in names:
+                if t in ranks[name].index:
+                    row = row.add(ranks[name].loc[t] * w[name], fill_value=0)
+            tot = row.sum()
+            if tot > 0:
+                row = row / tot
+            score.loc[t] = row
+        return score
+
+    @staticmethod
+    def _lw_cov(ic_matrix: pd.DataFrame) -> np.ndarray:
+        """Ledoit-Wolf 收缩协方差 (因子 IC 矩阵)."""
+        T, N = ic_matrix.shape
+        sample_cov = np.cov(ic_matrix, rowvar=False, ddof=1)
+        sample_corr = np.corrcoef(ic_matrix, rowvar=False)
+        avg_corr = np.mean(sample_corr[np.triu_indices(N, k=1)]) if N > 1 else 0.0
+        target_corr = np.eye(N) * (1 - avg_corr) + np.ones((N, N)) * avg_corr
+        std_v = np.std(ic_matrix, axis=0, ddof=1)
+        target_cov = np.outer(std_v, std_v) * target_corr
+        centered = ic_matrix - ic_matrix.mean(axis=0)
+        pi = sum(np.sum((centered.iloc[i].values.reshape(-1, 1)
+                         @ centered.iloc[i].values.reshape(1, -1) - sample_cov) ** 2)
+                 for i in range(T)) / T
+        gamma = np.sum((target_cov - sample_cov) ** 2)
+        lam = max(0.0, min(1.0, pi / gamma)) if gamma > 0 else 0.5
+        return lam * target_cov + (1 - lam) * sample_cov
 
     def _capped_picks(self, row: pd.Series, ascending: bool, cap: int) -> list[str]:
         """按得分排序取 top_n 个, 但每板块最多 cap 个 (全市场排名 + 板块配额).
@@ -175,7 +241,8 @@ class CombinedStrategy:
         - 异常处理: 无数据品种自动跳过, 不报错
         """
         end = pd.Timestamp(date)
-        start = end - pd.Timedelta(days=40)
+        # IC_IR 需要 60 日历史算 IC, 放大窗口保证预热充足
+        start = end - pd.Timedelta(days=160)
         score = self.factor_scores(start.strftime("%Y-%m-%d"), date)
         if score.empty:
             return pd.Series(dtype=float)
