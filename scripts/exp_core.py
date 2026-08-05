@@ -68,7 +68,7 @@ class ExpEnv:
         self.cfg = load_config('config/intraday_backtest.yaml')
         self.runner = PipelineRunner(config=self.cfg)
         self.cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(
-            pd.Timestamp('2025-01-01'), pd.Timestamp('2026-08-04')))
+            pd.Timestamp('2024-01-01'), pd.Timestamp('2026-08-04')))
         self.u = list(UNIV38)
         self.engine = FactorEngine(self.runner.data_manager)
         self.close = self.runner.data_manager.get('close', self.cal, self.u)
