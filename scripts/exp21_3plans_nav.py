@@ -49,10 +49,18 @@ class Runner:
         self.cal, self.u, self.daily_ret = self.env.cal, self.env.u, self.env.daily_ret
         ALL = list(dict.fromkeys(list(PROD6) + CAND27 + F12))
         self.comp = {}
-        for i in range(0, len(ALL), 10):
-            part = self.env.engine.compute_factors(ALL[i:i+10], self.cal, self.u, parallel=False)
-            for k, v in part.items():
-                self.comp[k] = v
+        # 分年段 compute: 避免 2537 天 1min 全量 (drip_stone FFT) 一次性内存峰值
+        # (分年 drip_stone 正常 2-20% NaN, 全历史一起算会 OOM 返回全 NaN)
+        chunk = 400  # 400 交易日一段
+        for i in range(0, len(self.cal), chunk):
+            sub = self.cal[i:i+chunk]
+            for j in range(0, len(ALL), 10):
+                part = self.env.engine.compute_factors(ALL[j:j+10], sub, self.u, parallel=False)
+                for k, v in part.items():
+                    if k not in self.comp:
+                        self.comp[k] = v.reindex(self.cal)
+                    else:
+                        self.comp[k].loc[sub] = v
         self.ranks = {}
         for n in ALL:
             if n not in self.comp:
