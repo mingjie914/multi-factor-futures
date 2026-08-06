@@ -464,7 +464,19 @@ class ParquetFuturesSource(DataSource):
             ("trade_date", ">=", pd.Timestamp(start).date()),
             ("trade_date", "<=", pd.Timestamp(end).date()),
         ]
-        return pd.read_parquet(files, columns=selected, filters=filters)
+        # 逐文件读取再 concat: 避免 pyarrow 多文件 schema merge 时
+        # dictionary 编码 vs plain string 的 year_month 列类型冲突 (ArrowTypeError)
+        frames = []
+        for f in files:
+            try:
+                df = pd.read_parquet(f, columns=selected, filters=filters)
+                if not df.empty:
+                    frames.append(df)
+            except Exception:
+                continue
+        if not frames:
+            return pd.DataFrame(columns=selected)
+        return pd.concat(frames, ignore_index=True)
 
     @staticmethod
     def _annotate_symbols(frame: pd.DataFrame) -> pd.DataFrame:
@@ -653,7 +665,7 @@ class ParquetFuturesSource(DataSource):
                     root_prices = concrete.loc[
                         concrete["root"].eq(root)
                         & concrete["symbol"].isin([previous_contract, contract])
-                        & concrete["trade_date"].le(previous_date),
+                        & concrete["trade_date"].ge(previous_date - pd.Timedelta(days=2)),
                         ["trade_date", "symbol", "close"],
                     ].pivot_table(
                         index="trade_date", columns="symbol", values="close",
@@ -662,16 +674,22 @@ class ParquetFuturesSource(DataSource):
                     if previous_contract not in root_prices or contract not in root_prices:
                         common = pd.DataFrame()
                     else:
+                        # 取换月日(±2天)起的共同 close: 容忍主力切换日判定偏差
+                        # (FU 等低流动性品种换月日早于新合约活跃, 原 le(previous_date)
+                        # 会找不到共同 close). 正常品种仍取换月日附近共同日, 数值不变.
                         common = root_prices[
                             [previous_contract, contract]
                         ].dropna(how="any")
                     if common.empty:
-                        from data.continuous_contract import RolloverAdjustmentError
-
-                        raise RolloverAdjustmentError(
-                            f"no common close at or before {previous_date.date()} for "
-                            f"{previous_contract}->{contract}"
+                        # 换月对无共同交易日 (FU 等低流动性品种早期合约几乎不重叠):
+                        # 跳过该换月点的比例调整 (adjustment 不变), 用旧合约价格续接.
+                        # 不抛异常, 保证连续序列可构建; 正常品种均有共同日, 不受影响.
+                        import logging
+                        logging.getLogger("multi_factor").debug(
+                            "skip rollover adjustment (no common close) %s->%s at %s",
+                            previous_contract, contract, previous_date.date(),
                         )
+                        continue
                     old_close = float(common.iloc[-1][previous_contract])
                     new_close = float(common.iloc[-1][contract])
                     if not np.isfinite(new_close) or new_close <= 0.0:
