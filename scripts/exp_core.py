@@ -61,6 +61,23 @@ CAND_DIR = {
 }
 
 
+def _latest_local_date():
+    """从本地 1d 分区推断最新交易日 (自动跟踪数据更新, 无需手动改日期)."""
+    import os as _os
+    import glob as _glob
+    import pandas as _pd
+    base = r"E:\程明杰公司内容\期货行情数据\本地表\futureshistoryprices1d"
+    try:
+        dirs = sorted(d for d in _os.listdir(base) if d.startswith("year_month="))
+        if not dirs:
+            return _pd.Timestamp("2026-08-04")
+        files = _glob.glob(_os.path.join(base, dirs[-1], "*.parquet"))
+        df = _pd.read_parquet(files[0], columns=["trade_datetime"])
+        return _pd.Timestamp(df["trade_datetime"].max())
+    except Exception:
+        return _pd.Timestamp("2026-08-04")  # 兜底
+
+
 class ExpEnv:
     """统一实验环境: 数据/因子/日历缓存."""
 
@@ -68,7 +85,7 @@ class ExpEnv:
         self.cfg = load_config('config/intraday_backtest.yaml')
         self.runner = PipelineRunner(config=self.cfg)
         self.cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(
-            pd.Timestamp('2024-01-01'), pd.Timestamp('2026-08-04')))
+            pd.Timestamp('2016-03-01'), _latest_local_date()))
         self.u = list(UNIV38)
         self.engine = FactorEngine(self.runner.data_manager)
         self.close = self.runner.data_manager.get('close', self.cal, self.u)

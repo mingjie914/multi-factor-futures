@@ -102,10 +102,16 @@ class Runner:
 
 
 def main():
+    import time as _time
+    import cProfile as _cProfile
+    import pstats as _pstats
+    import io as _io
     r = Runner()
     print('=' * 60)
     print('实验21: 三方案净值对比')
     print('=' * 60)
+    _pr = _cProfile.Profile()
+    _pr.enable()
     plans = {
         '6因子-IC_IR (生产)': (F6, True),
         '12因子-IC_IR (前向候选)': (F12, True),
@@ -116,7 +122,9 @@ def main():
     for name, (names, icir) in plans.items():
         s = r.returns(names, icir)
         st = stats(s)
-        nav = (1 + s).cumprod()
+        # 净值图从 2016-03-31 起 (用户要求), 回测数据含前置冷启动
+        s_plot = s[s.index >= pd.Timestamp('2016-03-31')]
+        nav = (1 + s_plot).cumprod()
         ax.plot(nav.index, nav.values, lw=1.6,
                 label=f'{name} (夏普{st["sharpe"]:.2f}/实盘{st["live"]:.2f})')
         results[name] = st
@@ -124,13 +132,20 @@ def main():
               f'OOS={st["oos"]:.2f} 实盘={st["live"]:.2f} ({len(s)}天)')
     ax.axvline(pd.Timestamp('2026-03-01'), color='gray', ls='--', lw=1, label='OOS起点')
     ax.axvline(pd.Timestamp('2026-05-16'), color='red', ls='--', lw=1, label='实盘起点')
-    ax.set_title('三方案净值对比 (6icir / 12icir / 6等权, 2024-01~2026-08)')
+    ax.set_title('三方案净值对比 (6icir / 12icir / 6等权, 2016-03-31 起)')
     ax.legend(loc='upper left', fontsize=10)
     ax.grid(alpha=0.3)
     fig.tight_layout()
     out = 'runs/nav_3plans_compare.png'
     fig.savefig(out, dpi=150)
     print(f'\n净值对比图: {out}')
+    # 性能剖析 (任务4)
+    _pr.disable()
+    _st = _io.StringIO()
+    _ps = _pstats.Stats(_pr, stream=_st).sort_stats('cumulative')
+    _ps.print_stats(12)
+    print('\n=== cProfile 性能热点 (三方案回测) ===')
+    print(_st.getvalue()[:2500])
 
 
 if __name__ == '__main__':

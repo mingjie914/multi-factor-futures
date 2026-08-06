@@ -2621,7 +2621,7 @@ class IntradayOvernightAbsorption20d(Factor):
                 h = grp_high[col].dropna()
                 l = grp_low[col].dropna()
                 c = grp_close[col].dropna()
-                if len(o) < 1 or len(h) < 5:
+                if len(o) < 1 or len(h) < 5 or len(c) < 1:
                     continue
                 o_first = o.iloc[0]
                 h_day, l_day = h.max(), l.min()
@@ -25038,3 +25038,724 @@ class IntradayRolloverBasisGap20d(Factor):
         # 换月稀疏, min_periods=1: 窗口内出现基差跳变即计入
         gap = basis_d.diff().abs().where(win > 0)
         return (-gap.rolling(20, min_periods=1).sum()).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 439. intraday_dazzling_vol — 放量冲击后波动 (知乎 feat_dazzling_vol 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_dazzling_vol_20d", category="intraday_advanced")
+class IntradayDazzlingVol20d(Factor):
+    """放量冲击后波动因子 (知乎 feat_dazzling_vol, 1min).
+
+    识别分钟成交量显著高于日内基准的激增时刻, 取激增后 h=10 分钟窗口内
+    收益率标准差, 再对当日所有激增窗口的波动率取均值:
+    dazzling_vol = Mean( Std(ret[t+1..t+h]) | vol_surge_flag(t)=1 ).
+    放量激增后短窗波动大 → 交易结构不稳定 → 情绪回落/流动性冲击风险 → 负向.
+    与 #8 jump_intensity(跳空次数) / #36 large_order_impact(冲击后方向) 不同:
+    本因子度量冲击后的波动幅度(风险), 而非次数/方向.
+    方向: 负向.
+    """
+    name = "intraday_dazzling_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量冲击后波动 (激增后10min收益std均值, 不稳定=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        ret_1m = close.pct_change()
+        day = ret_1m.index.normalize()
+        dazzling: dict = {}
+        h = 10
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < h + 10:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < h + 10:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                v_mean = v_c.mean()
+                if v_mean < 1e-12:
+                    continue
+                r = c_c.pct_change().values
+                vol_arr = v_c.values
+                surge_pos = np.where(vol_arr > 2.0 * v_mean)[0]
+                if len(surge_pos) == 0:
+                    continue
+                post_vols = []
+                for pos in surge_pos:
+                    s = pos + 1
+                    e = min(pos + h + 1, len(r))
+                    if e - s < 5:
+                        continue
+                    window = r[s:e]
+                    if len(window) > 0 and np.std(window) >= 0:
+                        post_vols.append(float(np.std(window)))
+                if post_vols:
+                    vals[col] = float(np.mean(post_vols))
+            if vals:
+                dazzling[dt] = pd.Series(vals)
+        if not dazzling:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(dazzling).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 440. intraday_day_pp_maxm — 近20日最大日振幅 (知乎 feat_day_pp_maxm 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_day_pp_maxm_20d", category="intraday_advanced")
+class IntradayDayPpMaxm20d(Factor):
+    """近20日最大日振幅因子 (知乎 feat_day_pp_maxm, 日频).
+
+    amp_t = (High_t - Low_t) / Close_t;  maxm = Max(amp_t-19 .. amp_t).
+    近20日内最大日内振幅 → 期间出现过剧烈价格冲击 → 资金分歧/情绪扰动 → 负向.
+    与 #42 parkinson_vol_ratio(HL波动均值比) 不同: 本因子取 20 日窗口的
+    振幅**最大值**(极值统计), 而非平均波动水平.
+    方向: 负向.
+    """
+    name = "intraday_day_pp_maxm_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "近20日最大日振幅 (max((H-L)/C,20), 极端冲击=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        high = data.get("high", dates, universe)
+        low = data.get("low", dates, universe)
+        close = data.get("close", dates, universe)
+        if high is None or low is None or close is None or high.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        amp = (high - low) / close.replace(0, np.nan)
+        maxm = amp.rolling(20, min_periods=5).max()
+        return maxm.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 441. intraday_tcc_rel — 时间网络中心度偏离 (知乎 feat_tcc_rel 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tcc_rel_20d", category="intraday_advanced")
+class IntradayTccRel20d(Factor):
+    """时间网络中心度因子 (知乎 feat_tcc_rel, 1min, 期货转换).
+
+    每分钟计算全品种截面收益中心 center_m = Mean_i(ret_i,m),
+    个股偏离 dev_i,m = ret_i,m - center_m; 日内偏离序列的波动(中心度):
+    tcc = Std(dev_i,m over day) / 截面均值(|dev|).
+    持续偏离市场中心 → 独立信息/资金节奏差异 → 不稳定 → 负向.
+    与 #373 sector_sync(相关) / #376 cross_spread(截面价差) 不同:
+    本因子是"偏离截面中心的日内波动"网络视角.
+    方向: 负向.
+    """
+    name = "intraday_tcc_rel_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "时间网络中心度 (偏离全品种中心日内波动, 独立=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        ret_1m = close.pct_change()
+        day = ret_1m.index.normalize()
+        tccs: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            sub = grp.dropna(how="all")
+            if sub.shape[1] < 2:
+                continue
+            center = sub.mean(axis=1)  # 全品种截面中心
+            dev = sub.sub(center, axis=0)  # 各品种偏离
+            center_abs = dev.abs().mean(axis=1).mean() + 1e-12
+            vals = {}
+            for col in sub.columns:
+                d = dev[col].dropna()
+                if len(d) < 20:
+                    continue
+                tcc = float(d.std(ddof=0) / center_abs)
+                vals[col] = tcc
+            if vals:
+                tccs[dt] = pd.Series(vals)
+        if not tccs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(tccs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 442. intraday_vol_burst_peak_cnt — 放量脉冲次数 (知乎 feat_vol_burst_peak_cnt 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_burst_peak_cnt_20d", category="intraday_advanced")
+class IntradayVolBurstPeakCnt20d(Factor):
+    """放量脉冲次数因子 (知乎 feat_vol_burst_peak_cnt, 1min).
+
+    分钟量日内标准化 vol_z = (vol - mean)/std; 超阈值(>1.5)标记放量分钟,
+    连续放量分钟合并为一次脉冲, 统计当日脉冲数:
+    burst_cnt = Count(连续放量区间).
+    放量脉冲多 → 资金参与/信息冲击/主动交易集中 → 活跃 → 正向.
+    与 #89 liquidity_spike_freq(单分钟>3σ频率) 不同: 本因子将连续放量合并
+    为一次脉冲(峰值计数), 而非逐分钟计数.
+    方向: 正向.
+    """
+    name = "intraday_vol_burst_peak_cnt_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量脉冲次数 (连续放量合并计数, 资金活跃=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        counts: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30:
+                    continue
+                v_mean = v.mean()
+                v_std = v.std(ddof=0)
+                if v_std < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                vol_z = (v - v_mean) / v_std
+                flag = (vol_z > 1.5).values
+                # 连续放量合并为脉冲
+                peaks = 0
+                in_burst = False
+                for f in flag:
+                    if f and not in_burst:
+                        peaks += 1
+                        in_burst = True
+                    elif not f:
+                        in_burst = False
+                vals[col] = float(peaks)
+            if vals:
+                counts[dt] = pd.Series(vals)
+        if not counts:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(counts).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 443. intraday_csad_sigma120 — 同伴股离散度120日波动 (知乎 feat_csad_sigma120 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_sigma120_20d", category="intraday_advanced")
+class IntradayCsadSigma12020d(Factor):
+    """CSAD 同伴股离散度120日波动因子 (知乎 feat_csad_sigma120, 日频, 期货转换).
+
+    同伴股 = 同板块品种 (板块映射); 每日 CSAD:
+    CSAD_i,t = Mean_j(|ret_i,t - ret_j,t|), j ∈ 同板块其他品种.
+    sigma120 = Std(CSAD_i,t, 120日).
+    长期分化波动大 → 与同伴股走势脱节/资金分歧 → 定价偏离 → 负向.
+    与 #374 sector_dispersion(板块内收益std) 不同: 本因子是相对同伴股的
+    绝对离散度, 并取长窗波动(羊群效应视角).
+    方向: 负向.
+    """
+    name = "intraday_csad_sigma120_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD同伴离散120日std (长期分化波动=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        sigma = csad.rolling(120, min_periods=30).std()
+        return (-sigma).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 444. intraday_csad_sigma20 — 同伴股离散度20日波动 (知乎 feat_csad_sigma20 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_sigma20_20d", category="intraday_advanced")
+class IntradayCsadSigma2020d(Factor):
+    """CSAD 同伴股离散度20日波动因子 (知乎 feat_csad_sigma20, 日频, 期货转换).
+
+    同 #443 的 CSAD, 但取 20 日窗口波动:
+    sigma20 = Std(CSAD_i,t, 20日).
+    短期分化波动大 → 近期相对同伴股剧烈分化 → 交易拥挤/主题退潮 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_csad_sigma20_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD同伴离散20日std (短期分化剧烈=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        sigma = csad.rolling(20, min_periods=5).std()
+        return (-sigma).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 445. intraday_csad_ratio — CSAD 短长窗比值 (知乎 feat_csad_ratio 复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_ratio_20d", category="intraday_advanced")
+class IntradayCsadRatio20d(Factor):
+    """CSAD 短长窗比值因子 (知乎 feat_csad_ratio, 日频, 期货转换).
+
+    ratio = sigma20 / sigma120 (近20日CSAD波动 / 近120日CSAD波动).
+    比值高 → 近期相对同伴股的分化程度高于长期常态 → 拥挤释放/分歧加大 → 负向.
+    与 #443/#444 是同一族的相对化版本.
+    方向: 负向.
+    """
+    name = "intraday_csad_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD短长窗比 (sigma20/sigma120, 近期分化加剧=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        s20 = csad.rolling(20, min_periods=5).std()
+        s120 = csad.rolling(120, min_periods=30).std().replace(0, np.nan)
+        ratio = s20 / s120
+        return (-ratio).reindex(index=idx, columns=universe).shift(1)
+
+
+def _csad_sector(ret, universe):
+    """板块内 CSAD: 每品种 vs 同板块其他品种收益绝对差均值 (板块内≥2品种).
+
+    返回 shape 同 ret 的 DataFrame; 板块内仅 1 品种或无板块归属 → NaN.
+    """
+    out = pd.DataFrame(np.nan, index=ret.index, columns=ret.columns, dtype=float)
+    sectors: dict = {}
+    for col in ret.columns:
+        sec = _SECTOR_MAP.get(str(col).upper(), "other")
+        sectors.setdefault(sec, []).append(col)
+    for sec, cols in sectors.items():
+        if len(cols) < 2:
+            continue
+        sub = ret[cols]
+        for col in cols:
+            others = [c for c in cols if c != col]
+            if len(others) < 1:
+                continue
+            # 逐日: Mean_j(|ret_i - ret_j|)
+            diff = sub[others].sub(sub[col], axis=0).abs()
+            out[col] = diff.mean(axis=1)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 446. intraday_dazzling_vol_decay — 放量冲击后波动衰减 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_dazzling_vol_decay_20d", category="intraday_advanced")
+class IntradayDazzlingVolDecay20d(Factor):
+    """放量冲击后波动衰减因子 (原创: #439 改进).
+
+    #439 只统计冲击后短窗波动水平; 本因子比较冲击后 10min 与 30min 的波动比:
+    decay = Std(ret[t+1..t+30]) / Std(ret[t+1..t+10]).
+    decay < 1 → 波动快速收敛 → 冲击被迅速消化 → 健康 → 正向.
+    decay > 1 → 波动持续放大 → 冲击未消化 → 风险蔓延 → 负向.
+    方向: 正向 (取 -decay 使收敛=高值).
+    """
+    name = "intraday_dazzling_vol_decay_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量冲击后波动衰减 (30min/10min波动比, 收敛=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        ret_1m = close.pct_change()
+        day = ret_1m.index.normalize()
+        decays: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 40:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 40:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                v_mean = v_c.mean()
+                if v_mean < 1e-12:
+                    continue
+                r = c_c.pct_change().values
+                vol_arr = v_c.values
+                surge_pos = np.where(vol_arr > 2.0 * v_mean)[0]
+                ratios = []
+                for pos in surge_pos:
+                    s = pos + 1
+                    e10 = min(pos + 11, len(r))
+                    e30 = min(pos + 31, len(r))
+                    if e10 - s < 5 or e30 - e10 < 5:
+                        continue
+                    w10 = r[s:e10]
+                    w30 = r[s:e30]
+                    std10 = np.std(w10)
+                    if std10 < 1e-12:
+                        continue
+                    ratios.append(float(np.std(w30) / std10))
+                if ratios:
+                    vals[col] = -float(np.mean(ratios))
+            if vals:
+                decays[dt] = pd.Series(vals)
+        if not decays:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(decays).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 447. intraday_amp_maxm_recency — 最大振幅出现时间位置 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amp_maxm_recency_20d", category="intraday_advanced")
+class IntradayAmpMaxmRecency20d(Factor):
+    """最大振幅出现时间位置因子 (原创: #440 改进).
+
+    #440 只取 20 日最大振幅值; 本因子记录最大振幅出现在窗口内的位置 (0=最近):
+    recency = 距最大振幅日的天数 / 20.
+    大振幅刚发生 (recency 小) → 冲击释放未充分消化 → 风险延续 → 负向.
+    大振幅发生在窗口早期 (recency 大) → 冲击已消化 → 结构恢复 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_amp_maxm_recency_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "最大振幅时间位置 (距冲击天数/20, 冲击消化=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        high = data.get("high", dates, universe)
+        low = data.get("low", dates, universe)
+        close = data.get("close", dates, universe)
+        if high is None or low is None or close is None or high.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        amp = (high - low) / close.replace(0, np.nan)
+        idx = pd.DatetimeIndex(dates)
+        amp = amp.reindex(index=idx)
+        recency = amp.rolling(20, min_periods=5).apply(
+            lambda x: float(np.argmax(x.values) / max(1, len(x) - 1)), raw=False)
+        return recency.reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 448. intraday_tcc_breakaway — 市场中心脱离度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tcc_breakaway_20d", category="intraday_advanced")
+class IntradayTccBreakaway20d(Factor):
+    """市场中心脱离度因子 (原创: #441 改进).
+
+    #441 度量偏离截面中心的波动; 本因子度量偏离的**方向性持续性**:
+    连续同向偏离市场中心 (独立行情) 的分钟占比.
+    breakaway 高 → 品种走独立行情 → 资金高度关注但风险集中 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_tcc_breakaway_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "市场中心脱离度 (连续同向偏离占比, 独立行情=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        ret_1m = close.pct_change()
+        day = ret_1m.index.normalize()
+        breakaways: dict = {}
+        for dt in sorted(set(day)):
+            grp = ret_1m.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            sub = grp.dropna(how="all")
+            if sub.shape[1] < 2:
+                continue
+            center = sub.mean(axis=1)
+            dev = sub.sub(center, axis=0)
+            vals = {}
+            for col in sub.columns:
+                d = dev[col].dropna()
+                if len(d) < 20:
+                    continue
+                signs = np.sign(d.values)
+                # 同向持续: 计算 sign 序列的最长 run 占比
+                max_run = 1
+                cur = 1
+                for i in range(1, len(signs)):
+                    if signs[i] == signs[i - 1] and signs[i] != 0:
+                        cur += 1
+                        max_run = max(max_run, cur)
+                    else:
+                        cur = 1
+                vals[col] = float(max_run / len(signs))
+            if vals:
+                breakaways[dt] = pd.Series(vals)
+        if not breakaways:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(breakaways).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 449. intraday_vol_burst_intensity — 放量脉冲强度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_burst_intensity_20d", category="intraday_advanced")
+class IntradayVolBurstIntensity20d(Factor):
+    """放量脉冲强度因子 (原创: #442 改进).
+
+    #442 只计脉冲次数; 本因子度量脉冲的平均强度:
+    intensity = Mean( 脉冲峰值 vol_z ).
+    脉冲强度高 → 放量程度极端 → 资金激烈博弈/情绪化 → 不稳定 → 负向.
+    与 #442 (次数=活跃) 互补: 本因子是单次冲击的烈度.
+    方向: 负向.
+    """
+    name = "intraday_vol_burst_intensity_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量脉冲强度 (脉冲峰值vol_z均值, 极端放量=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        intensities: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30:
+                    continue
+                v_mean = v.mean()
+                v_std = v.std(ddof=0)
+                if v_std < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                vol_z = (v - v_mean) / v_std
+                flag = (vol_z > 1.5).values
+                zvals = vol_z.values
+                peaks = []
+                in_burst = False
+                for i, f in enumerate(flag):
+                    if f:
+                        if not in_burst:
+                            in_burst = True
+                            peaks.append(zvals[i])
+                        else:
+                            peaks[-1] = max(peaks[-1], zvals[i])
+                    else:
+                        in_burst = False
+                if peaks:
+                    vals[col] = float(np.mean(peaks))
+                else:
+                    vals[col] = 0.0
+            if vals:
+                intensities[dt] = pd.Series(vals)
+        if not intensities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(intensities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 450. intraday_csad_trend — CSAD 分化趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_trend_20d", category="intraday_advanced")
+class IntradayCsadTrend20d(Factor):
+    """CSAD 分化趋势因子 (原创: #443/#444 改进).
+
+    sigma 系列只度量分化波动; 本因子度量 CSAD 的 20 日趋势 (斜率):
+    用 CSAD 序列在 20 日窗口内做 OLS 斜率归一化.
+    分化趋势向上 → 与同伴股背离在加剧 → 拥挤/主题退潮进行中 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_csad_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD分化趋势 (20日CSAD斜率, 背离加剧=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        trend = csad.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 451. intraday_csad_extreme_reversal — CSAD 极值反转 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_extreme_reversal_20d", category="intraday_advanced")
+class IntradayCsadExtremeReversal20d(Factor):
+    """CSAD 极值反转因子 (原创: #443-#445 改进).
+
+    CSAD 极端高分位 (分化剧烈到历史极值) 后, 分化大概率收敛:
+    reversal = 1 - rank(CSAD, 60日) — CSAD 处极高分位时输出负值(反向).
+    与 #443-#445 (水平/比值) 不同: 本因子是"极值 → 均值回归"的触发式信号.
+    方向: 负向 (分化极值后做反转).
+    """
+    name = "intraday_csad_extreme_reversal_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD极值反转 (1-60日分位, 分化极值后反转)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        rank = csad.rolling(60, min_periods=15).apply(
+            lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
+        reversal = (rank - 0.7)  # 高分位(>0.7)时为正信号 → 取负
+        return (-reversal).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 452. intraday_csad_volume_confirm — CSAD×成交量确认 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_csad_volume_confirm_20d", category="intraday_advanced")
+class IntradayCsadVolumeConfirm20d(Factor):
+    """CSAD×成交量确认因子 (原创: #443-#445 改进).
+
+    分化 + 放量 = 拥挤交易确认 (资金激烈博弈); 分化 + 缩量 = 自然分化.
+    confirm = CSAD 分位 × 成交量 z-score — 双重高位才触发强负向.
+    相比纯 CSAD 因子, 加入成交量确认降低"流动性薄导致的假分化"误报.
+    方向: 负向.
+    """
+    name = "intraday_csad_volume_confirm_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "CSAD×量确认 (分化×放量双高, 拥挤=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        volume = data.get("volume", dates, universe)
+        if close is None or close.empty or volume is None or volume.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        vol = volume.reindex(index=idx)
+        csad = _csad_sector(ret, universe)
+        csad_rank = csad.rolling(60, min_periods=15).apply(
+            lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
+        v_mean = vol.rolling(20, min_periods=5).mean()
+        v_std = vol.rolling(20, min_periods=5).std().replace(0, np.nan)
+        v_z = (vol - v_mean) / v_std
+        confirm = csad_rank * v_z.clip(lower=0)
+        return (-confirm).reindex(index=idx, columns=universe).shift(1)
