@@ -112,6 +112,8 @@ class ParquetFuturesSource(DataSource):
             "1min": datasets.get("1min", "futureshistoryprices1m"),
             "15min": datasets.get("15min", "futureshistoryprices15m"),
         }
+        # 日历缓存 (fetch_calendar 每次全量读 1d + 正则, 静态数据按 (start,end) 缓存)
+        self._CALENDAR_CACHE: dict = {}
         for name, relative in self.datasets.items():
             path = self.root_path / str(relative)
             if not path.is_dir():
@@ -1257,14 +1259,25 @@ class ParquetFuturesSource(DataSource):
         return pd.Index(roots)
 
     def fetch_calendar(self, start, end) -> pd.DatetimeIndex:
+        # 日历是静态数据: 按 (start,end) 缓存, 避免每次 erc_w/回测重复读全量 1d
+        # 并重复 _annotate_symbols 正则 (6000万次 str.extract 热点)
+        key = (pd.Timestamp(start), pd.Timestamp(end))
+        if key in self._CALENDAR_CACHE:
+            return self._CALENDAR_CACHE[key]
         frame = self._read_partitions(
             "daily", start, end, ["symbol", "trade_date"]
         )
         frame = self._annotate_symbols(frame)
         if frame.empty:
-            return pd.DatetimeIndex([])
-        dates = frame.loc[frame["suffix"].eq("9999"), "trade_date"].dropna().unique()
-        return pd.DatetimeIndex(sorted(dates))
+            res = pd.DatetimeIndex([])
+        else:
+            dates = frame.loc[frame["suffix"].eq("9999"), "trade_date"].dropna().unique()
+            res = pd.DatetimeIndex(sorted(dates))
+        # LRU: 最多缓存 32 个日历 (回测窗口固定, 命中率高)
+        if len(self._CALENDAR_CACHE) >= 32:
+            self._CALENDAR_CACHE.pop(next(iter(self._CALENDAR_CACHE)))
+        self._CALENDAR_CACHE[key] = res
+        return res
 
     def fetch_macro(
         self,
