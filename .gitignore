@@ -53,3 +53,6 @@ weights/
 
 # production snapshots (not pushed to remote)
 /snapshot/
+
+# monitoring runtime outputs
+/monitoring_data/
