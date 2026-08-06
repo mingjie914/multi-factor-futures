@@ -522,8 +522,13 @@ _TERM_CACHE: dict = {}
 _MAX_TERM_CACHE_ENTRIES = 8
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=65536)
 def _expiry_ym(sym):
     # symbol 形如 RB2610 / IC2609 → (年, 月) 或 None; 月份须 1-12
+    # lru_cache: 每个唯一 symbol 只正则一次 (此前 6400 万次调用, 回测瓶颈)
     m = re.match(r"^[A-Za-z]+(\d{2})(\d{2})$", str(sym))
     if not m:
         return None
