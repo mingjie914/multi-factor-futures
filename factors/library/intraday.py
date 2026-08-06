@@ -478,23 +478,32 @@ def _panel_cache_key(dates, universe, freq):
 # 切换: 设 _INTRADAY_FREQ = "5min" 后, 所有 _get_minute_panel(freq="1min") 自动用 5min 数据
 _INTRADAY_FREQ = "5min"
 
+# 需强制真 1min 的因子 (声明集): 即使全局切 5min 也强制用 1min 数据
+# 规则: 因子 compute 里调用 _get_minute_panel(..., force_1min=True) 或
+#       将因子名加入 _REQUIRE_1MIN_FACTORS 集合
+# 当前: 全量 53 因子已验证 5min 与 1min 值 100% 一致 (verify_53_consistency.py),
+#       无一需要真 1min. 未来新增真 1min 因子 (微结构/订单流类) 时在此声明.
+_REQUIRE_1MIN_FACTORS: set = set()
 
-def _get_minute_panel(data, dates, universe, freq="1min"):
+
+def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
     """获取分钟级 OHLCV 面板.
 
     优先级: 本地 Parquet > data.get_at_frequency() > DDBSource.
     带模块级缓存: 同一 (日期区间, 品种池, 频率) 组合只读一次 Parquet,
     多个因子共享面板, 避免 N 因子重复读取 N 次.
 
-    频率准入: 因子请求 "1min" 时, 若全局 _INTRADAY_FREQ != "1min",
-    则改用 _INTRADAY_FREQ 数据源 (已准入验证数值一致). 这是唯一入口,
-    防止因子绕过开关误用其他频率.
+    频率准入 (防 1min/5min 错配):
+    - 因子请求 freq="1min" 时, 若全局 _INTRADAY_FREQ != "1min" 且
+      未声明 force_1min, 则改用 _INTRADAY_FREQ (默认降采样到 5min)
+    - force_1min=True: 强制用真 1min (不降采样)
+    - 因子请求 freq="5min"/其他: 直接用请求频率 (不映射)
     """
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    # 准入映射: 因子请求 1min -> 若开关开启, 用开关频率
-    if freq == "1min" and _INTRADAY_FREQ != "1min":
+    # 准入映射: 请求 1min -> 若开关开启且非强制真1min, 用开关频率
+    if freq == "1min" and _INTRADAY_FREQ != "1min" and not force_1min:
         freq = _INTRADAY_FREQ
     cache_key = _panel_cache_key(dates, universe, freq)
     if cache_key in _PANEL_CACHE:
