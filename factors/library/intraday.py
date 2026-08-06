@@ -383,7 +383,10 @@ def _read_local_raw(dates, universe, freq="1min"):
         if not os.path.exists(parquet_path):
             continue
         try:
-            df = pd.read_parquet(parquet_path)
+            # 列裁剪: 只读因子计算实际需要的列 (省 exchange/type/trade_date/year_month 4列, ~30% IO)
+            cols = ["trade_datetime", "symbol", "open", "high", "low", "close",
+                    "volume", "amount", "position"]
+            df = pd.read_parquet(parquet_path, columns=cols)
             ts = pd.to_datetime(df["trade_datetime"])
             df = df.loc[(ts >= start) & (ts <= end)]
             if not df.empty:
