@@ -50,3 +50,6 @@ weights/
 
 # kanyanbao scripts (contains account credentials handling)
 /kanyanbao/
+
+# production snapshots (not pushed to remote)
+/snapshot/
