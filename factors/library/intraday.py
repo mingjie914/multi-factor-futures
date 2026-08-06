@@ -487,6 +487,8 @@ _INTRADAY_FREQ = "5min"
 # 当前: 全量 53 因子已验证 5min 与 1min 值 100% 一致 (verify_53_consistency.py),
 #       无一需要真 1min. 未来新增真 1min 因子 (微结构/订单流类) 时在此声明.
 _REQUIRE_1MIN_FACTORS: set = set()
+# FFT 频谱因子 (drip_stone) 依赖 1min 粒度 (5min 每天仅 48 bar < FFT 60 bar 门槛), 强制真 1min
+_REQUIRE_1MIN_FACTORS.add("intraday_drip_stone_20d")
 
 
 def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
@@ -1418,7 +1420,8 @@ class IntradayHerding20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        # FFT 频谱依赖 1min 粒度 (每天需 60+ bar, 5min 仅 48 bar 会 NaN) — 强制真 1min
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
         if "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         vol_1m = panel["volume"]
@@ -1677,7 +1680,8 @@ class IntradayVolumeVol20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        # FFT 频谱依赖 1min 粒度 (每天需 60+ bar, 5min 仅 48 bar 会 NaN) — 强制真 1min
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
         if "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         vol_1m = panel["volume"]
@@ -1846,7 +1850,8 @@ class IntradayDripStone20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        # FFT 频谱依赖 1min 粒度 (每天需 60+ bar, 5min 仅 48 bar 会 NaN) — 强制真 1min
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
         if "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         vol_1m = panel["volume"]
