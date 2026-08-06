@@ -343,15 +343,26 @@ _FREQ_DIR_MAP = {
 }
 
 
+_RAW_CACHE: dict = {}
+_MAX_RAW_CACHE_ENTRIES = 4
+
+
 def _read_local_raw(dates, universe, freq="1min"):
     """读取本地 Parquet 并按根代码映射, 返回含 _ts/root 列的原始数据 (共享读取).
 
     供 _read_local_minute (OHLCV聚合) 与 _read_local_term (期限结构) 复用.
     读取失败或无匹配合约时返回 None.
+    带内存缓存 (按 freq + 日期范围), 消除多因子重复读 parquet 的瓶颈.
     """
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
+    # 缓存 key: freq + 日期范围 (同一范围复用, 避免重复读 parquet)
+    _dmin = pd.Timestamp(dates.min())
+    _dmax = pd.Timestamp(dates.max())
+    cache_key = (freq, str(_dmin.date()), str(_dmax.date()))
+    if cache_key in _RAW_CACHE:
+        return _RAW_CACHE[cache_key]
     subdir = _FREQ_DIR_MAP.get(freq)
     if subdir is None:
         return None
@@ -403,6 +414,10 @@ def _read_local_raw(dates, universe, freq="1min"):
     # 例: 周五夜盘 21:00-周六 02:30 的 bar (自然日周六 00:00-02:30) 归入周五
     # 日盘 (08:00 后) 保持当天; 与 1d 表 trade_date 对齐
     all_data["_ts"] = ts.where(ts.dt.hour >= 8, ts - pd.Timedelta(hours=8))
+    # 存入缓存 (LRU: 超限淘汰最旧)
+    if len(_RAW_CACHE) >= _MAX_RAW_CACHE_ENTRIES:
+        _RAW_CACHE.pop(next(iter(_RAW_CACHE)))
+    _RAW_CACHE[cache_key] = all_data
     return all_data
 
 
