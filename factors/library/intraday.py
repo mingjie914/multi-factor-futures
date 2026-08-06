@@ -357,10 +357,11 @@ def _read_local_raw(dates, universe, freq="1min"):
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    # 缓存 key: freq + 日期范围 (同一范围复用, 避免重复读 parquet)
+    # 缓存 key: freq + 日期范围 + universe (数据已按 universe 过滤, 防跨品种池污染)
     _dmin = pd.Timestamp(dates.min())
     _dmax = pd.Timestamp(dates.max())
-    cache_key = (freq, str(_dmin.date()), str(_dmax.date()))
+    _ukey = tuple(sorted(str(s).upper() for s in universe))
+    cache_key = (freq, str(_dmin.date()), str(_dmax.date()), _ukey)
     if cache_key in _RAW_CACHE:
         return _RAW_CACHE[cache_key]
     subdir = _FREQ_DIR_MAP.get(freq)
@@ -481,14 +482,9 @@ def _panel_cache_key(dates, universe, freq):
 # 切换: 设 _INTRADAY_FREQ = "5min" 后, 所有 _get_minute_panel(freq="1min") 自动用 5min 数据
 _INTRADAY_FREQ = "5min"
 
-# 需强制真 1min 的因子 (声明集): 即使全局切 5min 也强制用 1min 数据
-# 规则: 因子 compute 里调用 _get_minute_panel(..., force_1min=True) 或
-#       将因子名加入 _REQUIRE_1MIN_FACTORS 集合
-# 当前: 全量 53 因子已验证 5min 与 1min 值 100% 一致 (verify_53_consistency.py),
-#       无一需要真 1min. 未来新增真 1min 因子 (微结构/订单流类) 时在此声明.
-_REQUIRE_1MIN_FACTORS: set = set()
-# FFT 频谱因子 (drip_stone) 依赖 1min 粒度 (5min 每天仅 48 bar < FFT 60 bar 门槛), 强制真 1min
-_REQUIRE_1MIN_FACTORS.add("intraday_drip_stone_20d")
+# 需强制真 1min 的因子: 在因子 compute 内显式调用
+# _get_minute_panel(..., force_1min=True) 强制用 1min (不降采样).
+# 当前: drip_stone (FFT 频谱, 5min 部分品种/日期覆盖缺口) 已 force_1min=True.
 
 
 def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
@@ -666,11 +662,17 @@ def _read_local_term(dates, universe, freq="1min"):
     return panel
 
 
-def _get_term_structure_panel(data, dates, universe, freq="1min"):
-    """获取期限结构面板 (主连+次连), 优先本地 Parquet, 带缓存."""
+def _get_term_structure_panel(data, dates, universe, freq="1min", force_1min=False):
+    """获取期限结构面板 (主连+次连), 优先本地 Parquet, 带缓存.
+
+    频率准入 (与 _get_minute_panel 一致): 请求 1min 且全局 _INTRADAY_FREQ 非 1min
+    且未强制真 1min 时, 改用 _INTRADAY_FREQ (term 因子吃 5min 加速).
+    """
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
+    if freq == "1min" and _INTRADAY_FREQ != "1min" and not force_1min:
+        freq = _INTRADAY_FREQ
     cache_key = _panel_cache_key(dates, universe, freq) + ("term",)
     if cache_key in _TERM_CACHE:
         return _TERM_CACHE[cache_key]
