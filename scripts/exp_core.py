@@ -85,7 +85,7 @@ class ExpEnv:
         self.cfg = load_config('config/intraday_backtest.yaml')
         self.runner = PipelineRunner(config=self.cfg)
         self.cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(
-            pd.Timestamp('2016-03-01'), _latest_local_date()))
+            pd.Timestamp('2015-12-01'), _latest_local_date()))
         self.u = list(UNIV38)
         self.engine = FactorEngine(self.runner.data_manager)
         self.close = self.runner.data_manager.get('close', self.cal, self.u)
@@ -130,7 +130,8 @@ class ExpEnv:
         if len(pool) < 2:
             return None
         sd = t - pd.Timedelta(days=90)
-        c = pd.DatetimeIndex(self.runner.data_manager.get_calendar(sd, t))
+        # 用 ExpEnv 已缓存的全量日历切片 (绕开 fetch_calendar 重复读 1d + 正则热点)
+        c = self.cal[(self.cal >= sd) & (self.cal <= t)]
         rs = self.daily_ret.reindex(c)[list(pool)].dropna()
         if rs.shape[0] < 10:
             return None
