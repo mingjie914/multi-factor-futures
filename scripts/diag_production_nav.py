@@ -51,7 +51,7 @@ def main():
     for n, direction in F6.items():
         r = comp[n].rank(axis=1, pct=True)
         score = score.add(r if direction == 1 else (1 - r), fill_value=0)
-    score = score.div(len(F7))
+    score = score.div(len(F6))
     close = runner.data_manager.get("close", cal, univ)
     daily_ret = close.pct_change()
     vol20 = close.pct_change().rolling(20, min_periods=10).std(ddof=0)
