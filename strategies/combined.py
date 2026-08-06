@@ -61,7 +61,7 @@ USE_SIMPLE_RP = False
 # 因子合成方式: True = IC_IR 动态加权 (60日滚动 Ledoit-Wolf), False = 等权
 # 2026-08-05 升级: 6f-IC_IR (夏普 2.56/实盘+2.24) > 6f-等权 (1.96/-0.19), 见 docs/策略基准记录.md
 IC_IR_WEIGHT = True
-# IC_IR 滚动窗口 (60日最优, 见 prod_snapshot_12f_icir/技术说明.md 6.1 敏感性)
+# IC_IR 滚动窗口 (60日最优, 见 snapshot/12f_icir/技术说明.md 6.1 敏感性)
 IC_IR_WINDOW = 60
 # 协方差收缩系数
 COV_SHRINKAGE = 0.30
