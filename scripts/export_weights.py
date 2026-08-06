@@ -2,7 +2,8 @@
 
 输出: weights/daily_weights.csv
 格式: date | symbol | direction | weight   (每日每品种一行, 权重=净权重, 多头正/空头负)
-逻辑: 与 combined.py 完全一致 (7因子等权 → cap=3 选池 → 池内 ERC → 多空合并净权重)
+逻辑: 与 combined.py 完全一致 (6因子等权 → cap=3 选池 → 池内 ERC → 多空合并净权重)
+⚠️ 历史版本: 生产已升级为 6因子 IC_IR 动态加权 (2026-08-05), 请使用 scripts/export_weights_both_half.py (含 IC_IR 版)
       T 日权重 = T-1 信号 (shift 已内建), 用于 T 日收益计算.
 """
 import sys

@@ -1,15 +1,14 @@
 """combined — 融合策略模块 (最终固化版, ERC 升级).
 
-方案: 7因子打分选池 + 池内 ERC 风险平价 (多空, 日度调仓)
+方案: 6因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 (多空, 日度调仓)
   - 品种池: 38 (manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR, 见 docs/策略基准记录.md)
-  - 信号: 7个已验证因子等权打分 → Top10做多 / Bottom10做空
+  - 信号: 6个已验证因子 IC_IR 动态加权 (60日滚动 Ledoit-Wolf, 2026-08-05 升级) → Top10做多 / Bottom10做空
   - 权重: 池内 ERC (等风险贡献, 协方差 shrinkage=0.3), 可回退到逆波动率
   - 选池: 板块配额 cap=3 (每板块最多3个多头/空头)
   - 调仓: 日度 (每天收盘生成信号, 次日持有)
 
-验证数据 (2025-01~2026-05 / OOS 2026-03~05):
-  逆波动率版: 全量夏普 0.96, OOS 夏普 0.92, 月换手 18%
-  ERC 版: 待验证 (预期 OOS 回撤进一步收窄)
+验证数据 (2025-01~2026-07 / OOS 2026-03~05):
+  IC_IR 版: 全段夏普 2.56, OOS 夏普 2.94, 实盘 +2.24 (2026-08-05 升级, 优于等权 2.04)
 
 用法:
     from strategies.combined import CombinedStrategy
@@ -70,7 +69,8 @@ MAX_WEIGHT = 0.20
 MIN_WEIGHT = 0.005
 
 # 板块配额: 每板块最多 SECTOR_CAP 个多头/空头 (0 = 不限制, 全市场 Top10/Bottom10)
-# 2026-08 验证: cap=3 夏普 2.64 vs 无配额 2.01, 回撤 -3.4% vs -7.3% (见 docs/策略基准记录.md)
+# 2026-08 历史对比实验 (cap=3 vs 无配额, 等权时代): cap=3 夏普 2.64 vs 无配额 2.01, 回撤 -3.4% vs -7.3% (见 docs/策略基准记录.md)
+# 注: 此 2.64 是 cap 对比实验值, 非当前生产基线; 当前生产 = 6因子 IC_IR (全段 2.56, 见 docs/策略基准记录.md L42)
 SECTOR_CAP = 3
 
 # 38 品种板块映射 (含金融板块; 用于配额选池, 不用于中性化)
@@ -84,7 +84,7 @@ SECTOR_MAP = {
 
 
 class CombinedStrategy:
-    """7因子打分选池 + 池内 ERC 风险平价 融合策略 (38品种, cap=3, 日度)."""
+    """6因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 融合策略 (38品种, cap=3, 日度)."""
 
     def __init__(self, config_path: str = "config/intraday_backtest.yaml",
                  top_n: int = _DEFAULT_TOP_N):

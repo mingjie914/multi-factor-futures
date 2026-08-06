@@ -1,4 +1,4 @@
-"""diag_production_nav — 当前生产方案净值图 (7因子+38池+cap3+ERC+日度).
+"""diag_production_nav — 当前生产方案净值图 (6因子+38池+cap3+ERC+日度).
 
 数据窗口: 2025-01-01 ~ 最新数据日 (2026-07-31). 标注 OOS 起点 2026-03-01 与实盘起点 2026-05-16.
 输出: runs/production_nav.png + 控制台分阶段统计.
@@ -32,7 +32,7 @@ SECTORS = {
     "农产品": ["A", "M", "P", "RM", "Y", "SR", "CF", "OI", "LH", "JD"],
     "金融": ["IC", "IF", "IH", "T", "TL", "TS", "IM", "TF"],
 }
-F7 = {
+F6 = {
     "intraday_jump_intensity_20d": -1, "intraday_price_peak_count_20d": 1,
     "intraday_realised_skewness_20d": 1, "intraday_dtws_20d": 1,
     "intraday_drip_stone_20d": -1, "intraday_peak_ridge_ratio_20d": -1,
@@ -46,9 +46,9 @@ def main():
     cal = pd.DatetimeIndex(runner.data_manager.get_calendar(
         pd.Timestamp("2025-01-01"), pd.Timestamp("2026-07-31")))
     engine = FactorEngine(runner.data_manager)
-    comp = engine.compute_factors(list(F7), cal, univ, parallel=True)
+    comp = engine.compute_factors(list(F6), cal, univ, parallel=True)
     score = pd.DataFrame(index=cal, columns=univ, dtype=float)
-    for n, direction in F7.items():
+    for n, direction in F6.items():
         r = comp[n].rank(axis=1, pct=True)
         score = score.add(r if direction == 1 else (1 - r), fill_value=0)
     score = score.div(len(F7))
