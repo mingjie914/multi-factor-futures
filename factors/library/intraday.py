@@ -376,23 +376,26 @@ def _read_local_raw(dates, universe, freq="1min"):
     for month in months:
         partition = "year_month=" + month.strftime("%Y-%m")
         pdir = os.path.join(base, partition)
-        # 兼容两种分区文件命名: data_0.parquet (1m/15m/1d) / part.parquet (5m)
-        parquet_path = os.path.join(pdir, "data_0.parquet")
-        if not os.path.exists(parquet_path):
-            parquet_path = os.path.join(pdir, "part.parquet")
-        if not os.path.exists(parquet_path):
+        if not os.path.isdir(pdir):
             continue
-        try:
-            # 列裁剪: 只读因子计算实际需要的列 (省 exchange/type/trade_date/year_month 4列, ~30% IO)
-            cols = ["trade_datetime", "symbol", "open", "high", "low", "close",
-                    "volume", "amount", "position"]
-            df = pd.read_parquet(parquet_path, columns=cols)
-            ts = pd.to_datetime(df["trade_datetime"])
-            df = df.loc[(ts >= start) & (ts <= end)]
-            if not df.empty:
-                frames.append(df)
-        except Exception:
-            log.debug("读取 %s 失败", parquet_path, exc_info=True)
+        # 读取分区内全部 parquet 分片: data_0~data_N.parquet (1m/15m/1d 多分片)
+        # 或 part.parquet (5m)。仅读 data_0 会漏掉多分片月份 (如 2024-11 的 data_0~data_3)。
+        import glob as _glob
+        parquet_files = sorted(_glob.glob(os.path.join(pdir, "data_*.parquet")))
+        if not parquet_files:
+            parquet_files = sorted(_glob.glob(os.path.join(pdir, "part.parquet")))
+        for parquet_path in parquet_files:
+            try:
+                # 列裁剪: 只读因子计算实际需要的列 (省 exchange/type/trade_date/year_month 4列, ~30% IO)
+                cols = ["trade_datetime", "symbol", "open", "high", "low", "close",
+                        "volume", "amount", "position"]
+                df = pd.read_parquet(parquet_path, columns=cols)
+                ts = pd.to_datetime(df["trade_datetime"])
+                df = df.loc[(ts >= start) & (ts <= end)]
+                if not df.empty:
+                    frames.append(df)
+            except Exception:
+                log.debug("读取 %s 失败", parquet_path, exc_info=True)
     if not frames:
         return None
     all_data = pd.concat(frames, ignore_index=True)
