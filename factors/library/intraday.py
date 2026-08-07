@@ -22308,12 +22308,12 @@ class IntradayAmihudRankMa20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 393. intraday_multiperiod_trend_vote — 多周期趋势投票 (A1 复现)
+# 393. intraday_multiperiod_trend_vote — 多周期趋势投票
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_multiperiod_trend_vote_20d", category="intraday_advanced")
 class IntradayMultiperiodTrendVote20d(Factor):
-    """多周期趋势投票因子 (资料A1, 基于5min).
+    """多周期趋势投票因子 (基于5min).
 
     分别计算 5/15/30/60 根5min K线的均线斜率方向, 多头票数/总票数.
     votes_bullish 高 → 多周期共振看多 → 正向.
@@ -22425,12 +22425,12 @@ class IntradayMultiperiodVoteConfirm20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 395. intraday_volume_price_corr_div — 量价相关快慢窗背离 (A2 复现)
+# 395. intraday_volume_price_corr_div — 量价相关快慢窗背离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_price_corr_div_20d", category="intraday_advanced")
 class IntradayVolumePriceCorrDiv20d(Factor):
-    """量价相关快慢窗背离因子 (资料A2, 基于5min).
+    """量价相关快慢窗背离因子 (基于5min).
 
     Corr(ret, volume, 20根) − Corr(ret, volume, 60根) (快慢窗口相关之差).
     正背离 → 近期量价共振强于长期 → 趋势确认 → 正向.
@@ -22553,7 +22553,7 @@ class IntradayVpCorrDivSlope20d(Factor):
 
 @register_factor("intraday_price_range_volume_ratio_20d", category="intraday_advanced")
 class IntradayPriceRangeVolumeRatio20d(Factor):
-    """价格区间量能偏斜因子 (资料A3 变体, 基于5min).
+    """价格区间量能偏斜因子 (变体, 基于5min).
 
     落在近20日价格区间上半部的成交量占比: Σvol[price > mid(N日)] / Σvol.
     与 #19 (日内中位) 不同: 本因子用 N 日区间中位, 捕捉跨日相对位置.
@@ -22698,12 +22698,12 @@ class IntradayRangeVolSkewDelta20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 399. intraday_false_breakout_retrace — 假突破回撤 (A5 复现)
+# 399. intraday_false_breakout_retrace — 假突破回撤
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_false_breakout_retrace_20d", category="intraday_advanced")
 class IntradayFalseBreakoutRetrace20d(Factor):
-    """假突破回撤因子 (资料A5, 基于5min).
+    """假突破回撤因子 (基于5min).
 
     价格触及近20根5min高低点后, 5根内回撤幅度 (突破失败度量):
     max(突破幅度后回撤) / ATR.
@@ -22854,12 +22854,12 @@ class IntradayBreakoutQuality20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 401. intraday_session_effect_z — 时段效应 z-score (A6 复现)
+# 401. intraday_session_effect_z — 时段效应 z-score
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_session_effect_z_20d", category="intraday_advanced")
 class IntradaySessionEffectZ20d(Factor):
-    """时段效应 z-score 因子 (资料A6, 基于5min).
+    """时段效应 z-score 因子 (基于5min).
 
     将当日分为4个时段 (开盘30min/午前/午后/收盘30min),
     当前时段收益对近期(20日)同段均值的 z-score.
@@ -22993,12 +22993,12 @@ class IntradaySessionVolState20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 403. intraday_oi_volume_crowding — OI-量能拥挤度 (A7 复现)
+# 403. intraday_oi_volume_crowding — OI-量能拥挤度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_volume_crowding_20d", category="intraday_advanced")
 class IntradayOiVolumeCrowding20d(Factor):
-    """OI-量能拥挤度因子 (资料A7, 基于5min+OI).
+    """OI-量能拥挤度因子 (基于5min+OI).
 
     拥挤度 = OI增速20根z-score × 0.5 + (vol/OI)分位 × 0.5 合成.
     拥挤度高 → 持仓快速膨胀+高换手 → 拥挤交易 → 反转/降杠杆 → 负向.
@@ -23125,12 +23125,12 @@ class IntradayCrowdingExtremeReversal20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 405. intraday_volume_oi_divergence — 量仓四象限 (A8 复现)
+# 405. intraday_volume_oi_divergence — 量仓四象限
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_oi_divergence_20d", category="intraday_advanced")
 class IntradayVolumeOiDivergence20d(Factor):
-    """量仓四象限因子 (资料A8, 基于5min+OI).
+    """量仓四象限因子 (基于5min+OI).
 
     四象限: sign(Δvol) × sign(ΔOI) 组合 — 放量增仓/放量减仓/缩量增仓/缩量减仓.
     放量减仓 (换手出货) 占比高 → 短线转弱 → 负向.
@@ -23259,12 +23259,12 @@ class IntradayVolumeOiPriceConfirm20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 407. intraday_rv_fast_slow_divergence — RV 快慢窗背离 (A9 复现)
+# 407. intraday_rv_fast_slow_divergence — RV 快慢窗背离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_fast_slow_divergence_20d", category="intraday_advanced")
 class IntradayRvFastSlowDivergence20d(Factor):
-    """RV 快慢窗背离因子 (资料A9, 基于5min).
+    """RV 快慢窗背离因子 (基于5min).
 
     RV5 (5根已实现波动) − RV20 (20根滚动) 的 z-score 背离 (类 IV-HV 背离).
     快线升+慢线降 → 波动结构变化预警 → 波动放大 → 负向.
@@ -23383,12 +23383,12 @@ class IntradayRvDivergencePersistence20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 409. intraday_rv_compression — RV 波动压缩度 (A10 改名复现)
+# 409. intraday_rv_compression — RV 波动压缩度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_compression_20d", category="intraday_advanced")
 class IntradayRvCompression20d(Factor):
-    """RV 波动压缩度因子 (资料A10, 改名避免与 #142 冲突).
+    """RV 波动压缩度因子 (改名避免与 #142 冲突).
 
     当前 RV 的 20 日历史分位 (压缩度): 分位越低 → 波动越压缩.
     压缩后 (分位<20%) → 预判波动放大 ("弹簧"效应) → 正向 (低压缩分位=正向).
@@ -23486,12 +23486,12 @@ class IntradayRvCompressionBreakout20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 411. intraday_ma_count_bullish — 均线簇多空强度 (A11 复现)
+# 411. intraday_ma_count_bullish — 均线簇多空强度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_ma_count_bullish_20d", category="intraday_advanced")
 class IntradayMaCountBullish20d(Factor):
-    """均线簇多空强度因子 (资料A11, 基于5min).
+    """均线簇多空强度因子 (基于5min).
 
     收盘价位于 5/10/20/30/60/120 根5min均线上方的数量 (0-6).
     均线簇上方数量多 → 全面多头排列 → 趋势确认 → 正向.
@@ -23604,12 +23604,12 @@ class IntradayMaCountWeighted20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 413. intraday_overnight_gap_reaction — 跳空后反应模式 (A13 复现)
+# 413. intraday_overnight_gap_reaction — 跳空后反应模式
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_overnight_gap_reaction_20d", category="intraday_advanced")
 class IntradayOvernightGapReaction20d(Factor):
-    """跳空后反应模式因子 (资料A13, 基于5min).
+    """跳空后反应模式因子 (基于5min).
 
     开盘跳空 (open−prev_close) 后, 30分钟内的回补/延续方向.
     输出 = 跳空后30min收益方向 × 跳空方向 (正=缺口延续, 负=缺口回补).
@@ -23745,12 +23745,12 @@ class IntradayGapFillSpeed20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 415. intraday_implied_sector_beta — 板块隐含 β (A14 复现)
+# 415. intraday_implied_sector_beta — 板块隐含 β
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_implied_sector_beta_20d", category="intraday_advanced")
 class IntradayImpliedSectorBeta20d(Factor):
-    """板块隐含 β 因子 (资料A14, 基于5min).
+    """板块隐含 β 因子 (基于5min).
 
     品种5min收益对板块内其他品种平均收益回归的滚动 β (60根).
     高 β → 品种与板块强联动 → 系统性驱动主导.
@@ -23873,12 +23873,12 @@ class IntradayBetaChangeSignal20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 417. intraday_money_flow_margin — 资金流边际 (A15 复现)
+# 417. intraday_money_flow_margin — 资金流边际
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_money_flow_margin_20d", category="intraday_advanced")
 class IntradayMoneyFlowMargin20d(Factor):
-    """资金流边际因子 (资料A15, 基于5min).
+    """资金流边际因子 (基于5min).
 
     主动买卖差 (tick test: 涨=主动买, 跌=主动卖) 的近5根变化率 (边际而非水平).
     边际为正 → 大资金正在加速介入 → 企稳反弹模式 → 正向.
@@ -24003,12 +24003,12 @@ class IntradayMoneyPriceDivergence20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 419. intraday_annualized_basis_z — 基差分位极值反转 (B1 复现)
+# 419. intraday_annualized_basis_z — 基差分位极值反转
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_annualized_basis_z_20d", category="intraday_advanced")
 class IntradayAnnualizedBasisZ20d(Factor):
-    """基差分位极值反转因子 (资料B1, 基于5min term).
+    """基差分位极值反转因子 (基于5min term).
 
     近远月基差率 (far−near)/near 的 20 日时序分位, 中间区线性、极值区(>80%/<20%)反转:
     backwardation (近月升水) → 现货偏紧 → 正向; 但基差处历史极值 → 反转.
@@ -24130,12 +24130,12 @@ class IntradayBasisReversionConviction20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 421. intraday_roll_yield_dualscore — 展期收益双打分 (B3 复现)
+# 421. intraday_roll_yield_dualscore — 展期收益双打分
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_roll_yield_dualscore_20d", category="intraday_advanced")
 class IntradayRollYieldDualscore20d(Factor):
-    """展期收益双打分因子 (资料B3, 基于5min term).
+    """展期收益双打分因子 (基于5min term).
 
     展期收益 (far−near)/near (正=近月贴水=多头展期正收益) 双打分:
     截面分 = 品种间展期收益排名 (0-1) + 时序分 = 自身20日分位, 各半合成.
@@ -24257,7 +24257,7 @@ class IntradayRollDualscoreConsistency20d(Factor):
 
 @register_factor("intraday_cross_contract_spread_z_20d", category="intraday_advanced")
 class IntradayCrossContractSpreadZ20d(Factor):
-    """板块内价比时序 z 因子 (资料B5 变体, 基于5min).
+    """板块内价比时序 z 因子 (变体, 基于5min).
 
     品种价格 / 板块其他品种平均价的比值, 取 20 日时序 z (配对价差的自身历史偏离).
     比值 z 高 → 该品种相对板块超涨 → 均值回归 → 负向.
@@ -24377,12 +24377,12 @@ class IntradayCrossRatioReversionSpeed20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 425. intraday_sector_rotation_strength — 板块轮动强度 (B6 复现)
+# 425. intraday_sector_rotation_strength — 板块轮动强度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_sector_rotation_strength_20d", category="intraday_advanced")
 class IntradaySectorRotationStrength20d(Factor):
-    """板块轮动强度因子 (资料B6, 基于5min).
+    """板块轮动强度因子 (基于5min).
 
     板块内分化度 (品种日内收益std) × 轮动速度 (板块内排名变化幅度):
     高分化 + 快速轮动 → 结构性行情 → 板块内相对因子有效 → 正向.
@@ -24493,12 +24493,12 @@ class IntradaySectorRotationMomentum20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 427. intraday_seat_net_position_margin — 席位净持仓边际 (C4 复现)
+# 427. intraday_seat_net_position_margin — 席位净持仓边际
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_seat_net_position_margin_20d", category="intraday_advanced")
 class IntradaySeatNetPositionMargin20d(Factor):
-    """席位净持仓边际因子 (资料C4, 基于日度席位).
+    """席位净持仓边际因子 (基于日度席位).
 
     席位净持仓 (net_position) 的 5 日边际变化 / 总持仓 — 机构资金的边际动向.
     净多边际为正 → 机构资金正在持续加多 → 正向.
@@ -24561,12 +24561,12 @@ class IntradaySeatMarginConsensus20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 429. intraday_seat_concentration — 席位持仓 HHI 集中度 (C5 复现)
+# 429. intraday_seat_concentration — 席位持仓 HHI 集中度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_seat_concentration_20d", category="intraday_advanced")
 class IntradaySeatConcentration20d(Factor):
-    """席位持仓 HHI 集中度因子 (资料C5, 基于日度席位).
+    """席位持仓 HHI 集中度因子 (基于日度席位).
 
     席位净持仓的 Herfindahl 指数 Σ(seat_net / total_net)² (净持仓在席位间的集中度).
     集中度高 → 少数席位主导方向 → 拥挤交易 → 反转风险 → 负向.
@@ -24637,12 +24637,12 @@ class IntradaySeatConcentrationChange20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 431. intraday_flow_price_divergence — 席位资金流-价格背离 (C6 复现)
+# 431. intraday_flow_price_divergence — 席位资金流-价格背离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_flow_price_divergence_20d", category="intraday_advanced")
 class IntradayFlowPriceDivergence20d(Factor):
-    """席位资金流-价格背离因子 (资料C6, 基于日度席位).
+    """席位资金流-价格背离因子 (基于日度席位).
 
     席位净持仓边际的 20 日 z − 价格收益的 20 日 z (资金流与价格背离度).
     正背离 = 机构净流入但价格未同步上涨 → 逆势吸筹 → 补涨 → 正向.
@@ -24729,7 +24729,7 @@ class IntradayFlowPriceCatchup20d(Factor):
 
 @register_factor("intraday_annualized_basis_20d", category="intraday_advanced")
 class IntradayAnnualizedBasis20d(Factor):
-    """真年化基差率因子 (基于修复后的期限结构面板, 资料B1).
+    """真年化基差率因子 (基于修复后的期限结构面板, ).
 
     年化基差率 = (far - near) / near * 365 / remaining_days, 其中 near/far 为
     按到期月最近两月 (排除合成合约), remaining_days 为 near 剩余自然日.
@@ -25041,12 +25041,12 @@ class IntradayRolloverBasisGap20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 439. intraday_dazzling_vol — 放量冲击后波动 (知乎 feat_dazzling_vol 复现)
+# 439. intraday_dazzling_vol — 放量冲击后波动
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_dazzling_vol_20d", category="intraday_advanced")
 class IntradayDazzlingVol20d(Factor):
-    """放量冲击后波动因子 (知乎 feat_dazzling_vol, 1min).
+    """放量冲击后波动因子.
 
     识别分钟成交量显著高于日内基准的激增时刻, 取激增后 h=10 分钟窗口内
     收益率标准差, 再对当日所有激增窗口的波动率取均值:
@@ -25117,12 +25117,12 @@ class IntradayDazzlingVol20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 440. intraday_day_pp_maxm — 近20日最大日振幅 (知乎 feat_day_pp_maxm 复现)
+# 440. intraday_day_pp_maxm — 近20日最大日振幅
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_day_pp_maxm_20d", category="intraday_advanced")
 class IntradayDayPpMaxm20d(Factor):
-    """近20日最大日振幅因子 (知乎 feat_day_pp_maxm, 日频).
+    """近20日最大日振幅因子.
 
     amp_t = (High_t - Low_t) / Close_t;  maxm = Max(amp_t-19 .. amp_t).
     近20日内最大日内振幅 → 期间出现过剧烈价格冲击 → 资金分歧/情绪扰动 → 负向.
@@ -25151,12 +25151,12 @@ class IntradayDayPpMaxm20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 441. intraday_tcc_rel — 时间网络中心度偏离 (知乎 feat_tcc_rel 复现)
+# 441. intraday_tcc_rel — 时间网络中心度偏离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_tcc_rel_20d", category="intraday_advanced")
 class IntradayTccRel20d(Factor):
-    """时间网络中心度因子 (知乎 feat_tcc_rel, 1min, 期货转换).
+    """时间网络中心度因子.
 
     每分钟计算全品种截面收益中心 center_m = Mean_i(ret_i,m),
     个股偏离 dev_i,m = ret_i,m - center_m; 日内偏离序列的波动(中心度):
@@ -25210,12 +25210,12 @@ class IntradayTccRel20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 442. intraday_vol_burst_peak_cnt — 放量脉冲次数 (知乎 feat_vol_burst_peak_cnt 复现)
+# 442. intraday_vol_burst_peak_cnt — 放量脉冲次数
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_burst_peak_cnt_20d", category="intraday_advanced")
 class IntradayVolBurstPeakCnt20d(Factor):
-    """放量脉冲次数因子 (知乎 feat_vol_burst_peak_cnt, 1min).
+    """放量脉冲次数因子.
 
     分钟量日内标准化 vol_z = (vol - mean)/std; 超阈值(>1.5)标记放量分钟,
     连续放量分钟合并为一次脉冲, 统计当日脉冲数:
@@ -25277,12 +25277,12 @@ class IntradayVolBurstPeakCnt20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 443. intraday_csad_sigma120 — 同伴股离散度120日波动 (知乎 feat_csad_sigma120 复现)
+# 443. intraday_csad_sigma120 — 同伴股离散度120日波动
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_csad_sigma120_20d", category="intraday_advanced")
 class IntradayCsadSigma12020d(Factor):
-    """CSAD 同伴股离散度120日波动因子 (知乎 feat_csad_sigma120, 日频, 期货转换).
+    """CSAD 同伴股离散度120日波动因子.
 
     同伴股 = 同板块品种 (板块映射); 每日 CSAD:
     CSAD_i,t = Mean_j(|ret_i,t - ret_j,t|), j ∈ 同板块其他品种.
@@ -25313,12 +25313,12 @@ class IntradayCsadSigma12020d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 444. intraday_csad_sigma20 — 同伴股离散度20日波动 (知乎 feat_csad_sigma20 复现)
+# 444. intraday_csad_sigma20 — 同伴股离散度20日波动
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_csad_sigma20_20d", category="intraday_advanced")
 class IntradayCsadSigma2020d(Factor):
-    """CSAD 同伴股离散度20日波动因子 (知乎 feat_csad_sigma20, 日频, 期货转换).
+    """CSAD 同伴股离散度20日波动因子.
 
     同 #443 的 CSAD, 但取 20 日窗口波动:
     sigma20 = Std(CSAD_i,t, 20日).
@@ -25346,12 +25346,12 @@ class IntradayCsadSigma2020d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 445. intraday_csad_ratio — CSAD 短长窗比值 (知乎 feat_csad_ratio 复现)
+# 445. intraday_csad_ratio — CSAD 短长窗比值
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_csad_ratio_20d", category="intraday_advanced")
 class IntradayCsadRatio20d(Factor):
-    """CSAD 短长窗比值因子 (知乎 feat_csad_ratio, 日频, 期货转换).
+    """CSAD 短长窗比值因子.
 
     ratio = sigma20 / sigma120 (近20日CSAD波动 / 近120日CSAD波动).
     比值高 → 近期相对同伴股的分化程度高于长期常态 → 拥挤释放/分歧加大 → 负向.
@@ -25762,7 +25762,7 @@ class IntradayCsadVolumeConfirm20d(Factor):
 
 
 def _fund_flow_minute(panel, day, dt, col, base_col=None):
-    """分钟符号成交额资金流: sign(ret) × amount (tick test 代理, 开源31期).
+    """分钟符号成交额资金流: sign(ret) × amount (tick test 代理, ).
 
     返回 (资金流Series, 振幅Series, 涨跌幅Series); 数据不足返回 None.
     """
@@ -25786,7 +25786,7 @@ def _fund_flow_minute(panel, day, dt, col, base_col=None):
 
 
 def _fund_flow_resid(flow, dates, universe, momentum=None):
-    """标准化(z-score截面) + 动量中性化残差 (开源31期两步处理).
+    """标准化(z-score截面) + 动量中性化残差.
 
     flow: 日度资金流面板; momentum: 可选, 默认用 flow 自身20日动量.
     """
@@ -25813,12 +25813,12 @@ def _fund_flow_resid(flow, dates, universe, momentum=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 453. intraday_amp_cut_flow_resid — 振幅切割资金流残差 (开源31期复现)
+# 453. intraday_amp_cut_flow_resid — 振幅切割资金流残差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_amp_cut_flow_resid_20d", category="intraday_advanced")
 class IntradayAmpCutFlowResid20d(Factor):
-    """振幅切割资金流残差因子 (开源证券31期, 1min).
+    """振幅切割资金流残差因子.
 
     切割思想: 按分钟振幅将分钟资金流分为高/低组, 取"50%较高振幅分钟"的资金流
     作为构造对象 → 标准化(截面z-score) + 动量中性化(对20日均值回归取残差).
@@ -25879,12 +25879,12 @@ class IntradayAmpCutFlowResid20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 454. intraday_open_flow_resid — 开盘时段资金流残差 (开源31期复现)
+# 454. intraday_open_flow_resid — 开盘时段资金流残差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_open_flow_resid_20d", category="intraday_advanced")
 class IntradayOpenFlowResid20d(Factor):
-    """开盘时段资金流残差因子 (开源证券31期, 1min).
+    """开盘时段资金流残差因子.
 
     时段思想: 机构偏好开盘时段交易 → 前30分钟资金流信息量大:
     取每日前30分钟符号成交额资金流 → 标准化 + 动量中性化残差.
@@ -25936,12 +25936,12 @@ class IntradayOpenFlowResid20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 455. intraday_scene_flow_resid — 情景资金流残差 (开源31期复现)
+# 455. intraday_scene_flow_resid — 情景资金流残差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_scene_flow_resid_20d", category="intraday_advanced")
 class IntradaySceneFlowResid20d(Factor):
-    """情景资金流残差因子 (开源证券31期, 1min).
+    """情景资金流残差因子.
 
     情景思想: 按5min涨跌幅划分市场情景, 同情景内资金流信息更纯:
     取5min涨跌幅为正(上涨情景)的分钟符号成交额资金流 → 标准化+动量中性化.
@@ -26172,12 +26172,12 @@ class IntradaySceneAmpFlow20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 459. intraday_same_state_traction — 同状态收益率牵引 (开源32期复现)
+# 459. intraday_same_state_traction — 同状态收益率牵引
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_same_state_traction_20d", category="intraday_advanced")
 class IntradaySameStateTraction20d(Factor):
-    """同状态收益率牵引因子 (开源证券32期, 日频, 期货转换).
+    """同状态收益率牵引因子.
 
     收益率牵引因子: 找到与品种同状态的品种集(期货: 同板块), 计算该集合日收益均值,
     再回归掉品种自身收益, 残差即因子值 (GAT 挖掘的雏形):
@@ -26217,12 +26217,12 @@ class IntradaySameStateTraction20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 460. intraday_flow_state_quad — 资金流四问状态 (开源32期借鉴原创)
+# 460. intraday_flow_state_quad — 资金流四问状态
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_flow_state_quad_20d", category="intraday_advanced")
 class IntradayFlowStateQuad20d(Factor):
-    """资金流四问状态因子 (开源32期借鉴原创, 日频).
+    """资金流四问状态因子.
 
     借鉴 32 期"状态变量转化": 对每类资金流用 4 个布尔问题编码状态:
     1)当日净资金流 >0? 2)当日主动净买入 >0? 3)主动买入比例>0.5? 4)主动卖出比例>0.5?
@@ -26283,7 +26283,7 @@ class IntradayFlowStateQuad20d(Factor):
 
 
 def _peak_ridge_valley(close, ret, amp, amp_thr):
-    """33期价格峰岭谷状态划分 (开源证券33期).
+    """33期价格峰岭谷状态划分.
 
     - 跳跃时点: 分钟振幅 > 1倍标准差(日内); 价谷: 振幅 ≤ 阈值
     - 局域情绪: 前后时点振幅高低 (前低后高/前高后低→适中, 双低→低迷, 双高→高涨)
@@ -26328,12 +26328,12 @@ def _peak_ridge_valley(close, ret, amp, amp_thr):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 461. intraday_peak_moment_count — 价峰时点计数 (开源33期复现)
+# 461. intraday_peak_moment_count — 价峰时点计数
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_peak_moment_count_20d", category="intraday_advanced")
 class IntradayPeakMomentCount20d(Factor):
-    """价峰时点计数因子 (开源证券33期 p1, 1min).
+    """价峰时点计数因子.
 
     统计过去20日价峰时点数量 (价峰 = 非局域高涨 + 无缺口的振幅跳跃).
     价峰多 → 有效信息冲击频繁 → 有信息支撑的活跃 → 正向.
@@ -26386,12 +26386,12 @@ class IntradayPeakMomentCount20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 462. intraday_price_ridge_ret — 价岭分钟收益 (开源33期复现)
+# 462. intraday_price_ridge_ret — 价岭分钟收益
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_price_ridge_ret_20d", category="intraday_advanced")
 class IntradayPriceRidgeRet20d(Factor):
-    """价岭分钟收益因子 (开源证券33期 p3, 1min).
+    """价岭分钟收益因子.
 
     过去20日价岭时点 (非局域低迷 + 有缺口跳跃) 的分钟涨跌幅加总.
     价岭 = 有缺口的跳跃 → 定价断层/追涨杀跌 → 负向 (负 alpha).
@@ -26443,12 +26443,12 @@ class IntradayPriceRidgeRet20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 463. intraday_price_valley_vwap — 价谷相对加权价 (开源33期复现)
+# 463. intraday_price_valley_vwap — 价谷相对加权价
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_price_valley_vwap_20d", category="intraday_advanced")
 class IntradayPriceValleyVwap20d(Factor):
-    """价谷相对加权价因子 (开源证券33期 p4, 1min).
+    """价谷相对加权价因子.
 
     每日价谷时点(振幅≤1σ)的成交量加权价格 ÷ 当日总成交量加权价格, 取20日均值:
     vwap_ratio = mean_20d( Σ(price×vol)_valley / Σvol_valley ÷ 全天VWAP ).
@@ -26509,12 +26509,12 @@ class IntradayPriceValleyVwap20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 464. intraday_price_ridge_interval_skew — 价岭间隔偏度 (开源33期复现)
+# 464. intraday_price_ridge_interval_skew — 价岭间隔偏度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_price_ridge_interval_skew_20d", category="intraday_advanced")
 class IntradayPriceRidgeIntervalSkew20d(Factor):
-    """价岭间隔偏度因子 (开源证券33期 p10, 1min).
+    """价岭间隔偏度因子.
 
     过去20日同日前后两个价岭之间的时间间隔分布, 计算偏度.
     间隔偏度正 → 价岭时间间隔右偏(偶发长间隔) → 跳跃节奏不规律 → 负向.
@@ -26574,12 +26574,12 @@ class IntradayPriceRidgeIntervalSkew20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 465. intraday_jump_amount_lagcorr — 价格跳跃成交额相关性 (开源33期复现)
+# 465. intraday_jump_amount_lagcorr — 价格跳跃成交额相关性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_jump_amount_lagcorr_20d", category="intraday_advanced")
 class IntradayJumpAmountLagcorr20d(Factor):
-    """价格跳跃成交额相关性因子 (开源证券33期 p16, 1min).
+    """价格跳跃成交额相关性因子.
 
     过去20日价格跳跃时点成交额 与 下一分钟成交额 的错位相关系数:
     跳跃成交额延续性强 → 冲击后仍有资金持续跟进 → 追涨杀跌结构 → 负向.
@@ -26954,12 +26954,12 @@ class IntradayPeakRidgeCoherence20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 471. intraday_ret_extreme_magnitude — 收益率极大值幅度 (知乎#098复现)
+# 471. intraday_ret_extreme_magnitude — 收益率极大值幅度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_ret_extreme_magnitude_20d", category="intraday_advanced")
 class IntradayRetExtremeMagnitude20d(Factor):
-    """收益率极大值幅度因子 (知乎#098/#012, 1min).
+    """收益率极大值幅度因子.
 
     5分钟滚动收益 > VaR(1分钟收益95%分位) 的样本均值 / VaR:
     magnitude = Mean(ret_5min[ret_5min > VaR_95]) / VaR_95.
@@ -27067,12 +27067,12 @@ class IntradayRetExtremeFreq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 473. intraday_torrent_down — 放量下跌占比 (知乎#136复现)
+# 473. intraday_torrent_down — 放量下跌占比
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_torrent_down_20d", category="intraday_advanced")
 class IntradayTorrentDown20d(Factor):
-    """放量下跌占比因子 (知乎#136激流勇进, 1min).
+    """放量下跌占比因子.
 
     放量下跌区间 (5分钟量增 + 收益为负) 的成交额 / 全天成交额:
     torrent = Σamount[vol增 & ret5<0] / Σamount.
@@ -27187,12 +27187,12 @@ class IntradayTorrentUp20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 475. intraday_kline_shortest_path_illiq — K线最短路径非流动性 (知乎#140复现)
+# 475. intraday_kline_shortest_path_illiq — K线最短路径非流动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_kline_shortest_path_illiq_20d", category="intraday_advanced")
 class IntradayKlineShortestPathIlliq20d(Factor):
-    """K线最短路径非流动性因子 (知乎#140, 1min).
+    """K线最短路径非流动性因子.
 
     [2(high−low) − |close−open|] / 成交额, 1分钟K线计算后21日均值.
     分子 = K线内实际路径(2×振幅) 与净位移(收盘-开盘)的差 → 路径曲折度.
@@ -27244,12 +27244,12 @@ class IntradayKlineShortestPathIlliq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 476. intraday_trajectory_illiq — 轨迹非流动性 (知乎#148复现)
+# 476. intraday_trajectory_illiq — 轨迹非流动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_trajectory_illiq_20d", category="intraday_advanced")
 class IntradayTrajectoryIlliq20d(Factor):
-    """轨迹非流动性因子 (知乎#148/#195, 1min).
+    """轨迹非流动性因子.
 
     Σ log(1+|分钟收益|) / 总成交额.
     分子 = 价格轨迹总长度(对数化) → 单位成交额推动的轨迹长度大 → 流动性差 → 正向.
@@ -27300,12 +27300,12 @@ class IntradayTrajectoryIlliq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 477. intraday_vp_corr_volatility — 价量相关波动性 (知乎#005复现)
+# 477. intraday_vp_corr_volatility — 价量相关波动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vp_corr_volatility_20d", category="intraday_advanced")
 class IntradayVpCorrVolatility20d(Factor):
-    """价量相关波动性因子 (知乎#005, 1min).
+    """价量相关波动性因子.
 
     corr(分钟收盘价, 分钟成交量) 的日值, 取过去21日 std.
     价量相关性的波动大 → 量价关系不稳定 → 资金行为不一致 → 负向.
@@ -27358,12 +27358,12 @@ class IntradayVpCorrVolatility20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 478. intraday_vol_bucket_entropy — 成交量分桶熵 (知乎#075复现)
+# 478. intraday_vol_bucket_entropy — 成交量分桶熵
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_bucket_entropy_20d", category="intraday_advanced")
 class IntradayVolBucketEntropy20d(Factor):
-    """成交量分桶熵因子 (知乎#075, 1min).
+    """成交量分桶熵因子.
 
     成交量按 min~max 等距分10桶, 熵 = -Σ p·log(p), 再取过去21日熵的 std.
     高熵 → 成交量在各水平均匀分布 → 无主导交易水平 → 散户随机交易 → 负向.
@@ -27412,12 +27412,12 @@ class IntradayVolBucketEntropy20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 479. intraday_illiq_bucket_entropy_diff — 分桶熵差 (知乎#032复现)
+# 479. intraday_illiq_bucket_entropy_diff — 分桶熵差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_illiq_bucket_entropy_diff_20d", category="intraday_advanced")
 class IntradayIlliqBucketEntropyDiff20d(Factor):
-    """分桶熵差因子 (知乎#032, 1min).
+    """分桶熵差因子.
 
     非流动性分桶熵 − 成交量分桶熵, 非流动性 = abs(close/open−1)/volume:
     diff = Entropy(illiq, 10桶) − Entropy(volume, 10桶).
@@ -27476,12 +27476,12 @@ class IntradayIlliqBucketEntropyDiff20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 480. intraday_money_flow_ratio — 资金流向占比 (知乎#185复现)
+# 480. intraday_money_flow_ratio — 资金流向占比
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_money_flow_ratio_20d", category="intraday_advanced")
 class IntradayMoneyFlowRatio20d(Factor):
-    """资金流向占比因子 (知乎#185, 1min).
+    """资金流向占比因子.
 
     Σ sign(close_t − close_{t−1}) × amount_t / Σ amount_t (t 遍历日内容分钟).
     正 → 主动买入主导 → 正向; 负 → 主动卖出主导.
@@ -27590,12 +27590,12 @@ class IntradayMoneyFlowVolatility20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 482. intraday_vp_corr_high_freq — 量价高频乐章 (知乎#106复现)
+# 482. intraday_vp_corr_high_freq — 量价高频乐章
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vp_corr_high_freq_20d", category="intraday_advanced")
 class IntradayVpCorrHighFreq20d(Factor):
-    """量价高频乐章因子 (知乎#106, 1min).
+    """量价高频乐章因子.
 
     |log(1 + ret_{t−1})| 与成交量的滚动相关 (期货: 用成交量代替换手率):
     前一分钟收益的绝对对数与当前成交量的相关性.
@@ -27649,12 +27649,12 @@ class IntradayVpCorrHighFreq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 483. intraday_wcut_reversal — W式切割理想反转 (开源01期复现)
+# 483. intraday_wcut_reversal — W式切割理想反转
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_wcut_reversal_20d", category="intraday_advanced")
 class IntradayWcutReversal20d(Factor):
-    """W式切割理想反转因子 (开源证券01期, 1min).
+    """W式切割理想反转因子.
 
     W式切割: 过去20日按日平均单笔成交金额(期货: 分钟平均成交额)高/低分组,
     高组10日涨跌幅加总 M_high, 低组 M_low, 理想反转因子 M = M_high − M_low.
@@ -27716,12 +27716,12 @@ class IntradayWcutReversal20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 484. intraday_smart_money_vwap — 聪明钱VWAP偏离 (开源03期复现)
+# 484. intraday_smart_money_vwap — 聪明钱VWAP偏离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_smart_money_vwap_20d", category="intraday_advanced")
 class IntradaySmartMoneyVwap20d(Factor):
-    """聪明钱VWAP偏离因子 (开源证券03期, 1min).
+    """聪明钱VWAP偏离因子.
 
     成交量累积占比前 20% 的分钟视为聪明钱交易, 其成交量加权价格:
     smart_vwap = Σ(price×vol)[cum_vol<=20%] / Σvol 同段; 因子 = smart_vwap / 全天VWAP − 1.
@@ -27781,17 +27781,17 @@ class IntradaySmartMoneyVwap20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 485. intraday_flow_ret_resid — 资金流对涨跌幅残差 (开源12期复现)
+# 485. intraday_flow_ret_resid — 资金流对涨跌幅残差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_flow_ret_resid_20d", category="intraday_advanced")
 class IntradayFlowRetResid20d(Factor):
-    """资金流对涨跌幅残差因子 (开源证券12期, 1min).
+    """资金流对涨跌幅残差因子.
 
     大单资金流强度(期货: 符号成交额占比)与涨跌幅同步正相关 → 横截面回归剥离涨跌幅:
     resid = flow_strength − beta × ret (截面OLS).
     剥离涨跌幅后的资金流 → 与价格同步无关的纯资金行为 → 正向.
-    与 #453-455(对动量回归) 不同: 本因子对**当日涨跌幅**横截面回归(开源12期).
+    与 #453-455(对动量回归) 不同: 本因子对**当日涨跌幅**横截面回归.
     方向: 正向.
     """
     name = "intraday_flow_ret_resid_20d"
@@ -27856,12 +27856,12 @@ class IntradayFlowRetResid20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 486. intraday_emotion_instability — 交易情绪不稳定性 (开源20期复现)
+# 486. intraday_emotion_instability — 交易情绪不稳定性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_emotion_instability_20d", category="intraday_advanced")
 class IntradayEmotionInstability20d(Factor):
-    """交易情绪不稳定性因子 (开源证券20期, 1min).
+    """交易情绪不稳定性因子.
 
     日内分钟特征 (分钟收益波动, 分钟量价相关性, 分钟标准成交量波动) 的日值,
     再取 20 日时序极差(max − min):
@@ -27918,12 +27918,12 @@ class IntradayEmotionInstability20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 487. intraday_order_flow_memory — 订单流长期记忆性 (开源25期复现)
+# 487. intraday_order_flow_memory — 订单流长期记忆性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_order_flow_memory_20d", category="intraday_advanced")
 class IntradayOrderFlowMemory20d(Factor):
-    """订单流长期记忆性因子 (开源证券25期, 1min).
+    """订单流长期记忆性因子.
 
     每笔委托方向(期货: 分钟收益符号)序列的自相关: 计算 1..20 阶自相关系数,
     对滞后阶对数回归取斜率 (长期记忆强度):
@@ -27989,12 +27989,12 @@ class IntradayOrderFlowMemory20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 488. intraday_vol_peak_moment_cnt — 量峰时点计数 (开源27期复现)
+# 488. intraday_vol_peak_moment_cnt — 量峰时点计数
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_peak_moment_cnt_20d", category="intraday_advanced")
 class IntradayVolPeakMomentCnt20d(Factor):
-    """量峰时点计数因子 (开源证券27期, 1min).
+    """量峰时点计数因子.
 
     对过去20日同时点成交量按1倍标准差划分: 高于1σ为喷发, 低于为温和;
     喷发且前后1分钟均温和 = 孤立喷发 = **量峰**.
@@ -28367,12 +28367,12 @@ class IntradayOrderFlowAutocorr20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 494. intraday_vol_valley_vwap — 量谷相对加权价 (开源27期复现补充+原创)
+# 494. intraday_vol_valley_vwap — 量谷相对加权价
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_valley_vwap_20d", category="intraday_advanced")
 class IntradayVolValleyVwap20d(Factor):
-    """量谷相对加权价因子 (开源证券27期, 1min).
+    """量谷相对加权价因子.
 
     量谷 = 温和成交量(≤1σ); 量谷时点成交量加权价格 / 全天VWAP:
     ratio = VWAP(量谷时段) / VWAP(全天).
@@ -28429,12 +28429,12 @@ class IntradayVolValleyVwap20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 495. intraday_smart_money_v4 — 聪明钱V4异常VWAP (知乎#083复现)
+# 495. intraday_smart_money_v4 — 聪明钱V4异常VWAP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_smart_money_v4_20d", category="intraday_advanced")
 class IntradaySmartMoneyV420d(Factor):
-    """聪明钱V4因子 (知乎#083, 1min).
+    """聪明钱V4因子.
 
     市场收益分±两态, 马尔可夫链算滚动5分钟状态序列概率, <5%分位为异常时刻;
     因子 = 异常时刻VWAP / 其余时刻VWAP.
@@ -28512,12 +28512,12 @@ class IntradaySmartMoneyV420d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 496. intraday_following_volume_ratio — 待著而救跟随量比 (知乎#156复现)
+# 496. intraday_following_volume_ratio — 待著而救跟随量比
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_following_volume_ratio_20d", category="intraday_advanced")
 class IntradayFollowingVolumeRatio20d(Factor):
-    """待著而救跟随量比因子 (知乎#156, 1min).
+    """待著而救跟随量比因子.
 
     剔除开盘15分钟, 取成交量最大10时刻(间隔>5分钟)为优势时刻, 其后5分钟为跟随时刻:
     ratio = Σvol(跟随时刻) / Σvol(优势时刻).
@@ -28581,12 +28581,12 @@ class IntradayFollowingVolumeRatio20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 497. intraday_vol_flow_vol — 量涌波动率 (知乎#088复现)
+# 497. intraday_vol_flow_vol — 量涌波动率
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_flow_vol_20d", category="intraday_advanced")
 class IntradayVolFlowVol20d(Factor):
-    """量涌波动率因子 (知乎#088, 1min).
+    """量涌波动率因子.
 
     按成交量峰值二分递归划分时段6次, 取各时段收益率的 std:
     vol = mean(Std(ret) of 各递归时段).
@@ -28661,12 +28661,12 @@ class IntradayVolFlowVol20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 498. intraday_neg_ret_illiq — 负收益非流动性 (知乎#223复现)
+# 498. intraday_neg_ret_illiq — 负收益非流动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_neg_ret_illiq_20d", category="intraday_advanced")
 class IntradayNegRetIlliq20d(Factor):
-    """负收益非流动性因子 (知乎#223, 日频).
+    """负收益非流动性因子.
 
     仅收益率为负时段的 |rtn|/成交额 均值:
     illiq_neg = Mean(|rtn|/amount | rtn<0).
@@ -28720,12 +28720,12 @@ class IntradayNegRetIlliq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 499. intraday_enhanced_illiq — 增强非流动性 (知乎#121复现)
+# 499. intraday_enhanced_illiq — 增强非流动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_enhanced_illiq_20d", category="intraday_advanced")
 class IntradayEnhancedIlliq20d(Factor):
-    """增强非流动性因子 (知乎#121, 日频).
+    """增强非流动性因子.
 
     日收益对 [rtn_{t−1}, sign(rtn_t)×volume] 回归, 取后一系数:
     rtn_t = a + b1×rtn_{t−1} + b2×sign(rtn_t)×vol_t.
@@ -28789,18 +28789,18 @@ class IntradayEnhancedIlliq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 500. intraday_overconfidence_timing — 过度自信时点 (知乎#100复现)
+# 500. intraday_overconfidence_timing — 过度自信时点
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_overconfidence_timing_20d", category="intraday_advanced")
 class IntradayOverconfidenceTiming20d(Factor):
-    """过度自信时点因子 (知乎#100, 1min).
+    """过度自信时点因子.
 
     分钟收益>μ+1σ为快速上涨区间, <μ−1σ为快速下跌区间:
     因子 = 下跌区间时间中位数 − 上涨区间时间中位数.
     下跌发生得晚(时间中位数大) → 日内后期恐慌 → 过度自信破裂 → 负向.
     注: 与现有 #87 intraday_overconfidence_20d(下跌/上涨区间时间差, 同名不同公式)
-    区分: 本因子是知乎#100 的"区间时间中位数差"版本.
+    区分: 本因子是 的"区间时间中位数差"版本.
     方向: 负向.
     """
     name = "intraday_overconfidence_timing_20d"
@@ -29262,12 +29262,12 @@ class IntradayOverconfidenceIntensity20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 507. intraday_vol_dist_stability — 成交量分布稳定性 (知乎#002复现)
+# 507. intraday_vol_dist_stability — 成交量分布稳定性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_dist_stability_20d", category="intraday_advanced")
 class IntradayVolDistStability20d(Factor):
-    """成交量分布稳定性因子 (知乎#002, 1min).
+    """成交量分布稳定性因子.
 
     标准化成交量序列, 滚动5分钟窗口与其余时刻的 MMD(RBF核) 取 nanstd:
     用分桶直方图差异近似 MMD — 分布差异的稳定性.
@@ -29328,12 +29328,12 @@ class IntradayVolDistStability20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 508. intraday_vol_price_skew — 成交量价格分布偏斜 (知乎#039复现)
+# 508. intraday_vol_price_skew — 成交量价格分布偏斜
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_price_skew_20d", category="intraday_advanced")
 class IntradayVolPriceSkew20d(Factor):
-    """成交量价格分布偏斜因子 (知乎#039, 1min).
+    """成交量价格分布偏斜因子.
 
     日内价格按分位分10组求各组成交量占比, v_p_skew = 3(均值−中值)/std:
     成交量在价格高位的偏斜 → 高位放量程度.
@@ -29392,12 +29392,12 @@ class IntradayVolPriceSkew20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 509. intraday_vol_ret_dist — 成交量收益分布 (知乎#044复现)
+# 509. intraday_vol_ret_dist — 成交量收益分布
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_ret_dist_20d", category="intraday_advanced")
 class IntradayVolRetDist20d(Factor):
-    """成交量收益分布因子 (知乎#044, 1min).
+    """成交量收益分布因子.
 
     flag = 分钟收益 > 均值+1σ; 因子 = σ(rtn|flag) × mean(vol|flag) / mean(vol):
     高收益时刻(极端分钟)的波动×量能放大程度.
@@ -29455,12 +29455,12 @@ class IntradayVolRetDist20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 510. intraday_price_diff_autocorr — 价格差分自相关 (知乎#134复现)
+# 510. intraday_price_diff_autocorr — 价格差分自相关
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_price_diff_autocorr_20d", category="intraday_advanced")
 class IntradayPriceDiffAutocorr20d(Factor):
-    """价格差分自相关因子 (知乎#134, 1min).
+    """价格差分自相关因子.
 
     收盘价差分序列的自相关系数 (正/负差分分开计):
     差分序列自相关 → 价格变动的持续性.
@@ -29509,12 +29509,12 @@ class IntradayPriceDiffAutocorr20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 511. intraday_lead_amount_surge — 领先成交额异动 (知乎#074复现)
+# 511. intraday_lead_amount_surge — 领先成交额异动
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_lead_amount_surge_20d", category="intraday_advanced")
 class IntradayLeadAmountSurge20d(Factor):
-    """领先成交额异动因子 (知乎#074, 1min).
+    """领先成交额异动因子.
 
     日内收益最高/最低10%分钟的前一分钟成交额占比均值 / 全天平均成交额占比:
     大波动前的成交额预兆 → 知情资金提前布局.
@@ -29573,12 +29573,12 @@ class IntradayLeadAmountSurge20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 512. intraday_vwap_divergence_vol — 量能分歧波动 (知乎#042复现)
+# 512. intraday_vwap_divergence_vol — 量能分歧波动
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vwap_divergence_vol_20d", category="intraday_advanced")
 class IntradayVwapDivergenceVol20d(Factor):
-    """量能分歧波动因子 (知乎#042, 1min).
+    """量能分歧波动因子.
 
     vwap = 额/量, 偏离度 = vwap/收盘 − 1, 按偏离度正/倒序对量占比累积积分之差,
     截面标准化后 21 日 std:
@@ -29637,12 +29637,12 @@ class IntradayVwapDivergenceVol20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 513. intraday_highfreq_illiq — 高频非流动性 (知乎#119复现)
+# 513. intraday_highfreq_illiq — 高频非流动性
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_highfreq_illiq_20d", category="intraday_advanced")
 class IntradayHighfreqIlliq20d(Factor):
-    """高频非流动性因子 (知乎#119, 1min).
+    """高频非流动性因子.
 
     1分钟收益对 sign(rtn)×vol 回归斜率 (21日窗口):
     rtn_t = a + λ × sign(rtn_t)×vol_t.
@@ -29704,12 +29704,12 @@ class IntradayHighfreqIlliq20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 514. intraday_ret_square_21d — 21日收益平方和 (知乎#238复现)
+# 514. intraday_ret_square_21d — 21日收益平方和
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_ret_square_21d_20d", category="intraday_advanced")
 class IntradayRetSquare21d20d(Factor):
-    """21日收益平方和因子 (知乎#238, 日频).
+    """21日收益平方和因子.
 
     过去21日收益率平方和:
     vol21 = Σ ret_t² (t=1..21).
@@ -29737,12 +29737,12 @@ class IntradayRetSquare21d20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 515. intraday_upside_vol_ratio — 上行波动率占比 (知乎#234复现)
+# 515. intraday_upside_vol_ratio — 上行波动率占比
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_upside_vol_ratio_20d", category="intraday_advanced")
 class IntradayUpsideVolRatio20d(Factor):
-    """上行波动率占比因子 (知乎#234, 1min).
+    """上行波动率占比因子.
 
     上行波动率 / 总波动率 (按收益正负分样本):
     ratio = Var(ret|ret>0) / Var(ret).
@@ -29795,12 +29795,12 @@ class IntradayUpsideVolRatio20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 516. intraday_vol_extreme_magnitude — 波动率极大值幅度 (知乎#087复现)
+# 516. intraday_vol_extreme_magnitude — 波动率极大值幅度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vol_extreme_magnitude_20d", category="intraday_advanced")
 class IntradayVolExtremeMagnitude20d(Factor):
-    """波动率极大值幅度因子 (知乎#087, 1min).
+    """波动率极大值幅度因子.
 
     5分钟更优波动率(20个OHLC价格 std/mean) 的95%分位为 VaR;
     30分钟更优波动率 > VaR 的均值 / VaR:
@@ -29870,12 +29870,12 @@ class IntradayVolExtremeMagnitude20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 517. intraday_golden_ratio_reversal — 日内黄金分割反转 (知乎#153复现)
+# 517. intraday_golden_ratio_reversal — 日内黄金分割反转
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_golden_ratio_reversal_20d", category="intraday_advanced")
 class IntradayGoldenRatioReversal20d(Factor):
-    """日内黄金分割反转因子 (知乎#153, 30min).
+    """日内黄金分割反转因子.
 
     Σ_{21日} ln(收盘价 / 当日10点价格):
     用 30 分钟 K 线或日频; 期货转换: 用当日第 1 小时(约开盘30分钟)价格为锚.
@@ -29923,12 +29923,12 @@ class IntradayGoldenRatioReversal20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 518. intraday_short_term_crowding — 短线交易拥挤度 (知乎#128复现)
+# 518. intraday_short_term_crowding — 短线交易拥挤度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_short_term_crowding_20d", category="intraday_advanced")
 class IntradayShortTermCrowding20d(Factor):
-    """短线交易拥挤度因子 (知乎#128, 1min).
+    """短线交易拥挤度因子.
 
     最后30分钟成交量重心 + 最后3分钟成交量占比, 两因子截面排序求和, 21日均值:
     crowding = rank(尾盘量重心) + rank(最后3分钟量占比).
