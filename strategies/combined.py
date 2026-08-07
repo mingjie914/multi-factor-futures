@@ -135,9 +135,14 @@ class CombinedStrategy:
         score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
         for t in calendar:
             hist = ic.loc[:t].iloc[-IC_IR_WINDOW:]
+            # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前/未上市品种)
+            hist = hist.dropna(axis=1, how='all')
+            if hist.shape[1] < 2:
+                continue
+            names_eff = list(hist.columns)
             if len(hist) < max(10, IC_IR_WINDOW // 2):
                 # 冷启动: 等权
-                w = pd.Series(1.0 / len(names), index=names)
+                w = pd.Series(1.0 / len(names_eff), index=names_eff)
             else:
                 ic_mean = hist.mean()
                 lw_cov = self._lw_cov(hist)
@@ -146,11 +151,11 @@ class CombinedStrategy:
                 except np.linalg.LinAlgError:
                     wi = ic_mean.abs().values
                 wi = np.abs(wi)
-                w = pd.Series(wi / wi.sum(), index=names)
+                w = pd.Series(wi / wi.sum(), index=names_eff)
             row = pd.Series(0.0, index=self._universe)
-            for name in names:
+            for name in names_eff:
                 if t in ranks[name].index:
-                    row = row.add(ranks[name].loc[t] * w[name], fill_value=0)
+                    row = row.add(ranks[name].loc[t].fillna(0.0) * w[name], fill_value=0)  # 因子缺失不污染其他
             tot = row.sum()
             if tot > 0:
                 row = row / tot

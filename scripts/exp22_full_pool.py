@@ -181,8 +181,12 @@ def main():
         rets = []
         for t in r.cal:
             hist = ic.loc[:t].iloc[-60:]
+            # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前)
+            hist = hist.dropna(axis=1, how='all')
+            if hist.shape[1] < 2:
+                continue
             if len(hist) < 30:
-                w = pd.Series(1.0/len(names), index=names)
+                w = pd.Series(1.0/hist.shape[1], index=hist.columns)
             else:
                 im = hist.mean()
                 lwc = _lw(hist)
@@ -191,11 +195,12 @@ def main():
                 except np.linalg.LinAlgError:
                     wi = im.abs().values
                 wi = np.abs(wi)
-                w = pd.Series(wi/wi.sum(), index=names)
+                w = pd.Series(wi/wi.sum(), index=hist.columns)
+            names_eff = list(hist.columns)
             sc = pd.Series(0.0, index=r.u)
-            for n in names:
+            for n in names_eff:
                 if t in r.ranks[n].index:
-                    sc = sc.add(r.ranks[n].loc[t]*w[n], fill_value=0)
+                    sc = sc.add(r.ranks[n].loc[t].fillna(0.0)*w[n], fill_value=0)  # 因子缺失不污染其他
             tot = sc.sum()
             if tot > 0:
                 sc = sc/tot
