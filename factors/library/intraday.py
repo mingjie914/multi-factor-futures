@@ -25759,3 +25759,4986 @@ class IntradayCsadVolumeConfirm20d(Factor):
         v_z = (vol - v_mean) / v_std
         confirm = csad_rank * v_z.clip(lower=0)
         return (-confirm).reindex(index=idx, columns=universe).shift(1)
+
+
+def _fund_flow_minute(panel, day, dt, col, base_col=None):
+    """分钟符号成交额资金流: sign(ret) × amount (tick test 代理, 开源31期).
+
+    返回 (资金流Series, 振幅Series, 涨跌幅Series); 数据不足返回 None.
+    """
+    close = panel["close"]
+    if "amount" in panel:
+        amt = panel["amount"]
+    elif "volume" in panel:
+        amt = panel["volume"] * close
+    else:
+        return None
+    c = close[col].dropna()
+    a = amt[col].dropna()
+    common = c.index.intersection(a.index)
+    if len(common) < 5:
+        return None
+    c_c = c.loc[common]
+    a_c = a.loc[common]
+    ret = c_c.pct_change()
+    flow = np.sign(ret.fillna(0)) * a_c
+    return flow, a_c
+
+
+def _fund_flow_resid(flow, dates, universe, momentum=None):
+    """标准化(z-score截面) + 动量中性化残差 (开源31期两步处理).
+
+    flow: 日度资金流面板; momentum: 可选, 默认用 flow 自身20日动量.
+    """
+    idx = pd.DatetimeIndex(dates)
+    f = flow.reindex(index=idx)
+    # 截面 z-score (按日)
+    z = f.sub(f.mean(axis=1), axis=0).div(f.std(axis=1, ddof=0).replace(0, np.nan), axis=0)
+    mom = momentum if momentum is not None else f.rolling(20, min_periods=5).mean()
+    m = mom.reindex(index=idx)
+    mz = m.sub(m.mean(axis=1), axis=0).div(m.std(axis=1, ddof=0).replace(0, np.nan), axis=0)
+    # OLS 残差: z = a + b*mz
+    resid = pd.DataFrame(index=idx, columns=universe, dtype=float)
+    for col in z.columns:
+        zz = z[col].values
+        mm = mz[col].values
+        valid = ~(np.isnan(zz) | np.isnan(mm))
+        if valid.sum() < 20:
+            continue
+        x = np.column_stack([np.ones(valid.sum()), mm[valid]])
+        b = np.linalg.lstsq(x, zz[valid], rcond=None)[0]
+        resid.loc[:, col] = np.nan
+        resid.loc[z.index[valid], col] = zz[valid] - x @ b
+    return resid
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 453. intraday_amp_cut_flow_resid — 振幅切割资金流残差 (开源31期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amp_cut_flow_resid_20d", category="intraday_advanced")
+class IntradayAmpCutFlowResid20d(Factor):
+    """振幅切割资金流残差因子 (开源证券31期, 1min).
+
+    切割思想: 按分钟振幅将分钟资金流分为高/低组, 取"50%较高振幅分钟"的资金流
+    作为构造对象 → 标准化(截面z-score) + 动量中性化(对20日均值回归取残差).
+    高振幅分钟资金流 → 大资金在剧烈波动时段的净流入 → 信息含量高 → 正向.
+    与 #38 signed_volume_ratio(全时段水平) 不同: 本因子是振幅切割子样本 + 残差化.
+    方向: 正向.
+    """
+    name = "intraday_amp_cut_flow_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "振幅切割资金流残差 (高振幅分钟符号成交额+动量中性化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                hl = (c_c.max() - c_c.min()) if c_c.max() > 0 else 0.0
+                if hl < 1e-12:
+                    continue
+                # 分钟振幅用 (high-low) 不可得, 用 |ret| + 自身波动代理
+                ret = c_c.pct_change().fillna(0)
+                amp = ret.abs()
+                thr = amp.median()
+                high_mask = amp >= thr
+                if high_mask.sum() < 5:
+                    continue
+                flow_high = np.sign(ret[high_mask]) * a_c[high_mask]
+                vals[col] = float(flow_high.sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 454. intraday_open_flow_resid — 开盘时段资金流残差 (开源31期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_flow_resid_20d", category="intraday_advanced")
+class IntradayOpenFlowResid20d(Factor):
+    """开盘时段资金流残差因子 (开源证券31期, 1min).
+
+    时段思想: 机构偏好开盘时段交易 → 前30分钟资金流信息量大:
+    取每日前30分钟符号成交额资金流 → 标准化 + 动量中性化残差.
+    开盘时段大单净流入 → 机构隔夜研究后集中执行 → 正向.
+    与 #23 open_close_volume_ratio(量比) 不同: 本因子用符号资金流方向 + 残差化.
+    方向: 正向.
+    """
+    name = "intraday_open_flow_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "开盘时段资金流残差 (前30min符号成交额+动量中性化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            n_open = max(10, min(30, len(grp_c) // 4))
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < n_open:
+                    continue
+                c_c = c.loc[common].iloc[:n_open]
+                a_c = a.loc[common].iloc[:n_open]
+                ret = c_c.pct_change().fillna(0)
+                vals[col] = float((np.sign(ret) * a_c).sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 455. intraday_scene_flow_resid — 情景资金流残差 (开源31期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_scene_flow_resid_20d", category="intraday_advanced")
+class IntradaySceneFlowResid20d(Factor):
+    """情景资金流残差因子 (开源证券31期, 1min).
+
+    情景思想: 按5min涨跌幅划分市场情景, 同情景内资金流信息更纯:
+    取5min涨跌幅为正(上涨情景)的分钟符号成交额资金流 → 标准化+动量中性化.
+    上涨情景中资金净流入 → 顺势资金参与 → 正向.
+    与 #25 ret_vol_coupling(放量方向一致) 不同: 本因子是情景子样本 + 残差化.
+    方向: 正向.
+    """
+    name = "intraday_scene_flow_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "情景资金流残差 (5min涨跌情景符号成交额+动量中性化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret = c_c.pct_change().fillna(0)
+                # 5min情景: 滚动5分钟累计收益 > 0
+                ret5 = ret.rolling(5, min_periods=1).sum()
+                up_scene = ret5 > 0
+                if up_scene.sum() < 5:
+                    continue
+                vals[col] = float((np.sign(ret[up_scene]) * a_c[up_scene]).sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 456. intraday_lowamp_flow_resid — 低振幅资金流残差 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lowamp_flow_resid_20d", category="intraday_advanced")
+class IntradayLowampFlowResid20d(Factor):
+    """低振幅资金流残差因子 (原创: #453 改进).
+
+    #453 取高振幅分钟资金流, 本因子对称取低振幅分钟资金流:
+    低振幅时段 = 无信息冲击的常规交易 → 反映持续型资金的稳定行为.
+    低振幅资金流 → 常规市况下的机构持续吸筹/派发 → 与高振幅冲击资金流互补.
+    方向: 正向.
+    """
+    name = "intraday_lowamp_flow_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "低振幅资金流残差 (常规交易时段符号成交额+中性化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret = c_c.pct_change().fillna(0)
+                amp = ret.abs()
+                low_mask = amp < amp.median()
+                if low_mask.sum() < 5:
+                    continue
+                vals[col] = float((np.sign(ret[low_mask]) * a_c[low_mask]).sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 457. intraday_close_flow_resid — 尾盘时段资金流残差 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_close_flow_resid_20d", category="intraday_advanced")
+class IntradayCloseFlowResid20d(Factor):
+    """尾盘时段资金流残差因子 (原创: #454 改进).
+
+    #454 取开盘时段, 本因子对称取尾盘时段:
+    尾盘资金流 → 收盘定价/次日预期博弈 → 与开盘时段(隔夜研究执行)信息互补.
+    尾盘净流入 → 收盘抢筹/定价修复 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_close_flow_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "尾盘时段资金流残差 (最后30min符号成交额+中性化)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            n_tail = max(10, min(30, len(grp_c) // 4))
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < n_tail:
+                    continue
+                c_c = c.loc[common].iloc[-n_tail:]
+                a_c = a.loc[common].iloc[-n_tail:]
+                ret = c_c.pct_change().fillna(0)
+                vals[col] = float((np.sign(ret) * a_c).sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 458. intraday_scene_amp_flow — 情景×振幅双切割资金流 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_scene_amp_flow_20d", category="intraday_advanced")
+class IntradaySceneAmpFlow20d(Factor):
+    """情景×振幅双切割资金流因子 (原创: #453/#455 组合改进).
+
+    将 #453(振幅切割) 与 #455(情景切割) 组合: 上涨情景 ∩ 高振幅 分钟资金流.
+    双条件切割 → 信息冲击 + 顺势确认 同时满足 → 更纯的信号.
+    与单一切割相比, 过滤掉"高振幅但下跌"(恐慌)与"上涨但低振幅"(无资金)噪声.
+    方向: 正向.
+    """
+    name = "intraday_scene_amp_flow_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "情景×振幅双切割资金流 (上涨∩高振幅符号成交额)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret = c_c.pct_change().fillna(0)
+                amp = ret.abs()
+                ret5 = ret.rolling(5, min_periods=1).sum()
+                sel = (ret5 > 0) & (amp >= amp.median())
+                if sel.sum() < 5:
+                    continue
+                vals[col] = float((np.sign(ret[sel]) * a_c[sel]).sum())
+            if vals:
+                flows[dt] = pd.Series(vals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        df = pd.DataFrame(flows).T
+        df.index = pd.DatetimeIndex(df.index)
+        resid = _fund_flow_resid(df, dates, universe)
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 459. intraday_same_state_traction — 同状态收益率牵引 (开源32期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_same_state_traction_20d", category="intraday_advanced")
+class IntradaySameStateTraction20d(Factor):
+    """同状态收益率牵引因子 (开源证券32期, 日频, 期货转换).
+
+    收益率牵引因子: 找到与品种同状态的品种集(期货: 同板块), 计算该集合日收益均值,
+    再回归掉品种自身收益, 残差即因子值 (GAT 挖掘的雏形):
+    traction = ret_i - beta × mean_ret_same_sector.
+    残差正 → 品种表现强于同状态品种的均值预期 → 独立强势 → 正向.
+    与 #373 sector_sync(同步相关) 不同: 本因子是"相对同板块的残差收益".
+    方向: 正向.
+    """
+    name = "intraday_same_state_traction_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "同状态收益率牵引 (自身收益-同板块均值回归残差)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        sector_mean = _sector_mean(ret)
+        traction = pd.DataFrame(index=idx, columns=universe, dtype=float)
+        for col in ret.columns:
+            r = ret[col].values
+            sm = sector_mean[col].values
+            valid = ~(np.isnan(r) | np.isnan(sm))
+            if valid.sum() < 30:
+                continue
+            x = np.column_stack([np.ones(valid.sum()), sm[valid]])
+            b = np.linalg.lstsq(x, r[valid], rcond=None)[0]
+            traction.loc[:, col] = np.nan
+            traction.loc[ret.index[valid], col] = r[valid] - x @ b
+        return traction.rolling(20, min_periods=5).mean().reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 460. intraday_flow_state_quad — 资金流四问状态 (开源32期借鉴原创)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_flow_state_quad_20d", category="intraday_advanced")
+class IntradayFlowStateQuad20d(Factor):
+    """资金流四问状态因子 (开源32期借鉴原创, 日频).
+
+    借鉴 32 期"状态变量转化": 对每类资金流用 4 个布尔问题编码状态:
+    1)当日净资金流 >0? 2)当日主动净买入 >0? 3)主动买入比例>0.5? 4)主动卖出比例>0.5?
+    期货转换: 资金流 = 符号成交额(tick test); 主动买入比例 = 涨分钟成交额占比.
+    score = 4 问的布尔和 (0-4), 高 → 资金全面做多状态 → 正向.
+    与 #38/#453 等(连续值)不同: 本因子是离散状态编码, 更稳健.
+    方向: 正向.
+    """
+    name = "intraday_flow_state_quad_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "资金流四问状态 (4布尔问编码, 全面做多=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        states: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret = c_c.pct_change().fillna(0)
+                signed = np.sign(ret) * a_c
+                net = signed.sum()
+                buy_amt = a_c[ret > 0].sum()
+                sell_amt = a_c[ret < 0].sum()
+                total = buy_amt + sell_amt
+                q = 0
+                if net > 0: q += 1
+                if signed.sum() > 0: q += 1  # 主动净买入
+                if total > 0 and buy_amt / total > 0.5: q += 1
+                if total > 0 and sell_amt / total <= 0.5: q += 1
+                vals[col] = float(q)
+            if vals:
+                states[dt] = pd.Series(vals)
+        if not states:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(states).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+def _peak_ridge_valley(close, ret, amp, amp_thr):
+    """33期价格峰岭谷状态划分 (开源证券33期).
+
+    - 跳跃时点: 分钟振幅 > 1倍标准差(日内); 价谷: 振幅 ≤ 阈值
+    - 局域情绪: 前后时点振幅高低 (前低后高/前高后低→适中, 双低→低迷, 双高→高涨)
+    - 缺口: 跳跃前后价格震荡区间是否重叠
+    - 价峰 = 非高涨的无缺口跳跃; 价岭 = 非低迷的有缺口跳跃
+
+    返回 dict: {'peak': mask, 'ridge': mask, 'valley': mask} (布尔Series).
+    """
+    n = len(amp)
+    if n < 10:
+        return None
+    thr = float(amp_thr)
+    jump = (amp > thr).values
+    valley = (amp <= thr).values
+    # 局域情绪: 前一时点与后一时点的振幅高低 (用3分钟窗口)
+    prev_amp = amp.shift(1).fillna(amp.median())
+    next_amp = amp.shift(-1).fillna(amp.median())
+    prev_high = (prev_amp > thr).values
+    next_high = (next_amp > thr).values
+    local_mood = np.where(prev_high & next_high, 2, np.where(~prev_high & ~next_high, 0, 1))  # 高涨/低迷/适中
+    # 缺口: 跳跃前后价格震荡区间(用 ±1 根 close 极差)是否重叠
+    gap = np.zeros(n, dtype=bool)
+    close_vals = close.values
+    ret_vals = ret.values
+    for i in range(n):
+        if not jump[i]:
+            continue
+        s = max(0, i - 1)
+        e = min(n, i + 2)
+        seg_before = close_vals[s:i]
+        seg_after = close_vals[i:e]
+        if len(seg_before) == 0 or len(seg_after) == 0:
+            continue
+        rng_b = (seg_before.min(), seg_before.max())
+        rng_a = (seg_after.min(), seg_after.max())
+        overlap = not (rng_b[1] < rng_a[0] or rng_a[1] < rng_b[0])
+        gap[i] = not overlap
+    peak = jump & (local_mood != 2) & (~gap)
+    ridge = jump & (local_mood != 0) & gap
+    return {"peak": pd.Series(peak, index=amp.index), "ridge": pd.Series(ridge, index=amp.index),
+            "valley": pd.Series(valley, index=amp.index)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 461. intraday_peak_moment_count — 价峰时点计数 (开源33期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_peak_moment_count_20d", category="intraday_advanced")
+class IntradayPeakMomentCount20d(Factor):
+    """价峰时点计数因子 (开源证券33期 p1, 1min).
+
+    统计过去20日价峰时点数量 (价峰 = 非局域高涨 + 无缺口的振幅跳跃).
+    价峰多 → 有效信息冲击频繁 → 有信息支撑的活跃 → 正向.
+    注: 与现有 #3 intraday_price_peak_count_20d(日内创新高/新低次数) 区分:
+    本因子按 33 期状态划分 (振幅>1σ + 局域情绪 + 缺口) 识别"价峰"时点并计数.
+    方向: 正向.
+    """
+    name = "intraday_peak_moment_count_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价峰时点计数 (非高涨无缺口跳跃计数, 有效冲击=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        counts: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                vals[col] = float(st["peak"].sum())
+            if vals:
+                counts[dt] = pd.Series(vals)
+        if not counts:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(counts).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 462. intraday_price_ridge_ret — 价岭分钟收益 (开源33期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_ridge_ret_20d", category="intraday_advanced")
+class IntradayPriceRidgeRet20d(Factor):
+    """价岭分钟收益因子 (开源证券33期 p3, 1min).
+
+    过去20日价岭时点 (非局域低迷 + 有缺口跳跃) 的分钟涨跌幅加总.
+    价岭 = 有缺口的跳跃 → 定价断层/追涨杀跌 → 负向 (负 alpha).
+    与 #10 peak_ridge_ratio(成交量峰脊) 不同: 本因子是价格岭时点收益的累积.
+    方向: 负向.
+    """
+    name = "intraday_price_ridge_ret_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价岭分钟收益 (有缺口跳跃点收益累计, 断层=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ridge_rets: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                vals[col] = float(ret[st["ridge"]].sum())
+            if vals:
+                ridge_rets[dt] = pd.Series(vals)
+        if not ridge_rets:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ridge_rets).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 463. intraday_price_valley_vwap — 价谷相对加权价 (开源33期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_valley_vwap_20d", category="intraday_advanced")
+class IntradayPriceValleyVwap20d(Factor):
+    """价谷相对加权价因子 (开源证券33期 p4, 1min).
+
+    每日价谷时点(振幅≤1σ)的成交量加权价格 ÷ 当日总成交量加权价格, 取20日均值:
+    vwap_ratio = mean_20d( Σ(price×vol)_valley / Σvol_valley ÷ 全天VWAP ).
+    价谷加权价高于全天VWAP → 低波动时点价格维持在相对高位 → 有支撑 → 正向.
+    与 #17 close_position(收盘位置) 不同: 本因子是价谷时点的量加权价格水平.
+    方向: 正向.
+    """
+    name = "intraday_price_valley_vwap_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价谷相对加权价 (价谷量加权价/全天VWAP, 有支撑=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                ret = c_c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    continue
+                valley = amp <= thr
+                if valley.sum() < 5:
+                    continue
+                vw_valley = (c_c[valley] * v_c[valley]).sum() / v_c[valley].sum() if v_c[valley].sum() > 0 else np.nan
+                vw_all = (c_c * v_c).sum() / v_c.sum() if v_c.sum() > 0 else np.nan
+                if np.isnan(vw_all) or vw_all < 1e-12 or np.isnan(vw_valley):
+                    continue
+                vals[col] = float(vw_valley / vw_all)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 464. intraday_price_ridge_interval_skew — 价岭间隔偏度 (开源33期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_ridge_interval_skew_20d", category="intraday_advanced")
+class IntradayPriceRidgeIntervalSkew20d(Factor):
+    """价岭间隔偏度因子 (开源证券33期 p10, 1min).
+
+    过去20日同日前后两个价岭之间的时间间隔分布, 计算偏度.
+    间隔偏度正 → 价岭时间间隔右偏(偶发长间隔) → 跳跃节奏不规律 → 负向.
+    方向: 负向.
+    """
+    name = "intraday_price_ridge_interval_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价岭间隔偏度 (间隔分布右偏, 节奏不规律=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                ridge_idx = np.where(st["ridge"].values)[0]
+                if len(ridge_idx) < 3:
+                    vals[col] = 0.0
+                    continue
+                intervals = np.diff(ridge_idx)
+                if len(intervals) < 2 or np.std(intervals) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                s = float((np.mean((intervals - intervals.mean()) ** 3)) / np.std(intervals) ** 3)
+                vals[col] = s
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 465. intraday_jump_amount_lagcorr — 价格跳跃成交额相关性 (开源33期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_jump_amount_lagcorr_20d", category="intraday_advanced")
+class IntradayJumpAmountLagcorr20d(Factor):
+    """价格跳跃成交额相关性因子 (开源证券33期 p16, 1min).
+
+    过去20日价格跳跃时点成交额 与 下一分钟成交额 的错位相关系数:
+    跳跃成交额延续性强 → 冲击后仍有资金持续跟进 → 追涨杀跌结构 → 负向.
+    与 #24 amplitude_volume_corr(振幅-量相关) 不同: 本因子是跳跃时点 vs 次分钟的
+    错位相关(延续性), 而非同期相关.
+    方向: 负向.
+    """
+    name = "intraday_jump_amount_lagcorr_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "跳跃成交额错位相关 (跳跃t与t+1成交额相关, 延续追涨=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        corrs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret = c_c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                jump = (amp > thr).values
+                if jump.sum() < 3:
+                    vals[col] = 0.0
+                    continue
+                jump_amt = a_c.values[jump]
+                next_amt = a_c.values[1:][jump[:-1]] if len(a_c) > 1 else np.array([])
+                if len(next_amt) < 3 or np.std(jump_amt[:len(next_amt)]) < 1e-12 or np.std(next_amt) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                corr_val = float(np.corrcoef(jump_amt[:len(next_amt)], next_amt)[0, 1])
+                vals[col] = corr_val if not np.isnan(corr_val) else 0.0
+            if vals:
+                corrs[dt] = pd.Series(vals)
+        if not corrs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(corrs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 466. intraday_price_peak_ret — 价峰分钟收益 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_peak_ret_20d", category="intraday_advanced")
+class IntradayPricePeakRet20d(Factor):
+    """价峰分钟收益因子 (原创: #461/#462 改进).
+
+    #461 计价峰数量, #462 计价岭收益; 本因子计价峰时点收益累计:
+    价峰 = 非高涨无缺口跳跃 → 有效信息冲击 → 冲击方向有持续性 → 正向.
+    与 #462 (价岭收益=追涨断层, 负向) 对称: 价峰收益是"有效信息"的收益.
+    方向: 正向.
+    """
+    name = "intraday_price_peak_ret_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价峰分钟收益 (有效冲击点收益累计, 信息持续=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        peak_rets: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                vals[col] = float(ret[st["peak"]].sum())
+            if vals:
+                peak_rets[dt] = pd.Series(vals)
+        if not peak_rets:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(peak_rets).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 467. intraday_price_valley_ret — 价谷分钟收益 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_valley_ret_20d", category="intraday_advanced")
+class IntradayPriceValleyRet20d(Factor):
+    """价谷分钟收益因子 (原创: #463 改进).
+
+    #463 用价谷量加权价格; 本因子直接用价谷时点收益:
+    价谷 = 非跳跃(振幅≤1σ) → 常规交易时段 → 收益反映持续定价.
+    价谷收益正 → 低波动时段的稳定上行 → 有真实买盘支撑 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_price_valley_ret_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价谷分钟收益 (常规时段收益, 稳定买盘=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        valley_rets: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                vals[col] = float(ret[st["valley"]].mean())
+            if vals:
+                valley_rets[dt] = pd.Series(vals)
+        if not valley_rets:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(valley_rets).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 468. intraday_price_peak_interval_std — 价峰间隔标准差 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_peak_interval_std_20d", category="intraday_advanced")
+class IntradayPricePeakIntervalStd20d(Factor):
+    """价峰间隔标准差因子 (原创: #461/#464 改进).
+
+    #461 计价峰数量, #464 计价岭间隔偏度; 本因子计价峰间隔的标准差:
+    间隔波动大 → 跳跃节奏不规律 → 资金行为不一致 → 负向.
+    与 #464 (偏度) 互补: 标准差度量整体离散, 偏度度量方向不对称.
+    方向: 负向.
+    """
+    name = "intraday_price_peak_interval_std_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价峰间隔标准差 (跳跃节奏不规律=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        stds: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                peak_idx = np.where(st["peak"].values)[0]
+                if len(peak_idx) < 3:
+                    vals[col] = 0.0
+                    continue
+                intervals = np.diff(peak_idx)
+                if len(intervals) < 2:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.std(intervals, ddof=0))
+            if vals:
+                stds[dt] = pd.Series(vals)
+        if not stds:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(stds).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 469. intraday_jump_ret_follow_ratio — 跳跃收益跟随比例 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_jump_ret_follow_ratio_20d", category="intraday_advanced")
+class IntradayJumpRetFollowRatio20d(Factor):
+    """跳跃收益跟随比例因子 (原创: #465 改进).
+
+    #465 用成交额错位相关; 本因子用收益方向跟随:
+    follow = mean( sign(ret_jump) == sign(ret_next) ) — 跳跃后下一分钟同向比例.
+    跟随比例高 → 跳跃方向被市场确认 → 有效冲击 → 正向.
+    与 #465 (成交额延续=追涨, 负向) 不同: 本因子是收益方向确认(信息有效性).
+    方向: 正向.
+    """
+    name = "intraday_jump_ret_follow_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "跳跃收益跟随 (跳跃后同向比例, 方向确认=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        follows: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                jump_mask = st["peak"].values | st["ridge"].values
+                if jump_mask.sum() < 3:
+                    vals[col] = 0.5
+                    continue
+                r = ret.values
+                jump_pos = np.where(jump_mask)[0]
+                n_same = 0
+                n_valid = 0
+                for pos in jump_pos:
+                    if pos + 1 < len(r) and abs(r[pos]) > 1e-12 and abs(r[pos + 1]) > 1e-12:
+                        n_valid += 1
+                        if np.sign(r[pos]) == np.sign(r[pos + 1]):
+                            n_same += 1
+                vals[col] = float(n_same / n_valid) if n_valid > 0 else 0.5
+            if vals:
+                follows[dt] = pd.Series(vals)
+        if not follows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(follows).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 470. intraday_peak_ridge_coherence — 峰岭共振度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_peak_ridge_coherence_20d", category="intraday_advanced")
+class IntradayPeakRidgeCoherence20d(Factor):
+    """峰岭共振度因子 (原创: #461/#462 组合改进).
+
+    #461(价峰) 与 #462(价岭) 的对比: 峰岭比 = 价峰数 / (价峰数+价岭数).
+    比值高 → 有效冲击(峰)主导, 断层跳跃(岭)少 → 市场信息结构健康 → 正向.
+    比值低 → 追涨断层(岭)主导 → 情绪化定价 → 负向.
+    方向: 正向.
+    """
+    name = "intraday_peak_ridge_coherence_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "峰岭共振 (峰/(峰+岭), 有效冲击主导=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change()
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    vals[col] = 0.5
+                    continue
+                st = _peak_ridge_valley(c, ret, amp, thr)
+                if st is None:
+                    continue
+                n_peak = int(st["peak"].sum())
+                n_ridge = int(st["ridge"].sum())
+                total = n_peak + n_ridge
+                vals[col] = float(n_peak / total) if total > 0 else 0.5
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 471. intraday_ret_extreme_magnitude — 收益率极大值幅度 (知乎#098复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_ret_extreme_magnitude_20d", category="intraday_advanced")
+class IntradayRetExtremeMagnitude20d(Factor):
+    """收益率极大值幅度因子 (知乎#098/#012, 1min).
+
+    5分钟滚动收益 > VaR(1分钟收益95%分位) 的样本均值 / VaR:
+    magnitude = Mean(ret_5min[ret_5min > VaR_95]) / VaR_95.
+    极端收益幅度远超常态VaR → 尾部风险暴露大 → 负向.
+    与 #8 jump_intensity(跳跃次数) 不同: 本因子度量极端收益的幅度(超出VaR的程度).
+    方向: 负向.
+    """
+    name = "intraday_ret_extreme_magnitude_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "收益率极大值幅度 (5min收益>VaR95的均值/VaR, 尾部大=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        magnitudes: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 60:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 60:
+                    continue
+                r1 = c.pct_change()
+                r5 = c.pct_change(5)
+                var = np.percentile(r1.dropna(), 95)
+                if abs(var) < 1e-12:
+                    vals[col] = 1.0
+                    continue
+                extreme = r5[r5 > var]
+                if len(extreme) < 3:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(extreme.mean() / var)
+            if vals:
+                magnitudes[dt] = pd.Series(vals)
+        if not magnitudes:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(magnitudes).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 472. intraday_ret_extreme_freq — 极端收益频率 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_ret_extreme_freq_20d", category="intraday_advanced")
+class IntradayRetExtremeFreq20d(Factor):
+    """极端收益频率因子 (原创: #471 改进).
+
+    #471 度量极端收益的幅度, 本因子度量极端收益的**出现频率**:
+    freq = Count(1min收益 | |ret| > 2σ) / 总分钟数.
+    极端收益频繁 → 收益分布厚尾 → 波动 regime 不稳定 → 负向.
+    与 #471 (幅度) 互补: 本因子是频率维度.
+    方向: 负向.
+    """
+    name = "intraday_ret_extreme_freq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "极端收益频率 (|ret|>2σ占比, 厚尾频繁=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        freqs: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                r1 = c.pct_change().dropna()
+                if len(r1) < 20 or r1.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                thr = 2.0 * r1.std(ddof=0)
+                vals[col] = float((r1.abs() > thr).mean())
+            if vals:
+                freqs[dt] = pd.Series(vals)
+        if not freqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(freqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 473. intraday_torrent_down — 放量下跌占比 (知乎#136复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_torrent_down_20d", category="intraday_advanced")
+class IntradayTorrentDown20d(Factor):
+    """放量下跌占比因子 (知乎#136激流勇进, 1min).
+
+    放量下跌区间 (5分钟量增 + 收益为负) 的成交额 / 全天成交额:
+    torrent = Σamount[vol增 & ret5<0] / Σamount.
+    放量下跌占比高 → 恐慌性抛售活跃 → 底部吸筹机会/反转信号 → 正向.
+    与 #14 torrent(放量整体) 不同: 本因子限定"放量+下跌"方向.
+    方向: 正向.
+    """
+    name = "intraday_torrent_down_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量下跌占比 (量增&跌成交额占比, 恐慌抛售=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        torrents: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret5 = c_c.pct_change(5)
+                vol_chg = a_c.pct_change(5)
+                down = (ret5 < 0) & (vol_chg > 0)
+                total = a_c.sum()
+                if total < 1e-12:
+                    continue
+                vals[col] = float(a_c[down].sum() / total)
+            if vals:
+                torrents[dt] = pd.Series(vals)
+        if not torrents:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(torrents).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 474. intraday_torrent_up — 放量上涨占比 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_torrent_up_20d", category="intraday_advanced")
+class IntradayTorrentUp20d(Factor):
+    """放量上涨占比因子 (原创: #473 改进).
+
+    #473 限定放量下跌, 本因子对称限定放量上涨:
+    放量上涨成交额占比 = 追涨资金活跃度.
+    放量上涨占比高 → 追涨情绪浓 → 高位接盘风险 → 负向.
+    与 #473 (恐慌抛售=正向) 方向相反: 追涨 vs 恐慌的镜像.
+    方向: 负向.
+    """
+    name = "intraday_torrent_up_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "放量上涨占比 (量增&涨成交额占比, 追涨=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        torrents: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                ret5 = c_c.pct_change(5)
+                vol_chg = a_c.pct_change(5)
+                up = (ret5 > 0) & (vol_chg > 0)
+                total = a_c.sum()
+                if total < 1e-12:
+                    continue
+                vals[col] = float(a_c[up].sum() / total)
+            if vals:
+                torrents[dt] = pd.Series(vals)
+        if not torrents:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(torrents).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 475. intraday_kline_shortest_path_illiq — K线最短路径非流动性 (知乎#140复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_kline_shortest_path_illiq_20d", category="intraday_advanced")
+class IntradayKlineShortestPathIlliq20d(Factor):
+    """K线最短路径非流动性因子 (知乎#140, 1min).
+
+    [2(high−low) − |close−open|] / 成交额, 1分钟K线计算后21日均值.
+    分子 = K线内实际路径(2×振幅) 与净位移(收盘-开盘)的差 → 路径曲折度.
+    曲折度大(高路径/成交额) → 同样的成交额推动更大价格曲折 → 流动性差 → 正向.
+    与 #26 price_volume_elasticity(|ret|/vol) 不同: 本因子用 OHLC 路径而非 |ret|.
+    方向: 正向.
+    """
+    name = "intraday_kline_shortest_path_illiq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "K线最短路径非流动性 ([2(HL)-|CO|]/成交额, 曲折=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"high", "low", "open", "close", "amount"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        high, low, open_px, close, amount = (panel[k] for k in ("high", "low", "open", "close", "amount"))
+        day = close.index.normalize()
+        illiqs: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                h = high.loc[day == dt, col].dropna()
+                l = low.loc[day == dt, col].dropna()
+                o = open_px.loc[day == dt, col].dropna()
+                c = close.loc[day == dt, col].dropna()
+                a = amount.loc[day == dt, col].dropna()
+                common = h.index.intersection(l.index).intersection(o.index).intersection(c.index).intersection(a.index)
+                if len(common) < 20:
+                    continue
+                path = 2.0 * (h.loc[common] - l.loc[common]) - (c.loc[common] - o.loc[common]).abs()
+                amt = a.loc[common]
+                illiq = (path / amt.replace(0, np.nan)).dropna()
+                illiq = illiq[illiq >= 0]
+                if len(illiq) < 10:
+                    continue
+                vals[col] = float(illiq.mean())
+            if vals:
+                illiqs[dt] = pd.Series(vals)
+        if not illiqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(illiqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 476. intraday_trajectory_illiq — 轨迹非流动性 (知乎#148复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trajectory_illiq_20d", category="intraday_advanced")
+class IntradayTrajectoryIlliq20d(Factor):
+    """轨迹非流动性因子 (知乎#148/#195, 1min).
+
+    Σ log(1+|分钟收益|) / 总成交额.
+    分子 = 价格轨迹总长度(对数化) → 单位成交额推动的轨迹长度大 → 流动性差 → 正向.
+    与 #475 (OHLC路径) 不同: 本因子用收益序列的轨迹长度, 对成交量不敏感.
+    方向: 正向.
+    """
+    name = "intraday_trajectory_illiq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "轨迹非流动性 (Σlog(1+|rtn|)/成交额, 轨迹长=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        illiqs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].pct_change().dropna()
+                amt_total = a.loc[common].sum()
+                if amt_total < 1e-12:
+                    continue
+                traj = np.log1p(r.abs()).sum()
+                vals[col] = float(traj / amt_total)
+            if vals:
+                illiqs[dt] = pd.Series(vals)
+        if not illiqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(illiqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 477. intraday_vp_corr_volatility — 价量相关波动性 (知乎#005复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vp_corr_volatility_20d", category="intraday_advanced")
+class IntradayVpCorrVolatility20d(Factor):
+    """价量相关波动性因子 (知乎#005, 1min).
+
+    corr(分钟收盘价, 分钟成交量) 的日值, 取过去21日 std.
+    价量相关性的波动大 → 量价关系不稳定 → 资金行为不一致 → 负向.
+    与 #1 vp_corr_intraday(相关水平) 不同: 本因子是相关性的时序波动(稳定性).
+    方向: 负向.
+    """
+    name = "intraday_vp_corr_volatility_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价量相关波动性 (corr(close,vol)的21日std, 关系不稳=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        corrs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                if c_c.std() < 1e-12 or v_c.std() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                corr_val = c_c.corr(v_c, method="spearman")
+                vals[col] = float(corr_val) if not np.isnan(corr_val) else 0.0
+            if vals:
+                corrs[dt] = pd.Series(vals)
+        if not corrs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(corrs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        vol = daily.rolling(21, min_periods=5).std()
+        return (-vol).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 478. intraday_vol_bucket_entropy — 成交量分桶熵 (知乎#075复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_bucket_entropy_20d", category="intraday_advanced")
+class IntradayVolBucketEntropy20d(Factor):
+    """成交量分桶熵因子 (知乎#075, 1min).
+
+    成交量按 min~max 等距分10桶, 熵 = -Σ p·log(p), 再取过去21日熵的 std.
+    高熵 → 成交量在各水平均匀分布 → 无主导交易水平 → 散户随机交易 → 负向.
+    低熵 → 成交量集中在特定水平 → 有序交易 → 正向.
+    与 #21 volume_dispersion(Gini) 不同: 本因子用分桶熵 + 时序波动.
+    方向: 负向.
+    """
+    name = "intraday_vol_bucket_entropy_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "成交量分桶熵 (10桶熵的21日std, 均匀=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        entropies: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30 or v.min() == v.max():
+                    vals[col] = 0.0
+                    continue
+                hist, _ = np.histogram(v.values, bins=10, range=(v.min(), v.max()))
+                prob = hist / hist.sum()
+                prob = prob[prob > 0]
+                vals[col] = float(-np.sum(prob * np.log(prob)))
+            if vals:
+                entropies[dt] = pd.Series(vals)
+        if not entropies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(entropies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        std21 = daily.rolling(21, min_periods=5).std()
+        return (-std21).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 479. intraday_illiq_bucket_entropy_diff — 分桶熵差 (知乎#032复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_illiq_bucket_entropy_diff_20d", category="intraday_advanced")
+class IntradayIlliqBucketEntropyDiff20d(Factor):
+    """分桶熵差因子 (知乎#032, 1min).
+
+    非流动性分桶熵 − 成交量分桶熵, 非流动性 = abs(close/open−1)/volume:
+    diff = Entropy(illiq, 10桶) − Entropy(volume, 10桶).
+    非流动性分布比成交量分布更分散(熵差正) → 冲击成本分布不均匀 → 负向.
+    与 #478 (单变量熵) 不同: 本因子是两类分布的熵差.
+    方向: 负向.
+    """
+    name = "intraday_illiq_bucket_entropy_diff_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "分桶熵差 (非流动性熵-量熵, 冲击分布不均=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close", "volume"}.issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        open_px, close, volume = panel["open"], panel["close"], panel["volume"]
+        day = close.index.normalize()
+        diffs: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                o = open_px.loc[day == dt, col].dropna()
+                c = close.loc[day == dt, col].dropna()
+                v = volume.loc[day == dt, col].dropna()
+                common = o.index.intersection(c.index).intersection(v.index)
+                if len(common) < 30:
+                    continue
+                v_c = v.loc[common]
+                if v_c.min() == v_c.max():
+                    vals[col] = 0.0
+                    continue
+                illiq = (c.loc[common] / o.loc[common].replace(0, np.nan) - 1.0).abs() / v_c.replace(0, np.nan)
+                illiq = illiq.dropna()
+                illiq = illiq[illiq < np.inf]
+                if len(illiq) < 20 or illiq.min() == illiq.max():
+                    vals[col] = 0.0
+                    continue
+                def entropy(x):
+                    h, _ = np.histogram(x.values, bins=10, range=(x.min(), x.max()))
+                    p = h / h.sum()
+                    p = p[p > 0]
+                    return float(-np.sum(p * np.log(p)))
+                vals[col] = entropy(illiq) - entropy(v_c)
+            if vals:
+                diffs[dt] = pd.Series(vals)
+        if not diffs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(diffs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 480. intraday_money_flow_ratio — 资金流向占比 (知乎#185复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_money_flow_ratio_20d", category="intraday_advanced")
+class IntradayMoneyFlowRatio20d(Factor):
+    """资金流向占比因子 (知乎#185, 1min).
+
+    Σ sign(close_t − close_{t−1}) × amount_t / Σ amount_t (t 遍历日内容分钟).
+    正 → 主动买入主导 → 正向; 负 → 主动卖出主导.
+    与 #38 signed_volume_ratio(量加权) 不同: 本因子用**成交额**加权(tick test).
+    方向: 随符号 (正值=正向).
+    """
+    name = "intraday_money_flow_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "资金流向占比 (Σsign(Δclose)×amount/Σamount)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].diff()
+                amt = a.loc[common].iloc[1:]
+                r = r.iloc[1:]
+                total = amt.sum()
+                if total < 1e-12:
+                    continue
+                vals[col] = float((np.sign(r) * amt).sum() / total)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 481. intraday_money_flow_volatility — 资金流占比波动 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_money_flow_volatility_20d", category="intraday_advanced")
+class IntradayMoneyFlowVolatility20d(Factor):
+    """资金流占比波动因子 (原创: #480 改进).
+
+    #480 度量资金流占比水平, 本因子度量其 20 日波动:
+    资金流占比忽正忽负 → 多空资金反复拉锯 → 无持续方向 → 负向.
+    占比稳定 → 资金方向一致 → 正向.
+    方向: 负向.
+    """
+    name = "intraday_money_flow_volatility_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "资金流占比波动 (20日std, 反复拉锯=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].diff().iloc[1:]
+                amt = a.loc[common].iloc[1:]
+                total = amt.sum()
+                if total < 1e-12:
+                    continue
+                vals[col] = float((np.sign(r) * amt).sum() / total)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        vol = daily.rolling(20, min_periods=5).std()
+        return (-vol).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 482. intraday_vp_corr_high_freq — 量价高频乐章 (知乎#106复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vp_corr_high_freq_20d", category="intraday_advanced")
+class IntradayVpCorrHighFreq20d(Factor):
+    """量价高频乐章因子 (知乎#106, 1min).
+
+    |log(1 + ret_{t−1})| 与成交量的滚动相关 (期货: 用成交量代替换手率):
+    前一分钟收益的绝对对数与当前成交量的相关性.
+    相关性高 → 上分钟波动吸引当前资金参与 → 交易联动 → 方向未明(需验证).
+    与 #24 amplitude_volume_corr(同期相关) 不同: 本因子是**滞后1分钟**的相关.
+    方向: 随符号.
+    """
+    name = "intraday_vp_corr_high_freq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量价高频乐章 (|log(1+ret_t-1)|与vol滚动相关, 滞后联动)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        corrs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                r = c.loc[common].pct_change()
+                lag_abs = np.log1p(r.shift(1).abs()).iloc[1:]
+                v_c = v.loc[common].iloc[1:]
+                if len(lag_abs) < 20 or lag_abs.std() < 1e-12 or v_c.std() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                corr_val = lag_abs.corr(v_c, method="spearman")
+                vals[col] = float(corr_val) if not np.isnan(corr_val) else 0.0
+            if vals:
+                corrs[dt] = pd.Series(vals)
+        if not corrs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(corrs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 483. intraday_wcut_reversal — W式切割理想反转 (开源01期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_wcut_reversal_20d", category="intraday_advanced")
+class IntradayWcutReversal20d(Factor):
+    """W式切割理想反转因子 (开源证券01期, 1min).
+
+    W式切割: 过去20日按日平均单笔成交金额(期货: 分钟平均成交额)高/低分组,
+    高组10日涨跌幅加总 M_high, 低组 M_low, 理想反转因子 M = M_high − M_low.
+    高单笔金额日的涨跌 → 主力大单参与的定价 → 反转之源(大单成交).
+    与 #65 intraday_return(整体收益) 不同: 本因子是切割后的结构差.
+    方向: 负向 (反转因子, 高 M 后回落).
+    """
+    name = "intraday_wcut_reversal_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "W式切割反转 (高/低单笔金额日收益差, 反转之源=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        sorted_days = sorted(set(day))
+        reversals: dict = {}
+        for dt in sorted_days:
+            idx_pos = sorted_days.index(dt)
+            if idx_pos < 20:
+                continue
+            window_days = sorted_days[idx_pos - 20:idx_pos]
+            vals = {}
+            for col in close.columns:
+                day_rets = []
+                day_amts = []
+                for rd in window_days:
+                    c = close.loc[day == rd, col].dropna()
+                    a = amount.loc[day == rd, col].dropna()
+                    common = c.index.intersection(a.index)
+                    if len(common) < 5:
+                        continue
+                    ret = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0) if c.loc[common].iloc[0] > 0 else 0.0
+                    day_rets.append(ret)
+                    day_amts.append(float(a.loc[common].mean()))
+                if len(day_rets) < 15:
+                    continue
+                amt_arr = np.array(day_amts)
+                thr = np.median(amt_arr)
+                high_mask = amt_arr > thr
+                low_mask = amt_arr <= thr
+                m_high = float(np.sum(np.array(day_rets)[high_mask]))
+                m_low = float(np.sum(np.array(day_rets)[low_mask]))
+                vals[col] = m_high - m_low
+            if vals:
+                reversals[dt] = pd.Series(vals)
+        if not reversals:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(reversals).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 484. intraday_smart_money_vwap — 聪明钱VWAP偏离 (开源03期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_smart_money_vwap_20d", category="intraday_advanced")
+class IntradaySmartMoneyVwap20d(Factor):
+    """聪明钱VWAP偏离因子 (开源证券03期, 1min).
+
+    成交量累积占比前 20% 的分钟视为聪明钱交易, 其成交量加权价格:
+    smart_vwap = Σ(price×vol)[cum_vol<=20%] / Σvol 同段; 因子 = smart_vwap / 全天VWAP − 1.
+    聪明钱(大单/激进报价)参与的价格水平 → 主力成本位置 → 正向.
+    与 #463 price_valley_vwap(价谷加权) 不同: 本因子是成交量占比前20%的聪明钱时段.
+    方向: 正向.
+    """
+    name = "intraday_smart_money_vwap_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "聪明钱VWAP偏离 (量累计前20%分钟VWAP/全天VWAP)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                total_v = v_c.sum()
+                if total_v < 1e-12:
+                    continue
+                cum = v_c.cumsum() / total_v
+                smart = cum <= 0.20
+                if smart.sum() < 3:
+                    continue
+                smart_vwap = (c_c[smart] * v_c[smart]).sum() / v_c[smart].sum()
+                all_vwap = (c_c * v_c).sum() / total_v
+                if all_vwap < 1e-12:
+                    continue
+                vals[col] = float(smart_vwap / all_vwap - 1.0)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 485. intraday_flow_ret_resid — 资金流对涨跌幅残差 (开源12期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_flow_ret_resid_20d", category="intraday_advanced")
+class IntradayFlowRetResid20d(Factor):
+    """资金流对涨跌幅残差因子 (开源证券12期, 1min).
+
+    大单资金流强度(期货: 符号成交额占比)与涨跌幅同步正相关 → 横截面回归剥离涨跌幅:
+    resid = flow_strength − beta × ret (截面OLS).
+    剥离涨跌幅后的资金流 → 与价格同步无关的纯资金行为 → 正向.
+    与 #453-455(对动量回归) 不同: 本因子对**当日涨跌幅**横截面回归(开源12期).
+    方向: 正向.
+    """
+    name = "intraday_flow_ret_resid_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "资金流对涨跌幅残差 (符号成交额占比剥离涨跌幅, 纯资金=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        rets: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            fvals, rvals = {}, {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].diff()
+                amt = a.loc[common].iloc[1:]
+                r = r.iloc[1:]
+                total = amt.sum()
+                if total < 1e-12:
+                    continue
+                fvals[col] = float((np.sign(r) * amt).sum() / total)
+                if c.loc[common].iloc[0] > 0:
+                    rvals[col] = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0)
+            if fvals and rvals:
+                flows[dt] = pd.Series(fvals)
+                rets[dt] = pd.Series(rvals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        fdf = pd.DataFrame(flows).T
+        rdf = pd.DataFrame(rets).T
+        fdf.index = pd.DatetimeIndex(fdf.index)
+        rdf.index = pd.DatetimeIndex(rdf.index)
+        resid = pd.DataFrame(index=fdf.index, columns=universe, dtype=float)
+        for col in fdf.columns:
+            f = fdf[col].values
+            r = rdf[col].values
+            valid = ~(np.isnan(f) | np.isnan(r))
+            if valid.sum() < 20:
+                continue
+            x = np.column_stack([np.ones(valid.sum()), r[valid]])
+            b = np.linalg.lstsq(x, f[valid], rcond=None)[0]
+            resid.loc[:, col] = np.nan
+            resid.loc[fdf.index[valid], col] = f[valid] - x @ b
+        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 486. intraday_emotion_instability — 交易情绪不稳定性 (开源20期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_emotion_instability_20d", category="intraday_advanced")
+class IntradayEmotionInstability20d(Factor):
+    """交易情绪不稳定性因子 (开源证券20期, 1min).
+
+    日内分钟特征 (分钟收益波动, 分钟量价相关性, 分钟标准成交量波动) 的日值,
+    再取 20 日时序极差(max − min):
+    emotion = max_20d(min_vol_ret) − min_20d(min_vol_ret).
+    日内交易行为在日间的波动大 → 情绪不稳定 → 负向.
+    与 #27 volatility_vol(波动率的波动) 不同: 本因子是量价行为特征组合的极差.
+    方向: 负向.
+    """
+    name = "intraday_emotion_instability_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "交易情绪不稳定 (量价行为特征20日极差, 情绪波动=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        features: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change().dropna()
+                if len(r) < 20:
+                    continue
+                ret_vol = r.std(ddof=0)
+                vp_corr = c_c.corr(v_c, method="spearman") if c_c.std() > 0 and v_c.std() > 0 else 0.0
+                std_vol_vol = (v_c / v_c.mean()).std(ddof=0) if v_c.mean() > 0 else 0.0
+                vals[col] = float(ret_vol + abs(vp_corr) * 0.01 + std_vol_vol * 0.001)
+            if vals:
+                features[dt] = pd.Series(vals)
+        if not features:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(features).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        rng = daily.rolling(20, min_periods=5).max() - daily.rolling(20, min_periods=5).min()
+        return (-rng).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 487. intraday_order_flow_memory — 订单流长期记忆性 (开源25期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_order_flow_memory_20d", category="intraday_advanced")
+class IntradayOrderFlowMemory20d(Factor):
+    """订单流长期记忆性因子 (开源证券25期, 1min).
+
+    每笔委托方向(期货: 分钟收益符号)序列的自相关: 计算 1..20 阶自相关系数,
+    对滞后阶对数回归取斜率 (长期记忆强度):
+    memory = slope(log(k) → acf_k).
+    记忆性强 → 挂单方向持续(算法拆单/知情交易) → 资金行为有序 → 正向.
+    与 #18 reversal_intensity(方向切换) 不同: 本因子是自相关**结构**(长记忆).
+    方向: 正向.
+    """
+    name = "intraday_order_flow_memory_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "订单流长期记忆 (收益符号自相关对数斜率, 拆单有序=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        memories: dict = {}
+        max_lag = 20
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 40:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 40:
+                    continue
+                signs = np.sign(c.pct_change().fillna(0).values)
+                n = len(signs)
+                mean_s = signs.mean()
+                var_s = signs.var(ddof=0)
+                if var_s < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                acfs = []
+                lags = []
+                for k in range(1, max_lag + 1):
+                    if n - k < 10:
+                        continue
+                    acf = float(np.mean((signs[:-k] - mean_s) * (signs[k:] - mean_s)) / var_s)
+                    acfs.append(acf)
+                    lags.append(k)
+                if len(acfs) < 5:
+                    vals[col] = 0.0
+                    continue
+                log_lags = np.log(np.array(lags, dtype=float))
+                b = np.polyfit(log_lags, np.array(acfs), 1)[0]
+                vals[col] = -float(b)  # 衰减慢(斜率负的小) = 记忆强 → 取负使高=正向
+            if vals:
+                memories[dt] = pd.Series(vals)
+        if not memories:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(memories).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 488. intraday_vol_peak_moment_cnt — 量峰时点计数 (开源27期复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_peak_moment_cnt_20d", category="intraday_advanced")
+class IntradayVolPeakMomentCnt20d(Factor):
+    """量峰时点计数因子 (开源证券27期, 1min).
+
+    对过去20日同时点成交量按1倍标准差划分: 高于1σ为喷发, 低于为温和;
+    喷发且前后1分钟均温和 = 孤立喷发 = **量峰**.
+    count = 20日量峰时点数. 量峰 = 情绪低迷处的大额交易(知情交易) → 正向.
+    与 #10 peak_ridge_ratio(峰脊比) 不同: 本因子按27期"孤立喷发"精确定义量峰并计数.
+    方向: 正向.
+    """
+    name = "intraday_vol_peak_moment_cnt_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量峰时点计数 (孤立喷发成交量计数, 知情交易=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        counts: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30 or v.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                thr = v.mean() + v.std(ddof=0)
+                burst = (v > thr).values
+                n = len(burst)
+                cnt = 0
+                for i in range(n):
+                    if not burst[i]:
+                        continue
+                    prev_ok = (i == 0) or (not burst[i - 1])
+                    next_ok = (i == n - 1) or (not burst[i + 1])
+                    if prev_ok and next_ok:
+                        cnt += 1
+                vals[col] = float(cnt)
+            if vals:
+                counts[dt] = pd.Series(vals)
+        if not counts:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(counts).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 489. intraday_wcut_amp_momentum — W式切割振幅动量 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_wcut_amp_momentum_20d", category="intraday_advanced")
+class IntradayWcutAmpMomentum20d(Factor):
+    """W式切割振幅动量因子 (原创: #483 改进).
+
+    #483 按单笔金额切割收益, 本因子改用振幅切割: 高振幅10日收益 − 低振幅10日收益.
+    高振幅日 = 信息冲击日 → 其收益反映冲击定价 → 动量(而非反转).
+    与 #483 (金额切割=反转) 方向互补: 本因子是振幅切割的动量视角.
+    方向: 正向.
+    """
+    name = "intraday_wcut_amp_momentum_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "W式切割振幅动量 (高/低振幅日收益差, 冲击定价=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "high" not in panel or "low" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, high, low = panel["close"], panel["high"], panel["low"]
+        day = close.index.normalize()
+        sorted_days = sorted(set(day))
+        momentums: dict = {}
+        for dt in sorted_days:
+            idx_pos = sorted_days.index(dt)
+            if idx_pos < 20:
+                continue
+            window_days = sorted_days[idx_pos - 20:idx_pos]
+            vals = {}
+            for col in close.columns:
+                day_rets = []
+                day_amps = []
+                for rd in window_days:
+                    c = close.loc[day == rd, col].dropna()
+                    h = high.loc[day == rd, col].dropna()
+                    l = low.loc[day == rd, col].dropna()
+                    if len(c) < 5:
+                        continue
+                    ret = float(c.iloc[-1] / c.iloc[0] - 1.0) if c.iloc[0] > 0 else 0.0
+                    amp = float((h.max() - l.min()) / c.mean()) if c.mean() > 0 else 0.0
+                    day_rets.append(ret)
+                    day_amps.append(amp)
+                if len(day_rets) < 15:
+                    continue
+                amp_arr = np.array(day_amps)
+                thr = np.median(amp_arr)
+                high_mask = amp_arr > thr
+                m_high = float(np.sum(np.array(day_rets)[high_mask]))
+                m_low = float(np.sum(np.array(day_rets)[~high_mask]))
+                vals[col] = m_high - m_low
+            if vals:
+                momentums[dt] = pd.Series(vals)
+        if not momentums:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(momentums).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 490. intraday_smart_money_ret — 聪明钱收益 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_smart_money_ret_20d", category="intraday_advanced")
+class IntradaySmartMoneyRet20d(Factor):
+    """聪明钱收益因子 (原创: #484 改进).
+
+    #484 用聪明钱VWAP位置, 本因子用聪明钱时点的收益:
+    smart_ret = Mean(ret_1min | 量累计前20%分钟).
+    聪明钱时点收益 → 主力交易的方向性 → 主力做多时收益正 → 正向.
+    与 #484 (价格位置) 互补: 本因子是聪明钱行为的收益方向.
+    方向: 正向.
+    """
+    name = "intraday_smart_money_ret_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "聪明钱收益 (量累计前20%分钟收益均值, 主力方向=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        smart_rets: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                total_v = v_c.sum()
+                if total_v < 1e-12:
+                    continue
+                cum = v_c.cumsum() / total_v
+                smart = cum <= 0.20
+                r = c_c.pct_change()
+                sr = r[smart]
+                if len(sr) < 3:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(sr.mean())
+            if vals:
+                smart_rets[dt] = pd.Series(vals)
+        if not smart_rets:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(smart_rets).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 491. intraday_flow_ret_resid_vol — 资金流残差波动 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_flow_ret_resid_vol_20d", category="intraday_advanced")
+class IntradayFlowRetResidVol20d(Factor):
+    """资金流残差波动因子 (原创: #485 改进).
+
+    #485 用剥离涨跌幅的资金流残差水平, 本因子用残差的 20 日波动:
+    残差波动大 → 资金流与价格脱钩后的行为不稳定 → 资金方向反复 → 负向.
+    残差波动小 → 纯资金行为稳定 → 正向.
+    方向: 负向.
+    """
+    name = "intraday_flow_ret_resid_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "资金流残差波动 (剥离涨跌幅残差的20日std, 反复=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        flows: dict = {}
+        rets: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            fvals, rvals = {}, {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].diff()
+                amt = a.loc[common].iloc[1:]
+                r = r.iloc[1:]
+                total = amt.sum()
+                if total < 1e-12:
+                    continue
+                fvals[col] = float((np.sign(r) * amt).sum() / total)
+                if c.loc[common].iloc[0] > 0:
+                    rvals[col] = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0)
+            if fvals and rvals:
+                flows[dt] = pd.Series(fvals)
+                rets[dt] = pd.Series(rvals)
+        if not flows:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        fdf = pd.DataFrame(flows).T
+        rdf = pd.DataFrame(rets).T
+        fdf.index = pd.DatetimeIndex(fdf.index)
+        rdf.index = pd.DatetimeIndex(rdf.index)
+        resid = pd.DataFrame(index=fdf.index, columns=universe, dtype=float)
+        for col in fdf.columns:
+            f = fdf[col].values
+            r = rdf[col].values
+            valid = ~(np.isnan(f) | np.isnan(r))
+            if valid.sum() < 20:
+                continue
+            x = np.column_stack([np.ones(valid.sum()), r[valid]])
+            b = np.linalg.lstsq(x, f[valid], rcond=None)[0]
+            resid.loc[:, col] = np.nan
+            resid.loc[fdf.index[valid], col] = f[valid] - x @ b
+        vol = resid.rolling(20, min_periods=5).std()
+        return (-vol).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 492. intraday_emotion_direction — 情绪方向偏度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_emotion_direction_20d", category="intraday_advanced")
+class IntradayEmotionDirection20d(Factor):
+    """情绪方向偏度因子 (原创: #486 改进).
+
+    #486 度量情绪波动的幅度, 本因子度量情绪的**方向不对称**:
+    用分钟量价行为特征的偏度 — 特征偏正 → 放量上涨为主 → 追涨情绪 → 负向.
+    与 #486 (极差=幅度) 互补: 本因子是分布偏斜(方向).
+    方向: 负向.
+    """
+    name = "intraday_emotion_direction_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "情绪方向偏度 (量价特征偏度, 追涨偏斜=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                signed = np.sign(c_c.pct_change().fillna(0)) * v_c
+                if signed.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                skew = float((np.mean((signed - signed.mean()) ** 3)) / signed.std(ddof=0) ** 3)
+                vals[col] = skew
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 493. intraday_order_flow_autocorr — 订单流自相关水平 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_order_flow_autocorr_20d", category="intraday_advanced")
+class IntradayOrderFlowAutocorr20d(Factor):
+    """订单流自相关水平因子 (原创: #487 改进).
+
+    #487 用自相关随滞后衰减斜率(结构), 本因子用**1阶自相关水平**:
+    收益符号的一阶自相关 → 短期方向持续性.
+    高正自相关 → 短时趋势 → 顺势; 负自相关 → 频繁反转 → 负向.
+    与 #487 (长记忆) 互补: 本因子是短期(1阶)自相关.
+    方向: 正向.
+    """
+    name = "intraday_order_flow_autocorr_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "订单流自相关 (收益符号1阶自相关, 短趋势=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        autocorrs: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                signs = np.sign(c.pct_change().fillna(0).values)
+                if signs.var(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                ac1 = float(np.mean((signs[:-1] - signs.mean()) * (signs[1:] - signs.mean())) / signs.var(ddof=0))
+                vals[col] = ac1
+            if vals:
+                autocorrs[dt] = pd.Series(vals)
+        if not autocorrs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(autocorrs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 494. intraday_vol_valley_vwap — 量谷相对加权价 (开源27期复现补充+原创)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_valley_vwap_20d", category="intraday_advanced")
+class IntradayVolValleyVwap20d(Factor):
+    """量谷相对加权价因子 (开源证券27期, 1min).
+
+    量谷 = 温和成交量(≤1σ); 量谷时点成交量加权价格 / 全天VWAP:
+    ratio = VWAP(量谷时段) / VWAP(全天).
+    量谷加权价高于全天VWAP → 低波动时点价格维持在相对高位 → 有支撑 → 正向.
+    与 #463 price_valley_vwap(价谷) 不同: 本因子用**量**谷(成交量维度)而非振幅维度.
+    方向: 正向.
+    """
+    name = "intraday_vol_valley_vwap_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量谷相对加权价 (温和成交量时段VWAP/全天, 有支撑=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                thr = v_c.mean() + v_c.std(ddof=0)
+                valley = v_c <= thr
+                if valley.sum() < 5 or v_c[valley].sum() < 1e-12 or v_c.sum() < 1e-12:
+                    continue
+                vw_valley = (c_c[valley] * v_c[valley]).sum() / v_c[valley].sum()
+                vw_all = (c_c * v_c).sum() / v_c.sum()
+                if vw_all < 1e-12:
+                    continue
+                vals[col] = float(vw_valley / vw_all)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 495. intraday_smart_money_v4 — 聪明钱V4异常VWAP (知乎#083复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_smart_money_v4_20d", category="intraday_advanced")
+class IntradaySmartMoneyV420d(Factor):
+    """聪明钱V4因子 (知乎#083, 1min).
+
+    市场收益分±两态, 马尔可夫链算滚动5分钟状态序列概率, <5%分位为异常时刻;
+    因子 = 异常时刻VWAP / 其余时刻VWAP.
+    异常时刻(聪明钱集中)的价格相对水平 → 主力定价 → 正向.
+    与 #484 smart_money_vwap(量占比前20%) 不同: 本因子用马尔可夫状态概率识别异常.
+    方向: 正向.
+    """
+    name = "intraday_smart_money_v4_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "聪明钱V4 (马尔可夫异常时刻VWAP/其余, 主力定价=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change().fillna(0)
+                states = (r > 0).astype(int).values  # +态/−态
+                n = len(states)
+                if n < 20:
+                    continue
+                # 马尔可夫转移概率
+                trans = np.zeros((2, 2))
+                for i in range(n - 1):
+                    trans[states[i], states[i + 1]] += 1
+                row_sums = trans.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1
+                trans = trans / row_sums
+                # 滚动5分钟序列概率 (初始均匀)
+                probs = np.zeros(n)
+                p0 = np.array([0.5, 0.5])
+                for i in range(n):
+                    if i > 0:
+                        p0 = p0 @ trans
+                    # 观察状态概率
+                    obs = np.array([1.0, 0.0]) if states[i] == 0 else np.array([0.0, 1.0])
+                    probs[i] = p0 @ obs
+                thr = np.percentile(probs, 5)
+                anomaly = probs < thr
+                if anomaly.sum() < 3 or v_c[~anomaly].sum() < 1e-12:
+                    continue
+                vw_anom = (c_c[anomaly] * v_c[anomaly]).sum() / v_c[anomaly].sum()
+                vw_rest = (c_c[~anomaly] * v_c[~anomaly]).sum() / v_c[~anomaly].sum()
+                if vw_rest < 1e-12:
+                    continue
+                vals[col] = float(vw_anom / vw_rest)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 496. intraday_following_volume_ratio — 待著而救跟随量比 (知乎#156复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_following_volume_ratio_20d", category="intraday_advanced")
+class IntradayFollowingVolumeRatio20d(Factor):
+    """待著而救跟随量比因子 (知乎#156, 1min).
+
+    剔除开盘15分钟, 取成交量最大10时刻(间隔>5分钟)为优势时刻, 其后5分钟为跟随时刻:
+    ratio = Σvol(跟随时刻) / Σvol(优势时刻).
+    跟随量相对优势量高 → 放量后量能延续 → 大资金持续参与 → 正向.
+    与 #25 ret_vol_coupling(方向一致) 不同: 本因子是"优势时刻后量延续".
+    方向: 正向.
+    """
+    name = "intraday_following_volume_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "待著而救跟随量比 (优势时刻后5min量/优势量, 量延续=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30:
+                    continue
+                # 剔除开盘15分钟
+                v_c = v.iloc[15:]
+                if len(v_c) < 20:
+                    continue
+                # 取量最大10个时刻(间隔>5分钟)
+                order = np.argsort(v_c.values)[::-1]
+                chosen = []
+                for idx in order:
+                    if len(chosen) >= 10:
+                        break
+                    if all(abs(int(idx) - c) >= 5 for c in chosen):
+                        chosen.append(int(idx))
+                if len(chosen) < 3:
+                    vals[col] = 1.0
+                    continue
+                adv_vol = sum(v_c.iloc[c] for c in chosen)
+                follow_vol = sum(v_c.iloc[c + 5] for c in chosen if c + 5 < len(v_c))
+                if adv_vol < 1e-12:
+                    vals[col] = 1.0
+                    continue
+                vals[col] = float(follow_vol / adv_vol)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 497. intraday_vol_flow_vol — 量涌波动率 (知乎#088复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_flow_vol_20d", category="intraday_advanced")
+class IntradayVolFlowVol20d(Factor):
+    """量涌波动率因子 (知乎#088, 1min).
+
+    按成交量峰值二分递归划分时段6次, 取各时段收益率的 std:
+    vol = mean(Std(ret) of 各递归时段).
+    量能分段后的波动 → 放量段波动大 → 资金博弈激烈 → 负向.
+    与 #21 volume_dispersion(量分布) 不同: 本因子是按量分段后的收益波动.
+    方向: 负向.
+    """
+    name = "intraday_vol_flow_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量涌波动率 (按量峰值递归分段收益std, 博弈=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        vols: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change().dropna()
+                if len(r) < 20:
+                    continue
+                # 按量峰值二分递归 6 次
+                seg_vols = []
+                v_arr = v_c.values
+                n = len(v_arr)
+                boundaries = [0, n]
+                for _ in range(6):
+                    new_b = []
+                    for i in range(len(boundaries) - 1):
+                        s, e = boundaries[i], boundaries[i + 1]
+                        if e - s < 3:
+                            new_b.append((s, e))
+                            continue
+                        peak = s + int(np.argmax(v_arr[s:e]))
+                        new_b.append((s, peak))
+                        new_b.append((peak, e))
+                    boundaries = [x for pair in new_b for x in pair]
+                for i in range(len(boundaries) - 1):
+                    s, e = boundaries[i], boundaries[i + 1]
+                    if e - s >= 3:
+                        seg_vols.append(float(r.iloc[s:e].std(ddof=0)))
+                if not seg_vols:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.mean(seg_vols))
+            if vals:
+                vols[dt] = pd.Series(vals)
+        if not vols:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(vols).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 498. intraday_neg_ret_illiq — 负收益非流动性 (知乎#223复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_neg_ret_illiq_20d", category="intraday_advanced")
+class IntradayNegRetIlliq20d(Factor):
+    """负收益非流动性因子 (知乎#223, 日频).
+
+    仅收益率为负时段的 |rtn|/成交额 均值:
+    illiq_neg = Mean(|rtn|/amount | rtn<0).
+    下跌时段的冲击成本 → 下跌时流动性差 → 抛压大 → 正向(非流动性溢价).
+    与 K4 amihud(全时段) 不同: 本因子仅取负收益子样本(不对称非流动性).
+    方向: 正向.
+    """
+    name = "intraday_neg_ret_illiq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "负收益非流动性 (仅下跌段|rtn|/amount, 抛压=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        illiqs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].pct_change()
+                amt = a.loc[common]
+                neg = r < 0
+                if neg.sum() < 5 or amt[neg].sum() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                illiq = (r[neg].abs() / amt[neg]).mean()
+                vals[col] = float(illiq) if not np.isnan(illiq) else 0.0
+            if vals:
+                illiqs[dt] = pd.Series(vals)
+        if not illiqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(illiqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 499. intraday_enhanced_illiq — 增强非流动性 (知乎#121复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_enhanced_illiq_20d", category="intraday_advanced")
+class IntradayEnhancedIlliq20d(Factor):
+    """增强非流动性因子 (知乎#121, 日频).
+
+    日收益对 [rtn_{t−1}, sign(rtn_t)×volume] 回归, 取后一系数:
+    rtn_t = a + b1×rtn_{t−1} + b2×sign(rtn_t)×vol_t.
+    b2 → 控制动量后, 收益对带符号成交量的敏感度 → 单位净买入的价格冲击 → 正向.
+    与 K4 amihud(均值) 不同: 本因子是回归系数(控制滞后收益后的边际冲击).
+    方向: 正向.
+    """
+    name = "intraday_enhanced_illiq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "增强非流动性 (收益对sign(rtn)×vol回归系数, 边际冲击=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        coeffs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                r = c.loc[common].pct_change().dropna()
+                vol = v.loc[common].iloc[1:]
+                if len(r) < 25:
+                    continue
+                y = r.values  # rtn_t
+                x1 = r.shift(1).values[1:]  # rtn_{t-1}
+                x2 = np.sign(y[1:]) * vol.values[1:]  # sign(rtn_t)×vol_t (对齐 y[1:])
+                y_used = y[1:]
+                valid = ~(np.isnan(y_used) | np.isnan(x1) | np.isnan(x2))
+                if valid.sum() < 20:
+                    continue
+                X = np.column_stack([np.ones(valid.sum()), x1[valid], x2[valid]])
+                try:
+                    b = np.linalg.lstsq(X, y_used[valid], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(b[2])
+            if vals:
+                coeffs[dt] = pd.Series(vals)
+        if not coeffs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(coeffs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 500. intraday_overconfidence_timing — 过度自信时点 (知乎#100复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_overconfidence_timing_20d", category="intraday_advanced")
+class IntradayOverconfidenceTiming20d(Factor):
+    """过度自信时点因子 (知乎#100, 1min).
+
+    分钟收益>μ+1σ为快速上涨区间, <μ−1σ为快速下跌区间:
+    因子 = 下跌区间时间中位数 − 上涨区间时间中位数.
+    下跌发生得晚(时间中位数大) → 日内后期恐慌 → 过度自信破裂 → 负向.
+    注: 与现有 #87 intraday_overconfidence_20d(下跌/上涨区间时间差, 同名不同公式)
+    区分: 本因子是知乎#100 的"区间时间中位数差"版本.
+    方向: 负向.
+    """
+    name = "intraday_overconfidence_timing_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "过度自信时点 (跌涨极端区间时间中位数差, 后期恐慌=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        scores: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                r = c.pct_change().dropna()
+                if len(r) < 20 or r.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                mu = r.mean()
+                sig = r.std(ddof=0)
+                up_mask = r > mu + sig
+                dn_mask = r < mu - sig
+                n = len(r)
+                if up_mask.sum() < 2 or dn_mask.sum() < 2:
+                    vals[col] = 0.0
+                    continue
+                up_time = np.median(np.where(up_mask.values)[0]) / n
+                dn_time = np.median(np.where(dn_mask.values)[0]) / n
+                vals[col] = float(dn_time - up_time)
+            if vals:
+                scores[dt] = pd.Series(vals)
+        if not scores:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(scores).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 501. intraday_smart_money_v4_vol — 聪明钱异常波动 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_smart_money_v4_vol_20d", category="intraday_advanced")
+class IntradaySmartMoneyV4Vol20d(Factor):
+    """聪明钱异常波动因子 (原创: #495 改进).
+
+    #495 用异常时刻VWAP位置, 本因子用异常时刻的波动:
+    vol = Std(ret_1min | 马尔可夫异常时刻) / Std(ret_1min | 全部).
+    异常时刻波动相对放大 → 聪明钱冲击剧烈 → 价格不稳定 → 负向.
+    与 #495 (价格位置) 互补: 本因子是异常时刻的波动强度.
+    方向: 负向.
+    """
+    name = "intraday_smart_money_v4_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "聪明钱异常波动 (马尔可夫异常时刻收益std比, 冲击剧烈=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        vols: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                r = c.pct_change().fillna(0)
+                states = (r > 0).astype(int).values
+                n = len(states)
+                if n < 20:
+                    continue
+                trans = np.zeros((2, 2))
+                for i in range(n - 1):
+                    trans[states[i], states[i + 1]] += 1
+                row_sums = trans.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1
+                trans = trans / row_sums
+                probs = np.zeros(n)
+                p0 = np.array([0.5, 0.5])
+                for i in range(n):
+                    if i > 0:
+                        p0 = p0 @ trans
+                    obs = np.array([1.0, 0.0]) if states[i] == 0 else np.array([0.0, 1.0])
+                    probs[i] = p0 @ obs
+                thr = np.percentile(probs, 5)
+                anomaly = probs < thr
+                r_vals = r.values
+                all_std = r_vals.std(ddof=0)
+                if all_std < 1e-12 or anomaly.sum() < 3:
+                    vals[col] = 0.0
+                    continue
+                anom_std = r_vals[anomaly].std(ddof=0)
+                vals[col] = float(anom_std / all_std)
+            if vals:
+                vols[dt] = pd.Series(vals)
+        if not vols:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(vols).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 502. intraday_following_price_confirm — 跟随价格确认 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_following_price_confirm_20d", category="intraday_advanced")
+class IntradayFollowingPriceConfirm20d(Factor):
+    """跟随价格确认因子 (原创: #496 改进).
+
+    #496 只度量跟随量延续, 本因子度量跟随时刻的**价格方向**:
+    优势时刻后5分钟的收益方向与优势时刻方向的一致性.
+    方向延续 → 放量后趋势成立 → 顺势 → 正向; 反转 → 假突破 → 负向.
+    与 #496 (量延续) 互补: 本因子是价格方向的确认.
+    方向: 正向.
+    """
+    name = "intraday_following_price_confirm_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "跟随价格确认 (优势时刻后方向一致占比, 趋势成立=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        confirms: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                if len(v_c) < 20:
+                    continue
+                v_c = v_c.iloc[15:]
+                c_c = c_c.loc[v_c.index]
+                order = np.argsort(v_c.values)[::-1]
+                chosen = []
+                for idx in order:
+                    if len(chosen) >= 10:
+                        break
+                    if all(abs(int(idx) - ch) >= 5 for ch in chosen):
+                        chosen.append(int(idx))
+                if len(chosen) < 3:
+                    vals[col] = 0.5
+                    continue
+                n_same = 0
+                n_valid = 0
+                r = c_c.pct_change()
+                for ch in chosen:
+                    s = int(ch)
+                    if s + 5 >= len(c_c) or s == 0:
+                        continue
+                    adv_ret = float(r.iloc[s])
+                    fol_ret = float(c_c.iloc[s + 5] / c_c.iloc[s] - 1.0)
+                    if abs(adv_ret) < 1e-12 or abs(fol_ret) < 1e-12:
+                        continue
+                    n_valid += 1
+                    if np.sign(adv_ret) == np.sign(fol_ret):
+                        n_same += 1
+                vals[col] = float(n_same / n_valid) if n_valid > 0 else 0.5
+            if vals:
+                confirms[dt] = pd.Series(vals)
+        if not confirms:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(confirms).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 503. intraday_vol_segment_skew — 量分段收益偏度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_segment_skew_20d", category="intraday_advanced")
+class IntradayVolSegmentSkew20d(Factor):
+    """量分段收益偏度因子 (原创: #497 改进).
+
+    #497 度量量分段的波动幅度, 本因子度量各分段的收益偏斜:
+    放量段偏正 → 放量时上涨主导 → 追涨; 放量段偏负 → 放量出货 → 负向.
+    用分段收益分布的偏度度量量能方向.
+    方向: 负向.
+    """
+    name = "intraday_vol_segment_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量分段收益偏度 (放量段收益偏斜, 追涨/出货=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change().dropna()
+                if len(r) < 20:
+                    continue
+                v_arr = v_c.values[:len(r)]
+                thr = np.median(v_arr)
+                high_vol = r.values[v_arr > thr]
+                if len(high_vol) < 10 or high_vol.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                skew = float(np.mean((high_vol - high_vol.mean()) ** 3) / high_vol.std(ddof=0) ** 3)
+                vals[col] = skew
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 504. intraday_neg_illiq_asym — 非流动性不对称 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_neg_illiq_asym_20d", category="intraday_advanced")
+class IntradayNegIlliqAsym20d(Factor):
+    """非流动性不对称因子 (原创: #498 改进).
+
+    #498 用负收益非流动性水平, 本因子用其不对称程度:
+    asym = illiq_neg / illiq_all (负收益非流动性 / 全时段非流动性).
+    比值高 → 下跌时冲击成本远高于平均 → 抛压集中 → 负向.
+    与 #498 (水平) 互补: 本因子是相对不对称性.
+    方向: 负向.
+    """
+    name = "intraday_neg_illiq_asym_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "非流动性不对称 (负收益illiq/全时段, 抛压集中=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        asyms: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                r = c.loc[common].pct_change()
+                amt = a.loc[common]
+                neg = r < 0
+                all_illiq = (r.abs() / amt).dropna()
+                if len(all_illiq) < 10 or all_illiq.mean() < 1e-12:
+                    continue
+                if neg.sum() < 5:
+                    continue
+                neg_illiq = (r[neg].abs() / amt[neg]).mean()
+                vals[col] = float(neg_illiq / all_illiq.mean())
+            if vals:
+                asyms[dt] = pd.Series(vals)
+        if not asyms:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(asyms).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 505. intraday_illiq_flow_interaction — 非流动性×资金流交互 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_illiq_flow_interaction_20d", category="intraday_advanced")
+class IntradayIlliqFlowInteraction20d(Factor):
+    """非流动性×资金流交互因子 (原创: #499 改进).
+
+    #499 用回归系数, 本因子构造交互:
+    interaction = 符号成交额占比 × 非流动性 (资金流方向 × 冲击成本).
+    资金流入 + 高冲击成本 = 强势买入遇流动性差 → 溢价 → 正向.
+    资金流出 + 高冲击成本 = 抛压遇流动性差 → 崩塌风险 → 负向.
+    方向: 正向.
+    """
+    name = "intraday_illiq_flow_interaction_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "非流动性×资金流交互 (资金流×冲击成本, 强买溢价=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        inter: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 20:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 20:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                r = c_c.pct_change().fillna(0)
+                amt_total = a_c.sum()
+                if amt_total < 1e-12:
+                    continue
+                flow = float((np.sign(r) * a_c).sum() / amt_total)
+                illiq = float((r.abs() / a_c).mean())
+                vals[col] = flow * illiq
+            if vals:
+                inter[dt] = pd.Series(vals)
+        if not inter:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(inter).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 506. intraday_overconfidence_intensity — 过度自信强度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_overconfidence_intensity_20d", category="intraday_advanced")
+class IntradayOverconfidenceIntensity20d(Factor):
+    """过度自信强度因子 (原创: #500 改进).
+
+    #500 用区间时间位置差, 本因子用极端区间的成交占比:
+    intensity = 快速下跌区间成交额占比 / 快速上涨区间成交额占比.
+    下跌放量远超上涨 → 恐慌集中 → 负向.
+    与 #500 (时间位置) 互补: 本因子是极端区间的量能强度.
+    方向: 负向.
+    """
+    name = "intraday_overconfidence_intensity_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "过度自信强度 (跌极端区量/涨极端区量, 恐慌集中=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        intensities: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                r = c_c.pct_change().dropna()
+                if len(r) < 20 or r.std(ddof=0) < 1e-12:
+                    vals[col] = 1.0
+                    continue
+                mu = r.mean()
+                sig = r.std(ddof=0)
+                up_mask = r > mu + sig
+                dn_mask = r < mu - sig
+                a_cut = a_c.iloc[1:]
+                up_amt = a_cut[up_mask.values].sum()
+                dn_amt = a_cut[dn_mask.values].sum()
+                if up_amt < 1e-12:
+                    vals[col] = 1.0
+                    continue
+                vals[col] = float(dn_amt / up_amt)
+            if vals:
+                intensities[dt] = pd.Series(vals)
+        if not intensities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(intensities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 507. intraday_vol_dist_stability — 成交量分布稳定性 (知乎#002复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_dist_stability_20d", category="intraday_advanced")
+class IntradayVolDistStability20d(Factor):
+    """成交量分布稳定性因子 (知乎#002, 1min).
+
+    标准化成交量序列, 滚动5分钟窗口与其余时刻的 MMD(RBF核) 取 nanstd:
+    用分桶直方图差异近似 MMD — 分布差异的稳定性.
+    分布不稳定(高 std) → 成交量行为反复 → 负向.
+    与 #21 volume_dispersion(日内分布) 不同: 本因子是分布**稳定性**(时序).
+    方向: 负向.
+    """
+    name = "intraday_vol_dist_stability_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量分布稳定性 (5min窗与其余MMD的std, 行为反复=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        stabilities: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30 or v.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                v_norm = (v - v.mean()) / v.std(ddof=0)
+                n = len(v_norm)
+                mmd_vals = []
+                for i in range(0, n, 5):
+                    win = v_norm.iloc[i:i + 5]
+                    rest = pd.concat([v_norm.iloc[:i], v_norm.iloc[i + 5:]])
+                    if len(win) < 3 or len(rest) < 10:
+                        continue
+                    h1, _ = np.histogram(win.values, bins=10, range=(-4, 4))
+                    h2, _ = np.histogram(rest.values, bins=10, range=(-4, 4))
+                    p1 = h1 / h1.sum()
+                    p2 = h2 / h2.sum()
+                    mmd_vals.append(float(np.abs(p1 - p2).sum()))
+                if not mmd_vals:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.std(mmd_vals, ddof=0))
+            if vals:
+                stabilities[dt] = pd.Series(vals)
+        if not stabilities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(stabilities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 508. intraday_vol_price_skew — 成交量价格分布偏斜 (知乎#039复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_price_skew_20d", category="intraday_advanced")
+class IntradayVolPriceSkew20d(Factor):
+    """成交量价格分布偏斜因子 (知乎#039, 1min).
+
+    日内价格按分位分10组求各组成交量占比, v_p_skew = 3(均值−中值)/std:
+    成交量在价格高位的偏斜 → 高位放量程度.
+    v_p_skew 正 → 成交量偏高位分布 → 高位承接/派发活跃 → 方向待验证.
+    与 #19 upper_lower_volume_ratio(高/低位量比) 不同: 本因子用分布偏度.
+    方向: 随符号.
+    """
+    name = "intraday_vol_price_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量价分布偏斜 (v_p_skew=3(均值-中值)/std, 高位量偏斜)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                if v_c.sum() < 1e-12 or c_c.std() < 1e-12:
+                    continue
+                price_bins = pd.cut(c_c, bins=10, labels=False)
+                share = v_c.groupby(price_bins).sum() / v_c.sum()
+                mean_share = share.mean()
+                median_share = share.median()
+                std_share = share.std(ddof=0)
+                if std_share < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(3.0 * (mean_share - median_share) / std_share)
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 509. intraday_vol_ret_dist — 成交量收益分布 (知乎#044复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_ret_dist_20d", category="intraday_advanced")
+class IntradayVolRetDist20d(Factor):
+    """成交量收益分布因子 (知乎#044, 1min).
+
+    flag = 分钟收益 > 均值+1σ; 因子 = σ(rtn|flag) × mean(vol|flag) / mean(vol):
+    高收益时刻(极端分钟)的波动×量能放大程度.
+    高值 → 极端行情时波动大且放量 → 情绪化 → 负向.
+    与 #472 ret_extreme_freq(频率) 不同: 本因子是极端时刻的波动×量交互.
+    方向: 负向.
+    """
+    name = "intraday_vol_ret_dist_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量收益分布 (高收益分钟σ×量比, 极端放量=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        dists: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change()
+                if r.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                flag = r > r.mean() + r.std(ddof=0)
+                if flag.sum() < 3 or v_c.mean() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                val = float(r[flag].std(ddof=0) * (v_c[flag].mean() / v_c.mean()))
+                vals[col] = val
+            if vals:
+                dists[dt] = pd.Series(vals)
+        if not dists:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(dists).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 510. intraday_price_diff_autocorr — 价格差分自相关 (知乎#134复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_diff_autocorr_20d", category="intraday_advanced")
+class IntradayPriceDiffAutocorr20d(Factor):
+    """价格差分自相关因子 (知乎#134, 1min).
+
+    收盘价差分序列的自相关系数 (正/负差分分开计):
+    差分序列自相关 → 价格变动的持续性.
+    高自相关 → 价格变动有惯性 → 趋势性 → 负向(文中负向).
+    与 #493 order_flow_autocorr(收益符号) 不同: 本因子用价格差分(含幅度).
+    方向: 负向.
+    """
+    name = "intraday_price_diff_autocorr_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价格差分自相关 (差分序列1阶自相关, 惯性=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        autocorrs: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                diff = c.diff().dropna()
+                if len(diff) < 20 or diff.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                ac = float(np.corrcoef(diff.values[:-1], diff.values[1:])[0, 1])
+                vals[col] = ac if not np.isnan(ac) else 0.0
+            if vals:
+                autocorrs[dt] = pd.Series(vals)
+        if not autocorrs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(autocorrs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 511. intraday_lead_amount_surge — 领先成交额异动 (知乎#074复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lead_amount_surge_20d", category="intraday_advanced")
+class IntradayLeadAmountSurge20d(Factor):
+    """领先成交额异动因子 (知乎#074, 1min).
+
+    日内收益最高/最低10%分钟的前一分钟成交额占比均值 / 全天平均成交额占比:
+    大波动前的成交额预兆 → 知情资金提前布局.
+    领先放量 → 大波动前资金抢跑 → 预示波动 → 负向.
+    与 #36 large_order_impact(冲击后收益) 不同: 本因子是冲击**前**的成交额.
+    方向: 负向.
+    """
+    name = "intraday_lead_amount_surge_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "领先成交额异动 (大波动前1min成交额/均值, 抢跑=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        surges: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                r = c_c.pct_change()
+                if len(r) < 25:
+                    continue
+                thr_high = np.percentile(r.dropna(), 90)
+                thr_low = np.percentile(r.dropna(), 10)
+                extreme = (r > thr_high) | (r < thr_low)
+                if extreme.sum() < 3 or a_c.mean() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                lead_share = a_c.shift(1)[extreme].mean() / a_c.mean()
+                vals[col] = float(lead_share) if not np.isnan(lead_share) else 0.0
+            if vals:
+                surges[dt] = pd.Series(vals)
+        if not surges:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(surges).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 512. intraday_vwap_divergence_vol — 量能分歧波动 (知乎#042复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_divergence_vol_20d", category="intraday_advanced")
+class IntradayVwapDivergenceVol20d(Factor):
+    """量能分歧波动因子 (知乎#042, 1min).
+
+    vwap = 额/量, 偏离度 = vwap/收盘 − 1, 按偏离度正/倒序对量占比累积积分之差,
+    截面标准化后 21 日 std:
+    量能分歧的时序波动 → 量价背离反复 → 负向.
+    与 #30 vwap_deviation(偏离水平) 不同: 本因子是偏离分布的积分差+时序波动.
+    方向: 负向.
+    """
+    name = "intraday_vwap_divergence_vol_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量能分歧波动 (vwap偏离积分差21日std, 背离反复=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount, volume = panel["close"], panel["amount"], panel["volume"]
+        day = close.index.normalize()
+        divergences: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                c = close.loc[day == dt, col].dropna()
+                a = amount.loc[day == dt, col].dropna()
+                v = volume.loc[day == dt, col].dropna()
+                common = c.index.intersection(a.index).intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                v_c = v.loc[common]
+                vwap = (a_c.sum() / v_c.sum()) if v_c.sum() > 0 else c_c.mean()
+                if vwap < 1e-12:
+                    continue
+                dev = (vwap / c_c - 1.0).values
+                vol_share = (v_c / v_c.sum()).values
+                order = np.argsort(dev)
+                cum_pos = np.cumsum(vol_share[order])
+                total = v_c.sum()
+                if total < 1e-12 or len(cum_pos) < 3:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.abs(cum_pos[-1] - 2.0 * np.sum(cum_pos[:len(cum_pos)//2])) / total)
+            if vals:
+                divergences[dt] = pd.Series(vals)
+        if not divergences:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(divergences).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        std21 = daily.rolling(21, min_periods=5).std()
+        return (-std21).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 513. intraday_highfreq_illiq — 高频非流动性 (知乎#119复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_highfreq_illiq_20d", category="intraday_advanced")
+class IntradayHighfreqIlliq20d(Factor):
+    """高频非流动性因子 (知乎#119, 1min).
+
+    1分钟收益对 sign(rtn)×vol 回归斜率 (21日窗口):
+    rtn_t = a + λ × sign(rtn_t)×vol_t.
+    λ → 单位净买入(带符号量)的价格冲击 → 流动性差 → 正向.
+    与 #499 enhanced_illiq(加滞后收益控制) 不同: 本因子是简化的单变量冲击系数.
+    方向: 正向.
+    """
+    name = "intraday_highfreq_illiq_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "高频非流动性 (收益对sign(rtn)×vol回归斜率, 冲击=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        lambdas: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                r = c.loc[common].pct_change().dropna()
+                vol = v.loc[common].iloc[1:]
+                if len(r) < 25:
+                    continue
+                y = r.values
+                x = np.sign(y) * vol.values
+                valid = ~(np.isnan(y) | np.isnan(x))
+                if valid.sum() < 20:
+                    continue
+                X = np.column_stack([np.ones(valid.sum()), x[valid]])
+                try:
+                    b = np.linalg.lstsq(X, y[valid], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(b[1])
+            if vals:
+                lambdas[dt] = pd.Series(vals)
+        if not lambdas:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(lambdas).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 514. intraday_ret_square_21d — 21日收益平方和 (知乎#238复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_ret_square_21d_20d", category="intraday_advanced")
+class IntradayRetSquare21d20d(Factor):
+    """21日收益平方和因子 (知乎#238, 日频).
+
+    过去21日收益率平方和:
+    vol21 = Σ ret_t² (t=1..21).
+    高波动 → 风险大 → 负向(IC≈−0.1).
+    与 #34 volatility_smile(日内U型) 不同: 本因子是日频21日已实现波动.
+    方向: 负向.
+    """
+    name = "intraday_ret_square_21d_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "21日收益平方和 (已实现波动, 高风险=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        if close is None or close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        idx = pd.DatetimeIndex(dates)
+        ret = close.pct_change().reindex(index=idx)
+        vol21 = (ret ** 2).rolling(21, min_periods=5).sum()
+        return (-vol21).reindex(index=idx, columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 515. intraday_upside_vol_ratio — 上行波动率占比 (知乎#234复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_upside_vol_ratio_20d", category="intraday_advanced")
+class IntradayUpsideVolRatio20d(Factor):
+    """上行波动率占比因子 (知乎#234, 1min).
+
+    上行波动率 / 总波动率 (按收益正负分样本):
+    ratio = Var(ret|ret>0) / Var(ret).
+    上行波动占比高 → 上涨波动主导 → 好波动 → 正向; 反之坏波动 → 负向.
+    与 #39 semivariance_ratio(已实现方差比) 不同: 本因子用波动率占比(非比值).
+    方向: 正向.
+    """
+    name = "intraday_upside_vol_ratio_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "上行波动率占比 (上行Var/总Var, 好波动=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                r = c.pct_change().dropna()
+                total_var = r.var(ddof=0)
+                if total_var < 1e-12:
+                    vals[col] = 0.5
+                    continue
+                up = r[r > 0]
+                if len(up) < 5:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(up.var(ddof=0) / total_var)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 516. intraday_vol_extreme_magnitude — 波动率极大值幅度 (知乎#087复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_extreme_magnitude_20d", category="intraday_advanced")
+class IntradayVolExtremeMagnitude20d(Factor):
+    """波动率极大值幅度因子 (知乎#087, 1min).
+
+    5分钟更优波动率(20个OHLC价格 std/mean) 的95%分位为 VaR;
+    30分钟更优波动率 > VaR 的均值 / VaR:
+    magnitude = Mean(vol30[vol30 > VaR_95(vol5)]) / VaR_95.
+    长窗波动率远超常态VaR → 波动率爆发 → 风险 → 负向.
+    与 #471 ret_extreme_magnitude(收益尾部) 不同: 本因子用更优波动率.
+    方向: 负向.
+    """
+    name = "intraday_vol_extreme_magnitude_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "波动率极大值幅度 (vol30>VaR95(vol5)均值/VaR, 爆发=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "high" not in panel or "low" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, high, low = panel["close"], panel["high"], panel["low"]
+        day = close.index.normalize()
+        magnitudes: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                c = close.loc[day == dt, col].dropna()
+                h = high.loc[day == dt, col].dropna()
+                l = low.loc[day == dt, col].dropna()
+                common = c.index.intersection(h.index).intersection(l.index)
+                if len(common) < 40:
+                    continue
+                c_c = c.loc[common]
+                h_c = h.loc[common]
+                l_c = l.loc[common]
+                # 更优波动率: 5分钟窗内 OHLC 波动率
+                vol5 = []
+                for i in range(0, len(c_c) - 4, 5):
+                    seg = np.concatenate([c_c.iloc[i:i + 5].values, h_c.iloc[i:i + 5].values, l_c.iloc[i:i + 5].values])
+                    if seg.std(ddof=0) / seg.mean() > 0 if seg.mean() > 0 else False:
+                        vol5.append(seg.std(ddof=0) / seg.mean())
+                vol30 = []
+                for i in range(0, len(c_c) - 29, 30):
+                    seg = np.concatenate([c_c.iloc[i:i + 30].values, h_c.iloc[i:i + 30].values, l_c.iloc[i:i + 30].values])
+                    if seg.mean() > 0:
+                        vol30.append(seg.std(ddof=0) / seg.mean())
+                if len(vol5) < 5 or len(vol30) < 3:
+                    vals[col] = 0.0
+                    continue
+                var = np.percentile(vol5, 95)
+                if abs(var) < 1e-12:
+                    vals[col] = 1.0
+                    continue
+                extreme = [v for v in vol30 if v > var]
+                if not extreme:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.mean(extreme) / var)
+            if vals:
+                magnitudes[dt] = pd.Series(vals)
+        if not magnitudes:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(magnitudes).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 517. intraday_golden_ratio_reversal — 日内黄金分割反转 (知乎#153复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_golden_ratio_reversal_20d", category="intraday_advanced")
+class IntradayGoldenRatioReversal20d(Factor):
+    """日内黄金分割反转因子 (知乎#153, 30min).
+
+    Σ_{21日} ln(收盘价 / 当日10点价格):
+    用 30 分钟 K 线或日频; 期货转换: 用当日第 1 小时(约开盘30分钟)价格为锚.
+    收盘相对开盘时段价格偏离 → 日内收益的累积 → 反转 → 负向.
+    与 #65 intraday_return(日内收益) 不同: 本因子用 21 日累积对数收益(反转视角).
+    方向: 负向.
+    """
+    name = "intraday_golden_ratio_reversal_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "日内黄金分割反转 (21日Σln(收盘/开盘段价格), 累积偏离=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="30min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 3:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 3:
+                    continue
+                anchor = c.iloc[0]  # 当日第1根30min(约开盘)
+                if anchor < 1e-12:
+                    continue
+                vals[col] = float(np.log(c.iloc[-1] / anchor))
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        cum21 = daily.rolling(21, min_periods=5).sum()
+        return (-cum21).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 518. intraday_short_term_crowding — 短线交易拥挤度 (知乎#128复现)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_short_term_crowding_20d", category="intraday_advanced")
+class IntradayShortTermCrowding20d(Factor):
+    """短线交易拥挤度因子 (知乎#128, 1min).
+
+    最后30分钟成交量重心 + 最后3分钟成交量占比, 两因子截面排序求和, 21日均值:
+    crowding = rank(尾盘量重心) + rank(最后3分钟量占比).
+    尾盘集中放量 → 收盘抢跑/拥挤交易 → 负向.
+    与 #111 last15min_volume(尾盘量占比) 不同: 本因子是量重心+占比的双重排序.
+    方向: 负向.
+    """
+    name = "intraday_short_term_crowding_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "短线交易拥挤度 (尾盘量重心+3min量占比排序, 拥挤=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        centroids: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            n = len(grp)
+            if n < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30:
+                    continue
+                n_tail = max(5, min(30, n // 6))
+                tail = v.iloc[-n_tail:]
+                total = tail.sum()
+                if total < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                # 尾盘量重心 (时间加权位置, 靠近尾=大)
+                tw = np.arange(1, len(tail) + 1) / len(tail)
+                centroid = float(np.sum(tw * tail.values) / total)
+                last3 = float(v.iloc[-3:].sum() / v.sum()) if v.sum() > 0 else 0.0
+                vals[col] = centroid + last3
+            if vals:
+                centroids[dt] = pd.Series(vals)
+        if not centroids:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(centroids).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        mean21 = daily.rolling(21, min_periods=5).mean()
+        return (-mean21).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 519. intraday_vol_dist_skew — 量分布偏斜 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_dist_skew_20d", category="intraday_advanced")
+class IntradayVolDistSkew20d(Factor):
+    """量分布偏斜因子 (原创: #507 改进).
+
+    #507 度量分布稳定性, 本因子度量成交量分布的**偏斜方向**:
+    skew(成交量) 正 → 大量成交集中在尾部(偶发天量) → 冲击不规律 → 负向.
+    与 #507 (MMD稳定性) 互补: 本因子是分布形状.
+    方向: 负向.
+    """
+    name = "intraday_vol_dist_skew_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量分布偏斜 (成交量偏度, 偶发天量=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        skews: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30 or v.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                skew = float(np.mean((v - v.mean()) ** 3) / v.std(ddof=0) ** 3)
+                vals[col] = skew
+            if vals:
+                skews[dt] = pd.Series(vals)
+        if not skews:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(skews).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 520. intraday_vol_price_reversal — 量价反转强度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_price_reversal_20d", category="intraday_advanced")
+class IntradayVolPriceReversal20d(Factor):
+    """量价反转强度因子 (原创: #508 改进).
+
+    #508 用量价分布偏斜, 本因子用 POC 与收盘位置关系:
+    v_p_reversal = (POC − C + 1) × 日内收益 (POC=量最大价格组, C=收盘价组):
+    量集中价位与收盘价的偏离 × 收益 → 量价背离的动量.
+    正 → 量能支撑价格方向 → 正向.
+    方向: 正向.
+    """
+    name = "intraday_vol_price_reversal_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量价反转强度 ((POC-C+1)×日内收益, 量能支撑=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        reversals: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                if v_c.sum() < 1e-12:
+                    continue
+                price_bins = pd.cut(c_c, bins=10, labels=False)
+                vol_by_bin = v_c.groupby(price_bins).sum()
+                poc = int(vol_by_bin.idxmax())
+                close_bin = int(pd.cut(pd.Series([c_c.iloc[-1]]), bins=10, labels=False).iloc[0])
+                ret = float(c_c.iloc[-1] / c_c.iloc[0] - 1.0) if c_c.iloc[0] > 0 else 0.0
+                vals[col] = float((poc - close_bin + 1) * ret)
+            if vals:
+                reversals[dt] = pd.Series(vals)
+        if not reversals:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(reversals).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 521. intraday_vol_ret_coupling_dist — 量收益耦合分布 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_ret_coupling_dist_20d", category="intraday_advanced")
+class IntradayVolRetCouplingDist20d(Factor):
+    """量收益耦合分布因子 (原创: #509 改进).
+
+    #509 用高收益时刻的波动×量, 本因子用低收益(负)时刻的耦合:
+    coupling = σ(rtn|ret<0) × mean(vol|ret<0) / mean(vol).
+    下跌时刻的量能放大 → 恐慌抛售 → 负向.
+    与 #509 (上涨极端) 互补: 本因子是下跌端.
+    方向: 负向.
+    """
+    name = "intraday_vol_ret_coupling_dist_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量收益耦合分布 (下跌时刻σ×量比, 恐慌=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        couplings: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                r = c_c.pct_change()
+                if r.std(ddof=0) < 1e-12 or v_c.mean() < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                neg = r < 0
+                if neg.sum() < 3:
+                    vals[col] = 0.0
+                    continue
+                val = float(r[neg].std(ddof=0) * (v_c[neg].mean() / v_c.mean()))
+                vals[col] = val
+            if vals:
+                couplings[dt] = pd.Series(vals)
+        if not couplings:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(couplings).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 522. intraday_diff_autocorr_long — 差分自相关长记忆 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_diff_autocorr_long_20d", category="intraday_advanced")
+class IntradayDiffAutocorrLong20d(Factor):
+    """差分自相关长记忆因子 (原创: #510 改进).
+
+    #510 用1阶自相关, 本因子用 1..10 阶自相关的衰减斜率:
+    差分自相关衰减慢 → 价格变动有长记忆 → 有序 → 正向.
+    与 #487 order_flow_memory(收益符号记忆) 不同: 本因子用价格差分(含幅度)长记忆.
+    方向: 正向.
+    """
+    name = "intraday_diff_autocorr_long_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "差分自相关长记忆 (差分1-10阶acf对数斜率, 长记忆=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        memories: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 40:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 40:
+                    continue
+                diff = c.diff().dropna()
+                if len(diff) < 30 or diff.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                vals_arr = diff.values
+                n = len(vals_arr)
+                mean_d = vals_arr.mean()
+                var_d = vals_arr.var(ddof=0)
+                if var_d < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                acfs = []
+                lags = []
+                for k in range(1, 11):
+                    if n - k < 15:
+                        continue
+                    acf = float(np.mean((vals_arr[:-k] - mean_d) * (vals_arr[k:] - mean_d)) / var_d)
+                    acfs.append(acf)
+                    lags.append(k)
+                if len(acfs) < 5:
+                    vals[col] = 0.0
+                    continue
+                log_lags = np.log(np.array(lags, dtype=float))
+                b = np.polyfit(log_lags, np.array(acfs), 1)[0]
+                vals[col] = -float(b)
+            if vals:
+                memories[dt] = pd.Series(vals)
+        if not memories:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(memories).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 523. intraday_lead_amount_persistence — 领先成交额持续性 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lead_amount_persistence_20d", category="intraday_advanced")
+class IntradayLeadAmountPersistence20d(Factor):
+    """领先成交额持续性因子 (原创: #511 改进).
+
+    #511 用大波动前1分钟成交额, 本因子用波动后5分钟的成交额持续性:
+    persist = Mean(amount[t+1..t+5] | 大波动时刻) / 全天平均.
+    波动后量能持续 → 冲击被资金承接 → 健康 → 正向.
+    与 #511 (波动前抢跑=负向) 互补: 本因子是波动后的承接.
+    方向: 正向.
+    """
+    name = "intraday_lead_amount_persistence_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "领先成交额持续 (波动后5min量/均值, 资金承接=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount = panel["close"], panel["amount"]
+        day = close.index.normalize()
+        persists: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_a = amount.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                a = grp_a[col].dropna()
+                common = c.index.intersection(a.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                r = c_c.pct_change()
+                if len(r) < 25 or a_c.mean() < 1e-12:
+                    continue
+                thr_high = np.percentile(r.dropna(), 90)
+                thr_low = np.percentile(r.dropna(), 10)
+                extreme = (r > thr_high) | (r < thr_low)
+                if extreme.sum() < 3:
+                    vals[col] = 0.0
+                    continue
+                # 波动后5分钟量能
+                after = a_c.shift(-1)
+                persist_vals = []
+                for i, e in enumerate(extreme.values):
+                    if e and i + 5 < len(a_c):
+                        persist_vals.append(float(a_c.iloc[i + 1:i + 6].mean()))
+                if not persist_vals:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.mean(persist_vals) / a_c.mean())
+            if vals:
+                persists[dt] = pd.Series(vals)
+        if not persists:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(persists).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 524. intraday_vwap_divergence_trend — 量能分歧趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vwap_divergence_trend_20d", category="intraday_advanced")
+class IntradayVwapDivergenceTrend20d(Factor):
+    """量能分歧趋势因子 (原创: #512 改进).
+
+    #512 用分歧的波动, 本因子用分歧的 20 日趋势:
+    量能分歧持续扩大 → 量价背离在加剧 → 结构恶化 → 负向.
+    与 #512 (波动) 互补: 本因子是趋势方向.
+    方向: 负向.
+    """
+    name = "intraday_vwap_divergence_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量能分歧趋势 (分歧20日斜率, 背离加剧=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "amount" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, amount, volume = panel["close"], panel["amount"], panel["volume"]
+        day = close.index.normalize()
+        divergences: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                c = close.loc[day == dt, col].dropna()
+                a = amount.loc[day == dt, col].dropna()
+                v = volume.loc[day == dt, col].dropna()
+                common = c.index.intersection(a.index).intersection(v.index)
+                if len(common) < 30:
+                    continue
+                c_c = c.loc[common]
+                a_c = a.loc[common]
+                v_c = v.loc[common]
+                vwap = (a_c.sum() / v_c.sum()) if v_c.sum() > 0 else c_c.mean()
+                if vwap < 1e-12:
+                    continue
+                dev = (vwap / c_c - 1.0).values
+                vol_share = (v_c / v_c.sum()).values
+                order = np.argsort(dev)
+                cum_pos = np.cumsum(vol_share[order])
+                total = v_c.sum()
+                if total < 1e-12 or len(cum_pos) < 3:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.abs(cum_pos[-1] - 2.0 * np.sum(cum_pos[:len(cum_pos)//2])) / total)
+            if vals:
+                divergences[dt] = pd.Series(vals)
+        if not divergences:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(divergences).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 525. intraday_illiq_trend — 非流动性趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_illiq_trend_20d", category="intraday_advanced")
+class IntradayIlliqTrend20d(Factor):
+    """非流动性趋势因子 (原创: #513 改进).
+
+    #513 用冲击系数水平, 本因子用其 20 日趋势:
+    冲击系数持续上升 → 流动性持续恶化 → 负向.
+    与 #63 amihud_trend(前半后半) 不同: 本因子是高频冲击系数的20日斜率.
+    方向: 负向.
+    """
+    name = "intraday_illiq_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "非流动性趋势 (冲击系数20日斜率, 流动性恶化=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        day = close.index.normalize()
+        lambdas: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close.loc[day == dt]
+            grp_v = volume.loc[day == dt]
+            if len(grp_c) < 30:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 30:
+                    continue
+                r = c.loc[common].pct_change().dropna()
+                vol = v.loc[common].iloc[1:]
+                if len(r) < 25:
+                    continue
+                y = r.values
+                x = np.sign(y) * vol.values
+                valid = ~(np.isnan(y) | np.isnan(x))
+                if valid.sum() < 20:
+                    continue
+                X = np.column_stack([np.ones(valid.sum()), x[valid]])
+                try:
+                    b = np.linalg.lstsq(X, y[valid], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(b[1])
+            if vals:
+                lambdas[dt] = pd.Series(vals)
+        if not lambdas:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(lambdas).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 526. intraday_vol_skew_balance — 波动率平衡度 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_skew_balance_20d", category="intraday_advanced")
+class IntradayVolSkewBalance20d(Factor):
+    """波动率平衡度因子 (原创: #515 改进).
+
+    #515 用上行波动占比(水平), 本因子用其 20 日趋势:
+    上行波动占比上升 → 好波动增加 → 正向; 下降 → 坏波动主导 → 负向.
+    与 #515 (水平) 互补: 本因子是波动结构的演化.
+    方向: 正向.
+    """
+    name = "intraday_vol_skew_balance_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "波动率平衡度 (上行波动占比20日趋势, 好波动增加=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                r = c.pct_change().dropna()
+                total_var = r.var(ddof=0)
+                if total_var < 1e-12:
+                    vals[col] = 0.5
+                    continue
+                up = r[r > 0]
+                if len(up) < 5:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(up.var(ddof=0) / total_var)
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 527. intraday_vol_ratio_trend — 波动率结构趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_ratio_trend_20d", category="intraday_advanced")
+class IntradayVolRatioTrend20d(Factor):
+    """波动率结构趋势因子 (原创: #516 改进).
+
+    #516 用极端波动幅度, 本因子用波动率爆发频率:
+    freq = Count(vol30 > VaR95(vol5)) / 总窗数.
+    波动爆发频繁 → 波动 regime 不稳定 → 负向.
+    与 #516 (幅度) 互补: 本因子是爆发频率.
+    方向: 负向.
+    """
+    name = "intraday_vol_ratio_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "波动率爆发频率 (vol30>VaR95次数占比, regime不稳=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "close" not in panel or "high" not in panel or "low" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, high, low = panel["close"], panel["high"], panel["low"]
+        day = close.index.normalize()
+        freqs: dict = {}
+        for dt in sorted(set(day)):
+            vals = {}
+            for col in close.columns:
+                c = close.loc[day == dt, col].dropna()
+                h = high.loc[day == dt, col].dropna()
+                l = low.loc[day == dt, col].dropna()
+                common = c.index.intersection(h.index).intersection(l.index)
+                if len(common) < 40:
+                    continue
+                c_c = c.loc[common]
+                h_c = h.loc[common]
+                l_c = l.loc[common]
+                vol5 = []
+                for i in range(0, len(c_c) - 4, 5):
+                    seg = np.concatenate([c_c.iloc[i:i + 5].values, h_c.iloc[i:i + 5].values, l_c.iloc[i:i + 5].values])
+                    if seg.mean() > 0:
+                        vol5.append(seg.std(ddof=0) / seg.mean())
+                vol30 = []
+                for i in range(0, len(c_c) - 29, 30):
+                    seg = np.concatenate([c_c.iloc[i:i + 30].values, h_c.iloc[i:i + 30].values, l_c.iloc[i:i + 30].values])
+                    if seg.mean() > 0:
+                        vol30.append(seg.std(ddof=0) / seg.mean())
+                if len(vol5) < 5 or len(vol30) < 3:
+                    vals[col] = 0.0
+                    continue
+                var = np.percentile(vol5, 95)
+                vals[col] = float(np.mean([1.0 if v > var else 0.0 for v in vol30]))
+            if vals:
+                freqs[dt] = pd.Series(vals)
+        if not freqs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(freqs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 528. intraday_reversal_consistency — 反转一致性 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_reversal_consistency_20d", category="intraday_advanced")
+class IntradayReversalConsistency20d(Factor):
+    """反转一致性因子 (原创: #517 改进).
+
+    #517 用 21 日累积对数收益(水平), 本因子用其 20 日趋势:
+    累积反转持续加深 → 反转动能 → 负向.
+    与 #517 (水平) 互补: 本因子是反转的动量.
+    方向: 负向.
+    """
+    name = "intraday_reversal_consistency_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "反转一致性 (日内收益21日趋势, 反转动能=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="30min")
+        if "close" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close = panel["close"]
+        day = close.index.normalize()
+        ratios: dict = {}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 3:
+                continue
+            vals = {}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 3:
+                    continue
+                anchor = c.iloc[0]
+                if anchor < 1e-12:
+                    continue
+                vals[col] = float(np.log(c.iloc[-1] / anchor))
+            if vals:
+                ratios[dt] = pd.Series(vals)
+        if not ratios:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(ratios).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 529. intraday_tail_crowding — 尾盘拥挤趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tail_crowding_20d", category="intraday_advanced")
+class IntradayTailCrowding20d(Factor):
+    """尾盘拥挤趋势因子 (原创: #518 改进).
+
+    #518 用尾盘拥挤度水平, 本因子用其 20 日趋势:
+    尾盘拥挤度持续上升 → 收盘博弈加剧 → 负向.
+    与 #518 (水平) 互补: 本因子是拥挤的演化.
+    方向: 负向.
+    """
+    name = "intraday_tail_crowding_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "尾盘拥挤趋势 (拥挤度20日斜率, 博弈加剧=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        centroids: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            n = len(grp)
+            if n < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30:
+                    continue
+                n_tail = max(5, min(30, n // 6))
+                tail = v.iloc[-n_tail:]
+                total = tail.sum()
+                if total < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                tw = np.arange(1, len(tail) + 1) / len(tail)
+                centroid = float(np.sum(tw * tail.values) / total)
+                last3 = float(v.iloc[-3:].sum() / v.sum()) if v.sum() > 0 else 0.0
+                vals[col] = centroid + last3
+            if vals:
+                centroids[dt] = pd.Series(vals)
+        if not centroids:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(centroids).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 530. intraday_vol_stability_trend — 量稳定趋势 (原创改进)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_vol_stability_trend_20d", category="intraday_advanced")
+class IntradayVolStabilityTrend20d(Factor):
+    """量稳定趋势因子 (原创: #507 补充).
+
+    成交量分布稳定性的 20 日趋势:
+    稳定性恶化(MMD std 上升) → 量行为越来越反复 → 负向.
+    与 #507 (水平) 互补: 本因子是稳定性演化.
+    方向: 负向.
+    """
+    name = "intraday_vol_stability_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "量稳定趋势 (MMD std 20日斜率, 恶化=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        volume = panel["volume"]
+        day = volume.index.normalize()
+        stabilities: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            vals = {}
+            for col in grp.columns:
+                v = grp[col].dropna()
+                if len(v) < 30 or v.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                v_norm = (v - v.mean()) / v.std(ddof=0)
+                n = len(v_norm)
+                mmd_vals = []
+                for i in range(0, n, 5):
+                    win = v_norm.iloc[i:i + 5]
+                    rest = pd.concat([v_norm.iloc[:i], v_norm.iloc[i + 5:]])
+                    if len(win) < 3 or len(rest) < 10:
+                        continue
+                    h1, _ = np.histogram(win.values, bins=10, range=(-4, 4))
+                    h2, _ = np.histogram(rest.values, bins=10, range=(-4, 4))
+                    p1 = h1 / h1.sum()
+                    p2 = h2 / h2.sum()
+                    mmd_vals.append(float(np.abs(p1 - p2).sum()))
+                if not mmd_vals:
+                    vals[col] = 0.0
+                    continue
+                vals[col] = float(np.std(mmd_vals, ddof=0))
+            if vals:
+                stabilities[dt] = pd.Series(vals)
+        if not stabilities:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(stabilities).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
