@@ -337,6 +337,10 @@ _FREQ_DIR_MAP = {
     "1min": "futureshistoryprices1m",
     "5min": "futureshistoryprices5m",
     "15min": "futureshistoryprices15m",
+    # ⚠ 注意: 本地无独立 30min 数据, 此映射实际返回的是 15min bar (无重采样).
+    # 需要真 30min 时, 请勿直接请求 freq="30min"; 应因子内自聚合:
+    #   _get_minute_panel(..., freq="1min", force_1min=True) 后 .resample("30min")
+    #   (close 取 last / volume 取 sum). 参见 #517/#528/#531/#532 的【用法说明】.
     "30min": "futureshistoryprices15m",
     "daily": "futureshistoryprices1d",
     "1d": "futureshistoryprices1d",
@@ -494,15 +498,24 @@ def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
     带模块级缓存: 同一 (日期区间, 品种池, 频率) 组合只读一次 Parquet,
     多个因子共享面板, 避免 N 因子重复读取 N 次.
 
-    频率准入 (防 1min/5min 错配):
+    freq 准入 (防 1min/5min 错配):
     - 因子请求 freq="1min" 时, 若全局 _INTRADAY_FREQ != "1min" 且
       未声明 force_1min, 则改用 _INTRADAY_FREQ (默认降采样到 5min)
     - force_1min=True: 强制用真 1min (不降采样)
     - 因子请求 freq="5min"/其他: 直接用请求频率 (不映射)
+    - freq="30min" 陷阱: 管道无 30min 数据 (_FREQ_DIR_MAP["30min"]=15min 目录),
+      请求 30min 会静默拿到 15min bar. 因子需用 1min + resample("30min") 自聚合
+      (见 #517/#528/#531/#532). 这里显式报错防误用.
     """
     import logging
     log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
+    if freq == "30min":
+        raise ValueError(
+            "freq='30min' 无直接数据源 (_FREQ_DIR_MAP['30min']=15min 目录). "
+            "请改用 freq='1min' + resample('30min') 因子内自聚合 "
+            "(参考 #517/#528/#531/#532)."
+        )
     # 准入映射: 请求 1min -> 若开关开启且非强制真1min, 用开关频率
     if freq == "1min" and _INTRADAY_FREQ != "1min" and not force_1min:
         freq = _INTRADAY_FREQ
@@ -29877,8 +29890,14 @@ class IntradayVolExtremeMagnitude20d(Factor):
 class IntradayGoldenRatioReversal20d(Factor):
     """日内黄金分割反转因子.
 
-    Σ_{21日} ln(收盘价 / 当日10点价格):
-    用 30 分钟 K 线或日频; 期货转换: 用当日第 1 小时(约开盘30分钟)价格为锚.
+    【用法说明】
+    - 输入: 1 分钟 OHLCV 数据 (force_1min=True 强制读取, 不受 _INTRADAY_FREQ=5min 影响)
+    - 聚合: 1min → 30min bar, close_30m = 窗口末分钟收盘价 (last)
+      (注意: 直接请求 freq="30min" 会落到 15min 数据源, 故必须自聚合)
+    - 锚: 当日第 1 个 30min bar 收盘价 (开盘 30 分钟后的价格水平)
+    - 输出: 日频, rolling(21) 累计, shift(1) 防未来
+
+    Σ_{21日} ln(收盘价 / 当日开盘30min价格):
     收盘相对开盘时段价格偏离 → 日内收益的累积 → 反转 → 负向.
     与 #65 intraday_return(日内收益) 不同: 本因子用 21 日累积对数收益(反转视角).
     方向: 负向.
@@ -29886,17 +29905,17 @@ class IntradayGoldenRatioReversal20d(Factor):
     name = "intraday_golden_ratio_reversal_20d"
     category = "intraday_advanced"
     frequency = "daily"
-    description = "日内黄金分割反转 (21日Σln(收盘/开盘段价格), 累积偏离=负向)"
+    description = "日内黄金分割反转 (21日Σln(收盘/开盘30min价), 累积偏离=负向)"
     validation_horizons = (5, 10, 20)
 
     def dependencies(self) -> list:
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="30min")
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
+        close = panel["close"].resample("30min").last()
         day = close.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -30569,6 +30588,13 @@ class IntradayVolRatioTrend20d(Factor):
 class IntradayReversalConsistency20d(Factor):
     """反转一致性因子 (原创: #517 改进).
 
+    【用法说明】
+    - 输入: 1 分钟 OHLCV 数据 (force_1min=True 强制读取, 不受 _INTRADAY_FREQ=5min 影响)
+    - 聚合: 1min → 30min bar, close_30m = 窗口末分钟收盘价 (last)
+      (注意: 直接请求 freq="30min" 会落到 15min 数据源, 故必须自聚合)
+    - 锚: 当日第 1 个 30min bar 收盘价 (开盘 30 分钟后的价格水平)
+    - 输出: 日频, rolling(20) 趋势, shift(1) 防未来
+
     #517 用 21 日累积对数收益(水平), 本因子用其 20 日趋势:
     累积反转持续加深 → 反转动能 → 负向.
     与 #517 (水平) 互补: 本因子是反转的动量.
@@ -30584,10 +30610,10 @@ class IntradayReversalConsistency20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="30min")
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
+        close = panel["close"].resample("30min").last()
         day = close.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -30742,3 +30768,171 @@ class IntradayVolStabilityTrend20d(Factor):
             lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
             raw=False)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 531. intraday_amt_ratio_entropy_30m — 30分钟时段价量熵
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amt_ratio_entropy_30m_20d", category="intraday_advanced")
+class IntradayAmtRatioEntropy30m20d(Factor):
+    """30分钟时段价量熵因子.
+
+    【用法说明】
+    - 输入: 1 分钟 OHLCV 数据 (force_1min=True 强制读取, 不受 _INTRADAY_FREQ=5min 影响)
+    - 聚合: 1min → 30min bar, 同一 30min 窗口内
+        close_30m   = 窗口末分钟收盘价 (last)
+        volume_30m  = 窗口内分钟成交量之和 (sum)
+      (注意: 直接请求 freq="30min" 会落到 15min 数据源, 故必须自聚合)
+    - 输出: 日频 (每个交易日 1 个值), rolling(20) 平滑, shift(1) 防未来
+    - 时段划分: resample("30min") 按整点/半点对齐 (09:00/09:30/...), 夜盘独立成窗不跨日
+
+    【公式】
+    price_ratio_b  = close_30m,b / Σ close_30m,b
+    volume_ratio_b = volume_30m,b / Σ volume_30m,b
+    p_b            = price_ratio_b × volume_ratio_b (再归一化为概率)
+    entropy        = -Σ p_b × ln(p_b)
+
+    【含义】
+    高熵 → 价量成交在日内各时段分散均衡 → 资金参与持续、结构稳定 → 正向.
+    低熵 → 成交集中在少数时段 → 突发冲击/短时资金拥挤 → 负向.
+    与 #37 volume_price_entropy(分钟级2D直方图) / #478 vol_bucket_entropy(分桶熵)
+    不同: 本因子用 30 分钟时段的价占比×量占比联合权重, 时段粒度更粗、含价格维度.
+    方向: 正向.
+    """
+    name = "intraday_amt_ratio_entropy_30m_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "30分钟时段价量熵 (价占比×量占比权重熵, 均衡分散=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        # 1min → 30min 聚合: close 取窗口末值, volume 取窗口和
+        close30 = close.resample("30min").last()
+        vol30 = volume.resample("30min").sum()
+        day = close30.index.normalize()
+        entropies: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close30.loc[day == dt]
+            grp_v = vol30.loc[day == dt]
+            if len(grp_c) < 3:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 3:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                sum_c = c_c.sum()
+                sum_v = v_c.sum()
+                if sum_c < 1e-12 or sum_v < 1e-12:
+                    continue
+                price_ratio = c_c / sum_c
+                volume_ratio = v_c / sum_v
+                p = (price_ratio * volume_ratio).values
+                p_sum = p.sum()
+                if p_sum < 1e-12:
+                    continue
+                p = p / p_sum
+                p = p[p > 0]
+                entropy = float(-np.sum(p * np.log(p)))
+                vals[col] = entropy
+            if vals:
+                entropies[dt] = pd.Series(vals)
+        if not entropies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(entropies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 532. intraday_price_vol_entropy_diff — 价格-成交量熵差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_price_vol_entropy_diff_20d", category="intraday_advanced")
+class IntradayPriceVolEntropyDiff20d(Factor):
+    """价格-成交量熵差因子.
+
+    【用法说明】
+    - 输入: 1 分钟 OHLCV 数据 (force_1min=True 强制读取, 不受 _INTRADAY_FREQ=5min 影响)
+    - 聚合: 1min → 30min bar, 同一 30min 窗口内
+        close_30m   = 窗口末分钟收盘价 (last)
+        volume_30m  = 窗口内分钟成交量之和 (sum)
+      (注意: 直接请求 freq="30min" 会落到 15min 数据源, 故必须自聚合)
+    - 输出: 日频 (每个交易日 1 个值), rolling(20) 平滑, shift(1) 防未来
+    - 时段划分: resample("30min") 按整点/半点对齐 (09:00/09:30/...), 夜盘独立成窗不跨日
+
+    【公式】
+    diff = Entropy(price_ratio) − Entropy(volume_ratio)
+    price_ratio_b  = close_30m,b / Σ close_30m,b
+    volume_ratio_b = volume_30m,b / Σ volume_30m,b
+
+    【含义】
+    价格时段熵高但成交量时段熵低 → 价格在多个时段变动, 但量集中在少数时段
+    → 无量上涨(拉抬)或有量集中在冲击时刻 → 结构不健康 → 负向.
+    反之价低量高 → 量能分散但价格集中 → 持续建仓 → 正向.
+    与 #531 (联合熵水平) 互补: 本因子是两类分布的结构差.
+    方向: 负向.
+    """
+    name = "intraday_price_vol_entropy_diff_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "价格量熵差 (价分布熵-量分布熵, 无量拉抬=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        # 1min → 30min 聚合: close 取窗口末值, volume 取窗口和
+        close30 = close.resample("30min").last()
+        vol30 = volume.resample("30min").sum()
+        day = close30.index.normalize()
+        diffs: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close30.loc[day == dt]
+            grp_v = vol30.loc[day == dt]
+            if len(grp_c) < 3:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 3:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                sum_c = c_c.sum()
+                sum_v = v_c.sum()
+                if sum_c < 1e-12 or sum_v < 1e-12:
+                    continue
+                def entropy(x):
+                    p = x / x.sum()
+                    p = p[p > 0]
+                    return float(-np.sum(p * np.log(p)))
+                price_ent = entropy(c_c)
+                vol_ent = entropy(v_c)
+                vals[col] = price_ent - vol_ent
+            if vals:
+                diffs[dt] = pd.Series(vals)
+        if not diffs:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(diffs).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
