@@ -685,15 +685,15 @@ class ParquetFuturesSource(DataSource):
                             [previous_contract, contract]
                         ].dropna(how="any")
                     if common.empty:
-                        # 换月对无共同交易日 (数据稀疏品种罕见情形):
-                        # 跳过该换月点的比例调整 (adjustment 不变), 用旧合约价格续接.
-                        # warning 级别让数据质量事件可见 (fail-open 但可观测).
-                        import logging
-                        logging.getLogger("multi_factor").warning(
-                            "skip rollover adjustment (no common close) %s->%s at %s",
-                            previous_contract, contract, previous_date.date(),
+                        # 换月对无共同交易日: fail-closed (与 continuous_contract.py 一致)
+                        # 数据补全后 2015-2026 全历史无触发 (已验证 skip=0);
+                        # 若未来数据缺失则显式报错, 不静默生成断层连续序列
+                        from data.continuous_contract import RolloverAdjustmentError
+
+                        raise RolloverAdjustmentError(
+                            f"no common close at or before {previous_date.date()} for "
+                            f"{previous_contract}->{contract}"
                         )
-                        continue
                     old_close = float(common.iloc[-1][previous_contract])
                     new_close = float(common.iloc[-1][contract])
                     if not np.isfinite(new_close) or new_close <= 0.0:

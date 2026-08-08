@@ -70,7 +70,7 @@ def main():
         ic = pd.DataFrame({n: ranks[n].corrwith(fwd_rank, axis=1) for n in names})
         w = {}
         for t in cal:
-            hist = ic.loc[:t].iloc[-window:]
+            hist = ic.loc[:t].iloc[-window:-1]  # 不含 ic[T] (防同日泄漏)
             if len(hist) < 20:
                 w[t] = pd.Series(1.0 / len(names), index=names)
                 continue
