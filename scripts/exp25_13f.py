@@ -119,6 +119,30 @@ def main():
         sh = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
         print(f'  去 {n:<44} 夏普={sh:.2f} (Δ={sh-base:+.2f})')
 
+    # 净值图 (6/13/14 三方案 + 年化) - main 内
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for name, s in [('6因子', s6), ('13因子', s13), ('14因子', s14)]:
+        st = seg(s)
+        ann = s.mean() * 252
+        s_plot = s[s.index >= pd.Timestamp('2016-03-31')]
+        nav = (1 + s_plot).cumprod()
+        ax.plot(nav.index, nav.values, lw=1.6,
+                label=f'{name} (夏普{st["full"]:.2f}/年化{ann:.1%}/实盘{st["live"]:.2f})')
+    ax.axvline(pd.Timestamp('2026-03-01'), color='gray', ls='--', lw=1, label='OOS起点')
+    ax.axvline(pd.Timestamp('2026-05-16'), color='red', ls='--', lw=1, label='实盘起点')
+    ax.set_title('6/13/14因子 净值对比 (2016-03-31 起, 修复泄漏后)')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    out = 'runs/nav_6f_13f_14f.png'
+    fig.savefig(out, dpi=150)
+    print(f'净值对比图: {out}')
+
 
 if __name__ == '__main__':
     main()
