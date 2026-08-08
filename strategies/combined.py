@@ -134,7 +134,7 @@ class CombinedStrategy:
             index=calendar)
         score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
         for t in calendar:
-            hist = ic.loc[:t].iloc[-IC_IR_WINDOW:]
+            hist = ic.loc[:t].iloc[-IC_IR_WINDOW:-1]  # 不含 ic[T]: 权重[T] 只用 ≤T-1 的 IC (防同日泄漏)
             # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前/未上市品种)
             hist = hist.dropna(axis=1, how='all')
             if hist.shape[1] < 2:
@@ -231,9 +231,12 @@ class CombinedStrategy:
         return w / w.sum()
 
     def _recent_returns(self, date: pd.Timestamp, symbols: list[str]) -> pd.DataFrame:
-        """最近 60 日收益率 (截至于 date, 用于协方差估计)."""
+        """最近 60 日收益率 (截至 date 前一交易日, 用于协方差估计, 防同日泄漏)."""
         start = date - pd.Timedelta(days=90)
         cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(start, date))
+        # 去掉最后一个交易日 (T 日): 其 pct_change 含 T-1->T 收益, 协方差[T] 若含 T 收益则泄漏
+        if len(cal) > 1:
+            cal = cal[:-1]
         close = self.runner.data_manager.get("close", cal, symbols)
         if close is None or close.empty:
             return pd.DataFrame()

@@ -131,7 +131,8 @@ class ExpEnv:
             return None
         sd = t - pd.Timedelta(days=90)
         # 用 ExpEnv 已缓存的全量日历切片 (绕开 fetch_calendar 重复读 1d + 正则热点)
-        c = self.cal[(self.cal >= sd) & (self.cal <= t)]
+        # 去掉 t (T 日): 协方差[T] 若含 T 收益则泄漏 (T-1 信号 x T 收益)
+        c = self.cal[(self.cal >= sd) & (self.cal < t)]
         rs = self.daily_ret.reindex(c)[list(pool)].dropna()
         if rs.shape[0] < 10:
             return None

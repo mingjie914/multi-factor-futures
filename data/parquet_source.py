@@ -667,7 +667,9 @@ class ParquetFuturesSource(DataSource):
                     root_prices = concrete.loc[
                         concrete["root"].eq(root)
                         & concrete["symbol"].isin([previous_contract, contract])
-                        & concrete["trade_date"].ge(previous_date - pd.Timedelta(days=2)),
+                        # 共同报价限换月日当天及之前 (防用换月后未来价调整, 与 continuous_contract.py 一致)
+                        & concrete["trade_date"].ge(previous_date - pd.Timedelta(days=2))
+                        & concrete["trade_date"].le(previous_date),
                         ["trade_date", "symbol", "close"],
                     ].pivot_table(
                         index="trade_date", columns="symbol", values="close",
@@ -683,11 +685,11 @@ class ParquetFuturesSource(DataSource):
                             [previous_contract, contract]
                         ].dropna(how="any")
                     if common.empty:
-                        # 换月对无共同交易日 (FU 等低流动性品种早期合约几乎不重叠):
+                        # 换月对无共同交易日 (数据稀疏品种罕见情形):
                         # 跳过该换月点的比例调整 (adjustment 不变), 用旧合约价格续接.
-                        # 不抛异常, 保证连续序列可构建; 正常品种均有共同日, 不受影响.
+                        # warning 级别让数据质量事件可见 (fail-open 但可观测).
                         import logging
-                        logging.getLogger("multi_factor").debug(
+                        logging.getLogger("multi_factor").warning(
                             "skip rollover adjustment (no common close) %s->%s at %s",
                             previous_contract, contract, previous_date.date(),
                         )

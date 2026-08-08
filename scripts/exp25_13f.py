@@ -1,8 +1,7 @@
-"""实验24: 14因子(B1) 修复后分年度/分增量贡献分析.
+"""实验25: 13因子 (14 - ma_count_bullish) 验证.
 
-1. 逐年夏普: 6因子 vs 14因子 (修复后)
-2. 8个增量因子各自边际贡献 (从14因子逐个去掉)
-3. OOS/实盘稳健性
+对比: 6因子(生产) vs 13因子 vs 14因子(B1).
+评估: 全段/分年度/OOS/实盘/边际(13因子逐个去增量).
 """
 import sys
 sys.path.insert(0, '.')
@@ -14,7 +13,9 @@ import pandas as pd
 from exp_core import ExpEnv, PROD6
 from exp23_6v14_nav import R22, B1
 
-INCR8 = B1[6:]  # 8 个增量因子
+F6 = list(PROD6)
+F13 = [x for x in B1 if x != 'intraday_ma_count_bullish_20d']
+F14 = B1
 
 
 def lw(icm):
@@ -75,40 +76,48 @@ def bt(r, names):
 def main():
     r = R22()
     print('=' * 60)
-    print('实验24: 14因子修复后分析')
+    print('实验25: 13因子 (14 - ma_count_bullish) 验证')
     print('=' * 60)
-    s6 = bt(r, list(PROD6))
-    s14 = bt(r, B1)
+    s6 = bt(r, F6)
+    s13 = bt(r, F13)
+    s14 = bt(r, F14)
 
-    # 1. 逐年夏普
-    print('\n--- 逐年夏普 ---')
-    print(f'{"年份":<6} {"6因子":>8} {"14因子":>8} {"差":>8}')
-    for y in range(2016, 2027):
-        a = s6[s6.index.year == y]
-        b = s14[s14.index.year == y]
-        if len(a) > 20 and len(b) > 20:
-            sh_a = a.mean() * 252 / (a.std() * np.sqrt(252)) if a.std() > 0 else 0
-            sh_b = b.mean() * 252 / (b.std() * np.sqrt(252)) if b.std() > 0 else 0
-            print(f'{y:<6} {sh_a:>8.2f} {sh_b:>8.2f} {sh_b-sh_a:>+8.2f}')
-
-    # 2. 增量边际贡献 (14因子逐个去掉增量)
-    print('\n--- 8增量因子边际贡献 (从14因子去掉) ---')
-    base_sh = s14.mean() * 252 / (s14.std() * np.sqrt(252)) if s14.std() > 0 else 0
-    print(f'14因子全: 夏普={base_sh:.2f}')
-    for n in INCR8:
-        sub = [x for x in B1 if x != n]
-        s = bt(r, sub)
-        sh = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
-        print(f'  去 {n:<44} 夏普={sh:.2f} (Δ={sh-base_sh:+.2f})')
-
-    # 3. OOS/实盘
-    print('\n--- OOS/实盘 ---')
-    for name, s in [('6因子', s6), ('14因子', s14)]:
+    def seg(s):
+        st = {}
+        st['full'] = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
         oos = s[(s.index >= pd.Timestamp('2026-03-01')) & (s.index <= pd.Timestamp('2026-05-15'))]
         live = s[s.index > pd.Timestamp('2026-05-15')]
-        osh = oos.mean() * 252 / (oos.std() * np.sqrt(252)) if len(oos) > 2 and oos.std() > 0 else 0
-        lsh = live.mean() * 252 / (live.std() * np.sqrt(252)) if len(live) > 2 and live.std() > 0 else 0
-        print(f'{name}: OOS={osh:.2f} 实盘={lsh:.2f}')
+        st['oos'] = oos.mean() * 252 / (oos.std() * np.sqrt(252)) if len(oos) > 2 and oos.std() > 0 else 0
+        st['live'] = live.mean() * 252 / (live.std() * np.sqrt(252)) if len(live) > 2 and live.std() > 0 else 0
+        mdd = ((1 + s).cumprod() / (1 + s).cumprod().cummax() - 1).min()
+        st['mdd'] = mdd
+        return st
+
+    print('\n--- 全段/OOS/实盘 ---')
+    print(f'{"方案":<12} {"全段夏普":>8} {"回撤":>8} {"OOS":>6} {"实盘":>6}')
+    for name, s in [('6因子', s6), ('13因子', s13), ('14因子', s14)]:
+        st = seg(s)
+        print(f'{name:<12} {st["full"]:>8.2f} {st["mdd"]:>7.1%} {st["oos"]:>6.2f} {st["live"]:>6.2f}')
+
+    # 分年度
+    print('\n--- 逐年夏普 ---')
+    print(f'{"年份":<6} {"6因子":>8} {"13因子":>8} {"14因子":>8}')
+    for y in range(2016, 2027):
+        row = []
+        for s in [s6, s13, s14]:
+            yr = s[s.index.year == y]
+            row.append(yr.mean() * 252 / (yr.std() * np.sqrt(252)) if len(yr) > 20 and yr.std() > 0 else 0)
+        print(f'{y:<6} {row[0]:>8.2f} {row[1]:>8.2f} {row[2]:>8.2f}')
+
+    # 13因子边际 (去掉的7个增量各自)
+    print('\n--- 13因子边际 (逐个去增量) ---')
+    base = seg(s13)['full']
+    INCR7 = [x for x in F13 if x not in F6]
+    for n in INCR7:
+        sub = [x for x in F13 if x != n]
+        s = bt(r, sub)
+        sh = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
+        print(f'  去 {n:<44} 夏普={sh:.2f} (Δ={sh-base:+.2f})')
 
 
 if __name__ == '__main__':

@@ -180,7 +180,7 @@ def main():
         ic = r.ic[names]
         rets = []
         for t in r.cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (防同日泄漏)
             # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前)
             hist = hist.dropna(axis=1, how='all')
             if hist.shape[1] < 2:
