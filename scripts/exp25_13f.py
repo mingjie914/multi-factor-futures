@@ -74,7 +74,7 @@ def bt(r, names):
 
 
 def main():
-    r = R22()
+    r = R22(F14)
     print('=' * 60)
     print('实验25: 13因子 (14 - ma_count_bullish) 验证')
     print('=' * 60)
@@ -118,6 +118,11 @@ def main():
         s = bt(r, sub)
         sh = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
         print(f'  去 {n:<44} 夏普={sh:.2f} (Δ={sh-base:+.2f})')
+
+    # 保存净值数据 (核对横线)
+    s6.to_csv('runs/exp25_s6.csv')
+    s13.to_csv('runs/exp25_s13.csv')
+    s14.to_csv('runs/exp25_s14.csv')
 
     # 净值图 (6/13/14 三方案 + 年化) - main 内
     import matplotlib

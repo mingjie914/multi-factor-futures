@@ -350,3 +350,33 @@ def test_intraday_night_bar_uses_next_exchange_trading_day(tmp_path, monkeypatch
         pd.Timestamp("2024-01-05"),
         pd.Timestamp("2024-01-08"),
     ]
+
+
+def _fixture_no_overlap(tmp_path: Path) -> Path:
+    """A2401 与 A2405 无共同交易日 (A2401 仅 01-02, A2405 仅 01-04) -> 换月无共同 close."""
+    rows = [
+        _row(" A2401", "2024-01-02", 100.0, 500, 1000),
+        _row("A9999", "2024-01-02", 100.0, 500, 1000),
+        # 01-03 无 A2401 (停牌/退市), 01-04 才有 A2405
+        _row("A2405", "2024-01-04", 126.0, 900, 1800),
+        _row("A9999", "2024-01-04", 126.0, 900, 1800),
+    ]
+    _write_dataset(tmp_path, DATASETS["daily"], rows)
+    # 初始化要求 1min/15min 目录存在 (空数据集即可)
+    _write_dataset(tmp_path, DATASETS["1min"], [])
+    _write_dataset(tmp_path, DATASETS["15min"], [])
+    return tmp_path
+
+
+def test_no_common_close_raises_rollover_adjustment_error(tmp_path):
+    """换月无共同收盘价必须抛 RolloverAdjustmentError (fail-closed)."""
+    root = _fixture_no_overlap(tmp_path)
+    source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
+    from data.continuous_contract import RolloverAdjustmentError
+    try:
+        source.fetch_price_at_frequency(
+            ["A"], "2024-01-02", "2024-01-05", ["close"], "daily"
+        )
+        raise AssertionError("应抛 RolloverAdjustmentError 但未抛")
+    except RolloverAdjustmentError as e:
+        assert "no common close" in str(e)
