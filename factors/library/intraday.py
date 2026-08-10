@@ -30936,3 +30936,248 @@ class IntradayPriceVolEntropyDiff20d(Factor):
         daily = pd.DataFrame(diffs).T
         daily.index = pd.DatetimeIndex(daily.index)
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 533. intraday_amt_ratio_entropy_60m — 60分钟时段价量熵
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amt_ratio_entropy_60m_20d", category="intraday_advanced")
+class IntradayAmtRatioEntropy60m20d(Factor):
+    """60分钟时段价量熵因子.
+
+    【用法说明】
+    - 输入: 1 分钟 OHLCV 数据 (force_1min=True 强制读取, 不受 _INTRADAY_FREQ=5min 影响)
+    - 聚合: 1min → 60min bar, 同一 60min 窗口内
+        close_60m   = 窗口末分钟收盘价 (last)
+        volume_60m  = 窗口内分钟成交量之和 (sum)
+      (注意: 直接请求 freq="30min" 会落到 15min 数据源, 故必须自聚合)
+    - 输出: 日频 (每个交易日 1 个值), rolling(20) 平滑, shift(1) 防未来
+    - 时段划分: resample("60min") 按整点对齐 (09:00/10:00/11:00/13:00/14:00),
+      午休与隔夜无数据时自动留空, 半满时段(如 11:00-11:30)为自然交易日段切分
+
+    【公式】
+    price_ratio_b  = close_60m,b / Σ close_60m,b
+    volume_ratio_b = volume_60m,b / Σ volume_60m,b
+    p_b            = price_ratio_b × volume_ratio_b (再归一化为概率)
+    entropy        = -Σ p_b × ln(p_b)
+
+    【含义】
+    高熵 → 价量成交在日内各 60 分钟时段分散均衡 → 资金参与持续、结构稳定 → 正向.
+    低熵 → 成交集中在少数时段 → 短时冲击、情绪交易或资金拥挤 → 负向.
+    与 #531 (30min 时段熵) 同族不同粒度: 本因子用 60min 时段, 对日内结构的刻画更粗、
+    对短时噪声更稳健, 侧重"资金参与是否贯穿全天各小时段".
+    方向: 正向.
+    """
+    name = "intraday_amt_ratio_entropy_60m_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "60分钟时段价量熵 (价占比×量占比权重熵, 全天均衡=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        # 1min → 60min 聚合: close 取窗口末值, volume 取窗口和
+        close60 = close.resample("60min").last()
+        vol60 = volume.resample("60min").sum()
+        day = close60.index.normalize()
+        entropies: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close60.loc[day == dt]
+            grp_v = vol60.loc[day == dt]
+            if len(grp_c) < 3:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 3:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                sum_c = c_c.sum()
+                sum_v = v_c.sum()
+                if sum_c < 1e-12 or sum_v < 1e-12:
+                    continue
+                price_ratio = c_c / sum_c
+                volume_ratio = v_c / sum_v
+                p = (price_ratio * volume_ratio).values
+                p_sum = p.sum()
+                if p_sum < 1e-12:
+                    continue
+                p = p / p_sum
+                p = p[p > 0]
+                entropy = float(-np.sum(p * np.log(p)))
+                vals[col] = entropy
+            if vals:
+                entropies[dt] = pd.Series(vals)
+        if not entropies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(entropies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 534. intraday_amt_ratio_entropy_trend — 时段价量熵趋势
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amt_ratio_entropy_trend_20d", category="intraday_advanced")
+class IntradayAmtRatioEntropyTrend20d(Factor):
+    """时段价量熵趋势因子 (原创改进).
+
+    【用法说明】
+    - 输入/聚合: 同 #533 (1min → 60min, close=last / volume=sum)
+    - 输出: 日频, rolling(20) 线性趋势(斜率), shift(1) 防未来
+
+    【公式】
+    entropy_t  = 60min 时段价量熵 (见 #533)
+    trend      = polyfit(1..20, entropy_{t-19..t}) 的斜率
+
+    【含义】
+    #533 度量熵的水平, 本因子度量其 20 日趋势:
+    熵持续上升 → 日内价量结构越来越分散均衡 → 资金参与趋于持续、拥挤度缓解 → 正向.
+    熵持续下降 → 成交越来越集中在少数时段 → 结构恶化(拥挤/冲击) → 负向.
+    与 #533 (水平) 互补: 本因子是结构的**演进方向**.
+    方向: 正向.
+    """
+    name = "intraday_amt_ratio_entropy_trend_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "时段价量熵趋势 (60min熵20日斜率, 结构趋均衡=正向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        close60 = close.resample("60min").last()
+        vol60 = volume.resample("60min").sum()
+        day = close60.index.normalize()
+        entropies: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close60.loc[day == dt]
+            grp_v = vol60.loc[day == dt]
+            if len(grp_c) < 3:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 3:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                sum_c = c_c.sum()
+                sum_v = v_c.sum()
+                if sum_c < 1e-12 or sum_v < 1e-12:
+                    continue
+                price_ratio = c_c / sum_c
+                volume_ratio = v_c / sum_v
+                p = (price_ratio * volume_ratio).values
+                p_sum = p.sum()
+                if p_sum < 1e-12:
+                    continue
+                p = p / p_sum
+                p = p[p > 0]
+                vals[col] = float(-np.sum(p * np.log(p)))
+            if vals:
+                entropies[dt] = pd.Series(vals)
+        if not entropies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(entropies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        trend = daily.rolling(20, min_periods=8).apply(
+            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
+            raw=False)
+        return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 535. intraday_amt_ratio_entropy_volatility — 时段价量熵波动
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amt_ratio_entropy_volatility_20d", category="intraday_advanced")
+class IntradayAmtRatioEntropyVolatility20d(Factor):
+    """时段价量熵波动因子 (原创改进).
+
+    【用法说明】
+    - 输入/聚合: 同 #533 (1min → 60min, close=last / volume=sum)
+    - 输出: 日频, rolling(20) 标准差, shift(1) 防未来
+
+    【公式】
+    entropy_t  = 60min 时段价量熵 (见 #533)
+    vol        = std(entropy_{t-19..t})
+
+    【含义】
+    #533 度量熵的水平, 本因子度量其 20 日波动:
+    熵忽高忽低 → 日内价量结构在"分散-集中"间反复切换 → 资金行为不稳定 → 负向.
+    熵稳定 → 成交结构处于稳定 regime → 可预期 → 正向.
+    与 #533 (水平)、#534 (趋势) 互补: 本因子是结构的**稳定性**.
+    方向: 负向.
+    """
+    name = "intraday_amt_ratio_entropy_volatility_20d"
+    category = "intraday_advanced"
+    frequency = "daily"
+    description = "时段价量熵波动 (60min熵20日std, 结构反复=负向)"
+    validation_horizons = (5, 10, 20)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min", force_1min=True)
+        if "close" not in panel or "volume" not in panel:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        close, volume = panel["close"], panel["volume"]
+        close60 = close.resample("60min").last()
+        vol60 = volume.resample("60min").sum()
+        day = close60.index.normalize()
+        entropies: dict = {}
+        for dt in sorted(set(day)):
+            grp_c = close60.loc[day == dt]
+            grp_v = vol60.loc[day == dt]
+            if len(grp_c) < 3:
+                continue
+            vals = {}
+            for col in grp_c.columns:
+                c = grp_c[col].dropna()
+                v = grp_v[col].dropna()
+                common = c.index.intersection(v.index)
+                if len(common) < 3:
+                    continue
+                c_c = c.loc[common]
+                v_c = v.loc[common]
+                sum_c = c_c.sum()
+                sum_v = v_c.sum()
+                if sum_c < 1e-12 or sum_v < 1e-12:
+                    continue
+                price_ratio = c_c / sum_c
+                volume_ratio = v_c / sum_v
+                p = (price_ratio * volume_ratio).values
+                p_sum = p.sum()
+                if p_sum < 1e-12:
+                    continue
+                p = p / p_sum
+                p = p[p > 0]
+                vals[col] = float(-np.sum(p * np.log(p)))
+            if vals:
+                entropies[dt] = pd.Series(vals)
+        if not entropies:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = pd.DataFrame(entropies).T
+        daily.index = pd.DatetimeIndex(daily.index)
+        std20 = daily.rolling(20, min_periods=5).std()
+        return (-std20).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
