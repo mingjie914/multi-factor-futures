@@ -1,0 +1,89 @@
+snapshot:
+  name: guosen_china_assets_trend_allocation_proxy
+  source_documents:
+    - "E:/程明杰公司内容/指数编制方案/趋势配置指数编制方案.docx"
+    - "E:/程明杰公司内容/指数编制方案/趋势配置指数编制方案2.docx"
+  note: >-
+    文档未披露原始因子、因子参数及回看参数；目标波动率由用户确认为 4%。本配置是规则透明的
+    可比较代理，不宣称精确复制 GSIXTREND.WI。
+  reference_nav: "E:/程明杰公司内容/GSIXTREND.WI_nav.csv"
+
+universe: [AU, CU, IF, IC, RB, SC, M, TF, T]
+selection_pct: 0.51
+target_volatility: 0.04
+volatility_window: 20
+correlation_window: 20
+correlation_multiplier_cap: 2.0
+minimum_risk_observations: 10
+# 项目因子输出已内建 shift(1)：factor[T] 使用不晚于 T-1 的信息，故同日持有。
+# 若未来接入未预滞后的原始外部因子，应复制快照并改为 1。
+execution_lag_days: 0
+periods_per_year: 242
+transaction_cost_rate: 0.0002
+annual_management_fee: 0.001
+# 基准指数从基日即有仓位；预取历史只用于因子和风险估计，不进入输出净值。
+warmup_calendar_days: 180
+# 实际指数最终合成后每日 9 个品种均为多头；这是结果验收项，不改变九选五规则。
+expected_final_holdings: 9
+factor_chunk_size: 400
+factor_chunk_overlap: 64
+
+asset_caps:
+  IF: 0.20
+  IC: 0.20
+  AU: 0.30
+  CU: 0.30
+  RB: 0.30
+  SC: 0.30
+  M: 0.30
+  TF: 1.00
+  T: 1.00
+
+factor_sets:
+  6f:
+    intraday_jump_intensity_20d: -1
+    intraday_price_peak_count_20d: 1
+    intraday_realised_skewness_20d: 1
+    intraday_dtws_20d: 1
+    intraday_drip_stone_20d: -1
+    intraday_peak_ridge_ratio_20d: -1
+  10f:
+    intraday_jump_intensity_20d: -1
+    intraday_price_peak_count_20d: 1
+    intraday_realised_skewness_20d: 1
+    intraday_dtws_20d: 1
+    intraday_drip_stone_20d: -1
+    intraday_peak_ridge_ratio_20d: -1
+    intraday_torrent_down_20d: -1
+    intraday_lowest_time_20d: 1
+    intraday_term_slope_20d: 1
+    intraday_price_delay_20d: -1
+  13f:
+    intraday_jump_intensity_20d: -1
+    intraday_price_peak_count_20d: 1
+    intraday_realised_skewness_20d: 1
+    intraday_dtws_20d: 1
+    intraday_drip_stone_20d: -1
+    intraday_peak_ridge_ratio_20d: -1
+    intraday_torrent_down_20d: -1
+    intraday_lowest_time_20d: 1
+    intraday_term_slope_20d: 1
+    intraday_open_close_volume_ratio_20d: -1
+    intraday_seat_long_short_seat_ratio_20d: 1
+    intraday_turnover_velocity_20d: 1
+    intraday_price_delay_20d: -1
+  14f:
+    intraday_jump_intensity_20d: -1
+    intraday_price_peak_count_20d: 1
+    intraday_realised_skewness_20d: 1
+    intraday_dtws_20d: 1
+    intraday_drip_stone_20d: -1
+    intraday_peak_ridge_ratio_20d: -1
+    intraday_ma_count_bullish_20d: 1
+    intraday_torrent_down_20d: -1
+    intraday_lowest_time_20d: 1
+    intraday_term_slope_20d: 1
+    intraday_open_close_volume_ratio_20d: -1
+    intraday_seat_long_short_seat_ratio_20d: 1
+    intraday_turnover_velocity_20d: 1
+    intraday_price_delay_20d: -1

@@ -94,7 +94,7 @@ def main():
     def run_icir(mode='orig', window=60, floor=0.0, extra_lam=0.0):
         wmap = {}
         for t in cal:
-            hist = ic.loc[:t].iloc[-window:]
+            hist = ic.loc[:t].iloc[-window:-1]
             if len(hist) < 20:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue
@@ -120,7 +120,7 @@ def main():
         # 每期: 33因子得分 → 投影到前n_comp主成分 → 合成
         wmap = {}
         for t in cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 20:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

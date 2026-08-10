@@ -64,7 +64,7 @@ class Runner:
         ic = pd.DataFrame({n: self.ranks[n].corrwith(self.fwd_rank, axis=1) for n in names})
         wmap = {}
         for t in self.cal:
-            hist = ic.loc[:t].iloc[-window:]
+            hist = ic.loc[:t].iloc[-window:-1]
             if len(hist) < max(10, window // 2):
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

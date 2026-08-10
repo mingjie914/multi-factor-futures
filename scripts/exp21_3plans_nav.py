@@ -75,7 +75,7 @@ class Runner:
         rets = []
         for t in self.cal:
             if icir:
-                hist = ic.loc[:t].iloc[-60:]
+                hist = ic.loc[:t].iloc[-60:-1]
                 if len(hist) < 30:
                     w = pd.Series(1.0 / len(names), index=names)
                 else:

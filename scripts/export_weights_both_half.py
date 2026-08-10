@@ -69,7 +69,7 @@ def run(F, mode, label):
     for t in cal:
         sc = pd.Series(0.0, index=u)
         if mode == 'icir':
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 20:
                 continue
             ic_mean = hist.mean()

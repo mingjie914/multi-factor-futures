@@ -60,7 +60,7 @@ def main():
         ic = ic_all[names]
         rets = []
         for t in cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 30: continue
             im = hist.mean()
             lwc = lw(hist)

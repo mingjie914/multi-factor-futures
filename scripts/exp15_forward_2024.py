@@ -66,7 +66,7 @@ class Runner:
         for t in self.cal:
             if t0 is not None and t < t0:
                 continue
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 30:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

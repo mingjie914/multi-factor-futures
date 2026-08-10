@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 import pandas as pd
 import numpy as np
 from exp_core import PROD6
-from exp22_full_pool import Runner as R22
+from exp22_full_pool import Runner as R22, prepare_ic_history
 
 
 def lw(icm):
@@ -29,7 +29,7 @@ def lw(icm):
 
 
 def main():
-    r = R22()
+    r = R22(list(PROD6))
     names = list(PROD6)
     print(f'回测: 生产6因子 IC_IR, {len(r.cal)} 天', flush=True)
     ic = r.ic[names]
@@ -37,7 +37,7 @@ def main():
     skipped = 0
     for t in r.cal:
         hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (严格无泄漏)
-        hist = hist.dropna(axis=1, how='all')
+        hist = prepare_ic_history(hist)
         if hist.shape[1] < 2 or len(hist) < 30:
             skipped += 1
             continue
@@ -61,8 +61,8 @@ def main():
         if len(sc) < 20:
             skipped += 1
             continue
-        top = r.env.capped(sc, ascending=False)
-        bot = r.env.capped(sc, ascending=True)
+        top = r.env.capped(sc, ascending=False, date=t)
+        bot = r.env.capped(sc, ascending=True, date=t)
         wl = r.env.erc_w(top, t) or {}
         ws = r.env.erc_w(bot, t) or {}
         if t in r.daily_ret.index:
@@ -92,8 +92,8 @@ def main():
             print(f'  {y}: 夏普={ann/vol if vol>0 else 0:.2f} 收益={yr.sum():.1%}')
     # 保存净值
     nav = (1 + s).cumprod()
-    nav.to_csv('runs/prod_benchmark_fixed_nav.csv')
-    print('\n净值已存 runs/prod_benchmark_fixed_nav.csv')
+    nav.to_csv('runs/production_benchmark_nav.csv')
+    print('\n净值已存 runs/production_benchmark_nav.csv')
 
 
 if __name__ == '__main__':

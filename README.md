@@ -46,6 +46,7 @@ python -m pip install -r requirements-dev.txt      # 最小运行时 + 测试工
 - **docs/因子创造方法论与完整参考.md** — 日内因子创造方法论与 170 因子参考
 - **docs/策略基准记录.md** — 所有基准方案（B1/B2/B3）
 - **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
+- **docs/扩展窗口历史方法与因子集搜索.md** — 当前有效因子库下的方法与因子集滚动搜索
 - **MAINTENANCE.md** — 维护、性能与版本控制
 
 ## 常用入口
@@ -74,6 +75,9 @@ $PY = '.\.venv\Scripts\python.exe'
 & $PY -X utf8 -B main.py backtest --help
 & $PY -X utf8 -B main.py multi --help
 & $PY -X utf8 -B main.py close --as-of YYYY-MM-DD
+
+# 隔离实验：扩展窗口搜索因子合成、Top/Bottom、品种权重和因子集
+& $PY -X utf8 -B -m workflows.experiments.historical_portfolio_search
 ```
 
 挖掘、冻结候选、挂载快照和正式筛选的最短流程见

@@ -83,6 +83,17 @@ SECTOR_MAP = {
 }
 
 
+def _prepare_erc_returns(returns: pd.DataFrame, minimum_observations: int = 10) -> pd.DataFrame:
+    """Keep only assets with enough finite history for a causal ERC estimate."""
+    clean = returns.replace([np.inf, -np.inf], np.nan)
+    eligible = clean.columns[
+        clean.notna().sum(axis=0).ge(int(minimum_observations))
+    ]
+    if len(eligible) < 2:
+        return clean.iloc[0:0, 0:0]
+    return clean.loc[:, eligible].dropna(axis=0, how="any")
+
+
 class CombinedStrategy:
     """6因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 融合策略 (38品种, cap=3, 日度)."""
 
@@ -202,9 +213,9 @@ class CombinedStrategy:
         if not pool:
             return pd.Series(dtype=float)
         ret = self._recent_returns(date, pool)
+        ret = _prepare_erc_returns(ret)
         if ret.shape[1] < 2 or ret.shape[0] < 10:
-            # 数据不足: 回退到等权
-            return pd.Series(1.0 / len(pool), index=pool)
+            return pd.Series(dtype=float)
 
         if USE_SIMPLE_RP:
             vol = ret.std(ddof=0)
@@ -218,13 +229,13 @@ class CombinedStrategy:
         target = np.diag(np.diag(cov_raw))
         cov = (1.0 - COV_SHRINKAGE) * cov_raw + COV_SHRINKAGE * target
         try:
-            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(len(pool)))
+            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(ret.shape[1]))
         except (RuntimeError, ValueError):
             # ERC 求解失败: 回退到逆波动率
             vol = ret.std(ddof=0)
             w = (1.0 / vol.replace(0, np.nan)).values
             w = w / w.sum()
-        w = pd.Series(w, index=pool)
+        w = pd.Series(w, index=ret.columns)
 
         # 极值保护: 单品种权重上限/下限
         w = w.clip(lower=MIN_WEIGHT, upper=MAX_WEIGHT)
@@ -258,6 +269,10 @@ class CombinedStrategy:
         row = score.iloc[-1].dropna()
         if len(row) < 2 * self.top_n:
             row = score.dropna(axis=1).iloc[-1]
+        if len(row) < 2:
+            return pd.Series(dtype=float)
+        risk_history = _prepare_erc_returns(self._recent_returns(end, list(row.index)))
+        row = row.reindex(risk_history.columns).dropna()
         if len(row) < 2:
             return pd.Series(dtype=float)
 

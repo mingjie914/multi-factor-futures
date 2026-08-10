@@ -73,7 +73,7 @@ def main():
         ic = pd.DataFrame({n: t_ic_map[n] for n in names})
         wmap = {}
         for t in cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 20:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue
@@ -139,7 +139,7 @@ def main():
     ic_df = pd.DataFrame({c: cat_ic[c] for c in cat_names})
     wmap = {}
     for t in cal:
-        hist = ic_df.loc[:t].iloc[-60:]
+        hist = ic_df.loc[:t].iloc[-60:-1]
         if len(hist) < 20:
             wmap[t] = pd.Series(1.0 / len(cat_names), index=cat_names)
             continue

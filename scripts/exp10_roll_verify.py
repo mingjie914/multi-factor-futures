@@ -69,7 +69,7 @@ class Runner:
         wmap = {}
         cal_win = [t for t in self.cal if t0 <= t <= t1]
         for t in cal_win:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 20:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

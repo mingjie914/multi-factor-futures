@@ -45,7 +45,7 @@ def run(F, mode):
     else:
         wmap = {}
         for t in cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 20:
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

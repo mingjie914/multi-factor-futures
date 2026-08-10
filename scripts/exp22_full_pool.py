@@ -51,23 +51,48 @@ NEW21_DIR = {
 }
 
 
+def prepare_ic_history(hist, minimum_observations=30):
+    """Admit factors only after enough finite IC history is available."""
+    clean = hist.replace([np.inf, -np.inf], np.nan)
+    required = min(int(minimum_observations), len(clean))
+    if required <= 0:
+        return clean.iloc[0:0, 0:0]
+    columns = clean.columns[clean.notna().sum(axis=0).ge(required)]
+    return clean.loc[:, columns].dropna(axis=0, how="any")
+
+
 class Runner:
-    def __init__(self):
+    FACTOR_CHUNK_SIZE = 400
+    # Intraday factors need warm-up rows.  Keeping the overlap is also
+    # required by the downstream 60-day IC window; without it, NaN IC rows
+    # poison the covariance window and produce artificial zero-return blocks.
+    FACTOR_CHUNK_OVERLAP = 64
+
+    def __init__(self, factor_names=None):
         self.env = ExpEnv(PROD6)
         self.cal, self.u, self.daily_ret = self.env.cal, self.env.u, self.env.daily_ret
-        ALL = list(dict.fromkeys(list(PROD6) + KEPT47 + NEW21))
-        # 分年段 compute (drip_stone FFT 内存)
+        ALL = list(dict.fromkeys(
+            factor_names if factor_names is not None
+            else list(PROD6) + KEPT47 + NEW21
+        ))
+        # 分块 compute (drip_stone FFT 内存).  Each request includes a
+        # history overlap, but only the target slice is written back.  This
+        # preserves rolling-factor continuity without increasing the final
+        # result index or duplicating observations.
         self.comp = {}
-        chunk = 400
-        for i in range(0, len(self.cal), chunk):
-            sub = self.cal[i:i+chunk]
+        for i in range(0, len(self.cal), self.FACTOR_CHUNK_SIZE):
+            sub = self.cal[i:i + self.FACTOR_CHUNK_SIZE]
+            request_start = max(0, i - self.FACTOR_CHUNK_OVERLAP)
+            request_dates = self.cal[request_start:i + len(sub)]
             for j in range(0, len(ALL), 10):
-                part = self.env.engine.compute_factors(ALL[j:j+10], sub, self.u, parallel=False)
+                part = self.env.engine.compute_factors(
+                    ALL[j:j + 10], request_dates, self.u, parallel=False
+                )
                 for k, v in part.items():
                     if k not in self.comp:
                         self.comp[k] = v.reindex(self.cal)
                     else:
-                        self.comp[k].loc[sub] = v
+                        self.comp[k].loc[sub] = v.reindex(sub)
         self.ranks = {}
         for n in ALL:
             if n not in self.comp:
@@ -182,7 +207,7 @@ def main():
         for t in r.cal:
             hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (防同日泄漏)
             # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前)
-            hist = hist.dropna(axis=1, how='all')
+            hist = prepare_ic_history(hist)
             if hist.shape[1] < 2:
                 continue
             if len(hist) < 30:
@@ -207,8 +232,8 @@ def main():
             sc = sc.dropna()
             if len(sc) < 20:
                 continue
-            top = r.env.capped(sc, ascending=False)
-            bot = r.env.capped(sc, ascending=True)
+            top = r.env.capped(sc, ascending=False, date=t)
+            bot = r.env.capped(sc, ascending=True, date=t)
             wl = r.env.erc_w(top, t) or {}
             ws = r.env.erc_w(bot, t) or {}
             if t in r.daily_ret.index:

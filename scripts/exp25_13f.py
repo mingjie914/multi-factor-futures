@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 import numpy as np
 import pandas as pd
 from exp_core import ExpEnv, PROD6
-from exp23_6v14_nav import R22, B1
+from exp23_6v14_nav import R22, B1, prepare_ic_history
 
 F6 = list(PROD6)
 F13 = [x for x in B1 if x != 'intraday_ma_count_bullish_20d']
@@ -38,7 +38,7 @@ def bt(r, names):
     rets = []
     for t in r.cal:
         hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (防同日泄漏)
-        hist = hist.dropna(axis=1, how='all')
+        hist = prepare_ic_history(hist)
         if hist.shape[1] < 2:
             continue
         names_eff = list(hist.columns)
@@ -63,8 +63,8 @@ def bt(r, names):
         sc = sc.dropna()
         if len(sc) < 20:
             continue
-        top = r.env.capped(sc, ascending=False)
-        bot = r.env.capped(sc, ascending=True)
+        top = r.env.capped(sc, ascending=False, date=t)
+        bot = r.env.capped(sc, ascending=True, date=t)
         wl = r.env.erc_w(top, t) or {}
         ws = r.env.erc_w(bot, t) or {}
         if t in r.daily_ret.index:

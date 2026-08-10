@@ -11,9 +11,18 @@
   keep its manifest, hashes, and archive URI with the study report.
 - Ad hoc backtests and experiments must use a new run directory and may be
   removed after their conclusions are superseded.
+- `historical_portfolio_search/<timestamp>/` contains the current-library,
+  expanding-window method/factor search. Keep the latest conclusion-linked run;
+  interrupted runs may retain `_factor_panel_cache.pkl` only until resumed or
+  explicitly discarded, and completed runs remove that temporary cache.
 - No run artifact is production configuration. `config/trading.yaml` is the
   separate fail-closed approval gate.
 
 Artifacts created before the 2026-07-28 cost-policy reset were purged locally.
 The current production decision is `NO_TRADE`: no factor or portfolio has been
 approved for paper or live trading, and no current-policy result bundle exists yet.
+
+On 2026-08-09, superseded local run workspaces were moved to the recoverable
+archive `E:/程明杰公司内容/multi_factor_artifact_archive_20260809`.  The project
+directory retains the append-only holdout ledger, current production benchmark,
+current 6/13/14 comparison, report-linked figures, and external-strategy snapshots.

@@ -1,4 +1,4 @@
-"""实验25: 13因子 (14 - ma_count_bullish) 验证.
+"""实验26: 6/10/13/14 因子组合对比.
 
 对比: 6因子(生产) vs 13因子 vs 14因子(B1).
 评估: 全段/分年度/OOS/实盘/边际(13因子逐个去增量).
@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 import numpy as np
 import pandas as pd
 from exp_core import ExpEnv, PROD6
-from exp23_6v14_nav import R22, B1
+from exp23_6v14_nav import R22, B1, prepare_ic_history
 
 F6 = list(PROD6)
 F13 = [x for x in B1 if x != 'intraday_ma_count_bullish_20d']
@@ -42,7 +42,7 @@ def bt(r, names):
     rets = []
     for t in r.cal:
         hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (防同日泄漏)
-        hist = hist.dropna(axis=1, how='all')
+        hist = prepare_ic_history(hist)
         if hist.shape[1] < 2:
             continue
         names_eff = list(hist.columns)
@@ -67,8 +67,8 @@ def bt(r, names):
         sc = sc.dropna()
         if len(sc) < 20:
             continue
-        top = r.env.capped(sc, ascending=False)
-        bot = r.env.capped(sc, ascending=True)
+        top = r.env.capped(sc, ascending=False, date=t)
+        bot = r.env.capped(sc, ascending=True, date=t)
         wl = r.env.erc_w(top, t) or {}
         ws = r.env.erc_w(bot, t) or {}
         if t in r.daily_ret.index:
@@ -78,14 +78,13 @@ def bt(r, names):
 
 
 def main():
-    r = R22()
+    r = R22(F14)
     print('=' * 60)
-    print('实验25: 13因子 (14 - ma_count_bullish) 验证')
+    print('实验26: 6/10/13/14 因子组合对比')
     print('=' * 60)
     s6 = bt(r, F6)
     s13 = bt(r, F13)
     s14 = bt(r, F14)
-    s10 = bt(r, F10)
     s10 = bt(r, F10)
 
     def seg(s):
@@ -107,13 +106,16 @@ def main():
 
     # 分年度
     print('\n--- 逐年夏普 ---')
-    print(f'{"年份":<6} {"6因子":>8} {"13因子":>8} {"14因子":>8}')
+    print(f'{"年份":<6} {"6因子":>8} {"10因子":>8} {"13因子":>8} {"14因子":>8}')
     for y in range(2016, 2027):
         row = []
         for s in [s6, s10, s13, s14]:
             yr = s[s.index.year == y]
             row.append(yr.mean() * 252 / (yr.std() * np.sqrt(252)) if len(yr) > 20 and yr.std() > 0 else 0)
-        print(f'{y:<6} {row[0]:>8.2f} {row[1]:>8.2f} {row[2]:>8.2f}')
+        print(
+            f'{y:<6} {row[0]:>8.2f} {row[1]:>8.2f} '
+            f'{row[2]:>8.2f} {row[3]:>8.2f}'
+        )
 
     # 13因子边际 (去掉的7个增量各自)
     print('\n--- 13因子边际 (逐个去增量) ---')
@@ -125,7 +127,7 @@ def main():
         sh = s.mean() * 252 / (s.std() * np.sqrt(252)) if s.std() > 0 else 0
         print(f'  去 {n:<44} 夏普={sh:.2f} (Δ={sh-base:+.2f})')
 
-    # 净值图 (6/13/14 三方案 + 年化) - main 内
+    # 净值图 (6/10/13/14 四方案 + 年化) - main 内
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -141,11 +143,11 @@ def main():
                 label=f'{name} (夏普{st["full"]:.2f}/年化{ann:.1%}/实盘{st["live"]:.2f})')
     ax.axvline(pd.Timestamp('2026-03-01'), color='gray', ls='--', lw=1, label='OOS起点')
     ax.axvline(pd.Timestamp('2026-05-16'), color='red', ls='--', lw=1, label='实盘起点')
-    ax.set_title('6/13/14因子 净值对比 (2016-03-31 起, 修复泄漏后)')
+    ax.set_title('6/10/13/14因子 净值对比 (2016-03-31 起, 修复泄漏后)')
     ax.legend(loc='upper left', fontsize=9)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    out = 'runs/nav_6f_13f_14f.png'
+    out = 'runs/nav_6f_10f_13f_14f.png'
     fig.savefig(out, dpi=150)
     print(f'净值对比图: {out}')
 

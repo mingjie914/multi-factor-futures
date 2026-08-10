@@ -52,7 +52,7 @@ def main():
         ic = pd.DataFrame({n: ranks[n].corrwith(fwd, axis=1) for n in names})
         rets = []
         for t in cal:
-            hist = ic.loc[:t].iloc[-60:]
+            hist = ic.loc[:t].iloc[-60:-1]
             if len(hist) < 30: continue
             im = hist.mean()
             lwc = lw(hist)

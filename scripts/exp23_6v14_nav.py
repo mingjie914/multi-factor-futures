@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 from exp_core import ExpEnv, stats, PROD6
-from exp22_full_pool import Runner as R22, NEW21_DIR
+from exp22_full_pool import Runner as R22, NEW21_DIR, prepare_ic_history
 from exp18_light_forward import DIRS
 
 B1 = list(PROD6) + [
@@ -44,7 +44,7 @@ def lw(icm):
 
 
 def main():
-    r = R22()
+    r = R22(B1)
     print('=' * 60)
     print('实验23: 6因子 vs 14因子(B1) 净值对比')
     print('=' * 60)
@@ -56,7 +56,7 @@ def main():
         for t in r.cal:
             hist = ic.loc[:t].iloc[-60:-1]  # 不含 ic[T] (防同日泄漏)
             # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前)
-            hist = hist.dropna(axis=1, how='all')
+            hist = prepare_ic_history(hist)
             if hist.shape[1] < 2:
                 continue
             if len(hist) < 30:
@@ -81,8 +81,8 @@ def main():
             sc = sc.dropna()
             if len(sc) < 20:
                 continue
-            top = r.env.capped(sc, ascending=False)
-            bot = r.env.capped(sc, ascending=True)
+            top = r.env.capped(sc, ascending=False, date=t)
+            bot = r.env.capped(sc, ascending=True, date=t)
             wl = r.env.erc_w(top, t) or {}
             ws = r.env.erc_w(bot, t) or {}
             if t in r.daily_ret.index:

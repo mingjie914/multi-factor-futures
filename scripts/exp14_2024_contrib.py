@@ -71,7 +71,7 @@ class Runner:
                 continue
             if t1 is not None and t > t1:
                 continue
-            hist = ic.loc[:t].iloc[-window:]
+            hist = ic.loc[:t].iloc[-window:-1]
             if len(hist) < max(10, window // 2):
                 wmap[t] = pd.Series(1.0 / len(names), index=names)
                 continue

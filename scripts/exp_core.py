@@ -61,6 +61,17 @@ CAND_DIR = {
 }
 
 
+def prepare_erc_returns(returns, pool, minimum_observations=10):
+    """Drop assets without enough causal return history before ERC."""
+    history = returns.reindex(columns=list(pool)).replace([np.inf, -np.inf], np.nan)
+    eligible = history.columns[
+        history.notna().sum(axis=0).ge(int(minimum_observations))
+    ]
+    if len(eligible) < 2:
+        return history.iloc[0:0, 0:0]
+    return history.loc[:, eligible].dropna(axis=0, how="any")
+
+
 def _latest_local_date():
     """从本地 1d 分区推断最新交易日 (自动跟踪数据更新, 无需手动改日期)."""
     import os as _os
@@ -94,6 +105,7 @@ class ExpEnv:
         # 默认 6 因子
         self.factors = factors if factors is not None else dict(PROD6)
         self._comp = None
+        self._eligible_symbols_cache = {}
         self.sector_of = {}
         for sec, mem in SECTOR_MAP.items():
             for m in mem:
@@ -110,9 +122,30 @@ class ExpEnv:
             score = score.add(r if direction == 1 else (1 - r), fill_value=0)
         return score.div(len(self.factors))
 
-    def capped(self, row, cap_n=SECTOR_CAP, ascending=False):
+    def eligible_symbols(self, date, minimum_observations=10):
+        """Symbols with enough return history strictly before ``date``."""
+        date = pd.Timestamp(date)
+        key = (date, int(minimum_observations))
+        cache = getattr(self, "_eligible_symbols_cache", None)
+        if cache is None:
+            cache = self._eligible_symbols_cache = {}
+        if key in cache:
+            return cache[key]
+        c = self.cal[
+            (self.cal >= date - pd.Timedelta(days=90)) & (self.cal < date)
+        ]
+        history = self.daily_ret.reindex(c).replace([np.inf, -np.inf], np.nan)
+        eligible = history.columns[
+            history.notna().sum(axis=0).ge(int(minimum_observations))
+        ].tolist()
+        cache[key] = eligible
+        return eligible
+
+    def capped(self, row, cap_n=SECTOR_CAP, ascending=False, date=None):
         """板块配额选池: 按得分排序取 top10, 每板块≤cap.
         ascending=False 取最高分(多头), True 取最低分(空头)."""
+        if date is not None:
+            row = row.reindex(self.eligible_symbols(date)).dropna()
         order = row.sort_values(ascending=ascending).index.tolist()
         picks, counts = [], {}
         for s in order:
@@ -133,20 +166,20 @@ class ExpEnv:
         # 用 ExpEnv 已缓存的全量日历切片 (绕开 fetch_calendar 重复读 1d + 正则热点)
         # 去掉 t (T 日): 协方差[T] 若含 T 收益则泄漏 (T-1 信号 x T 收益)
         c = self.cal[(self.cal >= sd) & (self.cal < t)]
-        rs = self.daily_ret.reindex(c)[list(pool)].dropna()
+        rs = prepare_erc_returns(self.daily_ret.reindex(c), pool)
         if rs.shape[0] < 10:
             return None
         cov_raw = rs.cov().values
         cov = 0.7 * cov_raw + 0.3 * np.diag(np.diag(cov_raw))
         try:
-            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(len(pool)))
-            return dict(zip(pool, w))
+            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(rs.shape[1]))
+            return dict(zip(rs.columns, w))
         except (RuntimeError, ValueError):
             v = rs.std(ddof=0).replace(0, np.nan).dropna()
             if v.empty:
                 return None
             w = (1.0 / v).values
-            return dict(zip(pool, w / w.sum()))
+            return dict(zip(v.index, w / w.sum()))
 
 
 def stats(s):
