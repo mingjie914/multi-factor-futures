@@ -23,6 +23,7 @@ import pandas as pd
 from core.interfaces import DataSource
 from core.registry import register
 from core.sectors import sector_for
+from data.contract_symbols import MARKET_FIELDS, canonicalize_contract_aliases
 
 
 logger = logging.getLogger(__name__)
@@ -49,8 +50,8 @@ _CURVE_FIELDS = (
 )
 _PRICE_FIELDS = {"open", "high", "low", "close"}
 _DEFAULT_EAGER_FIELDS = tuple(_RAW_FIELD_MAP)
-_CURVE_CACHE_SCHEMA_VERSION = 1
-_SELECTED_CACHE_SCHEMA_VERSION = 1
+_CURVE_CACHE_SCHEMA_VERSION = 2
+_SELECTED_CACHE_SCHEMA_VERSION = 2
 _FREQUENCY_ROUTE = {
     "daily": ("daily", None),
     "1min": ("1min", None),
@@ -459,9 +460,14 @@ class ParquetFuturesSource(DataSource):
         if not files:
             return pd.DataFrame(columns=list(columns))
         available = self._available_columns(files[0])
-        selected = [column for column in dict.fromkeys(columns) if column in available]
-        if not selected:
+        requested = [column for column in dict.fromkeys(columns) if column in available]
+        if not requested:
             return pd.DataFrame()
+        selected = list(requested)
+        if "symbol" in selected:
+            for column in ("exchange", "trade_date", "trade_datetime"):
+                if column in available and column not in selected:
+                    selected.append(column)
         filters = [
             ("trade_date", ">=", pd.Timestamp(start).date()),
             ("trade_date", "<=", pd.Timestamp(end).date()),
@@ -477,8 +483,34 @@ class ParquetFuturesSource(DataSource):
             except Exception:
                 continue
         if not frames:
-            return pd.DataFrame(columns=selected)
-        return pd.concat(frames, ignore_index=True)
+            return pd.DataFrame(columns=requested)
+        combined = pd.concat(frames, ignore_index=True)
+        if "symbol" in combined:
+            before = len(combined)
+            canonical = canonicalize_contract_aliases(combined)
+            missing_checks = [
+                field for field in MARKET_FIELDS
+                if field in available and field not in selected
+            ]
+            if len(canonical) < before and missing_checks:
+                validation_columns = selected + missing_checks
+                validation_frames = []
+                for path in files:
+                    try:
+                        frame = pd.read_parquet(
+                            path, columns=validation_columns, filters=filters
+                        )
+                        if not frame.empty:
+                            validation_frames.append(frame)
+                    except Exception:
+                        continue
+                if not validation_frames:
+                    return pd.DataFrame(columns=requested)
+                canonical = canonicalize_contract_aliases(
+                    pd.concat(validation_frames, ignore_index=True)
+                )
+            combined = canonical
+        return combined.loc[:, requested]
 
     @staticmethod
     def _annotate_symbols(frame: pd.DataFrame) -> pd.DataFrame:

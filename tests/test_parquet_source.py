@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import load_config
+from data.contract_symbols import ContractAliasConflictError
 from data.parquet_source import ParquetFuturesSource
 
 
@@ -130,6 +131,66 @@ def test_intraday_route_keeps_real_bar_index_and_resamples(tmp_path):
     assert five_minute["volume"].iloc[0, 0] == sum(range(10, 15))
 
 
+def test_czce_three_digit_alias_is_canonicalized_and_identical_rows_deduplicate(
+    tmp_path,
+):
+    root = _fixture_root(tmp_path)
+    rows = [
+        {**_row("FG609", "2026-08-03 09:00", 100.0, 10, 20), "exchange": "CZCE"},
+        {**_row("FG2609", "2026-08-03 09:00", 100.0, 10, 20), "exchange": "CZCE"},
+    ]
+    directory = root / DATASETS["1min"] / "year_month=2026-08"
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).drop(columns="sequence").to_parquet(
+        directory / "part.parquet", index=False
+    )
+    source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
+
+    actual = source._read_partitions(
+        "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
+    )
+
+    assert actual["symbol"].tolist() == ["FG2609"]
+
+
+def test_czce_alias_market_conflict_fails_even_when_requested_field_matches(tmp_path):
+    root = _fixture_root(tmp_path)
+    rows = [
+        {**_row("FG609", "2026-08-03 09:00", 100.0, 10, 20), "exchange": "CZCE"},
+        {**_row("FG2609", "2026-08-03 09:00", 100.0, 11, 20), "exchange": "CZCE"},
+    ]
+    directory = root / DATASETS["1min"] / "year_month=2026-08"
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).drop(columns="sequence").to_parquet(
+        directory / "part.parquet", index=False
+    )
+    source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
+
+    with np.testing.assert_raises(ContractAliasConflictError):
+        source._read_partitions(
+            "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
+        )
+
+
+def test_already_canonical_duplicate_market_conflict_fails_closed(tmp_path):
+    root = _fixture_root(tmp_path)
+    rows = [
+        {**_row("FG2609", "2026-08-03 09:00", 100.0, 10, 20), "exchange": "CZCE"},
+        {**_row("FG2609", "2026-08-03 09:00", 100.0, 11, 20), "exchange": "CZCE"},
+    ]
+    directory = root / DATASETS["1min"] / "year_month=2026-08"
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).drop(columns="sequence").to_parquet(
+        directory / "part.parquet", index=False
+    )
+    source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
+
+    with np.testing.assert_raises(ContractAliasConflictError):
+        source._read_partitions(
+            "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
+        )
+
+
 def test_daily_curve_fields_use_all_concrete_contracts(tmp_path):
     root = _fixture_root(tmp_path)
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
@@ -202,7 +263,7 @@ def test_intraday_curve_cache_reuses_validated_month_across_instances(
 
     pd.testing.assert_frame_equal(actual["curve_total_oi"], expected["curve_total_oi"])
     pd.testing.assert_frame_equal(actual["curve_oi_breadth"], expected["curve_oi_breadth"])
-    assert len(list(cache_path.glob("curve_v1_15min_2024-01_*.parquet"))) == 1
+    assert len(list(cache_path.glob("curve_v2_15min_2024-01_*.parquet"))) == 1
 
 
 def test_intraday_curve_cache_isolated_by_frequency_and_invalidated_by_source(
@@ -225,8 +286,8 @@ def test_intraday_curve_cache_isolated_by_frequency_and_invalidated_by_source(
         ["A"], "2024-01-03", "2024-01-03 23:59",
         ["curve_total_oi"], "5min",
     )
-    assert len(list(cache_path.glob("curve_v1_15min_2024-01_*.parquet"))) == 1
-    assert len(list(cache_path.glob("curve_v1_5min_2024-01_*.parquet"))) == 1
+    assert len(list(cache_path.glob("curve_v2_15min_2024-01_*.parquet"))) == 1
+    assert len(list(cache_path.glob("curve_v2_5min_2024-01_*.parquet"))) == 1
 
     source_file = next(
         (root / DATASETS["15min"] / "year_month=2024-01").glob("*.parquet")
@@ -281,7 +342,7 @@ def test_selected_contract_cache_reuses_validated_request_across_instances(
 
     for field in expected:
         pd.testing.assert_frame_equal(actual[field], expected[field])
-    assert len(list(cache_path.glob("selected_v1_5min_*.parquet"))) == 1
+    assert len(list(cache_path.glob("selected_v2_5min_*.parquet"))) == 1
 
 
 def test_panel_cache_adds_curve_fields_without_rebuilding_selected_panel(
