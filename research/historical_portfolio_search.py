@@ -199,7 +199,7 @@ def select_pool(
 
     ordered = (
         score.reindex(list(eligible)).replace([np.inf, -np.inf], np.nan).dropna()
-        .sort_values(ascending=ascending, kind="stable").index.tolist()
+        .sort_values(ascending=ascending).index.tolist()
     )
     picks: list[str] = []
     counts: dict[str, int] = {}

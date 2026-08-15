@@ -15,6 +15,17 @@
   expanding-window method/factor search. Keep the latest conclusion-linked run;
   interrupted runs may retain `_factor_panel_cache.pkl` only until resumed or
   explicitly discarded, and completed runs remove that temporary cache.
+- The retained conclusion-linked run is
+  `historical_portfolio_search/20260810_full_prod_sort/`; its strict expanding-OOS
+  ledger, method/factor evidence, metrics, and two NAV figures are the current
+  comparison bundle. Superseded or invalid attempts should not be retained.
+- `historical_portfolio_search/20260813_contract_symbol_fix/` is the focused,
+  two-recipe R8 walk-forward freeze audit. Retain its resolved boundary,
+  fold decisions, weights, ledger, metrics, figure, and review; it is research
+  evidence and does not alter the production gate.
+- `external_guosen_trend_index/20260813_contract_symbol_fix/` is the current
+  frozen-set comparison after CZCE contract-symbol cleanup. It recomputes
+  6f/10f/13f/14f/R8 under gross exposure 1 and 2 without rerunning factor selection.
 - No run artifact is production configuration. `config/trading.yaml` is the
   separate fail-closed approval gate.
 

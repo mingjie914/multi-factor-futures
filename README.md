@@ -55,7 +55,7 @@ python -m pip install -r requirements-dev.txt      # 最小运行时 + 测试工
 $PY = '.\.venv\Scripts\python.exe'
 
 # 本地数据健康与研究
-& $PY -X utf8 -B main.py data-health --config config/parquet_research.yaml
+& $PY -X utf8 -B main.py data-health --config config/parquet_research.yaml --strict
 & $PY -X utf8 -B main.py research --help
 & $PY -X utf8 -B main.py adaptivity --help
 
@@ -79,6 +79,9 @@ $PY = '.\.venv\Scripts\python.exe'
 # 隔离实验：扩展窗口搜索因子合成、Top/Bottom、品种权重和因子集
 & $PY -X utf8 -B -m workflows.experiments.historical_portfolio_search
 ```
+
+`data-health --strict`会检查四个Parquet频率的最新发布分区；郑商所三位代码、同键重复
+或冲突别名会使检查失败，但不会把全量扫描加入回测热路径。
 
 挖掘、冻结候选、挂载快照和正式筛选的最短流程见
 [`factor_mining/FRAMEWORK_INTEGRATION.md`](factor_mining/FRAMEWORK_INTEGRATION.md)。

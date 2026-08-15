@@ -195,6 +195,40 @@ def test_method_coordinate_search_keeps_each_fold_independent(monkeypatch, tmp_p
     assert {recipe.factor_weight for recipe in late_selection} <= {"lw_positive", "lw_abs"}
 
 
+def test_fixed_recipe_ranking_uses_only_bounded_training_evaluator():
+    fold = {
+        "train_start": "2016-01-01",
+        "train_end": "2019-12-31",
+        "test_start": "2020-01-01",
+        "test_end": "2021-12-31",
+    }
+    recipes = {
+        "production": PortfolioRecipe("lw_abs", 10, 3, "erc"),
+        "alternative": PortfolioRecipe("equal", 12, 0, "inverse_volatility"),
+    }
+    dates = pd.bdate_range("2016-01-01", "2021-12-31")
+
+    class TrainingOnlyEvaluator:
+        def ledger(self, _factors, recipe):
+            assert dates.max() > pd.Timestamp(fold["train_end"])
+            values = pd.Series(0.0, index=dates)
+            train = values.index <= pd.Timestamp(fold["train_end"])
+            wave = np.sin(np.arange(int(train.sum())) / 8.0)
+            values.loc[train] = (
+                0.001 + 0.0002 * wave
+                if recipe == recipes["alternative"]
+                else 0.0002 + 0.0010 * wave
+            )
+            values.loc[~train] = -0.50 if recipe == recipes["alternative"] else 0.50
+            return pd.DataFrame({"net_return": values, "turnover": 0.1}, index=dates)
+
+    ranked = workflow._rank_fixed_recipes_for_fold(
+        TrainingOnlyEvaluator(), ["f1", "f2"], recipes, fold
+    )
+
+    assert ranked[0]["challenger"] == "alternative"
+
+
 def test_current_lw_signal_and_top10_match_existing_production_runner():
     dates = pd.bdate_range("2023-01-02", periods=70)
     symbols = [f"S{index:02d}" for index in range(25)]
@@ -226,7 +260,7 @@ def test_current_lw_signal_and_top10_match_existing_production_runner():
 
         def capped(self, row, ascending=False, date=None):
             del date
-            return row.sort_values(ascending=ascending, kind="stable").index[:10].tolist()
+            return row.sort_values(ascending=ascending).index[:10].tolist()
 
         def erc_w(self, pool, _date):
             if int(dates.get_loc(_date)) < 10:

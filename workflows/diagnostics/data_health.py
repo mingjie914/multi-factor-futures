@@ -6,11 +6,95 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from core.config import load_config
+from data.contract_symbols import (
+    ContractAliasConflictError,
+    MARKET_FIELDS,
+    canonicalize_contract_aliases,
+)
 
 
 def _model_dict(model) -> dict:
+    if model is None:
+        return {}
     return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+def _check_latest_parquet_contract_keys(parquet_config: dict) -> dict:
+    """Validate the latest published partition without taxing backtest reads."""
+    root_text = str(parquet_config.get("root_path", "")).strip()
+    if not root_text:
+        return {"status": "not_configured"}
+    root = Path(root_text).expanduser().resolve()
+    if not root.is_dir():
+        return {"status": "unavailable", "path": str(root)}
+
+    datasets = dict(parquet_config.get("datasets") or {})
+    datasets = {
+        "daily": datasets.get("daily", "futureshistoryprices1d"),
+        "1min": datasets.get("1min", "futureshistoryprices1m"),
+        "5min": datasets.get("5min", "futureshistoryprices5m"),
+        "15min": datasets.get("15min", "futureshistoryprices15m"),
+    }
+    checks = {}
+    invalid = False
+    for frequency, relative in datasets.items():
+        dataset = root / str(relative)
+        partitions = sorted(dataset.glob("year_month=*") if dataset.is_dir() else [])
+        if not partitions:
+            checks[frequency] = {"status": "missing", "path": str(dataset)}
+            invalid = True
+            continue
+        latest = partitions[-1]
+        files = sorted(latest.glob("*.parquet"))
+        if not files:
+            checks[frequency] = {"status": "missing", "partition": str(latest)}
+            invalid = True
+            continue
+        try:
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(files[0]).schema_arrow.names)
+            columns = [
+                column for column in (
+                    "symbol", "exchange", "trade_date", "trade_datetime",
+                    *MARKET_FIELDS,
+                ) if column in available
+            ]
+            frames = [pd.read_parquet(path, columns=columns) for path in files]
+            frame = pd.concat(frames, ignore_index=True)
+            exchanges = frame["exchange"].astype(str).str.strip().str.upper()
+            symbols = frame["symbol"].astype(str).str.strip().str.upper()
+            three_digit = int(
+                (exchanges.isin({"CZC", "CZCE", "ZCE"})
+                 & symbols.str.fullmatch(r"[A-Z]+\d{3}")).sum()
+            )
+            canonical = canonicalize_contract_aliases(frame)
+            duplicate_rows = len(frame) - len(canonical)
+            status = "ok" if three_digit == 0 and duplicate_rows == 0 else "invalid"
+            invalid |= status != "ok"
+            checks[frequency] = {
+                "status": status,
+                "partition": latest.name,
+                "rows": len(frame),
+                "czce_three_digit_rows": three_digit,
+                "duplicate_rows": duplicate_rows,
+            }
+        except Exception as exc:
+            invalid = True
+            checks[frequency] = {
+                "status": "invalid",
+                "partition": latest.name,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+    return {
+        "status": "invalid" if invalid else "ok",
+        "path": str(root),
+        "latest_partitions": checks,
+    }
 
 
 def check_health(config_path: str) -> dict:
@@ -20,8 +104,12 @@ def check_health(config_path: str) -> dict:
         "config": str(Path(config_path).resolve()),
         "mysql": {},
         "ddb": {},
+        "parquet": {},
         "cache": {},
     }
+
+    parquet_config = _model_dict(config.data.parquet)
+    result["parquet"] = _check_latest_parquet_contract_keys(parquet_config)
 
     mysql_config = config.data.mysql
     if mysql_config is None:
@@ -114,8 +202,12 @@ def main() -> None:
         output.write_text(rendered + "\n", encoding="utf-8")
 
     if args.strict:
-        statuses = [result["mysql"].get("status"), result["ddb"].get("status")]
-        if any(status == "unavailable" for status in statuses):
+        statuses = [
+            result["mysql"].get("status"),
+            result["ddb"].get("status"),
+            result["parquet"].get("status"),
+        ]
+        if any(status in {"unavailable", "invalid"} for status in statuses):
             raise SystemExit(1)
 
 

@@ -1,12 +1,16 @@
 """实验22: 全因子池无预设筛选 (验证新因子 vs 6因子 vs 组合更优).
 
 因子池: 6生产 + 47旧候选 + 21新候选(#439-530通过FDR) = 74.
-路径:
+历史探索路径（不是严格扩展窗口准入）:
   A. 相关性去重: 与生产6因子 corr>=0.5 剔除 (同族冗余)
   B1. 从6因子出发前向加 (含替换: 允许换掉弱因子)
   B2. 从空集前向选 (完全不预设, 自然选最优)
   C. 跨样本验证: 全段/OOS/实盘
 轻量指标: Rank IC均值xICIR (corr计算, 快), 相关性门槛防同族.
+
+注意: B1 固定生产6因子是保守锚定，不代表6因子已被证明全局最优；最多加入8个
+是当时限制贪心搜索复杂度和过拟合的工程上限，不是理论最优因子数。当前无锚定、
+逐折冻结的搜索见 workflows/experiments/historical_portfolio_search.py。
 """
 import sys
 sys.path.insert(0, '.')
@@ -138,14 +142,14 @@ def main():
     for n, c in sorted(dropped, key=lambda x: -x[1])[:10]:
         print(f'  {n}: corr={c:.2f}')
 
-    # B1. 从6因子出发前向 (轻量 + 相关性门槛)
+    # B1. 从6因子出发前向（历史保守锚定；不证明6因子全局最优）
     print('\n--- B1. 从6因子出发前向 (轻量IC, 相关门槛) ---')
     base6 = list(PROD6)
     s0 = r.light_score(base6)
     print(f'基准 6因子: score={s0:.4f}')
     cur = list(base6)
     chosen = []
-    for step in range(8):
+    for step in range(8):  # 历史工程上限，不是最优因子数结论
         best, best_n = -1e9, None
         for c in kept:
             if c in cur:

@@ -102,6 +102,11 @@ OUTER_FOLDS = [
 ]
 
 BASE_RECIPE = PortfolioRecipe("lw_abs", 10, 3, "erc")
+R8_ALT_RECIPE = PortfolioRecipe("equal", 12, 0, "inverse_volatility")
+R8_RECIPE_CHALLENGERS = {
+    "production_method": BASE_RECIPE,
+    "equal_top12_no_cap_inverse_volatility": R8_ALT_RECIPE,
+}
 SEED_FACTOR_SETS = {"6f": F6, "14f": F14, "R8": R8}
 KNOWN_FACTOR_SETS = {
     "6f": F6,
@@ -135,7 +140,7 @@ def _rank_recipes_for_fold(
     train_end = pd.Timestamp(fold["train_end"])
     segments = calendar_segments(train_start, train_end, years=2)
     rows = []
-    for recipe_index, recipe in enumerate(recipes, 1):
+    for recipe in recipes:
         seed_summaries = []
         for seed_name, factors in factor_sets.items():
             ledger = evaluator.ledger(factors, recipe)
@@ -149,13 +154,13 @@ def _rank_recipes_for_fold(
             **recipe.to_dict(),
             **aggregate,
         })
-        print(
-            f"  [{stage} {fold['fold']}] {recipe_index}/{len(recipes)} "
-            f"{recipe.name} worst={aggregate['worst_sharpe']:.2f} "
-            f"median={aggregate['median_sharpe']:.2f}",
-            flush=True,
-        )
-    return sorted(rows, key=robustness_key, reverse=True)
+    ranked = sorted(rows, key=robustness_key, reverse=True)
+    print(
+        f"  [{stage} {fold['fold']}] selected {ranked[0]['name']} "
+        f"from {len(ranked)} candidates",
+        flush=True,
+    )
+    return ranked
 
 
 def _stage_method_search(
@@ -293,11 +298,6 @@ def _search_factor_recipe_pairs(
                 **summary,
                 "annual_turnover": annual_turnover,
             })
-        print(
-            f"  [factor {fold['fold']}] {candidate_index}/{len(candidates)} "
-            f"{candidate.get('candidate', 'beam')} ({len(factors)} factors)",
-            flush=True,
-        )
     ranked = sorted(
         rows,
         key=lambda row: (
@@ -425,6 +425,143 @@ def _factor_search(
     return weights, ledger, decisions, candidates_frame
 
 
+def _rank_fixed_recipes_for_fold(
+    evaluator: PortfolioEvaluator,
+    factors: Sequence[str],
+    recipes: Mapping[str, PortfolioRecipe],
+    fold: Mapping[str, str],
+) -> list[dict]:
+    """Rank a predeclared recipe set using one fold's training data only."""
+
+    segments = calendar_segments(
+        pd.Timestamp(fold["train_start"]), pd.Timestamp(fold["train_end"]), years=2
+    )
+    rows = []
+    for challenger, recipe in recipes.items():
+        ledger = evaluator.ledger(factors, recipe)
+        summary = robust_summary(ledger, segments)
+        train = ledger.loc[fold["train_start"]:fold["train_end"]]
+        rows.append({
+            "challenger": challenger,
+            **recipe.to_dict(),
+            **summary,
+            "annual_turnover": (
+                float(train["turnover"].mean() * 242) if len(train) else np.nan
+            ),
+        })
+    return sorted(
+        rows,
+        key=lambda row: (
+            *robustness_key(row),
+            -float(row.get("annual_turnover", np.inf)),
+        ),
+        reverse=True,
+    )
+
+
+def _r8_recipe_walk_forward(
+    evaluator: PortfolioEvaluator,
+    output: Path,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Freeze the R8 recipe choice per fold after training-only comparison.
+
+    The two recipes are declared before each fold is evaluated.  This makes the
+    mechanical selection causal, while the alternative recipe remains a
+    retrospectively generated research hypothesis until future shadow evidence
+    accumulates.
+    """
+
+    decisions = []
+    selected_parts = []
+    for fold in OUTER_FOLDS:
+        training = evaluator.bounded(fold["train_start"], fold["train_end"])
+        ranked = _rank_fixed_recipes_for_fold(
+            training, R8, R8_RECIPE_CHALLENGERS, fold
+        )
+        winner = ranked[0]
+        recipe = _recipe_from_row(winner)
+        training.clear_transient_caches()
+
+        testing = evaluator.bounded(fold["test_start"], fold["test_end"])
+        test_weights = testing.weights(R8, recipe).loc[
+            fold["test_start"]:fold["test_end"]
+        ]
+        selected_parts.append(test_weights)
+        test_ledger = testing.ledger_from_weights(test_weights)
+        decisions.append({
+            **dict(fold),
+            "selected_challenger": winner["challenger"],
+            "selected_recipe": recipe.to_dict(),
+            "training_robustness": {
+                key: winner[key]
+                for key in (
+                    "positive_segment_ratio", "worst_sharpe", "median_sharpe",
+                    "median_annual_return", "worst_drawdown", "annual_turnover",
+                )
+            },
+            "training_ranking": ranked,
+            "test_metrics_diagnostic_only": performance_metrics(
+                test_ledger["net_return"]
+            ),
+        })
+        testing.clear_transient_caches()
+
+    selected_weights = pd.concat(selected_parts).sort_index()
+    selected_weights = selected_weights[~selected_weights.index.duplicated(keep="first")]
+    selected_weights = selected_weights.reindex(columns=evaluator.runner.u).fillna(0.0)
+    start, end = selected_weights.index.min(), selected_weights.index.max()
+    selected_ledger = evaluator.ledger_from_weights(selected_weights).loc[start:end]
+    selected_weights.to_csv(output / "r8_recipe_walk_forward_weights.csv")
+    selected_ledger.to_csv(output / "r8_recipe_walk_forward_ledger.csv")
+    _json_dump(output / "r8_recipe_walk_forward_decisions.json", decisions)
+
+    ledgers = {"r8_recipe_walk_forward": selected_ledger}
+    rows = [{
+        "strategy": "r8_recipe_walk_forward",
+        "evidence": "training_selected_test_frozen",
+        **performance_metrics(selected_ledger["net_return"]),
+    }]
+    for challenger, recipe in R8_RECIPE_CHALLENGERS.items():
+        weights = evaluator.weights(R8, recipe).loc[start:end]
+        ledger = evaluator.ledger_from_weights(weights).loc[start:end]
+        strategy = f"R8_{challenger}"
+        ledgers[strategy] = ledger
+        rows.append({
+            "strategy": strategy,
+            "evidence": (
+                "fixed_production_baseline" if recipe == BASE_RECIPE
+                else "fixed_retrospective_hypothesis"
+            ),
+            **performance_metrics(ledger["net_return"]),
+        })
+    metrics = pd.DataFrame(rows)
+    metrics.to_csv(output / "r8_recipe_walk_forward_metrics.csv", index=False)
+
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for name, ledger in ledgers.items():
+        nav = ledger["nav"] / ledger["nav"].iloc[0] * 1000.0
+        metric = metrics.loc[metrics["strategy"] == name].iloc[0]
+        ax.plot(
+            nav.index,
+            nav.values,
+            linewidth=2.0 if name == "r8_recipe_walk_forward" else 1.3,
+            label=(
+                f"{name} | 年化{metric['annual_return']:.1%} "
+                f"夏普{metric['sharpe']:.2f} 回撤{metric['max_drawdown']:.1%}"
+            ),
+        )
+    ax.set_title("R8组合方法扩展窗口冻结验证（总敞口2，扣费后）")
+    ax.set_ylabel("净值（起点=1000）")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output / "nav_r8_recipe_walk_forward.png", dpi=160)
+    plt.close(fig)
+    return metrics, decisions
+
+
 def _comparison(
     evaluator: PortfolioEvaluator,
     adaptive_weights: pd.DataFrame,
@@ -454,6 +591,11 @@ def _comparison(
     })
     metrics = pd.DataFrame(rows)
     metrics.to_csv(output / "comparison_metrics.csv", index=False)
+
+    pd.DataFrame({
+        name: nav.loc[start:end] / nav.loc[start:end].iloc[0] * 1000.0
+        for name, nav in navs.items()
+    }).to_csv(output / "nav_comparison.csv")
 
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
@@ -503,11 +645,25 @@ def _write_review(
         f"- 最大回撤：{adaptive['max_drawdown']:.2%}",
         f"- 双倍交易成本夏普：{stress['sharpe']:.2f}",
         "",
+        "## 固定方案对照",
+        "",
+        "| 方案 | 年化收益 | 夏普 | 最大回撤 |",
+        "|---|---:|---:|---:|",
+    ]
+    for _, row in metrics.loc[
+        metrics["strategy"] != "adaptive_search_cost_2x"
+    ].iterrows():
+        lines.append(
+            f"| {row['strategy']} | {row['annual_return']:.2%} | "
+            f"{row['sharpe']:.2f} | {row['max_drawdown']:.2%} |"
+        )
+    lines.extend([
+        "",
         "## 各折训练期选择",
         "",
         "| 折 | 训练期 | 测试期 | 候选 | 因子数 | 方法 | 测试期夏普（诊断） |",
         "|---|---|---|---|---:|---|---:|",
-    ]
+    ])
     for decision in decisions:
         recipe = decision["selected_recipe"]
         lines.append(
@@ -528,7 +684,8 @@ def _write_review(
         f"相邻折因子集 Jaccard 均值：{np.mean(jaccards):.2f}" if jaccards else "相邻折不足，无法计算稳定性。",
         "",
         "最终评价以拼接后的 `adaptive_oos_ledger.csv` 为准；单折测试指标只用于诊断，",
-        "没有参与该折选择。生产策略和正式配置未被修改。",
+        "没有参与该折选择。生产策略和正式配置未被修改。自适应方案即使优于固定基线，",
+        "也因各折方法和因子集会变化而只构成候选证据，不能自动替代生产。",
         "",
     ])
     (output / "REVIEW.md").write_text("\n".join(lines), encoding="utf-8")
@@ -544,6 +701,11 @@ def main() -> None:
         action="store_true",
         help="reuse an interrupted run's temporary factor-panel cache",
     )
+    parser.add_argument(
+        "--r8-recipe-only",
+        action="store_true",
+        help="only run the two-recipe expanding-window freeze test for fixed R8",
+    )
     args = parser.parse_args()
     output = Path(args.output) if args.output else (
         ROOT / "runs" / "historical_portfolio_search" / f"{datetime.now():%Y%m%d_%H%M%S}"
@@ -554,26 +716,42 @@ def main() -> None:
     else:
         output.mkdir(parents=True, exist_ok=False)
 
-    valid_factors = list(dict.fromkeys(F6 + list(KEPT47) + list(NEW21)))
+    valid_factors = (
+        list(R8) if args.r8_recipe_only
+        else list(dict.fromkeys(F6 + list(KEPT47) + list(NEW21)))
+    )
     resolved = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "mode": "r8_recipe_only" if args.r8_recipe_only else "full_search",
         "factor_library_policy": "current_validated_library_fixed_for_all_historical_folds",
         "valid_factor_count": len(valid_factors),
         "valid_factors": valid_factors,
         "outer_folds": OUTER_FOLDS,
-        "method_grid": {
-            "factor_weight": ["equal", "diag_icir", "lw_abs", "lw_positive"],
-            "top_n": [8, 10, 12],
-            "sector_cap": [0, 3],
-            "asset_weight": ["equal", "inverse_volatility", "erc"],
-            "search": "three-stage coordinate search, top2/top2/top3",
-        },
-        "factor_search": {
-            "training_only_cluster_correlation": 0.65,
-            "factor_count": [4, 12],
-            "beam_width": 20,
-            "exact_portfolio_candidates_per_fold": 12,
-        },
+        "method_grid": (
+            {
+                "predeclared_recipes": {
+                    name: recipe.to_dict()
+                    for name, recipe in R8_RECIPE_CHALLENGERS.items()
+                },
+                "search": "training-rank two recipes, freeze winner to next test fold",
+            }
+            if args.r8_recipe_only else {
+                "factor_weight": ["equal", "diag_icir", "lw_abs", "lw_positive"],
+                "top_n": [8, 10, 12],
+                "sector_cap": [0, 3],
+                "asset_weight": ["equal", "inverse_volatility", "erc"],
+                "search": "three-stage coordinate search, top2/top2/top3",
+            }
+        ),
+        "factor_search": (
+            {"enabled": False, "fixed_factor_set": "R8"}
+            if args.r8_recipe_only else {
+                "training_only_cluster_correlation": 0.65,
+                "factor_count": [4, 12],
+                "beam_width": 20,
+                "exact_portfolio_candidates_per_fold": 12,
+            }
+        ),
         "costs": {"trade_cost_rate": 0.0002, "annual_fee": 0.001},
         "gross_exposure": 2.0,
     }
@@ -622,8 +800,37 @@ def main() -> None:
         trade_cost_rate=0.0002,
         annual_fee=0.001,
     )
-    print("stage 1-3: method search", flush=True)
-    recipes_by_fold, _ = _stage_method_search(evaluator, output)
+    if args.r8_recipe_only:
+        metrics, decisions = _r8_recipe_walk_forward(evaluator, output)
+        if panel_cache.is_file():
+            panel_cache.unlink()
+        print(json.dumps({
+            "output": str(output),
+            "metrics": metrics.to_dict("records"),
+            "selected_by_fold": [
+                row["selected_challenger"] for row in decisions
+            ],
+        }, ensure_ascii=False, indent=2), flush=True)
+        return
+    shortlist_path = output / "method_shortlist.json"
+    if args.resume and shortlist_path.is_file():
+        print("reuse completed method search", flush=True)
+        shortlist = json.loads(shortlist_path.read_text(encoding="utf-8"))
+        recipes_by_fold = {
+            fold: [
+                PortfolioRecipe(
+                    factor_weight=row["factor_weight"],
+                    top_n=int(row["top_n"]),
+                    sector_cap=int(row["sector_cap"]),
+                    asset_weight=row["asset_weight"],
+                )
+                for row in rows[:3]
+            ]
+            for fold, rows in shortlist["final_by_fold"].items()
+        }
+    else:
+        print("stage 1-3: method search", flush=True)
+        recipes_by_fold, _ = _stage_method_search(evaluator, output)
     evaluator.clear_transient_caches()
     print("stage 4: cluster-aware factor search", flush=True)
     adaptive_weights, adaptive_ledger, decisions, _ = _factor_search(
@@ -631,6 +838,7 @@ def main() -> None:
     )
     print("final comparison and cost stress", flush=True)
     metrics = _comparison(evaluator, adaptive_weights, adaptive_ledger, output)
+    _r8_recipe_walk_forward(evaluator, output)
     _write_review(output, decisions, metrics)
     if panel_cache.is_file():
         panel_cache.unlink()
