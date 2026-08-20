@@ -94,48 +94,6 @@ def test_layered_empty():
 
 
 # ============================================================
-# Test: Heuristic optimize no constraints
-# ============================================================
-def test_heuristic_no_constraints():
-    _run("Optimizer - 无约束启发式 → 权重方向与 alpha 一致")
-    from optimization.mean_variance import MeanVarianceOptimizer
-    opt = MeanVarianceOptimizer(risk_aversion=2.0, cost_penalty=0.5)
-    predicted = pd.Series(
-        [0.01, 0.02, 0.03, -0.01, 0.005],
-        index=["A", "B", "C", "D", "E"],
-    )
-    current = pd.Series(0.0, index=predicted.index)
-    universe = predicted.index
-
-    weights = opt._heuristic_optimize(predicted, current, [], universe)
-    _check(len(weights) == 5, f"权重数 = {len(weights)}")
-    # 正 alpha → 多头 (正权重), 负 alpha → 空头 (负权重)
-    _check(weights["C"] >= weights["B"] > 0, f"多头: C={weights['C']:.4f} >= B={weights['B']:.4f} > 0")
-    _check(weights["D"] < 0, f"负 alpha 品种 D 权重为负: {weights['D']:.4f}")
-
-
-# ============================================================
-# Test: Heuristic optimize with net exposure constraint
-# ============================================================
-def test_heuristic_with_net_exposure():
-    _run("Optimizer - 净敞口约束 [−0.5, 0.5]")
-    from optimization.mean_variance import MeanVarianceOptimizer
-    from optimization.constraints import NetExposureConstraint
-    opt = MeanVarianceOptimizer()
-    predicted = pd.Series(
-        [0.01, 0.02, 0.03, -0.01, 0.005],
-        index=["A", "B", "C", "D", "E"],
-    )
-    current = pd.Series(0.0, index=predicted.index)
-    universe = predicted.index
-
-    constraint = NetExposureConstraint(lower=-0.5, upper=0.5)
-    weights = opt._heuristic_optimize(predicted, current, [constraint], universe)
-    net = weights.sum()
-    _check(-0.5 <= net <= 0.5, f"净敞口 = {net:.4f}")
-
-
-# ============================================================
 # Test: Stack factors and returns
 # ============================================================
 def test_stack_factors():
@@ -168,18 +126,84 @@ def test_cache_key():
         _check(k1 != k2, f"key 不同 ({k1[-40:]} != {k2[-40:]})")
 
 
+def test_cache_rejects_unimplemented_backend():
+    from data.cache import Cache
+    with tempfile.TemporaryDirectory() as cache_dir:
+        try:
+            Cache(cache_dir=cache_dir, backend="feather")
+        except ValueError as exc:
+            _check("parquet" in str(exc), "拒绝未实现的缓存后端")
+        else:
+            _check(False, "未实现的缓存后端必须失败关闭")
+
+
+def test_dynamic_universe_schedule_reads_calendar_once():
+    from pipeline.runner import PipelineRunner
+
+    class Data:
+        calendar_calls = 0
+
+        def get_listing_dates(self, universe):
+            return pd.Series(
+                pd.to_datetime(["2024-01-01", "2024-01-08"]),
+                index=universe,
+            )
+
+        def get_calendar(self, start, end):
+            self.calendar_calls += 1
+            return pd.bdate_range(start, end)
+
+    runner = PipelineRunner.__new__(PipelineRunner)
+    runner.data_manager = Data()
+    schedule = runner._build_dynamic_universe_schedule(
+        pd.Index(["A", "B"]),
+        pd.to_datetime(["2024-01-05", "2024-01-07", "2024-01-08"]),
+    )
+
+    assert runner.data_manager.calendar_calls == 1
+    assert schedule[pd.Timestamp("2024-01-05")].tolist() == ["A"]
+    assert schedule[pd.Timestamp("2024-01-08")].tolist() == ["A", "B"]
+
+
 # ============================================================
 # Test: Registry constraint auto-discovery
 # ============================================================
 def test_registry_constraint():
     _run("Registry - 约束自动发现")
     from core.registry import create
+    from optimization import constraints  # noqa: F401
     try:
         c = create("constraint", "net_exposure", lower=-0.5, upper=0.5)
         _check(c is not None, "net_exposure 约束创建成功")
         _check(hasattr(c, "apply"), "约束有 apply 方法")
     except Exception as e:
         _check(False, f"约束创建失败: {e}")
+
+
+def test_registry_rejects_silent_replacement():
+    from core.registry import _REGISTRIES, register
+
+    kind = "test_component"
+    name = "duplicate_guard"
+
+    class First:
+        pass
+
+    class Second:
+        pass
+
+    try:
+        assert register(kind, name)(First) is First
+        assert register(kind, name)(First) is First
+        try:
+            register(kind, name)(Second)
+        except ValueError as exc:
+            assert "duplicate registration" in str(exc)
+        else:
+            raise AssertionError("duplicate component registration must fail")
+        assert _REGISTRIES[kind][name] is First
+    finally:
+        _REGISTRIES.pop(kind, None)
 
 
 # ============================================================
@@ -205,8 +229,6 @@ if __name__ == "__main__":
     test_ic_pearson_perfect_positive()
     test_ic_empty()
     test_layered_empty()
-    test_heuristic_no_constraints()
-    test_heuristic_with_net_exposure()
     test_stack_factors()
     test_cache_key()
     test_registry_constraint()

@@ -9,7 +9,9 @@ import pandas as pd
 
 
 _CZCE_EXCHANGES = {"CZC", "CZCE", "ZCE"}
-_CONTRACT_RE = re.compile(r"^([A-Z]+)(\d{3})$")
+_ROOT_SUFFIX_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+CONTRACT_SYMBOL_SEMANTICS_VERSION = 2
 
 MARKET_FIELDS = (
     "open", "high", "low", "close", "volume", "amount", "position",
@@ -21,28 +23,38 @@ class ContractAliasConflictError(ValueError):
     """Raised when aliases for one contract disagree at the same timestamp."""
 
 
-def canonical_contract_symbol(symbol, exchange, trade_date) -> str:
-    """Return an uppercase symbol, expanding CZCE ``YMM`` to ``YYMM``.
+def contract_symbol_parts(symbols: pd.Series) -> pd.DataFrame:
+    """Parse exact roots and flag real ``ROOT+YYMM`` delivery contracts.
 
-    CZCE's one-digit delivery year is resolved against the row's trade year.
-    For example, ``FG609`` on a 2026 trade date becomes ``FG2609`` and
-    ``FG701`` becomes ``FG2701``.
+    Plain roots, two-digit vendor aliases and continuous/index suffixes are
+    retained as parseable symbols but never marked as concrete contracts.
     """
-    text = str(symbol).strip().upper()
-    if str(exchange).strip().upper() not in _CZCE_EXCHANGES:
-        return text
-    match = _CONTRACT_RE.fullmatch(text)
-    if not match:
-        return text
-    suffix = match.group(2)
-    month = int(suffix[1:])
-    if not 1 <= month <= 12:
-        raise ValueError(f"invalid CZCE contract month: {text!r}")
-    year = pd.Timestamp(trade_date).year
-    delivery_year = year // 10 * 10 + int(suffix[0])
-    if delivery_year < year:
-        delivery_year += 10
-    return f"{match.group(1)}{delivery_year % 100:02d}{month:02d}"
+    normalized = symbols.astype(str).str.strip().str.upper()
+    parsed = normalized.str.extract(_ROOT_SUFFIX_RE)
+    suffix = parsed[1]
+    concrete_suffix = suffix.where(suffix.str.fullmatch(r"\d{4}", na=False))
+    delivery_year = pd.to_numeric(
+        concrete_suffix.str[:2], errors="coerce"
+    ).add(2000)
+    delivery_month = pd.to_numeric(
+        concrete_suffix.str[2:], errors="coerce"
+    )
+    is_concrete = (
+        parsed[0].notna()
+        & concrete_suffix.notna()
+        & delivery_month.between(1, 12)
+    )
+    return pd.DataFrame(
+        {
+            "symbol": normalized,
+            "root": parsed[0].str.upper(),
+            "suffix": suffix,
+            "delivery_year": delivery_year.where(is_concrete),
+            "delivery_month": delivery_month.where(is_concrete),
+            "is_concrete": is_concrete,
+        },
+        index=symbols.index,
+    )
 
 
 def _canonical_symbols(frame: pd.DataFrame) -> pd.Series:
@@ -138,3 +150,12 @@ def canonicalize_contract_aliases(
         )
 
     return result.drop_duplicates(keys, keep="last").reset_index(drop=True)
+
+
+__all__ = [
+    "CONTRACT_SYMBOL_SEMANTICS_VERSION",
+    "ContractAliasConflictError",
+    "MARKET_FIELDS",
+    "canonicalize_contract_aliases",
+    "contract_symbol_parts",
+]

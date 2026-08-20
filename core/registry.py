@@ -5,7 +5,7 @@ components (factors, processing steps, risk models, etc.) by kind and name.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Optional
 
 _REGISTRIES: Dict[str, Dict[str, type]] = {}
 """Internal storage: {kind -> {name -> class}}."""
@@ -23,7 +23,14 @@ def register(kind: str, name: str) -> Any:
     """
 
     def decorator(cls: type) -> type:
-        _REGISTRIES.setdefault(kind, {})[name] = cls
+        registry = _REGISTRIES.setdefault(kind, {})
+        existing = registry.get(name)
+        if existing is not None and existing is not cls:
+            raise ValueError(
+                f"duplicate registration for {kind!r}/{name!r}: "
+                f"{existing.__module__}.{existing.__qualname__} already registered"
+            )
+        registry[name] = cls
         return cls
 
     return decorator

@@ -22,7 +22,7 @@ WORKFLOW_COMMANDS = {
         "workflows.summarize_results", "summarize frozen walk-forward outputs"
     ),
     "data-health": ("workflows.diagnostics.data_health", "read-only data checks"),
-    "close": ("workflows.close_decision", "fail-closed end-of-day decision"),
+    "close": ("workflows.close_decision", "fail-closed end-of-day target publication"),
     "mining": ("factor_mining.cli", "local factor mining and candidate pool"),
 }
 
@@ -40,7 +40,7 @@ def _check_dependencies() -> list[str]:
 
 
 def _print_help() -> None:
-    print("Multi-factor futures research and trading framework")
+    print("Multi-factor futures research and target-weight framework")
     print(
         "\nUsage: python main.py <command> "
         "[--mined-snapshot PATH] [options]\n"

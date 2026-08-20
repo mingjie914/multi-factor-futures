@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sys
 
+import pandas as pd
 import pytest
 
 from core.factor_contract import bind_factor_contract, validate_factor_contract
 from core.registry import _REGISTRIES
 from workflows.research import (
+    _load_adaptivity_data,
     _passes_post_bonferroni_quality,
     _parse_requested_factors,
     _validate_requested_factors,
@@ -17,6 +19,13 @@ def test_requested_factor_parser_is_stable_and_deduplicated():
     assert _parse_requested_factors(" beta,alpha,beta ") == ["beta", "alpha"]
     with pytest.raises(ValueError, match="at least one"):
         _parse_requested_factors(" , ")
+
+
+def test_explicit_adaptivity_file_fails_closed(tmp_path):
+    bad = tmp_path / "adaptivity.csv"
+    bad.write_text("wrong\nvalue\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="factor"):
+        _load_adaptivity_data(str(bad))
 
 
 def test_registered_factor_contract_rejects_formal_horizon_override():

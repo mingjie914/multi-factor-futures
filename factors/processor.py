@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from core.interfaces import ProcessingContext, ProcessingStep
-from core.registry import get as registry_get, register
+from core.registry import get as registry_get
 from core.types import FactorMatrix
 
 
@@ -31,13 +30,13 @@ class FactorProcessor:
             try:
                 result = step.transform(result, context)
             except Exception as e:
-                if bool(getattr(step, "fail_closed", False)):
-                    raise
-                logging.getLogger(__name__).warning(
-                    f"Processing step '{step.name}' failed: {e}"
-                )
+                raise RuntimeError(
+                    f"processing step {step.name!r} failed: {e}"
+                ) from e
+            self._validate_result(result, factor, step.name)
         if eligibility is not None:
             result = result.where(eligibility)
+        self._validate_result(result, factor, "final_output")
         return result
 
     def process_batch(
@@ -65,14 +64,45 @@ class FactorProcessor:
             try:
                 result = step.transform(result, context)
             except Exception as exc:
-                if bool(getattr(step, "fail_closed", False)):
-                    raise
-                logging.getLogger(__name__).warning(
-                    "Processing step '%s' failed: %s", step.name, exc
-                )
+                raise RuntimeError(
+                    f"processing step {step.name!r} failed: {exc}"
+                ) from exc
+            self._validate_result(result, factor, step.name)
         if eligibility is not None:
             result = result.where(eligibility)
+        self._validate_result(result, factor, "final_output")
         return result
+
+    @staticmethod
+    def _validate_result(
+        result: FactorMatrix,
+        original: FactorMatrix,
+        step_name: str,
+    ) -> None:
+        if not isinstance(result, pd.DataFrame):
+            raise TypeError(
+                f"processing step {step_name!r} must return a DataFrame"
+            )
+        if not result.index.equals(original.index) or not result.columns.equals(
+            original.columns
+        ):
+            raise ValueError(
+                f"processing step {step_name!r} changed factor axes"
+            )
+        try:
+            values = result.to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"processing step {step_name!r} returned non-numeric values"
+            ) from exc
+        if np.isinf(values).any():
+            raise ValueError(
+                f"processing step {step_name!r} returned infinite values"
+            )
+        if not np.isfinite(values).any():
+            raise ValueError(
+                f"processing step {step_name!r} returned no finite values"
+            )
 
 
 def build_processing_steps(configs: List[dict]) -> List[ProcessingStep]:
@@ -81,11 +111,10 @@ def build_processing_steps(configs: List[dict]) -> List[ProcessingStep]:
     for cfg in configs:
         step_type = cfg.get("type", "")
         params = cfg.get("params", {})
-        try:
-            cls = registry_get("processing_step", step_type)
-            steps.append(cls(**params))
-        except KeyError:
-            continue
+        if not step_type:
+            raise ValueError("processing step type must not be empty")
+        cls = registry_get("processing_step", step_type)
+        steps.append(cls(**params))
     return steps
 
 

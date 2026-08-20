@@ -57,9 +57,13 @@ class LayeredBacktest(FactorTest):
     name = "layered"
 
     def __init__(self, n_groups: int = 5, holding_period: int = 1):
-        self.n_groups = n_groups
+        if isinstance(n_groups, bool) or int(n_groups) != n_groups or n_groups < 1:
+            raise ValueError("n_groups must be a positive integer")
+        if isinstance(holding_period, bool) or int(holding_period) != holding_period or holding_period < 1:
+            raise ValueError("holding_period must be a positive integer")
+        self.n_groups = int(n_groups)
         # CR-026: 持有期 (前向收益天数), 用于非重叠调仓频率年化
-        self.holding_period = holding_period
+        self.holding_period = int(holding_period)
 
     def run(
         self,
@@ -74,6 +78,9 @@ class LayeredBacktest(FactorTest):
 
         # CR-026: holding_period 可通过 params 覆盖
         holding_period = params.get("holding_period", self.holding_period)
+        if isinstance(holding_period, bool) or int(holding_period) != holding_period or holding_period < 1:
+            raise ValueError("holding_period must be a positive integer")
+        holding_period = int(holding_period)
 
         aligned_factor = factor.loc[common_dates, common_columns]
         aligned_returns = forward_returns.loc[common_dates, common_columns]
@@ -106,22 +113,21 @@ class LayeredBacktest(FactorTest):
             means = np.divide(
                 numerator,
                 denominator,
-                out=np.zeros(len(common_dates), dtype=float),
+                out=np.full(len(common_dates), np.nan, dtype=float),
                 where=denominator > 0,
             )
             gs[label] = pd.Series(means[valid_rows], index=valid_index)
 
         # CR-026: 统一 spread 方向: Q5(高因子) - Q1(低因子), 标准多空方向
-        ls = (gs[group_labels[-1]] - gs[group_labels[0]]).fillna(0)
+        ls = gs[group_labels[-1]] - gs[group_labels[0]]
         ls_cum = (1 + ls).cumprod()
         gs["long_short"] = ls
 
         # CR-026: 年化按非重叠调仓频率 (252/holding_period)
         periods_per_year = float(params.get("periods_per_year", 252.0))
-        ann_factor = (
-            periods_per_year / holding_period
-            if holding_period > 0 else periods_per_year
-        )
+        if not np.isfinite(periods_per_year) or periods_per_year <= 0:
+            raise ValueError("periods_per_year must be positive")
+        ann_factor = periods_per_year / holding_period
 
         # Per-group metrics
         def _metrics(s: pd.Series) -> dict:

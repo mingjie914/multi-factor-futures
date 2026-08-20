@@ -3,116 +3,33 @@ market: futures
 seed: 42
 
 data:
-  source: mysql_futures
+  # Current framework boundary: consume published local Parquet only.
+  source: parquet_futures
+  # Only exchange/source-verified market closures belong here. Unknown
+  # post-listing close gaps fail closed and must be repaired at the data source.
+  audited_nontrading_closes:
+    NI:
+      - '2022-03-10'
   cache:
-    enabled: true
-    only: false
+    # ParquetFuturesSource owns fingerprinted selected-contract caches. Disable
+    # the generic range cache so a source update cannot reuse stale close data.
+    enabled: false
     path: ./cache
     backend: parquet
-  mysql:
-    host: '${MF_MYSQL_HOST}'
-    port: 3306
-    user: '${MF_MYSQL_USER}'
-    password: '${MF_MYSQL_PASSWORD}'
-    database: '${MF_MYSQL_DATABASE:testmm}'
-    charset: utf8mb4
-    tables:
-      commodity_eod:
-        table_name: ccommodityfutureseodprices
-        columns:
-          date: TRADE_DT
-          ticker: S_INFO_WINDCODE
-          pre_settle: S_DQ_PRESETTLE
-          open: S_DQ_OPEN
-          high: S_DQ_HIGH
-          low: S_DQ_LOW
-          close: S_DQ_CLOSE
-          settle: S_DQ_SETTLE
-          volume: S_DQ_VOLUME
-          amount: S_DQ_AMOUNT
-          oi: S_DQ_OI
-          oi_change: S_DQ_OICHANGE
-      intraday_5m:
-        table_name: ths_data_5minute
-        timestamp_convention: end
-        bar_minutes: 5
-        columns:
-          datetime: time
-          ticker: code
-          open: open
-          high: high
-          low: low
-          close: close
-          volume: volume
-          amount: amt
-          oi: oi
-      contract_mapping:
-        table_name: cfuturescontractmapping
-        columns:
-          ticker: S_INFO_WINDCODE
-          mapped_to: FS_MAPPING_WINDCODE
-          start_date: STARTDATE
-          end_date: ENDDATE
-      contract_description:
-        table_name: cfuturesdescription
-        columns:
-          ticker: S_INFO_WINDCODE
-          name: S_INFO_NAME
-          exchange: S_INFO_EXCHMARKET
-          list_date: S_INFO_LISTDATE
-          delist_date: S_INFO_DELISTDATE
-      calendar:
-        table_name: cfuturescalendar
-        columns:
-          day: TRADE_DAYS
-          exchange: S_INFO_EXCHMARKET
-      macrodata:
-        table_name: macrodata
-        columns:
-          date: date
-          repo_7d: 银行间质押式回购加权利率7天月
-          repo_1y: 银行间质押式回购加权利率1年月
-          shibor_3m: SHIBOR3个月月
-          shibor_6m: SHIBOR6个月月
-          pmi: PMI
-          pmi_new_orders: PMI新订单
-          pmi_input_prices: PMI主要原材料购进价格
-          pmi_raw_inventory: PMI原材料库存
-          cpi_yoy: CPI当月同比
-          ppi_mom: PPI全部工业品环比
-          ppirm_nonferrous_yoy: PPIRM有色金属材料类当月同比
-          ppirm_agri_yoy: PPIRM农副产品类当月同比
-          taiwan_electronics: 台湾电子行业指数月
-          fai_secondary_yoy: 固定资产投资完成额第二产业累计同比
-          social_financing_yoy: 社融存量同比
-          leading_index: 宏观经济景气指数先行指数
-    pool_size: 5
-    query_timeout: 30
-    connect_timeout: 5
-    failure_cooldown: 30
-    dominant_lag_days: 1
-    schedule_buffer_days: 20
-    endpoints: []
-    fallbacks: []
-  ddb:
-    host: '${MF_DDB_HOST}'
-    port: 8961
-    user: '${MF_DDB_USER}'
-    password: '${MF_DDB_PASSWORD}'
-    minute_db: dfs://kline_db
-    minute_table: kline_futures_1min
-    eod_db: dfs://wind_db
-    eod_table: CCommodityFuturesEODPrices
-    data_version: v1
-    dominant_lag_days: 1
   parquet:
     root_path: '${MF_PARQUET_ROOT:}'
     datasets:
       daily: futureshistoryprices1d
       1min: futureshistoryprices1m
+      5min: futureshistoryprices5m
       15min: futureshistoryprices15m
+    seat_dataset: futuresseatdata
     dominant_lag_days: 1
     schedule_buffer_days: 45
+    # FU was relaunched as bonded 380 CST fuel oil on 2018-07-16.  Earlier FU
+    # contracts are a different economic epoch and must not be bridged.
+    root_active_from:
+      FU: '2018-07-16'
     eager_fields: true
     panel_cache_entries: 1
     curve_cache_enabled: true
@@ -120,6 +37,7 @@ data:
     selected_cache_enabled: true
     selected_cache_path: './cache/selected_contracts'
 
+# Reproducible baseline window, not an automatic latest-data sentinel.
 # 2017 is warm-up; formal historical studies evaluate from 2018.
 date_range:
   start: '2017-01-01'
@@ -245,22 +163,13 @@ optimization:
 
 costs:
   type: simple_futures
-  # Two-stage research policy. Screening uses only the annual 2 bp rate;
-  # post-screen backtests add the annual 10.5 bp roll allowance.
-  margin_rate: 0.12
-  annual_transaction_cost: 0.0002
+  # Full traded notional pays 2 bp. Post-screen backtests additionally accrue
+  # the annual 10.5 bp roll allowance on gross exposure.
+  turnover_cost_rate: 0.0002
   annual_fee: 0.0
   annual_roll_cost: 0.00105
   periods_per_year: 252
   cost_stage: post_screen_backtest
-
-signals:
-  mode: trend_following
-  position_sizer: atr_based
-  position_sizer_params: {target_volatility: 0.15, atr_period: 20}
-  sl_tp_rules: []
-  batch: {entry_batches: 3, exit_batches: 2}
-  output: {format: csv, path: ./signals_output}
 
 # Research universe: monthly point-in-time selection from lagged 60-day
 # liquidity. Sector floors protect small but economically distinct sleeves;
@@ -304,6 +213,24 @@ asset_selection:
   exit_buffer: 1
   min_abs_forecast: 0.0
   restrict_to_valid_sectors: false
+
+# Main branch A. Asset limits are fractions of each unit-gross long/short
+# sleeve. ``sector_count_cap`` limits names, not sector weight; optional sector
+# weight caps remain empty unless explicitly approved.
+production_portfolio:
+  factor_weight_method: lw_abs
+  ic_window: 60
+  top_n_per_side: 10
+  sector_count_cap: 3
+  asset_weight_method: erc
+  asset_min_fraction: 0.005
+  asset_max_fraction: 0.20
+  asset_max_overrides: {}
+  sector_weight_caps: {}
+  gross_exposure: 2.0
+  risk_lookback_calendar_days: 90
+  minimum_risk_observations: 10
+  covariance_shrinkage: 0.30
 
 backtest:
   rebalance_freq: weekly
@@ -349,7 +276,6 @@ meta_optimizer:
   covariance_shrinkage: 0.30
   enforce_underlying_constraints: true
   underlying_constraints: []
-  net_underlying_costs: true
   underlying_dynamic_risk_limits:
     enabled: true
     asset_vol_budget: 0.03
@@ -362,7 +288,7 @@ meta_optimizer:
     covariance_shrinkage: 0.30
 
 factor_synthesis: {enabled: false, confirm_map: []}
-research_artifacts: {enabled: false, path: '', required: false, strict_config_hash: true}
+research_artifacts: {enabled: false, path: '', strict_config_hash: true}
 factor_governance:
   enabled: true
   default_max_per_family: 20
@@ -474,18 +400,3 @@ horizon_ensemble:
   max_log_distance: 0.80
   use_valid_periods: false
   retrain_freq_by_horizon: {}
-
-defensive_sleeve: {enabled: false, integration_mode: standalone}
-supertrend_sleeve:
-  enabled: true
-  integration_mode: shadow
-  capital_weight: 0.0
-  rebalance_freq: 5
-  rebalance_on_flip: false
-  target_volatility: 0.12
-  asset_vol_budget: 0.025
-  sector_vol_budget: 0.06
-  hard_asset_cap: 1.0
-  gross_cap: 2.0
-  net_cap: 0.5
-  turnover_cap: 0.5

@@ -1,6 +1,3 @@
--r requirements-minimal.txt
+-r requirements.txt
 
 pytest>=8,<10
-sqlalchemy>=1.4.0,<3
-pymysql>=1.0.0,<2
-ta_cn[cn]==0.5.2

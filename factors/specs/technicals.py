@@ -1,9 +1,9 @@
-"""技术指标类因子 SPEC 定义 (来自 DolphinDB alpha_db 推导).
+"""技术指标类因子 SPEC 定义（历史公式参考来自 alpha_db，运行仅依赖本地OHLCV）.
 
 Technicals 类: MACD、KDJ、BOLL、OBV、BIAS、DMI、VR、WR、TRIX、DPO、MAVOL、ARBR、ASI、BBI、NEWDMA
 16 个 base × 8 种 transform × 3 种窗口 = 384 个因子
 
-算法来源: DolphinDB alpha_db/daily_alpha_table 中的 19 类标准技术分析指标.
+算法来源: 历史 alpha_db/daily_alpha_table 中的 19 类标准技术分析指标.
 其中 RSI 已在 oscillator.py 中实现, MTM 与 momentum 类似, 此处覆盖其余 16 类.
 全部仅依赖 OHLCV 数据, 保持与 SPEC 框架一致.
 """

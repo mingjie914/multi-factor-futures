@@ -1,14 +1,13 @@
-"""combined — 融合策略模块 (最终固化版, ERC 升级).
+"""combined — 主分支A：10f固定观察基线（ICIR + cap3 + ERC）。
 
-方案: 6因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 (多空, 日度调仓)
+方案: 10因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 (多空, 日度调仓)
   - 品种池: 38 (manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR, 见 docs/策略基准记录.md)
-  - 信号: 6个已验证因子 IC_IR 动态加权 (60日滚动 Ledoit-Wolf, 2026-08-05 升级) → Top10做多 / Bottom10做空
-  - 权重: 池内 ERC (等风险贡献, 协方差 shrinkage=0.3), 可回退到逆波动率
+  - 信号: 10f IC_IR动态加权（60日滚动Ledoit-Wolf）→ Top10做多 / Bottom10做空
+  - 权重: 池内 ERC (等风险贡献目标, 协方差 shrinkage=0.3)，再投影到显式资产约束
   - 选池: 板块配额 cap=3 (每板块最多3个多头/空头)
   - 调仓: 日度 (每天收盘生成信号, 次日持有)
 
-验证数据 (2025-01~2026-07 / OOS 2026-03~05):
-  IC_IR 版: 全段夏普 2.56, OOS 夏普 2.94, 实盘 +2.24 (2026-08-05 升级, 优于等权 2.04)
+10f只作为修复后统一比较的固定基线；历史表现不足以构成生产批准，目标权重发布门保持关闭。
 
 用法:
     from strategies.combined import CombinedStrategy
@@ -17,7 +16,6 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -29,17 +27,40 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.config import load_config
+from core.sectors import PORTFOLIO_SELECTION_GROUPS, portfolio_selection_group_for
+from data.manager import DataManager
 from factors.engine import FactorEngine
+from factors import library as _factor_library  # noqa: F401
+from optimization.factor_weighting import (
+    causal_history,
+    combine_available_factor_scores,
+    factor_weights,
+    prepare_complete_history,
+    rank_information_coefficients,
+)
+from optimization.portfolio_construction import (
+    PortfolioConstraints,
+    allocate_sleeve,
+    causal_risk_window,
+    combine_sleeves,
+    prepare_risk_history,
+    select_long_short_pools,
+)
 
-# 6 个已验证有效因子 + 方向 (+1=高暴露看多, -1=高暴露看空)
-# 2026-08-04: 时序 bug 修正后 6因子(夏普2.04) > 7因子(1.73), 席位因子 #326 不再增益
+# 当前固定观察10f及方向（+1=高暴露看多，-1=高暴露看空）。
+# 来源：13f剔除jump_intensity、dtws和seat_long_short_seat_ratio；
+# 组合方法仍为ICIR + Top10/Bottom10 + cap3 + ERC。
 FACTORS = {
-    "intraday_jump_intensity_20d": -1,
     "intraday_price_peak_count_20d": 1,
     "intraday_realised_skewness_20d": 1,
-    "intraday_dtws_20d": 1,
     "intraday_drip_stone_20d": -1,
     "intraday_peak_ridge_ratio_20d": -1,
+    "intraday_torrent_down_20d": -1,
+    "intraday_lowest_time_20d": 1,
+    "intraday_term_slope_20d": 1,
+    "intraday_open_close_volume_ratio_20d": -1,
+    "intraday_turnover_velocity_20d": 1,
+    "intraday_price_delay_20d": -1,
 }
 
 # 品种池 38 (2026-08-03 升级: manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR)
@@ -50,62 +71,41 @@ UNIVERSE38 = [
     # 2026-08-03 新增 9 个
     "IM", "TF", "CF", "OI", "LH", "JD", "SC", "V", "UR",
 ]
-# 兼容旧名
-MANUAL29 = UNIVERSE38
-
 _DEFAULT_TOP_N = 10
 
-# 权重引擎开关: False = ERC (协方差), True = 简化逆波动率 (回退用)
-USE_SIMPLE_RP = False
-# 因子合成方式: True = IC_IR 动态加权 (60日滚动 Ledoit-Wolf), False = 等权
-# 2026-08-05 升级: 6f-IC_IR (夏普 2.56/实盘+2.24) > 6f-等权 (1.96/-0.19), 见 docs/策略基准记录.md
-IC_IR_WEIGHT = True
-# IC_IR 滚动窗口 (60日最优, 见 snapshot/12f_icir/技术说明.md 6.1 敏感性)
-IC_IR_WINDOW = 60
-# 协方差收缩系数
-COV_SHRINKAGE = 0.30
-# 单品种权重硬限制
-MAX_WEIGHT = 0.20
-MIN_WEIGHT = 0.005
-
-# 板块配额: 每板块最多 SECTOR_CAP 个多头/空头 (0 = 不限制, 全市场 Top10/Bottom10)
-# 2026-08 历史对比实验 (cap=3 vs 无配额, 等权时代): cap=3 夏普 2.64 vs 无配额 2.01, 回撤 -3.4% vs -7.3% (见 docs/策略基准记录.md)
-# 注: 此 2.64 是 cap 对比实验值, 非当前生产基线; 当前生产 = 6因子 IC_IR (全段 2.56, 见 docs/策略基准记录.md L42)
-SECTOR_CAP = 3
-
-# 38 品种板块映射 (含金融板块; 用于配额选池, 不用于中性化)
+# 生产选池使用五个宽组；因子研究仍使用 core.sectors 的细分类。
+SECTOR_OF = {
+    symbol: portfolio_selection_group_for(symbol) for symbol in UNIVERSE38
+}
 SECTOR_MAP = {
-    "有色": ["CU", "AL", "ZN", "NI", "SN", "AG", "AU"],
-    "黑色": ["RB", "HC", "I", "J", "JM"],
-    "能化": ["FU", "MA", "RU", "SA", "TA", "SC", "V", "UR"],
-    "农产品": ["A", "M", "P", "RM", "Y", "SR", "CF", "OI", "LH", "JD"],
-    "金融": ["IC", "IF", "IH", "T", "TL", "TS", "IM", "TF"],
+    group: [symbol for symbol in UNIVERSE38 if SECTOR_OF[symbol] == group]
+    for group in PORTFOLIO_SELECTION_GROUPS
 }
 
 
-def _prepare_erc_returns(returns: pd.DataFrame, minimum_observations: int = 10) -> pd.DataFrame:
-    """Keep only assets with enough finite history for a causal ERC estimate."""
-    clean = returns.replace([np.inf, -np.inf], np.nan)
-    eligible = clean.columns[
-        clean.notna().sum(axis=0).ge(int(minimum_observations))
-    ]
-    if len(eligible) < 2:
-        return clean.iloc[0:0, 0:0]
-    return clean.loc[:, eligible].dropna(axis=0, how="any")
-
-
 class CombinedStrategy:
-    """6因子 IC_IR 动态加权打分选池 + 池内 ERC 风险平价 融合策略 (38品种, cap=3, 日度)."""
+    """10f IC_IR打分选池 + 池内ERC风险平价（38品种、cap3、日度）。"""
 
     def __init__(self, config_path: str = "config/intraday_backtest.yaml",
                  top_n: int = _DEFAULT_TOP_N):
         self.config_path = config_path
-        self.top_n = top_n
+        if int(top_n) <= 0:
+            raise ValueError("top_n must be positive")
+        self.top_n = int(top_n)
         self.cfg = load_config(config_path)
-        from pipeline.runner import PipelineRunner
-        self.runner = PipelineRunner(config=self.cfg)
-        self.engine = FactorEngine(self.runner.data_manager)
-        self._universe = [s for s in MANUAL29 if s in self.cfg.universe] or MANUAL29
+        self.data_manager = DataManager.from_config(self.cfg)
+        self.engine = FactorEngine(self.data_manager)
+        configured = set(map(str, self.cfg.universe))
+        missing = [symbol for symbol in UNIVERSE38 if symbol not in configured]
+        if missing:
+            raise ValueError(
+                "生产配置缺少固定38品种: " + ", ".join(missing)
+            )
+        self._universe = list(UNIVERSE38)
+        self.portfolio_cfg = self.cfg.production_portfolio
+        self.constraints = PortfolioConstraints.from_config(
+            self.portfolio_cfg, top_n=self.top_n
+        )
 
     @property
     def universe(self) -> list[str]:
@@ -114,186 +114,194 @@ class CombinedStrategy:
     def factor_scores(self, start: str, end: str) -> pd.DataFrame:
         """计算因子打分矩阵 (索引=日期, 列=品种, 0~1).
 
-        - IC_IR_WEIGHT=True: IC_IR 动态加权合成 (60日滚动 Ledoit-Wolf)
-        - IC_IR_WEIGHT=False: 等权合成
+        合成方法和窗口来自 ``production_portfolio`` 配置；默认是
+        ``lw_abs`` 与严格的60条历史IC。
         """
-        calendar = pd.DatetimeIndex(self.runner.data_manager.get_calendar(
+        calendar = pd.DatetimeIndex(self.data_manager.get_calendar(
             pd.Timestamp(start), pd.Timestamp(end)))
+        if calendar.empty:
+            raise RuntimeError(f"生产信号交易日历为空: {start} ~ {end}")
         names = list(FACTORS)
         computed = self.engine.compute_factors(
             names, calendar.tolist(), self._universe, parallel=True)
+        unavailable = [
+            name
+            for name in names
+            if name not in computed or not computed[name].notna().any().any()
+        ]
+        if unavailable:
+            raise RuntimeError(
+                "production factor computation failed or returned no values: "
+                + ", ".join(unavailable)
+            )
+        discontinuities = {}
+        for name in names:
+            available = computed[name].notna().any(axis=1)
+            missing_after_start = available.cummax() & ~available
+            if bool(missing_after_start.any()):
+                discontinuities[name] = [
+                    str(pd.Timestamp(value).date())
+                    for value in available.index[missing_after_start][:3]
+                ]
+        if discontinuities:
+            raise RuntimeError(
+                "production factor became unavailable after its first valid date: "
+                + "; ".join(
+                    f"{name}={dates}" for name, dates in discontinuities.items()
+                )
+            )
         # 各因子截面排名 (方向已调整: 高=好)
         ranks = {}
         for name, direction in FACTORS.items():
             rank = computed[name].rank(axis=1, pct=True)
             ranks[name] = rank if direction == 1 else (1 - rank)
 
-        if not IC_IR_WEIGHT:
-            score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
+        factor_weight_method = str(self.portfolio_cfg.factor_weight_method)
+        if factor_weight_method == "equal":
+            numerator = pd.DataFrame(0.0, index=calendar, columns=self._universe)
+            denominator = pd.DataFrame(0.0, index=calendar, columns=self._universe)
             for name in names:
-                score = score.add(ranks[name], fill_value=0)
-            return score.div(len(names))
+                available = ranks[name].notna()
+                numerator = numerator.add(ranks[name].fillna(0.0), fill_value=0.0)
+                denominator = denominator.add(available.astype(float), fill_value=0.0)
+            return numerator.div(denominator.where(denominator > 0.0))
 
         # IC_IR 动态加权: 60日滚动 IC → Ledoit-Wolf 收缩协方差 → w* = Σ⁻¹·mean(IC)
-        fwd_ret = self.runner.data_manager.get("close", calendar, self._universe)
-        if fwd_ret is None or fwd_ret.empty:
-            fwd_rank = pd.DataFrame(0.5, index=calendar, columns=self._universe)
-        else:
-            fwd_rank = fwd_ret.pct_change().rank(axis=1)
-        ic = pd.DataFrame(
-            {n: ranks[n].corrwith(fwd_rank, axis=1) for n in names},
-            index=calendar)
+        close = self.data_manager.get("close", calendar, self._universe)
+        if close is None or close.empty:
+            raise RuntimeError("生产因子权重缺少 close 数据")
+        # rank[T]预测T+1收益；IC[T]要到T+1收盘后才完整可知。
+        close_returns, _ = self.data_manager.prepare_close_data(close)
+        ic = rank_information_coefficients(
+            ranks, close_returns, minimum_cross_section=3
+        ).reindex(calendar)
         score = pd.DataFrame(index=calendar, columns=self._universe, dtype=float)
         for t in calendar:
-            hist = ic.loc[:t].iloc[-IC_IR_WINDOW:-1]  # 不含 ic[T]: 权重[T] 只用 ≤T-1 的 IC (防同日泄漏)
-            # 剔除 IC 全 NaN 的因子 (该段无信号, 如 seat 2020 前/未上市品种)
-            hist = hist.dropna(axis=1, how='all')
-            if hist.shape[1] < 2:
+            hist = prepare_complete_history(
+                causal_history(
+                    ic,
+                    t,
+                    int(self.portfolio_cfg.ic_window),
+                ),
+                minimum_observations=30,
+            )
+            w = factor_weights(hist, factor_weight_method)
+            if w.empty:
                 continue
-            names_eff = list(hist.columns)
-            if len(hist) < max(10, IC_IR_WINDOW // 2):
-                # 冷启动: 等权
-                w = pd.Series(1.0 / len(names_eff), index=names_eff)
-            else:
-                ic_mean = hist.mean()
-                lw_cov = self._lw_cov(hist)
-                try:
-                    wi = np.linalg.inv(lw_cov) @ ic_mean.values
-                except np.linalg.LinAlgError:
-                    wi = ic_mean.abs().values
-                wi = np.abs(wi)
-                w = pd.Series(wi / wi.sum(), index=names_eff)
-            row = pd.Series(0.0, index=self._universe)
-            for name in names_eff:
-                if t in ranks[name].index:
-                    row = row.add(ranks[name].loc[t].fillna(0.0) * w[name], fill_value=0)  # 因子缺失不污染其他
-            tot = row.sum()
-            if tot > 0:
-                row = row / tot
-            score.loc[t] = row
+            score.loc[t] = combine_available_factor_scores(
+                {name: ranks[name].loc[t] for name in w.index},
+                w,
+                self._universe,
+            )
         return score
 
-    @staticmethod
-    def _lw_cov(ic_matrix: pd.DataFrame) -> np.ndarray:
-        """Ledoit-Wolf 收缩协方差 (因子 IC 矩阵)."""
-        T, N = ic_matrix.shape
-        sample_cov = np.cov(ic_matrix, rowvar=False, ddof=1)
-        sample_corr = np.corrcoef(ic_matrix, rowvar=False)
-        avg_corr = np.mean(sample_corr[np.triu_indices(N, k=1)]) if N > 1 else 0.0
-        target_corr = np.eye(N) * (1 - avg_corr) + np.ones((N, N)) * avg_corr
-        std_v = np.std(ic_matrix, axis=0, ddof=1)
-        target_cov = np.outer(std_v, std_v) * target_corr
-        centered = ic_matrix - ic_matrix.mean(axis=0)
-        pi = sum(np.sum((centered.iloc[i].values.reshape(-1, 1)
-                         @ centered.iloc[i].values.reshape(1, -1) - sample_cov) ** 2)
-                 for i in range(T)) / T
-        gamma = np.sum((target_cov - sample_cov) ** 2)
-        lam = max(0.0, min(1.0, pi / gamma)) if gamma > 0 else 0.5
-        return lam * target_cov + (1 - lam) * sample_cov
+    def _pool_weights(
+        self,
+        pool: list[str],
+        date: pd.Timestamp,
+        recent_returns: pd.DataFrame | None = None,
+    ) -> pd.Series:
+        """使用共享构造器分配一个完整的单位多头或空头袖套。
 
-    def _capped_picks(self, row: pd.Series, ascending: bool, cap: int) -> list[str]:
-        """按得分排序取 top_n 个, 但每板块最多 cap 个 (全市场排名 + 板块配额).
-
-        ascending=True 按升序取 (得分最低, 用于空头), False 按降序取 (得分最高, 用于多头).
+        ``recent_returns`` 允许同一信号计算复用一次行情读取；仍在每个池内
+        独立执行历史完整性筛选，因此不改变 ERC 样本或权重语义。
         """
-        order = row.sort_values(ascending=not ascending).index.tolist()
-        picks, counts = [], {}
-        for s in order:
-            sec = next((k for k, mem in SECTOR_MAP.items() if s in mem), "其他")
-            if counts.get(sec, 0) >= cap:
-                continue
-            picks.append(s)
-            counts[sec] = counts.get(sec, 0) + 1
-            if len(picks) >= self.top_n:
-                break
-        return picks
-
-    def _pool_weights(self, pool: list[str], date: pd.Timestamp) -> pd.Series:
-        """池内权重: ERC (默认) 或逆波动率 (USE_SIMPLE_RP=True)."""
-        if not pool:
-            return pd.Series(dtype=float)
-        ret = self._recent_returns(date, pool)
-        ret = _prepare_erc_returns(ret)
-        if ret.shape[1] < 2 or ret.shape[0] < 10:
-            return pd.Series(dtype=float)
-
-        if USE_SIMPLE_RP:
-            vol = ret.std(ddof=0)
-            w = 1.0 / vol.replace(0, np.nan)
-            w = w / w.sum()
-            return w
-
-        # 协方差 ERC (框架正式 _erc_weights)
-        from optimization.risk_budgeting import RiskBudgetingOptimizer
-        cov_raw = ret.cov().values
-        target = np.diag(np.diag(cov_raw))
-        cov = (1.0 - COV_SHRINKAGE) * cov_raw + COV_SHRINKAGE * target
-        try:
-            w = RiskBudgetingOptimizer._erc_weights(cov, np.ones(ret.shape[1]))
-        except (RuntimeError, ValueError):
-            # ERC 求解失败: 回退到逆波动率
-            vol = ret.std(ddof=0)
-            w = (1.0 / vol.replace(0, np.nan)).values
-            w = w / w.sum()
-        w = pd.Series(w, index=ret.columns)
-
-        # 极值保护: 单品种权重上限/下限
-        w = w.clip(lower=MIN_WEIGHT, upper=MAX_WEIGHT)
-        return w / w.sum()
+        constraints = getattr(
+            self,
+            "constraints",
+            PortfolioConstraints(top_n_per_side=self.top_n),
+        )
+        ret = (
+            self._recent_returns(date, pool)
+            if recent_returns is None
+            else recent_returns.reindex(columns=pool)
+        )
+        history = prepare_risk_history(
+            ret,
+            pool,
+            constraints.minimum_risk_observations,
+        )
+        portfolio_cfg = getattr(self, "portfolio_cfg", None)
+        method = getattr(portfolio_cfg, "asset_weight_method", "erc")
+        return allocate_sleeve(
+            history,
+            method=str(method),
+            constraints=constraints,
+            sector_of=SECTOR_OF,
+        )
 
     def _recent_returns(self, date: pd.Timestamp, symbols: list[str]) -> pd.DataFrame:
-        """最近 60 日收益率 (截至 date 前一交易日, 用于协方差估计, 防同日泄漏)."""
-        start = date - pd.Timedelta(days=90)
-        cal = pd.DatetimeIndex(self.runner.data_manager.get_calendar(start, date))
-        # 去掉最后一个交易日 (T 日): 其 pct_change 含 T-1->T 收益, 协方差[T] 若含 T 收益则泄漏
-        if len(cal) > 1:
-            cal = cal[:-1]
-        close = self.runner.data_manager.get("close", cal, symbols)
+        """配置窗口内、严格截至决策日前的收益率。"""
+        portfolio_cfg = getattr(self, "portfolio_cfg", None)
+        lookback = int(getattr(portfolio_cfg, "risk_lookback_calendar_days", 90))
+        start = date - pd.Timedelta(days=lookback)
+        # Preload exactly one earlier close so the return stamped on the first
+        # window date is retained, matching the full-history evaluator.
+        calendar = pd.DatetimeIndex(
+            self.data_manager.get_calendar(start - pd.Timedelta(days=lookback), date)
+        )
+        before = calendar[calendar < start]
+        in_window = calendar[(calendar >= start) & (calendar < date)]
+        close_dates = before[-1:].append(in_window)
+        close = self.data_manager.get("close", close_dates, symbols)
         if close is None or close.empty:
-            return pd.DataFrame()
-        return close.pct_change().dropna(how="all")
+            raise RuntimeError("ERC 风险历史缺少 close 数据")
+        close_returns, _ = self.data_manager.prepare_close_data(close)
+        return causal_risk_window(close_returns, date, lookback).dropna(how="all")
 
     def signal(self, date: str) -> pd.Series:
         """给定交易日, 返回净持仓权重 Series (索引=品种, 值=多空抵消后净权重).
 
-        - 调仓日: 最近一个周五 (W-FRI) 的因子打分生成信号
-        - 异常处理: 无数据品种自动跳过, 不报错
+        - 调仓日: 使用当日可得的滞后因子打分生成次日持仓信号
+        - 异常处理: 风险历史不足的品种不进入候选；入选后数据或约束异常则报错
         """
         end = pd.Timestamp(date)
         # IC_IR 需要 60 日历史算 IC, 放大窗口保证预热充足
         start = end - pd.Timedelta(days=160)
         score = self.factor_scores(start.strftime("%Y-%m-%d"), date)
         if score.empty:
-            return pd.Series(dtype=float)
-        # 跳过无数据品种
+            raise RuntimeError(f"{end.date()} 未生成生产因子分数")
+        if pd.Timestamp(score.index[-1]).normalize() != end.normalize():
+            raise RuntimeError(f"{end.date()} 不是可生成收盘信号的交易日")
         row = score.iloc[-1].dropna()
-        if len(row) < 2 * self.top_n:
-            row = score.dropna(axis=1).iloc[-1]
-        if len(row) < 2:
-            return pd.Series(dtype=float)
-        risk_history = _prepare_erc_returns(self._recent_returns(end, list(row.index)))
-        row = row.reindex(risk_history.columns).dropna()
-        if len(row) < 2:
-            return pd.Series(dtype=float)
+        constraints = getattr(
+            self,
+            "constraints",
+            PortfolioConstraints(top_n_per_side=self.top_n),
+        )
+        recent_returns = self._recent_returns(end, list(row.index))
+        eligible = recent_returns.columns[
+            recent_returns.replace([np.inf, -np.inf], np.nan)
+            .notna()
+            .sum(axis=0)
+            .ge(constraints.minimum_risk_observations)
+        ].tolist()
+        row = row.reindex(eligible).dropna()
+        if len(row) < 2 * constraints.top_n_per_side:
+            raise RuntimeError(
+                f"{end.date()} 可用候选不足: {len(row)} < "
+                f"{2 * constraints.top_n_per_side}"
+            )
 
-        ranked = row.rank(ascending=False)
-        if SECTOR_CAP > 0:
-            long_pool = self._capped_picks(row, ascending=True, cap=SECTOR_CAP)
-            short_pool = self._capped_picks(row, ascending=False, cap=SECTOR_CAP)
-        else:
-            long_pool = ranked[ranked <= self.top_n].index.tolist()
-            short_pool = ranked[ranked > len(ranked) - self.top_n].index.tolist()
+        long_pool, short_pool = select_long_short_pools(
+            row,
+            eligible=eligible,
+            sector_of=SECTOR_OF,
+            constraints=constraints,
+        )
 
-        w_long = self._pool_weights(long_pool, end)
-        w_short = self._pool_weights(short_pool, end)
+        w_long = self._pool_weights(long_pool, end, recent_returns)
+        w_short = self._pool_weights(short_pool, end, recent_returns)
 
-        # 净权重: 多头 +, 空头 -
-        net = pd.Series(0.0, index=self._universe)
-        if not w_long.empty:
-            net = net.add(w_long, fill_value=0)
-        if not w_short.empty:
-            net = net.sub(w_short, fill_value=0)
-        return net[net.abs() > 1e-12]
+        return combine_sleeves(
+            w_long,
+            w_short,
+            universe=self._universe,
+            long_pool=long_pool,
+            short_pool=short_pool,
+            constraints=constraints,
+            sector_of=SECTOR_OF,
+        )
 
 
 if __name__ == "__main__":

@@ -8,24 +8,10 @@
 1. 方向修正: 负相关因子先翻转再聚类, 避免反向信号互相抵消
 2. 滚动相关性 (可选): 避免全样本数据窥探, 用最近 window 天的相关性
 3. 阈值自动选择 (可选): 层次聚类 + 轮廓系数, 自动确定聚类粒度
-4. 可重复运行: 独立模块, 支持命令行 + 函数调用
-
-Usage:
-    # 命令行: 对 ic_by_window_period.json 中的显著因子做相关性分析
-    python -m factors.correlation_analysis
-
-    # 指定相关性阈值 (默认 0.6)
-    python -m factors.correlation_analysis --threshold 0.5
-
-    # 用滚动相关性 (最近 252 天)
-    python -m factors.correlation_analysis --rolling 252
-
-    # 用层次聚类 + 自动选阈值
-    python -m factors.correlation_analysis --method hierarchical
+4. 可重复运行: 由 ``main.py research --correlation`` 显式传入数据与输出目录
 """
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
@@ -35,9 +21,6 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("multi_factor")
-
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 def _load_significant_factors(ic_json_path: str) -> List[dict]:
     """从 ic_by_window_period.json 加载显著因子列表."""
@@ -514,97 +497,3 @@ def _plot_correlation(
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close()
     print(f"  相关性图已保存: {out_path}")
-
-
-def main():
-    """命令行入口: 对显著因子做相关性分析."""
-    parser = argparse.ArgumentParser(description="因子相关性分析 + 聚类")
-    parser.add_argument(
-        "--ic-json", default=None,
-        help="IC 检验结果 JSON 路径 (默认: reports/ic_by_window_period.json)")
-    parser.add_argument(
-        "--threshold", type=float, default=0.6,
-        help="聚类阈值 |corr| > threshold (默认 0.6)")
-    parser.add_argument(
-        "--method", choices=["greedy", "hierarchical"], default="greedy",
-        help="聚类方法 (默认 greedy)")
-    parser.add_argument(
-        "--rolling", type=int, default=None,
-        help="滚动相关性窗口 (天数, 默认全样本)")
-    parser.add_argument(
-        "--auto-threshold", action="store_true",
-        help="自动选最优阈值 (用轮廓系数)")
-    parser.add_argument(
-        "--high-corr-threshold", type=float, default=0.7,
-        help="高相关对报告阈值 (默认 0.7)")
-    parser.add_argument(
-        "--config", default="config/default.yaml",
-        help="配置文件路径 (用于初始化 PipelineRunner)")
-    args = parser.parse_args()
-
-    # 加载显著因子
-    ic_json_path = args.ic_json or os.path.join(
-        _PROJECT_ROOT, "reports", "ic_by_window_period.json"
-    )
-    if not os.path.exists(ic_json_path):
-        print(f"IC 检验结果不存在: {ic_json_path}")
-        print("请先运行: python main.py research --all --multi-period --t-threshold 1.96")
-        return
-
-    significant_factors = _load_significant_factors(ic_json_path)
-    if not significant_factors:
-        print("无显著因子, 退出")
-        return
-
-    # 初始化 PipelineRunner, 计算因子矩阵
-    import sys
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-
-    from core.logger import setup_logger
-    from core.config import load_config
-    from data.manager import DataManager
-    from factors.engine import FactorEngine
-
-    setup_logger("multi_factor")
-
-    config_path = os.path.join(_PROJECT_ROOT, args.config) if not os.path.isabs(args.config) else args.config
-    config = load_config(config_path)
-
-    factor_names = [f["name"] for f in significant_factors]
-    ic_start = pd.Timestamp(config.date_range.start)
-    ic_end = pd.Timestamp(config.date_range.end)
-    factor_start = ic_start - pd.Timedelta(days=365)
-
-    print(f"计算 {len(factor_names)} 个因子矩阵 (含预热)...")
-    # CR-030: 旧代码 DataManager(config) 把 FrameworkConfig 当 source 传入, 类型不匹配.
-    # 改用 DataManager.from_config() 复用 Runner 的数据源工厂逻辑.
-    data_mgr = DataManager.from_config(config)
-    calendar = data_mgr.get_calendar(factor_start, ic_end)
-    if hasattr(calendar, "tz") and calendar.tz is not None:
-        calendar = calendar.tz_localize(None)
-    calendar = pd.DatetimeIndex(sorted(set(calendar)))
-    universe = pd.Index(config.universe) if config.universe else pd.Index([])
-
-    engine = FactorEngine(data_mgr)
-    factor_matrices = engine.compute_factors(
-        factor_names, calendar, universe, parallel=False, chunk_size=100
-    )
-    print(f"完成: {len(factor_matrices)} 个因子矩阵")
-
-    # 运行分析
-    output_dir = os.path.join(_PROJECT_ROOT, "reports")
-    analyze_and_save(
-        factor_matrices=factor_matrices,
-        significant_factors=significant_factors,
-        output_dir=output_dir,
-        threshold=args.threshold,
-        method=args.method,
-        rolling_window=args.rolling,
-        auto_threshold=args.auto_threshold,
-        high_corr_threshold=args.high_corr_threshold,
-    )
-
-
-if __name__ == "__main__":
-    main()

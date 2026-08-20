@@ -56,7 +56,6 @@ def main() -> None:
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--cache-only", action="store_true")
     parser.add_argument(
         "--variants", default=",".join(VARIANTS), help="Comma-separated variants"
     )
@@ -69,8 +68,6 @@ def main() -> None:
         base.date_range.start = args.start
     if args.end:
         base.date_range.end = args.end
-    if args.cache_only:
-        base.data.cache["only"] = True
 
     requested = [item.strip() for item in args.variants.split(",") if item.strip()]
     unknown = sorted(set(requested) - set(VARIANTS))
@@ -91,7 +88,6 @@ def main() -> None:
                 "variant": variant,
                 "start": config.date_range.start,
                 "end": config.date_range.end,
-                "cache_only": bool(args.cache_only),
                 "evidence_level": "historical_cache_segment_diagnostic",
             },
         )

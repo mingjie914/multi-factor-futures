@@ -11,4 +11,4 @@
 - 独立运行入口与测试；
 - 运行产物写入 `runs/external_<strategy>/<timestamp>/`，不会覆盖生产结果。
 
-当前适配器：`guosen_trend_index`（国信中国资产趋势配置指数形式）。
+当前变种：B1 `guosen_trend_index`（国信中国资产趋势配置指数形式）。

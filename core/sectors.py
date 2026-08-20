@@ -15,14 +15,16 @@ SECTOR_MAP = {
     "HC": "ferrous", "J": "ferrous", "SM": "ferrous", "SF": "ferrous",
     # Nonferrous industrial metals and precious metals are separate sectors.
     "CU": "nonferrous", "AL": "nonferrous", "SN": "nonferrous",
-    "NI": "nonferrous", "ZN": "nonferrous",
+    "NI": "nonferrous", "ZN": "nonferrous", "PB": "nonferrous",
+    "SS": "nonferrous",
     "AU": "precious", "AG": "precious",
     "SC": "energy", "SA": "energy", "FU": "energy", "V": "energy",
     "TA": "energy", "RU": "energy", "MA": "energy", "EG": "energy",
     "EB": "energy", "PK": "energy", "PP": "energy", "L": "energy",
+    "BU": "energy", "PG": "energy",
     "A": "agri", "M": "agri", "Y": "agri", "P": "agri", "C": "agri",
     "CF": "agri", "SR": "agri", "OI": "agri", "RM": "agri",
-    "JD": "agri", "AP": "agri", "LH": "agri",
+    "JD": "agri", "AP": "agri", "LH": "agri", "CS": "agri",
     # Stock-index and government-bond futures are separate sectors.
     "IF": "stock_index", "IC": "stock_index", "IM": "stock_index",
     "IH": "stock_index",
@@ -52,6 +54,17 @@ ASSET_CLASS_BY_SECTOR = {
 }
 
 ASSET_CLASS_NAMES = ("stock", "bond", "commodity")
+
+PORTFOLIO_SELECTION_GROUPS = ("有色", "黑色", "能化", "农产品", "金融")
+_PORTFOLIO_GROUP_BY_SECTOR = {
+    "nonferrous": "有色",
+    "precious": "有色",
+    "ferrous": "黑色",
+    "energy": "能化",
+    "agri": "农产品",
+    "stock_index": "金融",
+    "bond": "金融",
+}
 
 
 def taxonomy_sha256(sector_map: Mapping[str, str] = SECTOR_MAP) -> str:
@@ -88,6 +101,11 @@ def taxonomy_diff(
 
 def sector_for(instrument: str) -> str:
     return SECTOR_MAP.get(str(instrument), "other")
+
+
+def portfolio_selection_group_for(instrument: str) -> str:
+    """Return the broad bucket used only by production Top/Bottom caps."""
+    return _PORTFOLIO_GROUP_BY_SECTOR.get(sector_for(instrument), "其他")
 
 
 def asset_class_for(instrument: str) -> str:

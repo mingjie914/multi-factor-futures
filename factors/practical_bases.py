@@ -93,11 +93,11 @@ def compute_practical_base(
     if base not in PRACTICAL_BASES:
         raise ValueError(f"unknown practical base: {base}")
 
-    close = ohlcv["close"].astype(float, copy=False).where(lambda x: x > 0)
-    open_ = ohlcv["open"].astype(float, copy=False).where(lambda x: x > 0)
-    high = ohlcv["high"].astype(float, copy=False)
-    low = ohlcv["low"].astype(float, copy=False)
-    volume = ohlcv["volume"].astype(float, copy=False).where(lambda x: x > 0)
+    close = ohlcv["close"].astype(float).where(lambda x: x > 0)
+    open_ = ohlcv["open"].astype(float).where(lambda x: x > 0)
+    high = ohlcv["high"].astype(float)
+    low = ohlcv["low"].astype(float)
+    volume = ohlcv["volume"].astype(float).where(lambda x: x > 0)
     window = int(params.get("window", 20))
     short = max(2, window // 3)
     long = max(window * 2, 20)
@@ -236,7 +236,7 @@ def compute_practical_base(
         "oi_momentum", "oi_surprise", "oi_volatility", "turnover_oi",
         "turnover_trend", "price_oi_confirmation",
     }:
-        oi = ohlcv["oi"].astype(float, copy=False).where(lambda x: x > 0)
+        oi = ohlcv["oi"].astype(float).where(lambda x: x > 0)
         log_oi = np.log(oi)
         if base == "oi_momentum":
             return log_oi.diff(window)

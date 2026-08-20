@@ -4,10 +4,10 @@
 
 ## 快速流程
 
-以下示例假设已经运行根目录 `setup.bat`：
+以下示例使用本机已安装的项目解释器：
 
 ```powershell
-$PY = '.\.venv\Scripts\python.exe'
+$PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 ```
 
 ### 1. 挖掘到候选池
@@ -79,7 +79,7 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 
 未传入 `--mined-snapshot` 时，该文件不做任何注册，现有框架行为完全不变。网关内部使用
 `MF_MINED_CANDIDATE_SNAPSHOT` 在导入前传递已校验路径，不应由普通研究命令手工设置。
-主框架不会读取 SQLite，也不会访问阿里云/MySQL。
+主框架不会读取 SQLite，也不会访问远程行情源。
 
 ### 4. 用现有研究流程正式筛选
 

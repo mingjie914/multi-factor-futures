@@ -3,6 +3,7 @@ data:
   source: parquet_futures
   cache:
     enabled: false
+# Frozen validation evidence window; not the current production end date.
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'
@@ -56,13 +57,18 @@ processing:
   params:
     method: zscore
     by_date: true
+# 固定10f观察基线；该列表不是交易批准，也不代表修复后绩效已达生产门槛。
 factors:
-- intraday_jump_intensity_20d
 - intraday_price_peak_count_20d
 - intraday_realised_skewness_20d
-- intraday_dtws_20d
 - intraday_drip_stone_20d
 - intraday_peak_ridge_ratio_20d
+- intraday_torrent_down_20d
+- intraday_lowest_time_20d
+- intraday_term_slope_20d
+- intraday_open_close_volume_ratio_20d
+- intraday_turnover_velocity_20d
+- intraday_price_delay_20d
 validated_candidates:
 - intraday_zero_ret_freq_20d
 - intraday_open_close_drift_20d
@@ -75,14 +81,11 @@ validated_candidates:
 - intraday_amihud_vol_ratio_20d
 - intraday_oi_skew_stability_20d
 - intraday_depth_trend_20d
-- intraday_open_close_volume_ratio_20d
 - intraday_oi_quantile_range_20d
 - intraday_settle_gap_20d
 - intraday_amihud_trend_20d
-- intraday_price_delay_20d
 - intraday_overnight_absorption_20d
 - intraday_session_symmetry_20d
-- intraday_lowest_time_20d
 - intraday_oi_peak_ridge_ratio_20d
 - intraday_seat_long_short_seat_ratio_20d
 - intraday_volume_rank_ratio_20d
@@ -90,4 +93,3 @@ validated_candidates:
 - intraday_volume_time_shape_20d
 - intraday_extreme_freq_balance_20d
 - intraday_term_vol_ratio_20d
-- intraday_turnover_velocity_20d

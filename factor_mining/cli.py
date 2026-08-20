@@ -24,8 +24,6 @@ from factor_mining.api import (
 from factor_mining.data import (
     LocalParquetData,
     LocalParquetSpec,
-    MySQLRDSData,
-    MySQLRDSDataSpec,
     make_synthetic_panels,
 )
 from factor_mining.features import FeatureEngine
@@ -81,19 +79,12 @@ def _repository(args) -> CandidateRepository:
 
 
 def _load_market_panels(args, universe, start, end, feature_config):
-    source = str(getattr(args, "source", "parquet")).lower()
-    if source == "parquet":
-        data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
-        if not data_root:
-            raise ValueError("set --data-root or MF_PARQUET_ROOT")
-        return LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
-            universe, start, end, feature_config
-        )
-    if source == "mysql":
-        return MySQLRDSData(MySQLRDSDataSpec(Path(args.config))).load_panels(
-            universe, start, end, feature_config
-        )
-    raise ValueError(f"unsupported mining data source: {source}")
+    data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
+    if not data_root:
+        raise ValueError("set --data-root or MF_PARQUET_ROOT")
+    return LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
+        universe, start, end, feature_config
+    )
 
 
 def _feature_config(args) -> FeatureConfig:
@@ -786,8 +777,6 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     mine = commands.add_parser("mine", help="run GP against local Parquet bars")
-    mine.add_argument("--source", default="parquet", choices=("parquet", "mysql"))
-    mine.add_argument("--config", default="config/default.yaml")
     mine.add_argument("--data-root", type=Path, default=None)
     mine.add_argument("--universe", type=_csv_strings, required=True)
     mine.add_argument("--start", required=True)
@@ -808,8 +797,6 @@ def build_parser() -> argparse.ArgumentParser:
     screen = commands.add_parser(
         "screen", help="pre-screen mined candidates on local bars"
     )
-    screen.add_argument("--source", default="parquet", choices=("parquet", "mysql"))
-    screen.add_argument("--config", default="config/default.yaml")
     screen.add_argument("--data-root", type=Path, default=None)
     screen.add_argument("--universe", type=_csv_strings, required=True)
     screen.add_argument("--start", required=True)

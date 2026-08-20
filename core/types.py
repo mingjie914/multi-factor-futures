@@ -5,10 +5,8 @@ throughout the framework, providing a single source of truth for data shapes.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict
 
-import numpy as np  # noqa: F401
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -60,99 +58,5 @@ WeightVector = pd.Series
 ExpectedReturns = pd.Series
 """Expected returns vector. Index = ticker, value = expected_return."""
 
-SignalFrame = pd.DataFrame
-"""Signal data frame. Columns correspond to Signal dataclass fields."""
-
 NAVSeries = pd.Series
 """Net asset value time series."""
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class MarketState:
-    """Snapshot of market state for a given date.
-
-    Attributes:
-        date: Trading date.
-        prices: Current prices (typically close / settlement).
-        high: High prices.
-        low: Low prices.
-        open: Open prices.
-        volume: Trading volume.
-        atr: Average true range.
-        pre_settle: Previous settlement price.
-        additional: Extra market data fields.
-    """
-
-    date: Date
-    prices: pd.Series
-    high: pd.Series
-    low: pd.Series
-    open: pd.Series
-    volume: pd.Series
-    atr: pd.Series
-    pre_settle: pd.Series
-    additional: Dict[str, pd.Series] = field(default_factory=dict)
-
-
-@dataclass
-class Position:
-    """A single open position.
-
-    Attributes:
-        ticker: Instrument identifier.
-        side: 'long' or 'short'.
-        quantity: Number of contracts / shares held.
-        entry_price: Price at entry.
-        entry_date: Date the position was opened.
-        current_price: Latest available price.
-        high_since_entry: Highest price observed since entry.
-        pnl: Unrealised profit / loss (currency units).
-        pnl_pct: Unrealised profit / loss as a percentage.
-    """
-
-    ticker: str
-    side: str  # 'long' | 'short'
-    quantity: int
-    entry_price: float
-    entry_date: Date
-    current_price: float
-    high_since_entry: float
-    pnl: float
-    pnl_pct: float
-
-
-@dataclass
-class Signal:
-    """Trading signal for a single instrument on a single date.
-
-    Attributes:
-        date: Signal date.
-        ticker: Instrument identifier.
-        action: Operation type.
-        target_position: Desired position size after execution.
-        take_profit: Take-profit price level (optional).
-        stop_loss: Stop-loss price level (optional).
-        trailing_stop: Trailing stop distance (optional).
-        holding_period: Maximum holding periods (optional).
-        mode: Strategy mode identifier.
-        reason: Human-readable reason for the signal.
-        metadata: Arbitrary extra payload.
-    """
-
-    date: Date
-    ticker: str
-    action: str  # 'open_long' | 'open_short' | 'close_long' | 'close_short' |
-                 # 'add_long' | 'add_short' | 'reduce_long' | 'reduce_short' | 'hold'
-    target_position: int
-    take_profit: Optional[float] = None
-    stop_loss: Optional[float] = None
-    trailing_stop: Optional[float] = None
-    holding_period: Optional[int] = None
-    mode: str = ""
-    reason: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)

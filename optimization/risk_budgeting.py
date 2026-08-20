@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-import logging
 from typing import List, Optional, Dict, Any  # noqa: F401
 
 import pandas as pd
 import numpy as np  # noqa: F401
-
-# cvxpy 启用: 使用 OSQP/CLARABEL 求解器 (纯 Python 绑定, 不触发 0xC0000005 崩溃)
-# 与 mean_variance.py 保持一致的求解器策略.
-_HAS_CVXPY = True
-_CVXPY_WARNED = False
 
 from core.types import (
     Date,
@@ -25,7 +19,7 @@ from core.interfaces import (
     ConstraintContext,
 )
 from core.registry import register
-from optimization.solver_utils import solve_validated
+from optimization.solver_utils import solve_validated, validated_psd_covariance
 from optimization.costs import marginal_turnover_cost_rate
 
 
@@ -85,15 +79,20 @@ class RiskBudgetingOptimizer(Optimizer):
         """Solve long-only risk budgeting using the convex Spinu formulation."""
         from scipy.optimize import minimize
 
-        n = len(budget)
         budget = np.asarray(budget, dtype=float)
-        if len(cov) != n or not np.isfinite(cov).all():
+        n = len(budget)
+        if budget.ndim != 1 or n == 0:
+            raise ValueError("risk budget must be a non-empty vector")
+        if not np.isfinite(budget).all() or np.any(budget < 0.0):
+            raise ValueError("risk budget must be finite and non-negative")
+        total_budget = float(budget.sum())
+        if total_budget <= 0.0:
+            raise ValueError("risk budget must contain positive mass")
+        cov = np.asarray(cov, dtype=float)
+        if cov.shape != (n, n):
             raise ValueError("invalid covariance for risk-budget solve")
-        budget = np.maximum(budget, 1e-12)
-        budget = budget / budget.sum()
-        cov = (cov + cov.T) / 2.0
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        cov = (eigenvectors * np.maximum(eigenvalues, 1e-10)) @ eigenvectors.T
+        budget = budget / total_budget
+        cov = validated_psd_covariance(cov, eigenvalue_floor=1e-10)
 
         def objective(x):
             return 0.5 * float(x @ cov @ x) - float(budget @ np.log(x))
@@ -146,7 +145,10 @@ class RiskBudgetingOptimizer(Optimizer):
         if n == 0:
             return pd.Series(dtype=float)
 
-        mu = expected_returns.reindex(universe).fillna(0).values
+        aligned_returns = pd.Series(expected_returns, dtype=float).reindex(universe)
+        if aligned_returns.isna().any() or not np.isfinite(aligned_returns).all():
+            raise ValueError(f"expected returns contain missing/invalid values @ {date.date()}")
+        mu = aligned_returns.to_numpy(dtype=float)
         cov = (
             risk_model.covariance(date, universe)
             .reindex(index=universe, columns=universe)
@@ -154,28 +156,10 @@ class RiskBudgetingOptimizer(Optimizer):
         )
 
         # 数值安全校验: NaN/Inf 会触发 C 求解器的 0xC0000005 硬崩溃
-        if np.any(np.isnan(mu)) or np.any(np.isinf(mu)):
-            mu = np.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
-            log.warning(f"mu 含 NaN/Inf @ {date.date()}, 已零填充")
-        if np.any(np.isnan(cov)) or np.any(np.isinf(cov)):
-            raise ValueError(f"covariance contains NaN/Inf @ {date.date()}")
-        else:
-            # 对称化和负对角线修复
-            cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
-            cov = (cov + cov.T) / 2  # 强制对称
-            cov_diag = np.diag(cov)
-            neg_mask = cov_diag < 0
-            if np.any(neg_mask):
-                cov[neg_mask, neg_mask] = np.abs(cov[neg_mask, neg_mask])
-                log.warning(f"cov 对角线含负值 @ {date.date()}, 已取绝对值")
-
-        # cvxpy 不可用 → 直接启发式 (仅首次打印警告)
-        if not _HAS_CVXPY:
-            global _CVXPY_WARNED
-            if not _CVXPY_WARNED:
-                log.warning("cvxpy 已禁用 (0xC0000005 崩溃), 全局使用启发式优化器")
-                _CVXPY_WARNED = True
-            raise RuntimeError("cvxpy is required for validated risk-budget optimization")
+        try:
+            cov = validated_psd_covariance(cov)
+        except ValueError as exc:
+            raise ValueError(f"invalid covariance @ {date.date()}: {exc}") from exc
 
         try:
             import cvxpy as cp
@@ -197,9 +181,6 @@ class RiskBudgetingOptimizer(Optimizer):
                     raise ValueError(
                         f"risk_budget length {len(budget)} != universe length {n}"
                     )
-                else:
-                    budget = np.maximum(budget, 1e-12)
-                    budget = budget / budget.sum()
             else:
                 # ERC: 等风险贡献, 各品种预算均等
                 budget = np.ones(n) / n
@@ -305,131 +286,3 @@ class RiskBudgetingOptimizer(Optimizer):
             raise RuntimeError(
                 f"validated risk-budget optimization failed @ {date}: {e}"
             ) from e
-
-    def _heuristic_optimize(
-        self,
-        expected_returns: ExpectedReturns,
-        current_weights: WeightVector,
-        constraints: List[Constraint],
-        universe: Universe,
-        current_drawdown: float = 0.0,
-    ) -> WeightVector:
-        """启发式风险平价回退.
-
-        无 cvxpy 或 cov 含 NaN 时使用. 纯风险驱动, 不使用 alpha.
-        无 cov 时无法计算 vol_i, 退化为等权 (ERC 假设各品种 vol 相等)
-        或按 risk_budget 比例分配.
-
-        支持约束: position_limit, net_exposure, leverage, turnover, sector_exposure,
-                  drawdown_control.
-        """
-        from core.logger import get_logger
-        log = get_logger("multi_factor")
-
-        n = len(universe)
-        if n == 0:
-            return pd.Series(dtype=float)
-
-        # 提取约束参数 (与 mean_variance.py 启发式一致)
-        pos_lower = -0.2
-        pos_upper = 0.2
-        net_lower = -0.5
-        net_upper = 0.5
-        gross_limit = 3.0
-        turnover_limit = None
-        has_turnover_constraint = False
-        sector_limit = 0.0  # 0 表示不约束
-        for c in constraints:
-            name = getattr(c, "name", "")
-            if name == "position_limit":
-                pos_lower = getattr(c, "lower", -0.2)
-                pos_upper = getattr(c, "upper", 0.2)
-            elif name == "net_exposure":
-                net_lower = getattr(c, "lower", -0.5)
-                net_upper = getattr(c, "upper", 0.5)
-            elif name == "leverage":
-                gross_limit = getattr(c, "limit", 3.0)
-            elif name == "turnover":
-                has_turnover_constraint = True
-                turnover_limit = getattr(c, "limit", 0.30)
-            elif name == "sector_exposure":
-                sector_limit = getattr(c, "limit", 0.15)
-            elif name == "drawdown_control":
-                warning_dd = getattr(c, "warning_dd", -0.05)
-                critical_dd = getattr(c, "critical_dd", -0.10)
-                base_leverage = getattr(c, "leverage_limit", gross_limit)
-                if current_drawdown <= critical_dd:
-                    gross_limit = 0.1
-                elif current_drawdown <= warning_dd:
-                    gross_limit = base_leverage * 0.5
-
-        # 风险预算权重 (无 cov 时用预算比例作为权重代理, 或等权 ERC)
-        if self.risk_budget is not None and len(self.risk_budget) == n:
-            budget = np.maximum(np.asarray(self.risk_budget, dtype=float), 1e-12)
-            budget = budget / budget.sum()
-        else:
-            budget = np.ones(n) / n
-
-        target_gross = min(gross_limit, 1.0)  # 启发式默认 1x 杠杆
-        weights = pd.Series(budget, index=universe, dtype=float)
-        weights = weights / weights.abs().sum() * target_gross
-
-        # position_limit: 截断到 [pos_lower, pos_upper]
-        weights = weights.clip(lower=pos_lower, upper=pos_upper)
-
-        # net_exposure: 风险平价全多头, 需缩放到 [net_lower, net_upper]
-        net = float(weights.sum())
-        if net > net_upper and net > 0:
-            weights = weights * (net_upper / net)
-        elif net < net_lower and net < 0:
-            weights = weights * (net_lower / net)
-
-        # 再次 clip 确保 position_limit 不越界
-        weights = weights.clip(lower=pos_lower, upper=pos_upper)
-
-        # leverage: 总杠杆不超过 gross_limit
-        gross = float(weights.abs().sum())
-        if gross > gross_limit and gross > 0:
-            weights = weights / gross * gross_limit
-
-        # sector_exposure: 每个板块净敞口不超过 sector_limit
-        if sector_limit > 0:
-            try:
-                from core.sectors import SECTOR_MAP
-                sectors = pd.Series(
-                    [SECTOR_MAP.get(str(s), "other") for s in universe],
-                    index=universe,
-                )
-                for sector in sectors.unique():
-                    sector_mask = sectors == sector
-                    sector_net = float(weights[sector_mask].sum())
-                    if abs(sector_net) > sector_limit:
-                        scale = sector_limit / abs(sector_net)
-                        weights[sector_mask] = weights[sector_mask] * scale
-            except ImportError:
-                pass
-
-        # turnover 限制: 与上期权重混合
-        if (
-            has_turnover_constraint
-            and turnover_limit is not None
-            and not current_weights.empty
-        ):
-            prev = current_weights.reindex(universe).fillna(0.0)
-            turnover = float((weights - prev).abs().sum())
-            if turnover > turnover_limit and turnover > 0:
-                scale = turnover_limit / turnover
-                weights = prev + (weights - prev) * scale
-
-        # 清理数值噪声
-        weights = weights.where(weights.abs() > 1e-6, 0.0)
-
-        n_long = int((weights > 0.001).sum())
-        n_short = int((weights < -0.001).sum())
-        log.info(
-            f"启发式风险平价 | n={n} 多={n_long} 空={n_short} "
-            f"总={float(weights.abs().sum()):.3f} 净={float(weights.sum()):.3f} "
-            f"max={float(weights.max()):.3f} min={float(weights.min()):.3f}"
-        )
-
-        return weights

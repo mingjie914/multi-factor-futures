@@ -45,11 +45,8 @@ def main():
         "--no-plot", action="store_true",
         help="跳过净值图绘制")
     parser.add_argument(
-        "--export-signals", action="store_true",
-        help="导出信号到 CSV")
-    parser.add_argument(
-        "--cache-only", action="store_true",
-        help="严格离线模式；缓存未命中时不访问数据库")
+        "--target-output", default=None,
+        help="将最后一个收盘决策日的目标权重导出到显式 CSV 路径")
     parser.add_argument(
         "--output-dir", default=None,
         help="报告输出目录 (覆盖配置文件)")
@@ -75,8 +72,6 @@ def main():
             cfg.date_range.end = args.end
         if args.freq:
             cfg.backtest.rebalance_freq = args.freq
-        if args.cache_only:
-            cfg.data.cache["only"] = True
         if args.output_dir:
             cfg.backtest.report_dir = args.output_dir
         runner = PipelineRunner(config=cfg)
@@ -108,12 +103,14 @@ def main():
         try:
             result.plot(save_dir=runner.config.backtest.report_dir)
             print(f"  净值图 -> {runner.config.backtest.report_dir}/backtest_nav.png")
-        except Exception:
+        except ImportError as exc:
+            if "matplotlib" not in str(exc).lower():
+                raise
             print("  (MATPLOTLIB 未安装: 跳过净值图。运行 python -m pip install matplotlib)")
 
-    if args.export_signals:
-        runner.export_signals(result, fmt="csv")
-        print(f"  信号明细 -> signals_output/final_signals.csv")
+    if args.target_output:
+        exported = result.export_target_weights(args.target_output)
+        print(f"  目标权重 -> {exported}")
 
     print("\n回测完成.")
 

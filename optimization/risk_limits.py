@@ -6,6 +6,8 @@ from typing import Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from optimization.solver_utils import validated_psd_covariance
+
 
 class VolatilityRiskCapController:
     """Reduce positions that exceed instrument or standalone-sector risk caps.
@@ -28,13 +30,25 @@ class VolatilityRiskCapController:
         atr_window: int = 20,
         tolerance: float = 1e-10,
     ):
+        numeric = np.asarray([
+            asset_vol_budget, sector_vol_budget, hard_asset_cap, gross_cap,
+            net_cap, periods_per_year, tolerance,
+        ], dtype=float)
+        if not np.isfinite(numeric).all():
+            raise ValueError("dynamic risk-limit parameters must be finite")
+        if np.any(numeric[:5] < 0.0):
+            raise ValueError("dynamic risk budgets and caps must be non-negative")
+        if float(periods_per_year) <= 0.0 or float(tolerance) <= 0.0:
+            raise ValueError("periods_per_year and tolerance must be positive")
+        if int(atr_window) < 2:
+            raise ValueError("atr_window must be at least 2")
         self.asset_vol_budget = float(asset_vol_budget)
         self.sector_vol_budget = float(sector_vol_budget)
         self.hard_asset_cap = float(hard_asset_cap)
         self.gross_cap = float(gross_cap)
         self.net_cap = float(net_cap)
         self.periods_per_year = float(periods_per_year)
-        self.atr_window = max(int(atr_window), 2)
+        self.atr_window = int(atr_window)
         self.tolerance = float(tolerance)
         self._atr_provider_id: Optional[int] = None
         self._atr_dates = pd.DatetimeIndex([])
@@ -137,7 +151,11 @@ class VolatilityRiskCapController:
         annual_volatility: Optional[pd.Series | np.ndarray] = None,
     ) -> tuple[pd.Series, dict]:
         names = pd.Index(instruments if instruments is not None else weights.index)
-        result = weights.reindex(names).fillna(0.0).astype(float).copy()
+        if names.has_duplicates or pd.Index(weights.index).has_duplicates:
+            raise ValueError("dynamic risk-limit instruments must be unique")
+        result = weights.reindex(names).astype(float).copy()
+        if result.isna().any() or not np.isfinite(result.to_numpy(dtype=float)).all():
+            raise ValueError("dynamic risk-limit weights are missing or non-finite")
         original = result.to_numpy(dtype=float).copy()
         matrix = self._aligned_covariance(covariance, names)
         annual_cov = matrix if covariance_is_annualized else matrix * self.periods_per_year
@@ -163,6 +181,8 @@ class VolatilityRiskCapController:
             result *= self.net_cap / abs(net)
 
         final_values = result.to_numpy(dtype=float)
+        if not np.isfinite(final_values).all():
+            raise RuntimeError("dynamic risk limits produced non-finite weights")
         sector_vols = self._sector_volatility(final_values, annual_cov, names)
         asset_risk = np.abs(final_values) * annual_vol
         return result, {
@@ -299,9 +319,7 @@ class VolatilityRiskCapController:
         matrix = (matrix + matrix.T) / 2.0
         if not ensure_psd:
             return matrix
-        values, vectors = np.linalg.eigh(matrix)
-        values = np.maximum(values, 0.0)
-        return (vectors * values) @ vectors.T
+        return validated_psd_covariance(matrix)
 
 
 __all__ = ["VolatilityRiskCapController"]

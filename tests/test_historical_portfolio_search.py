@@ -14,11 +14,115 @@ from research.historical_portfolio_search import (
     PortfolioRecipe,
     beam_factor_sets,
     cluster_factors,
+    exhaustive_factor_set_shortlist,
     factor_weights,
+    performance_metrics,
     prepare_complete_history,
     select_pool,
     training_factor_diagnostics,
 )
+from optimization.factor_weighting import (
+    combine_available_factor_scores,
+    rank_information_coefficients,
+)
+from factors.engine import FactorComputationError
+from research.portfolio_experiment_support import FactorPanelRunner
+
+
+def test_factor_panel_schedule_is_frozen_before_data_environment_is_detached():
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    expected = pd.DataFrame({"A": ["A2401", "A2405"]}, index=dates)
+
+    class _Source:
+        def fetch_contract_schedule(self, tickers, start, end):
+            assert tickers == ["A"]
+            assert start == dates.min()
+            assert end == dates.max()
+            return expected
+
+    runner = FactorPanelRunner.__new__(FactorPanelRunner)
+    runner.env = SimpleNamespace(
+        data_manager=SimpleNamespace(source=_Source())
+    )
+    runner.u = ["A"]
+    runner.cal = dates
+    runner._contract_schedule = None
+    runner._contract_schedule_loaded = False
+
+    assert runner.get_contract_schedule() is expected
+    runner.env = SimpleNamespace()
+    assert runner.get_contract_schedule() is expected
+
+
+def test_return_metrics_include_drawdown_from_initial_capital():
+    metrics = performance_metrics(pd.Series([-0.50, 0.0]))
+
+    assert metrics["max_drawdown"] == -0.50
+
+
+def test_return_metrics_exclude_declared_nav_anchor():
+    metrics = performance_metrics(
+        pd.Series([0.0, 0.10, -0.10]),
+        periods_per_year=2,
+        initial_anchor=True,
+    )
+
+    assert metrics["observations"] == 2
+    assert np.isclose(metrics["annual_return"], -0.01)
+
+
+def test_factor_panel_schedule_fails_if_environment_was_detached_too_early():
+    runner = FactorPanelRunner.__new__(FactorPanelRunner)
+    runner.env = SimpleNamespace()
+    runner.u = ["A"]
+    runner.cal = pd.bdate_range("2024-01-02", periods=2)
+    runner._contract_schedule = None
+    runner._contract_schedule_loaded = False
+
+    with np.testing.assert_raises_regex(RuntimeError, "before detaching"):
+        runner.get_contract_schedule()
+
+
+def test_factor_panel_allows_only_leading_empty_chunks_for_late_start_factors():
+    dates = pd.bdate_range("2019-01-02", periods=2)
+    finite = pd.DataFrame({"A": [1.0, 2.0]}, index=dates)
+
+    class _Engine:
+        late_available = False
+
+        def compute_factors(self, names, request_dates, universe, parallel=False):
+            del request_dates, universe, parallel
+            if len(names) > 1:
+                raise FactorComputationError("retry individually")
+            name = names[0]
+            if name == "late" and not self.late_available:
+                try:
+                    raise ValueError("factor output contains no finite values")
+                except ValueError as exc:
+                    raise FactorComputationError("late empty") from exc
+            return {name: finite}
+
+    engine = _Engine()
+    first = FactorPanelRunner._compute_part(
+        engine, ["early", "late"], dates, ["A"], {}
+    )
+    assert list(first) == ["early"]
+
+    engine.late_available = True
+    second = FactorPanelRunner._compute_part(
+        engine, ["early", "late"], dates, ["A"], {"early": finite}
+    )
+    assert list(second) == ["early", "late"]
+
+    engine.late_available = False
+    with np.testing.assert_raises(FactorComputationError):
+        FactorPanelRunner._compute_part(
+            engine,
+            ["late"],
+            dates,
+            ["A"],
+            {"late": finite},
+        )
 
 
 def test_factor_weight_methods_are_positive_normalized_and_causal_ready():
@@ -52,6 +156,81 @@ def test_complete_history_waits_for_late_factor():
 
     assert list(clean.columns) == ["a", "b"]
     assert len(clean) == 59
+
+
+def test_complete_history_waits_for_global_minimum():
+    history = pd.DataFrame({
+        "a": np.linspace(-0.1, 0.1, 29),
+        "b": np.linspace(0.2, -0.2, 29),
+    })
+
+    clean = prepare_complete_history(history, minimum_observations=30)
+
+    assert clean.empty
+    assert list(clean.columns) == []
+
+
+def test_complete_history_rechecks_joint_overlap_after_column_admission():
+    history = pd.DataFrame({
+        "early": [1.0] * 30 + [np.nan] * 29,
+        "late": [np.nan] * 29 + [1.0] * 30,
+    })
+
+    clean = prepare_complete_history(history, minimum_observations=30)
+
+    assert clean.empty
+    assert list(clean.columns) == []
+
+
+def test_non_equal_factor_weighting_does_not_fall_back_during_warmup():
+    history = pd.DataFrame({
+        "a": np.linspace(0.01, 0.02, 29),
+        "b": np.linspace(0.02, 0.01, 29),
+    })
+
+    assert factor_weights(history, "diag_icir").empty
+    with np.testing.assert_raises_regex(ValueError, "unknown factor-weight method"):
+        factor_weights(history, "not-a-method")
+
+
+def test_equal_factor_scores_do_not_require_ic_history():
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    ranks = {
+        "a": pd.DataFrame([[0.2, 0.8], [0.4, 0.6]], index=dates, columns=["A", "B"]),
+        "b": pd.DataFrame([[0.6, 0.4], [0.8, 0.2]], index=dates, columns=["A", "B"]),
+    }
+    runner = SimpleNamespace(cal=dates, u=["A", "B"], ranks=ranks,
+                             ic=pd.DataFrame(np.nan, index=dates, columns=["a", "b"]))
+    score = PortfolioEvaluator(runner, start=dates[0], end=dates[-1])._score_matrix(
+        ["a", "b"], "equal"
+    )
+    pd.testing.assert_frame_equal(score, (ranks["a"] + ranks["b"]) / 2.0)
+
+
+def test_rank_ic_requires_three_common_instruments():
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    rank = pd.DataFrame([[0.2, 0.8, np.nan], [0.4, 0.6, 1.0]], index=dates,
+                        columns=["A", "B", "C"])
+    returns = pd.DataFrame([[0.0, 0.0, 0.0], [0.1, -0.1, 0.2]], index=dates,
+                           columns=rank.columns)
+    ic = rank_information_coefficients({"factor": rank}, returns)
+    assert pd.isna(ic.loc[dates[0], "factor"])
+
+
+def test_factor_scores_renormalize_over_available_factors_per_asset():
+    score = combine_available_factor_scores(
+        {
+            "f1": pd.Series({"A": 1.0, "B": 0.5, "C": 0.0}),
+            "f2": pd.Series({"A": np.nan, "B": 0.5, "C": 1.0}),
+        },
+        pd.Series({"f1": 0.75, "f2": 0.25}),
+        ["A", "B", "C"],
+    )
+
+    pd.testing.assert_series_equal(
+        score,
+        pd.Series({"A": 1.0, "B": 0.5, "C": 0.25}),
+    )
 
 
 def test_select_pool_honours_requested_size_and_sector_cap():
@@ -103,15 +282,50 @@ def test_training_clustering_and_beam_search_use_training_slice_only():
         assert len(labels) == len(set(labels))
 
 
+def test_exhaustive_shortlist_covers_every_subset_and_ignores_future_data():
+    dates = pd.bdate_range("2019-01-01", periods=520)
+    train_end = dates[399]
+    ic = pd.DataFrame({
+        "a": 0.003 + np.sin(np.arange(len(dates)) / 13.0) * 0.002,
+        "b": 0.002 + np.cos(np.arange(len(dates)) / 17.0) * 0.002,
+        "c": 0.001 + np.sin(np.arange(len(dates)) / 19.0) * 0.003,
+        "d": -0.001 + np.cos(np.arange(len(dates)) / 11.0) * 0.003,
+    }, index=dates)
+
+    first, audit = exhaustive_factor_set_shortlist(
+        ic,
+        list(ic),
+        start=dates[0],
+        end=train_end,
+        minimum_size=2,
+        per_size_limit=1,
+        global_limit=2,
+        batch_size=3,
+    )
+    changed = ic.copy()
+    changed.loc[changed.index > train_end] = 1000.0
+    second, changed_audit = exhaustive_factor_set_shortlist(
+        changed,
+        list(changed),
+        start=dates[0],
+        end=train_end,
+        minimum_size=2,
+        per_size_limit=1,
+        global_limit=2,
+        batch_size=4,
+    )
+
+    assert audit["examined_subsets"] == 11  # C(4,2) + C(4,3) + C(4,4)
+    assert changed_audit == audit
+    assert {row["factor_count"] for row in first} == {2, 3, 4}
+    assert first == second
+
+
 class _FakeEnv:
     def __init__(self, dates, returns):
         self._dates = dates
         self._returns = returns
         self.sector_of = {"A": "x", "B": "y", "C": "z"}
-
-    def eligible_symbols(self, date):
-        history = self._returns.loc[self._returns.index < pd.Timestamp(date)]
-        return history.columns[history.notna().sum().ge(10)].tolist()
 
 
 def test_evaluator_risk_history_excludes_decision_date_return():
@@ -139,7 +353,8 @@ def test_evaluator_risk_history_excludes_decision_date_return():
     history = evaluator._risk_history(decision, ["A", "B", "C"])
 
     assert history.index.max() < decision
-    assert list(history.columns) == ["A", "B"]
+    assert list(history.columns) == ["A", "B", "C"]
+    assert evaluator._risk_eligible(decision, ["A", "B", "C"], 10) == ["A", "B"]
     recipe = PortfolioRecipe("equal", 1, 0, "equal")
     assert recipe.name == "equal__top1_bottom1__capnone__equal"
 
@@ -220,7 +435,15 @@ def test_fixed_recipe_ranking_uses_only_bounded_training_evaluator():
                 else 0.0002 + 0.0010 * wave
             )
             values.loc[~train] = -0.50 if recipe == recipes["alternative"] else 0.50
-            return pd.DataFrame({"net_return": values, "turnover": 0.1}, index=dates)
+            values.iloc[0] = 0.0
+            return pd.DataFrame(
+                {
+                    "net_return": values,
+                    "turnover": 0.1,
+                    "executed_traded_notional": 0.1,
+                },
+                index=dates,
+            )
 
     ranked = workflow._rank_fixed_recipes_for_fold(
         TrainingOnlyEvaluator(), ["f1", "f2"], recipes, fold
@@ -255,18 +478,6 @@ def test_current_lw_signal_and_top10_match_existing_production_runner():
     class EqualRiskEnv:
         sector_of = {symbol: symbol for symbol in symbols}
 
-        def eligible_symbols(self, _date):
-            return symbols
-
-        def capped(self, row, ascending=False, date=None):
-            del date
-            return row.sort_values(ascending=ascending).index[:10].tolist()
-
-        def erc_w(self, pool, _date):
-            if int(dates.get_loc(_date)) < 10:
-                return None
-            return {symbol: 1.0 / len(pool) for symbol in pool}
-
     runner = SimpleNamespace(
         cal=dates,
         u=symbols,
@@ -282,3 +493,36 @@ def test_current_lw_signal_and_top10_match_existing_production_runner():
     )
 
     pd.testing.assert_frame_equal(candidate, existing)
+
+    for name in factors:
+        runner.ranks[name].loc[dates[-1]] = np.nan
+    interrupted = PortfolioEvaluator(runner, start=dates[0], end=dates[-1])
+    with np.testing.assert_raises_regex(RuntimeError, "after portfolio start"):
+        interrupted.weights(
+            factors, PortfolioRecipe("lw_abs", 10, 3, "equal")
+        )
+
+
+def test_risk_lookback_calendar_days_is_explicit_and_causal():
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    returns = pd.DataFrame({"A": 0.001, "B": -0.001}, index=dates)
+    runner = SimpleNamespace(cal=dates, daily_ret=returns)
+    short = PortfolioEvaluator(
+        runner,
+        start=dates[0],
+        end=dates[-1],
+        risk_lookback_calendar_days=60,
+    )
+    long = PortfolioEvaluator(
+        runner,
+        start=dates[0],
+        end=dates[-1],
+        risk_lookback_calendar_days=120,
+    )
+
+    short_history = short._risk_history(dates[-1], ["A", "B"])
+    long_history = long._risk_history(dates[-1], ["A", "B"])
+
+    assert len(short_history) < len(long_history)
+    assert short_history.index.max() < dates[-1]
+    assert long_history.index.max() < dates[-1]

@@ -16,16 +16,9 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from optimization.solver_utils import solve_validated
+from optimization.solver_utils import solve_validated, validated_psd_covariance
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# cvxpy 启用: 使用 OSQP 求解器 (纯 Python 绑定, 不触发 0xC0000005 崩溃)
-# 早期 ECOS/SCS 的 C 扩展在 Windows 上触发访问违规, 已通过切换到 OSQP 解决.
-# ---------------------------------------------------------------------------
-_HAS_CVXPY = True
-
 
 class MetaOptimizer:
     """子组合资本权重元优化器.
@@ -45,16 +38,34 @@ class MetaOptimizer:
         estimation_window: int = 252,
         covariance_shrinkage: float = 0.30,
     ):
+        supported = {
+            "max_sharpe",
+            "min_variance",
+            "shrinkage_min_variance",
+            "risk_parity",
+            "erc",
+            "inverse_volatility",
+            "hrp",
+        }
+        if method not in supported:
+            raise ValueError(f"unknown meta optimization method {method!r}")
+        if not 0.0 <= float(min_weight) <= float(max_weight) <= 1.0:
+            raise ValueError("meta weight bounds must satisfy 0 <= min <= max <= 1")
+        if not np.isfinite(float(target_volatility)) or float(target_volatility) < 0.0:
+            raise ValueError("target_volatility must be finite and non-negative")
+        if int(estimation_window) < 20:
+            raise ValueError("estimation_window must be at least 20")
+        if not 0.0 <= float(covariance_shrinkage) <= 1.0:
+            raise ValueError("covariance_shrinkage must be in [0, 1]")
         self.method = method
-        self.min_weight = min_weight
-        self.max_weight = max_weight
-        self.target_volatility = target_volatility
-        self.estimation_window = estimation_window
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self.target_volatility = float(target_volatility)
+        self.estimation_window = int(estimation_window)
         self.covariance_shrinkage = float(covariance_shrinkage)
         # Relative sleeve weights sum to one. This separate scale controls the
         # amount of capital invested, so volatility targeting is not normalized away.
         self.last_capital_scale = 1.0
-        self.last_failure: Optional[dict] = None
 
     def optimize(
         self,
@@ -75,8 +86,12 @@ class MetaOptimizer:
         Returns:
             归一化的资本权重数组 (sum=1, 各权重在 [min_weight, max_weight] 内)
         """
+        index = pd.DatetimeIndex(returns_df.index)
+        if index.has_duplicates or not index.is_monotonic_increasing:
+            raise ValueError("meta-optimizer return dates must be unique and sorted")
+        if returns_df.columns.has_duplicates:
+            raise ValueError("meta-optimizer sleeve names must be unique")
         n = returns_df.shape[1]
-        self.last_failure = None
         if n == 0:
             return np.array([])
         if n == 1:
@@ -88,7 +103,7 @@ class MetaOptimizer:
             returns_df = returns_df.iloc[:pos]
         if len(returns_df) > self.estimation_window:
             returns_df = returns_df.iloc[-self.estimation_window:]
-        returns_df = returns_df.dropna(how="all")
+        returns_df = returns_df.replace([np.inf, -np.inf], np.nan).dropna(how="any")
 
         if len(returns_df) < 20:
             # 样本不足时保持现有配置；首次调用才使用等权。
@@ -105,39 +120,22 @@ class MetaOptimizer:
         cov = returns_df.cov().values * 252  # 样本协方差
         # 强制对称化 (消除数值误差导致的不对称)
         cov = (cov + cov.T) / 2
-        # 数值安全: NaN/Inf填充
-        if np.any(np.isnan(cov)) or np.any(np.isinf(cov)):
-            diag_var = np.nan_to_num(np.diag(cov), nan=0.01, posinf=0.01, neginf=0.01)
-            cov = np.diag(np.maximum(diag_var, 1e-6))
-
-        try:
-            if self.method == "max_sharpe":
-                w = self._max_sharpe(mu, cov, n)
-            elif self.method == "min_variance":
-                w = self._min_variance(cov, n)
-            elif self.method == "shrinkage_min_variance":
-                cov = self._shrink_covariance(cov)
-                w = self._min_variance(cov, n)
-            elif self.method in {"risk_parity", "erc"}:
-                w = self._risk_parity(cov, n)
-            elif self.method == "inverse_volatility":
-                w = self._inverse_volatility(cov, n)
-            elif self.method == "hrp":
-                w = self._hrp(cov, n)
-            else:
-                raise ValueError(f"unknown meta optimization method {self.method!r}")
-        except Exception as exc:
-            self.last_failure = {
-                "stage": "meta_optimization",
-                "date": str(pd.Timestamp(date).date()) if date is not None else None,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-                "fallback": "hold_previous_relative_weights",
-            }
-            if current_weights is None or len(current_weights) != n:
-                raise RuntimeError(f"meta optimization failed without prior weights: {exc}") from exc
-            logger.warning("元优化失败，保持上期相对权重: %s", exc)
-            w = self._project_to_constraints(current_weights, n)
+        if not np.isfinite(mu).all() or not np.isfinite(cov).all():
+            raise RuntimeError("meta optimization history produced NaN/Inf moments")
+        cov = validated_psd_covariance(cov)
+        if self.method == "max_sharpe":
+            w = self._max_sharpe(mu, cov, n)
+        elif self.method == "min_variance":
+            w = self._min_variance(cov, n)
+        elif self.method == "shrinkage_min_variance":
+            cov = self._shrink_covariance(cov)
+            w = self._min_variance(cov, n)
+        elif self.method in {"risk_parity", "erc"}:
+            w = self._risk_parity(cov, n)
+        elif self.method == "inverse_volatility":
+            w = self._inverse_volatility(cov, n)
+        elif self.method == "hrp":
+            w = self._hrp(cov, n)
 
         # 与当前权重平滑 (避免剧烈换手)
         if current_weights is not None and len(current_weights) == n:
@@ -176,38 +174,36 @@ class MetaOptimizer:
         使用 cvxpy 凸优化的近似: 最大化 w·μ - 0.5 * risk_aversion * w^T Σ w
         然后归一化. 或者直接用解析解 (当无约束时).
         """
-        if _HAS_CVXPY:
-            import cvxpy as cp
-            w = cp.Variable(n)
-            risk_aversion = 2.0
-            objective = cp.Maximize(
-                mu @ w - 0.5 * risk_aversion * cp.quad_form(w, cp.psd_wrap(cov))
-            )
-            constraints = [
-                cp.sum(w) == 1,
-                w >= self.min_weight,
-                w <= self.max_weight,
-            ]
-            prob = cp.Problem(objective, constraints)
-            solve_validated(prob, w, ["OSQP", "CLARABEL"])
-            return np.asarray(w.value, dtype=float)
-        raise RuntimeError("cvxpy is required for validated max_sharpe optimization")
+        import cvxpy as cp
+
+        w = cp.Variable(n)
+        risk_aversion = 2.0
+        objective = cp.Maximize(
+            mu @ w - 0.5 * risk_aversion * cp.quad_form(w, cp.psd_wrap(cov))
+        )
+        constraints = [
+            cp.sum(w) == 1,
+            w >= self.min_weight,
+            w <= self.max_weight,
+        ]
+        prob = cp.Problem(objective, constraints)
+        solve_validated(prob, w, ["OSQP", "CLARABEL"])
+        return np.asarray(w.value, dtype=float)
 
     def _min_variance(self, cov: np.ndarray, n: int) -> np.ndarray:
         """最小化方差: w^T Σ w."""
-        if _HAS_CVXPY:
-            import cvxpy as cp
-            w = cp.Variable(n)
-            objective = cp.Minimize(cp.quad_form(w, cp.psd_wrap(cov)))
-            constraints = [
-                cp.sum(w) == 1,
-                w >= self.min_weight,
-                w <= self.max_weight,
-            ]
-            prob = cp.Problem(objective, constraints)
-            solve_validated(prob, w, ["OSQP", "CLARABEL"])
-            return np.asarray(w.value, dtype=float)
-        raise RuntimeError("cvxpy is required for validated min_variance optimization")
+        import cvxpy as cp
+
+        w = cp.Variable(n)
+        objective = cp.Minimize(cp.quad_form(w, cp.psd_wrap(cov)))
+        constraints = [
+            cp.sum(w) == 1,
+            w >= self.min_weight,
+            w <= self.max_weight,
+        ]
+        prob = cp.Problem(objective, constraints)
+        solve_validated(prob, w, ["OSQP", "CLARABEL"])
+        return np.asarray(w.value, dtype=float)
 
     def _risk_parity(self, cov: np.ndarray, n: int) -> np.ndarray:
         """风险平价: 各子组合风险贡献相等."""
@@ -324,11 +320,35 @@ class UnderlyingExposureController:
         sector_map: Optional[Mapping[str, str]] = None,
         tolerance: float = 1e-7,
     ):
-        self.constraint_specs = [
-            dict(spec)
-            for spec in constraint_specs
-            if str(spec.get("type", "")) in self._SUPPORTED
-        ]
+        self.constraint_specs = [dict(spec) for spec in constraint_specs]
+        unsupported = sorted({
+            str(spec.get("type", ""))
+            for spec in self.constraint_specs
+            if str(spec.get("type", "")) not in self._SUPPORTED
+        })
+        if unsupported:
+            raise ValueError(
+                "unsupported aggregate constraint types: " + ", ".join(unsupported)
+            )
+        for spec in self.constraint_specs:
+            kind = str(spec.get("type", ""))
+            if kind in {"net_exposure", "position_limit"}:
+                lower = float(spec.get("lower", -np.inf))
+                upper = float(spec.get("upper", np.inf))
+                if not np.isfinite([lower, upper]).all() or lower > upper:
+                    raise ValueError(f"invalid {kind} bounds")
+            elif kind in {"leverage", "margin", "sector_exposure"}:
+                limit = float(spec.get("limit", np.nan))
+                if not np.isfinite(limit) or limit < 0.0:
+                    raise ValueError(f"invalid {kind} limit")
+        if (
+            not np.isfinite([min_weight, max_weight, tolerance]).all()
+            or not 0.0 <= float(min_weight) <= float(max_weight) <= 1.0
+            or float(tolerance) <= 0.0
+        ):
+            raise ValueError(
+                "aggregate sleeve bounds require 0 <= min <= max <= 1 and positive tolerance"
+            )
         self.min_weight = float(min_weight)
         self.max_weight = float(max_weight)
         self.sector_map = dict(sector_map or {})
@@ -352,7 +372,12 @@ class UnderlyingExposureController:
         diagnostics["requested_capital_scale"] = float(target.sum())
         diagnostics["applied_capital_scale"] = float(target.sum())
 
-        if not self.constraint_specs or diagnostics["feasible"]:
+        scale = float(target.sum())
+        sleeve_bounds_ok = bool(
+            np.all(target >= self.min_weight * scale - self.tolerance)
+            and np.all(target <= self.max_weight * scale + self.tolerance)
+        )
+        if diagnostics["feasible"] and sleeve_bounds_ok:
             return target.copy(), diagnostics
         if target.sum() <= self.tolerance:
             raise RuntimeError("zero target capital is infeasible under aggregate constraints")
@@ -492,6 +517,8 @@ class UnderlyingExposureController:
             raise ValueError("aggregate exposure projection requires non-empty 2D inputs")
         if matrix.shape != (len(instruments), target.size):
             raise ValueError("exposure matrix shape does not match instruments and sleeves")
+        if len(set(instruments)) != len(instruments):
+            raise ValueError("aggregate exposure instruments must be unique")
         if not np.isfinite(target).all() or not np.isfinite(matrix).all():
             raise ValueError("aggregate exposure projection inputs contain NaN/Inf")
         if np.any(target < -1e-10):

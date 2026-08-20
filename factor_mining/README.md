@@ -8,7 +8,7 @@
 
 ## 边界
 
-- 数据：默认只读本地 1 分钟 Parquet；适配器显式传入 `mysql_config=None`。
+- 数据：只读已发布的本地1分钟Parquet，不包含远程数据旁路。
 - 搜索：首版使用内置轻量 GP，无 `gplearn`/`DEAP` 新依赖，不使用 Python `eval`。
 - 验证：挖掘期提供 rank IC/IR、分层、换手、成本和时间分段诊断；它们不是正式
   HAC 检验或 OOS 证据。
@@ -139,13 +139,13 @@ GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使�
 0 个有效因子×周期观测会直接失败，不再产生“零样本但完成”的结论。
 
 政策升级前的日期化复核报告和本地结果已经清除。当前正式准入只使用
-[`../docs/factor_validation_pipeline.md`](../docs/factor_validation_pipeline.md) 所述流程；
+[`../docs/因子检验与准入流程.md`](../docs/因子检验与准入流程.md) 所述流程；
 新结果必须写入新目录，不能与旧方法的通过数直接比较。
 
 ## 开发冒烟
 
 ```powershell
-$PY = '.\.venv\Scripts\python.exe'
+$PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -B main.py mining dev-smoke `
   --periods 600 --symbols 12 --population 80 --generations 4
 ```
@@ -209,7 +209,7 @@ portfolio fitness，不创建整代 `(M_all,T,N)` tensor。
 baseline、Accelerator v1、v1+FactorChunk 和 v2-lite，同时输出 JSON/CSV。
 benchmark 会保存固定 AST、raw factor memmap、worker/chunk 调优、各 kernel
 计时和 RSS，并硬断言 NaN mask、factor 容差、IC、direction、candidate
-集合和排序。
+集合和排序。运行时必须显式传入 `--output-dir`，脚本不会自动创建时间戳目录。
 
 NumPy stable-argsort rank 曾通过 ties/NaN 等价探针，但在完整 12,000×47
 benchmark 上慢于现有 SciPy `rankdata`，因此未进入生产路径；rank 仍使用 v1
@@ -233,14 +233,13 @@ v2-lite 使用算子能力白名单。`ts_ema`、`ts_corr`、`ts_cov`、横截�
 四条路径的 NaN mask、factor value、IC、direction、candidate ID/集合和 fitness
 排序全部通过硬断言，fallback 为 0。Factor Chunk 提供了确定性耗时收益；在线
 accumulator 的主要收益是避免整代状态常驻并将 RSS 控制在 2GB 内，不能把它描述成
-额外数量级加速。完整 JSON/CSV 位于本地
-`runs/factor_mining/benchmarks/v2_lite_12000x47_final_20260729/`。
+额外数量级加速。历史 benchmark 产物已经清理；如需复核，使用
+`python -m scripts.benchmark_gp_accelerator --output-dir <目录>` 显式重建。
 
 同一形状扩展到 220 population 后，Baseline、v1、FactorChunk、v2-lite 分别为
 23.313s、16.331s、15.540s、15.493s；最佳调度是 `chunk_size=50`、
 `workers=4`，v2-lite 峰值 RSS 为 1.61GB。目标 7–9 秒未达成，原因是表达式阶段
 已经降至约 0.98s，剩余时间主要是主线程 MAD、neutralization 和 rank-IC。继续增加
-expression worker 不能解决这部分瓶颈。220 规模报告位于本地
-`runs/factor_mining/benchmarks/v2_lite_220x12000x47_20260729/`；该扩展测试复用
+expression worker 不能解决这部分瓶颈。历史 220 规模报告也已清理；该扩展测试复用
 同一生成规则并检查 candidate 结果，但为控制耗时没有重复 raw factor value 断言，
 raw value 的正式硬验收仍以固定 100 AST 报告为准。

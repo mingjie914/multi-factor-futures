@@ -5,6 +5,7 @@ data:
   cache:
     enabled: false
 
+# Frozen narrow smoke-test window.
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'

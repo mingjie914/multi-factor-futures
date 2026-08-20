@@ -8,22 +8,23 @@
 - SQLite 候选库、市场数据缓存和普通运行输出留在本机，不进入 Git。
 - Git 只长期保留 `runs/README.md` 和 append-only holdout ledger。普通本地结果不进入
   Git；需要长期保留的大型证据应先写入只读归档，再从工作区清理。
-- `config/trading.yaml` 只能由人工批准流程修改，研究代码不得自动写入。
+- `config/target_publication.yaml`只能由人工批准流程修改，研究代码不得自动写入。
 
 ## 例行检查
 
 ```powershell
-$PY = '.\.venv\Scripts\python.exe'
+$PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 & $PY -m pip check
-& $PY -B -m compileall -q alpha backtest core data factor_mining factors `
-  optimization pipeline processing research risk signals strategies testing workflows tests main.py
+& $PY -B -m compileall -q alpha backtest core data external_strategies factor_mining factors `
+  monitoring optimization pipeline processing research risk scripts strategies testing `
+  workflows tests main.py
 & $PY -B -m pytest -q -p no:cacheprovider
 & $PY -X utf8 -B main.py mining dev-smoke `
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-完整测试在当前开发机通常约 10 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
+完整测试在当前开发机通常约 10～20 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
 持续集成更适合检查明显回退，而不是维护容易过期的固定秒数或测试项数量。
 
 ## 性能原则
@@ -39,7 +40,35 @@ $PY = '.\.venv\Scripts\python.exe'
   v2-lite，并核对 NaN mask、factor value、IC、direction、candidate 集合和排序。
 - 分钟数据按明确训练区间加载，超过特征内存预算时失败关闭，不用交换分区硬撑。
 - 本地 Parquet 的 selected-contract 和 curve cache 可以复用；源文件指纹变化时会失效。
+- 通用行情缓存命中更宽日期/品种覆盖时直接返回内存切片，不再为每个请求范围落一个
+  派生 Parquet；不要恢复这种会持续制造重复缓存文件的写回行为。
 - 因子批量计算依赖预取和 SPEC 按 base 分组，不要在单因子中重复读取相同字段。
+- 生产组合的风险历史按信号日只读取一次，再在多头池和空头池内分别执行完整性筛选与
+  ERC；不要重新引入同一日期的重复行情读取。
+- 行情分区读取失败或正式流程取得空交易日历时必须失败关闭，不能把工作日历伪装成
+  交易所日历。本框架的数据源即本地 Parquet，不再保留失效的 `cache-only` 分支。
+- 生产因子直接读取本地分钟/日线分片时，任一已发现分片损坏必须终止；不得跳过坏分片
+  或在同一次计算中静默切换到另一个行情源。
+
+## 行情缺口与停牌语义
+
+- 日线缺行不自动等同于停牌。未知上市后缺口必须失败关闭并先补权威数据源；不得为了
+  让净值连续而填0收益。
+- 日度前向收益按完整交易日历移位，不得在单品种上先删除缺行再跨日配对；空交易日历、
+  空close或全空前向收益均须失败关闭，不能输出平坦净值。
+- 只有交易所/权威源证实的停牌日才加入`data.audited_nontrading_closes`。该日沿用上一
+  可观察收盘估值、收益为0且禁止调仓；下一次真实报价一次性计入跨期涨跌。
+- NI 2022-03-10是当前唯一配置的已审计停牌。SC 2026-05-08属于日线漏数，已在
+  数据发布侧补齐到本地Parquet，不进入停牌白名单。
+- 郑商所YMM/YYMM别名在发布层统一处理；规范键数值冲突时停止发布，不按文件顺序
+  静默选择。全库重复检查留在数据发布和`data-health --strict`，不放入因子热路径。
+- 本框架只消费已发布的本地Parquet，不包含远程核对、回填或发布逻辑。
+- 连续价格与合约日程必须来自同一份点时主力选择。组合账本逐日检查下一交易日具体合约，
+  即使根权重不变、当天也不是常规调仓日，换月仍按旧约平仓＋新约开仓记录；停牌日延迟
+  至首次可交易收盘执行。数据源不能提供合约日程时，账本元数据必须标记`unavailable`。
+- 交易所重启上市或合约规格发生经济断代时，在`data.parquet.root_active_from`按品种配置
+  生效日期；这不是普通上市日期，也不写进数据源特例。FU当前配置为2018-07-16，正式
+  入口必须经`DataManager.from_config`构造数据源；直接实例化仅限显式传入同等配置的测试。
 
 ## 动态注册检查
 
@@ -59,7 +88,7 @@ SQLite candidate catalog -> immutable JSON snapshot
 
 ## 组合优化器生命周期
 
-- `hierarchical_asset_risk_parity` 标记为 `formal_default`，是正式研究、回测与实盘参考
+- `hierarchical_asset_risk_parity` 标记为 `formal_default`，是正式研究、回测与目标权重观察
   信号的唯一默认品种配置器。
 - `mean_variance` 标记为 `research_only`，仅允许在预期收益已经按相同周期、相同单位
   完成样本外幅度校准的对照实验中使用。
@@ -78,14 +107,18 @@ SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle
 ## 清理策略
 
 可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、`_work/`、空的
-`signals_output/`。清理前必须确认路径位于仓库内。
+`signals_output/`、`monitoring_data/` 和 `weeklyreport/`。清理前必须确认路径位于仓库内。
 
 不要清理：`cache/` 和 `runs/factor_research/holdout_ledger.jsonl`。前者是本地行情缓存，
 后者记录已消费 OOS。`runs/factor_mining/`、普通 `runs/factor_research/<study_id>/` 和
 回测输出在协议变更后应清理；若结果仍需审计，先保存 manifest、哈希和外部归档 URI。
+正式研究使用不可变 study/run 目录，这是审计要求；只有明确的研究入口可以创建这类
+目录。运维脚本默认覆盖固定目标或要求显式输出路径，不得在项目根目录自动堆积日期文件。
 
-期货成本模型不再保留单次手续费、滑点或按换手扣费的兼容参数。筛选期只使用年化
-0.02%，筛选成功后的研究回测使用年化 0.02% 加 0.105% 移仓成本。换手只输出诊断；
+期货成本模型不再保留含义重叠的手续费、滑点兼容参数。筛选期将年化半换手还原为
+完整成交名义后乘 0.02%；筛选成功后的研究回测按 `executed_traded_notional` 计提 0.02%，
+并按总暴露摊销年化 0.105% 的保守移仓预算。`decision_turnover` 只作诊断；显式换月腿
+进入实际成交名义和 0.02% 成本，不再额外触发另一笔固定移仓费。
 旧配置若仍含 `commission_rate`、`slippage`、`turnover_penalty` 或
 `max_monthly_turnover`，必须迁移后再运行，不能静默兼容。
 

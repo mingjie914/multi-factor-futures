@@ -557,7 +557,7 @@ def _require_valid_hypothesis_observations(results: list[dict]) -> int:
 
 
 def _load_adaptivity_data(csv_path: str | None = None) -> dict:
-    """加载因子适配性研究结果 (方案A: 最小集成).
+    """加载因子适配性研究结果（最小集成）.
 
     仅从显式指定的 CSV 加载, 返回 {factor_name: row_dict}.
     未指定文件时返回空字典，避免历史报告静默污染本次研究.
@@ -570,14 +570,15 @@ def _load_adaptivity_data(csv_path: str | None = None) -> dict:
     - decay_type: 衰减类型 (increasing/stable/decaying)
     """
     import pandas as pd
-    if not csv_path or not os.path.exists(csv_path):
+    if not csv_path:
         return {}
-    try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    except Exception:
-        return {}
-    if df.empty or "factor" not in df.columns:
-        return {}
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"adaptivity CSV does not exist: {csv_path}")
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    if df.empty:
+        raise ValueError(f"adaptivity CSV is empty: {csv_path}")
+    if "factor" not in df.columns:
+        raise ValueError(f"adaptivity CSV has no 'factor' column: {csv_path}")
     # 转为 {factor_name: row_dict} 索引
     result = {}
     for _, row in df.iterrows():
@@ -745,7 +746,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     import numpy as np
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor
-    from data.manager import DataManager, FrequencyDataProvider
+    from data.manager import FrequencyDataProvider
     from core.factor_contract import validate_factor_contract
     from core.registry import get as registry_get
     from factors.engine import FactorEngine
@@ -915,48 +916,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         calendar = calendar.tz_localize(None)
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
-    # 若 MySQL 连接失败导致日历为空, 从缓存的 close parquet 提取交易日历
-    if len(calendar) == 0 and period_ctx.is_daily:
-        import os as _os
-        _cache_dir = _os.path.join(_PROJECT_ROOT, "cache")
-        _close_files = [f for f in _os.listdir(_cache_dir)
-                        if f.startswith("futures_MySQLSource_close_") and f.endswith(".parquet")]
-        _best_dates = pd.DatetimeIndex([])
-        _best_score = -1
-        for _f in _close_files:
-            try:
-                _df = pd.read_parquet(_os.path.join(_cache_dir, _f))
-                _col_overlap = len(set(_df.columns) & set(universe))
-                _date_overlap = ((_df.index >= pd.Timestamp(factor_start)) &
-                                 (_df.index <= pd.Timestamp(ic_end))).sum()
-                _score = _col_overlap * 1000 + _date_overlap
-                if _score > _best_score:
-                    _best_score = _score
-                    _best_dates = pd.DatetimeIndex(_df.index)
-            except Exception:
-                continue
-        if len(_best_dates) > 0:
-            calendar = _best_dates
-            # 同时 monkey-patch DataManager.get 使其从缓存返回数据
-            _ohlcv_cache = {"close": pd.read_parquet(
-                _os.path.join(_cache_dir, _close_files[0])
-            ).reindex(index=calendar, columns=universe)}
-            for _field in ["open", "high", "low", "volume", "oi", "settle", "amount"]:
-                for _f in _os.listdir(_cache_dir):
-                    if _f.startswith(f"futures_MySQLSource_{_field}_") and _f.endswith(".parquet"):
-                        try:
-                            _df = pd.read_parquet(_os.path.join(_cache_dir, _f))
-                            _df = _df.reindex(index=calendar, columns=universe)
-                            _ohlcv_cache[_field] = _df
-                        except Exception:
-                            pass
-                        break
-            def _patched_get(field, dates, uni):
-                if field in _ohlcv_cache:
-                    return _ohlcv_cache[field].reindex(index=dates, columns=uni)
-                return pd.DataFrame(index=dates, columns=uni)
-            data_mgr.get = _patched_get
-            print(f"  (从缓存加载数据: {len(_ohlcv_cache)} 个字段)")
+    if len(calendar) == 0:
+        raise RuntimeError(
+            f"published Parquet returned an empty {frequency} research calendar"
+        )
 
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
     if not period_ctx.is_daily and len(calendar):
@@ -1031,7 +994,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         batch_names = all_factors[
             batch_start:batch_start + research_chunk_size
         ]
-        engine = FactorEngine(data_mgr)
+        # Discovery scans the entire registered library, including optional
+        # factors.  Failures are recorded instead of aborting unrelated tests.
+        engine = FactorEngine(data_mgr, tolerant=True)
         computed_batch = engine.compute_factors(
             batch_names,
             calendar,
@@ -1042,6 +1007,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         factor_batch = runner.processor.process_batch(
             computed_batch, processing_context
         )
+        if engine.failures:
+            print(f"  本批不可计算因子/依赖: {len(engine.failures)}（已记入日志）")
         raw_variant_batch = {
             name: runner.processor.process_excluding(
                 computed_batch[name], processing_context, {"neutralize"}
@@ -1064,6 +1031,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 f_ic = matrix.loc[ic_start:ic_end]
                 for p in periods:
                     fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
+                    estimation_failure = None
                     try:
                         stats = _joint_ic_ols_statistics(
                             f_ic,
@@ -1085,7 +1053,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         ols_n = stats["ols_n"]
                         ols_days = stats["ols_days"]
                         ic_n = stats["ic_n"]
-                    except Exception:
+                    except Exception as exc:
+                        estimation_failure = {
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
                         t_stat = 0.0
                         ic_mean = 0.0
                         ir_nw = 0.0
@@ -1114,6 +1086,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         "ic_pos_ratio": float(ic_pos_ratio),
                         "n": int(ic_n),
                     }
+                    if estimation_failure is not None:
+                        all_period_results[label]["estimation_failure"] = estimation_failure
 
             return {
                 "name": fname,
@@ -1432,10 +1406,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                     getattr(runner.cost_model, "annual_fee", 0.0)
                 ),
                 safety_margin=policy.cost_safety_margin,
-                annual_transaction_cost=float(
+                turnover_cost_rate=float(
                     getattr(
                         runner.cost_model,
-                        "annual_transaction_cost",
+                        "turnover_cost_rate",
                         0.0002,
                     )
                 ),
@@ -1661,7 +1635,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "n_factors_total": len(all_factors),
             "n_factors_t_significant": len(t_significant),
             "n_factors_significant": len(significant),
-            # 方案A: 适配性研究集成信息
+            # 适配性研究集成信息
             "adaptivity_enabled": bool(adaptivity_data),
             "adaptivity_source": os.path.abspath(adaptivity_file) if adaptivity_data else None,
         },
@@ -1678,7 +1652,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "by_best_period": {str(k): len(v) for k, v in by_period.items()},
             "total_significant": len(significant),
             "total_passed_all_tests": len(final_factors) if significant else 0,
-            # 方案A: 适配性摘要
+            # 适配性摘要
             "adaptivity_filtered_invalid": n_filtered if adaptivity_data else 0,
         },
     }
@@ -1705,7 +1679,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     yaml_source = final_factors if significant and final_factors else significant
     print("\n=== config/default.yaml 子组合配置片段 ===")
     print(f"# (基于 {'final_factors' if final_factors else 'significant_factors'})")
-    print(f"# 方案A: 含适配性研究标注 (best_sector / valid_sectors)")
+    print("# 含适配性研究标注 (best_sector / valid_sectors)")
     short_factors = [r for r in yaml_source if r["best_period"] in (3, 5)]
     mid_factors = [r for r in yaml_source if r["best_period"] in (10,)]
     long_factors = [r for r in yaml_source if r["best_period"] in (20, 40)]
@@ -1791,10 +1765,6 @@ def _run_correlation_analysis(
 
     print(f"\n计算 {len(factor_names)} 个因子矩阵...")
     t0 = time.time()
-    engine = FactorEngine(data_mgr)
-    factor_matrices = engine.compute_factors(
-        factor_names, calendar, universe, parallel=True, chunk_size=100
-    )
     from factors.processor import build_processing_context
 
     processing_context = build_processing_context(
@@ -1802,6 +1772,10 @@ def _run_correlation_analysis(
         calendar,
         universe,
         runner.config.universe_selection,
+    )
+    engine = FactorEngine(data_mgr)
+    factor_matrices = engine.compute_factors(
+        factor_names, calendar, universe, parallel=True, chunk_size=100
     )
     factor_matrices = runner.processor.process_batch(
         factor_matrices, processing_context
@@ -1891,16 +1865,13 @@ def main():
         help="自动选最优聚类阈值 (用轮廓系数, 配合 --correlation)")
     parser.add_argument(
         "--run-id", default=None,
-        help="研究运行标识；默认按当前时间生成，输出到 runs/<run_id>")
+        help="研究运行标识；输出到 runs/<run_id>")
     parser.add_argument(
         "--output-dir", default=None,
         help="显式输出目录；指定后覆盖 runs/<run_id>")
     parser.add_argument(
         "--refuse-existing-output", action="store_true",
         help="若输出目录已存在则拒绝运行；用于不可覆盖的规范化研究")
-    parser.add_argument(
-        "--cache-only", action="store_true",
-        help="严格只使用本地缓存；缓存未命中时禁止访问数据库")
     parser.add_argument(
         "--adaptivity-file", default=None,
         help="显式适配性 CSV。默认不加载历史 reports 产物")
@@ -1916,7 +1887,9 @@ def main():
 
     if args.run_id and not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_id):
         parser.error("--run-id 仅允许字母、数字、点、下划线和连字符")
-    run_id = args.run_id or time.strftime("research_%Y%m%d_%H%M%S")
+    if not args.run_id and not args.output_dir:
+        parser.error("必须显式指定 --run-id 或 --output-dir")
+    run_id = args.run_id
     output_dir = args.output_dir or os.path.join(_PROJECT_ROOT, "runs", run_id)
     if not os.path.isabs(output_dir):
         output_dir = os.path.join(_PROJECT_ROOT, output_dir)
@@ -1948,8 +1921,6 @@ def main():
         from core.config import load_config
 
         config = load_config(config_path)
-        if args.cache_only:
-            config.data.cache["only"] = True
         runner = PipelineRunner(config=config)
     except Exception as e:
         print(f"框架初始化失败: {e}")

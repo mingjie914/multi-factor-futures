@@ -1,5 +1,12 @@
 # 国信趋势配置指数形式适配器
 
+> **当前审计边界**：国信原始参考净值不受项目修复影响；项目固定8f/10f/13f及两种
+> 方法已于2026-08-17通过当前引擎重建。它只重评固定集合，不重新证明旧搜索结论；
+> 目标权重发布门继续关闭。
+
+> 策略分支编号：B1。它是复用框架数据与因子的多品种影子变种，不属于主分支 A，
+> 生产策略和主配置均不导入本目录。
+
 该适配器根据两份指数编制说明实现以下公开规则：九品种资产池、仅做多、每日调仓、
 每个“因子 × 参数”将因子值保留 10 位小数后独立选出前 51%（九选五）、
 目标波动率/相关性修正的逆波动
@@ -22,8 +29,10 @@
 版本；策略接口仍保留“因子内参数均值”这一步，增加参数版本时不会改变合成层级。
 
 日期语义：项目因子输出已内建 `shift(1)`，因此 `factor[T]` 只使用不晚于 T-1 的
-信息，并直接对应 T 日持有；配置中的 `execution_lag_days` 默认为 0，避免重复滞后。
-若接入未经预滞后的外部原始因子快照，应将其改为 1。
+信息。该行在 T 日收盘形成目标权重，并从下一交易日的收盘到收盘收益开始生效；
+`execution_lag_days=0` 表示不再额外等待，设为 1 才会额外推迟一个交易日。有效权重
+按收益漂移，收盘调仓换手以漂移后权重为起点；合约切换按旧约平仓、新约开仓计入
+完整成交名义，活跃持仓缺失收益时直接报错。
 
 运行示例：
 
@@ -31,10 +40,11 @@
 & 'E:\Python\Pythonvenv\Scripts\python.exe' -B -m external_strategies.guosen_trend_index.run `
   --start 2016-03-31 --end 2026-08-06 `
   --factor-set 6f --factor-set 10f --factor-set 13f --factor-set 14f `
-  --equal-gross 1.0 --search-subsets
+  --equal-gross 1.0 --search-subsets `
+  --output runs/external_guosen_trend_index/<run_id>
 ```
 
-结果写入独立时间戳目录，不会覆盖生产净值或权重。
+结果只写入显式 `--output` 目录，不会自动创建日期目录或覆盖主分支净值与权重。
 
 运行器会在回测起日前预取历史数据，避免基日后的风险窗口空仓；输出仍从指定基日
 以 1000 点开始。`summary.json` 同时记录最终合成组合的九品种覆盖率。这里不通过
@@ -59,3 +69,25 @@
 本地原始 `SC*`、`SC8888` 和框架连续合约的首个有效日均为 `2018-03-26`。因此
 2016-03-31 至 SC 上市前不可能构造九品种真实持仓；适配器让 SC 自然缺席，不通过
 代理品种或后见回填伪造上市前历史。
+
+## 当前核心方案比较
+
+以下入口只比较冻结因子集，不重新搜索因子，也不修改生产配置：
+
+```powershell
+& 'E:\Python\Pythonvenv\Scripts\python.exe' -X utf8 -B `
+  -m external_strategies.guosen_trend_index.current_core_compare `
+  --end YYYY-MM-DD --output runs/external_guosen_trend_index/<run_id>
+```
+
+它在一个共享因子面板中比较 8f、10f、13f 的生产结构（ICIR(LW)、
+Top10/Bottom10、单侧板块 cap=3、两侧 ERC），并分别用替代结构（因子等权、
+Top12/Bottom12、无 cap、两侧逆波动率）复算三套因子集。生产结构图和六方法图均含
+国信原始净值。输出包含2016-03-31起和2025-01-01起两组图。修复前标注的OOS/观察
+模拟分界已经消费过历史数据，不再作为独立前瞻或真实交易证据，因此当前图不作此类
+着色；外部指数晚于其最后日期不做填充。
+
+当前10f是13f剔除`jump_intensity`、`dtws`和`seat_long_short_seat_ratio`后的精简组合；
+旧10f定义已经退役。当前10f冻结于`snapshot/10f_icir/`并只作固定观察基线；
+当前统一证据位于
+`runs/external_guosen_trend_index/20260817_correctness_rebuild/`。

@@ -12,6 +12,7 @@ from core.registry import register
 from core.sectors import asset_class_for, sector_for
 from core.types import Date, ExpectedReturns, Universe, WeightVector
 from optimization.risk_budgeting import RiskBudgetingOptimizer
+from optimization.constraints import turnover_transition
 
 
 @register("optimizer", "hierarchical_asset_risk_parity")
@@ -38,6 +39,18 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
         asset_class_budgets: Optional[Mapping[str, float]] = None,
         commodity_sector_budgets: Optional[Mapping[str, float]] = None,
     ):
+        numeric = np.asarray(
+            [
+                target_volatility,
+                max_leverage,
+                covariance_shrinkage,
+                periods_per_year,
+                volatility_floor,
+            ],
+            dtype=float,
+        )
+        if not np.isfinite(numeric).all():
+            raise ValueError("hierarchical risk-parity parameters must be finite")
         if target_volatility < 0:
             raise ValueError("target_volatility must be non-negative")
         if max_leverage <= 0:
@@ -51,8 +64,20 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
         self.covariance_shrinkage = float(covariance_shrinkage)
         self.periods_per_year = float(periods_per_year)
         self.volatility_floor = float(volatility_floor)
-        self.asset_class_budgets = dict(asset_class_budgets or {})
-        self.commodity_sector_budgets = dict(commodity_sector_budgets or {})
+        self.asset_class_budgets = {
+            str(key): float(value)
+            for key, value in dict(asset_class_budgets or {}).items()
+        }
+        self.commodity_sector_budgets = {
+            str(key): float(value)
+            for key, value in dict(commodity_sector_budgets or {}).items()
+        }
+        configured_values = [
+            *self.asset_class_budgets.values(),
+            *self.commodity_sector_budgets.values(),
+        ]
+        if any(not np.isfinite(value) or value < 0.0 for value in configured_values):
+            raise ValueError("configured risk budgets must be finite and non-negative")
         self.last_diagnostics: dict = {}
 
     def optimize(
@@ -76,8 +101,9 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
             pd.Series(expected_returns, dtype=float)
             .reindex(names)
             .replace([np.inf, -np.inf], np.nan)
-            .fillna(0.0)
         )
+        if forecasts.isna().any():
+            raise ValueError("expected returns contain missing or non-finite values")
         if float(forecasts.abs().sum()) <= 1e-12:
             self.last_diagnostics = self._empty_diagnostics("no_active_signal")
             return pd.Series(0.0, index=names)
@@ -233,9 +259,11 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
         if len(labels) == 1:
             return np.ones(1, dtype=float)
         budget = np.asarray(
-            [max(float(configured_budgets.get(label, 1.0)), 0.0) for label in labels],
+            [float(configured_budgets.get(label, 1.0)) for label in labels],
             dtype=float,
         )
+        if not np.isfinite(budget).all() or bool((budget < 0.0).any()):
+            raise ValueError("active risk budgets must be finite and non-negative")
         if float(budget.sum()) <= 0:
             raise ValueError("active risk budgets must contain a positive value")
         budget /= budget.sum()
@@ -249,6 +277,49 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
         *,
         current_drawdown: float,
     ) -> pd.Series:
+        supported = {
+            "position_limit",
+            "sector_exposure",
+            "net_exposure",
+            "leverage",
+            "turnover",
+            "drawdown_control",
+        }
+        unknown = sorted({
+            str(getattr(constraint, "name", ""))
+            for constraint in constraints
+            if str(getattr(constraint, "name", "")) not in supported
+        })
+        if unknown:
+            raise ValueError(
+                "hierarchical risk parity does not support constraints: "
+                + ", ".join(unknown)
+            )
+        for constraint in constraints:
+            kind = str(getattr(constraint, "name", ""))
+            if kind == "leverage" and float(
+                getattr(constraint, "vol_target", 0.0)
+            ) > 0.0:
+                raise ValueError(
+                    "hierarchical risk parity uses its own target volatility; "
+                    "leverage.vol_target must be zero"
+                )
+            if kind == "net_exposure" and (
+                float(getattr(constraint, "lower", 0.0)) > 0.0
+                or float(getattr(constraint, "upper", 0.0)) < 0.0
+            ):
+                raise ValueError(
+                    "hierarchical risk parity supports only net-exposure ranges "
+                    "that include zero"
+                )
+            if kind == "position_limit" and (
+                float(getattr(constraint, "lower", 0.0)) > 0.0
+                or float(getattr(constraint, "upper", 0.0)) < 0.0
+            ):
+                raise ValueError(
+                    "hierarchical risk parity supports only position ranges "
+                    "that include zero"
+                )
         result = self._project_hard_limits(
             target,
             constraints,
@@ -263,15 +334,14 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
             None,
         )
         if turnover_limit is not None and turnover_limit >= 0:
-            previous = (
-                pd.Series(current_weights, dtype=float)
-                .reindex(result.index)
-                .fillna(0.0)
+            previous, forced_exit = turnover_transition(
+                current_weights, result.index
             )
+            discretionary_budget = max(turnover_limit - forced_exit, 0.0)
             change = result - previous
             turnover = float(change.abs().sum())
-            if turnover > turnover_limit and turnover > 0:
-                result = previous + change * (turnover_limit / turnover)
+            if turnover > discretionary_budget and turnover > 0:
+                result = previous + change * (discretionary_budget / turnover)
 
         # A stale position can already violate today's limits. Turnover is a
         # soft transition limit in that conflict: final risk caps take
@@ -301,8 +371,7 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
                 )
             elif kind == "sector_exposure":
                 limit = float(getattr(constraint, "limit", 0.0))
-                if limit > 0:
-                    result = self._cap_sector_net_exposure(result, limit)
+                result = self._cap_sector_net_exposure(result, limit)
 
         gross = max(float(result.abs().sum()), 1e-12)
         global_scale = min(1.0, self.max_leverage / gross)
@@ -350,7 +419,10 @@ class HierarchicalAssetRiskParityOptimizer(Optimizer):
     @staticmethod
     def _ensure_psd(matrix: np.ndarray) -> np.ndarray:
         values = np.asarray(matrix, dtype=float)
-        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        if values.ndim != 2 or values.shape[0] != values.shape[1]:
+            raise ValueError("covariance matrix must be square")
+        if not np.isfinite(values).all():
+            raise ValueError("covariance matrix must contain only finite values")
         values = (values + values.T) / 2.0
         eigenvalues, eigenvectors = np.linalg.eigh(values)
         eigenvalues = np.maximum(eigenvalues, 1e-12)

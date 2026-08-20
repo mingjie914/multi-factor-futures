@@ -5,6 +5,7 @@ import pandas as pd
 
 from external_strategies.guosen_trend_index.production_compare import (
     ANNUAL_FEE,
+    ANNUAL_ROLL_COST,
     F6,
     F10,
     F13,
@@ -15,11 +16,22 @@ from external_strategies.guosen_trend_index.production_compare import (
     TRADE_COST_RATE,
     _factor_weights,
     _ledger_from_weights,
+    _validate_fixed_factor_sets,
 )
 
 
 def test_validated_factor_pool_and_named_sets_are_stable():
+    _validate_fixed_factor_sets()
     assert (len(F6), len(F10), len(F13), len(F14)) == (6, 10, 13, 14)
+    assert set(F13) - set(F10) == {
+        "intraday_jump_intensity_20d",
+        "intraday_dtws_20d",
+        "intraday_seat_long_short_seat_ratio_20d",
+    }
+    assert {
+        "intraday_open_close_volume_ratio_20d",
+        "intraday_turnover_velocity_20d",
+    }.issubset(F10)
     assert len(dict.fromkeys(F6 + KEPT47 + NEW21)) == 74
 
 
@@ -50,7 +62,16 @@ def test_ledger_recomputes_turnover_cost_after_leverage_scaling():
     ledger = _ledger_from_weights(weights, returns, dates[0], dates[-1])
 
     assert ledger.iloc[0]["net_return"] == 0.0
-    assert np.isclose(ledger.iloc[1]["turnover"], 0.5)
-    expected = -(0.5 * TRADE_COST_RATE + ANNUAL_FEE / PERIODS_PER_YEAR)
+    daily_holding_cost = (ANNUAL_FEE + ANNUAL_ROLL_COST) / PERIODS_PER_YEAR
+    assert np.isclose(ledger.iloc[0]["turnover"], 0.0)
+    assert np.isclose(ledger.iloc[0]["decision_turnover"], 1.0)
+    assert np.isclose(ledger.iloc[1]["executed_traded_notional"], 1.0)
+    expected_turnover = 2.0 * (
+        0.5 / (1.0 - TRADE_COST_RATE - daily_holding_cost) - 0.25
+    )
+    assert np.isclose(ledger.iloc[1]["turnover"], 1.0)
+    assert np.isclose(ledger.iloc[1]["decision_turnover"], expected_turnover)
+    assert np.isclose(ledger.iloc[2]["turnover"], expected_turnover)
+    expected = -(TRADE_COST_RATE + daily_holding_cost)
     assert np.isclose(ledger.iloc[1]["net_return"], expected)
-    assert np.isclose(ledger.iloc[1]["gross_exposure"], 0.5)
+    assert np.isclose(ledger.iloc[1]["gross_exposure"], 1.0)

@@ -135,11 +135,12 @@ def _formula_inputs(data, dates, universe) -> dict[str, pd.DataFrame]:
             window, min_periods=window
         ).mean()
 
-    try:
-        industry = data.get_industry(dates, universe).reindex(
+    industry_getter = getattr(data, "get_industry", None)
+    if callable(industry_getter):
+        industry = industry_getter(dates, universe).reindex(
             index=dates, columns=universe
         )
-    except Exception:
+    else:
         industry = pd.DataFrame(index=dates, columns=universe, dtype=object)
     industry = industry.copy()
     industry.index = pd.RangeIndex(len(industry.index))
@@ -272,8 +273,8 @@ def _make_factor_class(spec: TaCnFormulaSpec):
                 return result.reindex(index=dates, columns=universe).replace(
                     [np.inf, -np.inf], np.nan
                 ).astype(float)
-            except Exception:
-                return _empty(dates, universe)
+            except Exception as exc:
+                raise RuntimeError(f"{spec.slug} formula computation failed") from exc
 
     class_name = "".join(part.title() for part in spec.slug.split("_"))
     TaCnFormulaFactor.__name__ = class_name

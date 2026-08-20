@@ -1,12 +1,41 @@
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict
 
 import numpy as np  # noqa: F401
+import pandas as pd
 
-from core.types import WeightVector
 from core.registry import register
-from core.interfaces import Constraint, ConstraintContext
+from core.interfaces import Constraint
+from core.sectors import sector_for
+
+
+def _weight_variable(variables: Dict):
+    weight = variables.get("w")
+    if weight is None:
+        raise KeyError("optimizer did not provide the 'w' weight variable")
+    return weight
+
+
+def turnover_transition(
+    current_weights, universe
+) -> tuple[pd.Series, float]:
+    """Return active prior weights and mandatory exits outside ``universe``."""
+    active = pd.Index(universe)
+    if active.has_duplicates:
+        raise ValueError("turnover universe must contain unique instruments")
+    current = (
+        pd.Series(dtype=float)
+        if current_weights is None
+        else pd.Series(current_weights, dtype=float)
+    )
+    if current.index.has_duplicates:
+        raise ValueError("current_weights must contain unique instruments")
+    if not np.isfinite(current.to_numpy(dtype=float)).all():
+        raise ValueError("current_weights must be finite")
+    previous_active = current.reindex(active).fillna(0.0)
+    forced_exit = float(current.loc[~current.index.isin(active)].abs().sum())
+    return previous_active, forced_exit
 
 
 @register("constraint", "long_only")
@@ -14,9 +43,8 @@ class LongOnlyConstraint(Constraint):
     name = "long_only"
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
-        w = variables.get("w")
-        if w is not None:
-            variables.setdefault("_constraints", []).append(w >= 0)
+        w = _weight_variable(variables)
+        variables.setdefault("_constraints", []).append(w >= 0)
 
 
 @register("constraint", "weight_sum")
@@ -24,14 +52,15 @@ class WeightSumConstraint(Constraint):
     name = "weight_sum"
 
     def __init__(self, target: float = 1.0):
-        self.target = target
+        self.target = float(target)
+        if not np.isfinite(self.target):
+            raise ValueError("weight-sum target must be finite")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is not None:
-            variables.setdefault("_constraints", []).append(cp.sum(w) == self.target)
+        w = _weight_variable(variables)
+        variables.setdefault("_constraints", []).append(cp.sum(w) == self.target)
 
 
 @register("constraint", "net_exposure")
@@ -45,17 +74,18 @@ class NetExposureConstraint(Constraint):
     name = "net_exposure"
 
     def __init__(self, lower: float = -0.5, upper: float = 0.5):
-        self.lower = lower
-        self.upper = upper
+        self.lower = float(lower)
+        self.upper = float(upper)
+        if not np.isfinite([self.lower, self.upper]).all() or self.lower > self.upper:
+            raise ValueError("net-exposure bounds must be finite and ordered")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is not None:
-            cs = variables.setdefault("_constraints", [])
-            cs.append(cp.sum(w) >= self.lower)
-            cs.append(cp.sum(w) <= self.upper)
+        w = _weight_variable(variables)
+        cs = variables.setdefault("_constraints", [])
+        cs.append(cp.sum(w) >= self.lower)
+        cs.append(cp.sum(w) <= self.upper)
 
 
 @register("constraint", "position_limit")
@@ -63,13 +93,14 @@ class PositionLimitConstraint(Constraint):
     name = "position_limit"
 
     def __init__(self, lower: float = 0.0, upper: float = 0.05):
-        self.lower = lower
-        self.upper = upper
+        self.lower = float(lower)
+        self.upper = float(upper)
+        if not np.isfinite([self.lower, self.upper]).all() or self.lower > self.upper:
+            raise ValueError("position bounds must be finite and ordered")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
-        w = variables.get("w")
-        if w is not None:
-            variables.setdefault("_constraints", []).extend([w >= self.lower, w <= self.upper])
+        w = _weight_variable(variables)
+        variables.setdefault("_constraints", []).extend([w >= self.lower, w <= self.upper])
 
 
 @register("constraint", "turnover")
@@ -77,31 +108,27 @@ class TurnoverConstraint(Constraint):
     name = "turnover"
 
     def __init__(self, limit: float = 0.30):
-        self.limit = limit
+        self.limit = float(limit)
+        if not np.isfinite(self.limit) or self.limit < 0.0:
+            raise ValueError("turnover limit must be finite and non-negative")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is not None and context is not None:
-            w_prev = context.current_weights
-            if w_prev is not None and len(w_prev) > 0:
-                # reindex 到当前 universe, 动态 universe 下品种上市日期不同
-                prev_arr = w_prev.reindex(context.universe).fillna(0.0).values
-                variables.setdefault("_constraints", []).append(
-                    cp.norm1(w - prev_arr) <= self.limit
-                )
-
-
-@register("constraint", "margin")
-class MarginConstraint(Constraint):
-    name = "margin"
-
-    def __init__(self, limit: float = 0.5):
-        self.limit = limit
-
-    def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
-        pass  # 实现需要合约乘数和保证金率信息，暂略
+        w = _weight_variable(variables)
+        if context is None:
+            raise ValueError("turnover constraint requires optimization context")
+        w_prev = context.current_weights
+        if w_prev is not None and len(w_prev) > 0:
+            previous, forced_exit = turnover_transition(
+                w_prev, context.universe
+            )
+            discretionary_budget = max(self.limit - forced_exit, 0.0)
+            variables["_forced_exit_turnover"] = forced_exit
+            variables.setdefault("_constraints", []).append(
+                cp.norm1(w - previous.to_numpy(dtype=float))
+                <= discretionary_budget
+            )
 
 
 @register("constraint", "leverage")
@@ -122,26 +149,32 @@ class LeverageConstraint(Constraint):
     name = "leverage"
 
     def __init__(self, limit: float = 3.0, vol_target: float = 0.0):
-        self.limit = limit
-        self.vol_target = vol_target  # 目标年化波动率, 0 表示不启用
+        self.limit = float(limit)
+        self.vol_target = float(vol_target)  # 目标年化波动率, 0 表示不启用
+        if not np.isfinite(self.limit) or self.limit <= 0.0:
+            raise ValueError("leverage limit must be finite and positive")
+        if not np.isfinite(self.vol_target) or self.vol_target < 0.0:
+            raise ValueError("vol_target must be finite and non-negative")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is None:
-            return
+        w = _weight_variable(variables)
 
         # 动态杠杆: 根据 vol_target 和 realized_vol 调整上限
         effective_limit = self.limit
-        if self.vol_target > 0 and context is not None:
-            realized_vol = getattr(context, "realized_vol", 0.0)
+        if self.vol_target > 0:
+            if context is None:
+                raise ValueError("vol-target leverage constraint requires optimization context")
+            realized_vol = float(getattr(context, "realized_vol", 0.0))
+            if not np.isfinite(realized_vol) or realized_vol < 0.0:
+                raise ValueError("realized_vol must be finite and non-negative")
             if realized_vol > 1e-6:
                 # 目标杠杆 = 目标波动率 / 已实现波动率, 不超过硬上限
                 dynamic_limit = self.vol_target / realized_vol
-                effective_limit = min(self.limit, dynamic_limit)
                 # 下限保护: 至少保留 0.5 倍杠杆, 避免极端降杠杆
-                effective_limit = max(effective_limit, 0.5)
+                # The configured hard limit always dominates that floor.
+                effective_limit = min(self.limit, max(dynamic_limit, 0.5))
 
         variables.setdefault("_constraints", []).append(
             cp.norm1(w) <= effective_limit
@@ -160,25 +193,21 @@ class SectorExposureConstraint(Constraint):
     name = "sector_exposure"
 
     def __init__(self, limit: float = 0.15):
-        self.limit = limit
+        self.limit = float(limit)
+        if not np.isfinite(self.limit) or self.limit < 0.0:
+            raise ValueError("sector-exposure limit must be finite and non-negative")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is None or context is None:
-            return
-
-        # 从 cross_commodity 获取板块映射 (延迟导入避免循环依赖)
-        try:
-            from core.sectors import SECTOR_MAP
-        except ImportError:
-            return
+        w = _weight_variable(variables)
+        if context is None:
+            raise ValueError("sector-exposure constraint requires optimization context")
 
         universe = context.universe
         sectors = {}
         for i, sym in enumerate(universe):
-            sec = SECTOR_MAP.get(str(sym), "other")
+            sec = sector_for(str(sym))
             sectors.setdefault(sec, []).append(i)
 
         cs = variables.setdefault("_constraints", [])
@@ -219,16 +248,26 @@ class DrawdownControlConstraint(Constraint):
         self.warning_dd = warning_dd
         self.critical_dd = critical_dd
         self.leverage_limit = leverage_limit
+        if not np.isfinite([warning_dd, critical_dd, leverage_limit]).all():
+            raise ValueError("drawdown-control parameters must be finite")
+        if critical_dd >= warning_dd or warning_dd > 0.0:
+            raise ValueError(
+                "drawdown thresholds require critical_dd < warning_dd <= 0"
+            )
+        if leverage_limit <= 0.0:
+            raise ValueError("drawdown leverage limit must be positive")
 
     def apply(self, problem, variables: Dict, context: "ConstraintContext") -> None:
         import cvxpy as cp
 
-        w = variables.get("w")
-        if w is None:
-            return
+        w = _weight_variable(variables)
 
         # 从 context 获取当前回撤 (由回测引擎注入)
-        current_dd = getattr(context, "current_drawdown", 0.0) if context else 0.0
+        if context is None:
+            raise ValueError("drawdown-control constraint requires optimization context")
+        current_dd = float(getattr(context, "current_drawdown", 0.0))
+        if not np.isfinite(current_dd) or current_dd > 0.0:
+            raise ValueError("current_drawdown must be finite and non-positive")
 
         # 根据回撤水平确定有效杠杆上限
         if current_dd <= self.critical_dd:

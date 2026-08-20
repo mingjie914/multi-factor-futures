@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from core.interfaces import ProcessingStep
@@ -14,6 +13,8 @@ class FillNAStep(ProcessingStep):
     name = "fillna"
 
     def __init__(self, method: str = "zero"):
+        if method not in {"zero", "forward", "mean"}:
+            raise ValueError(f"unsupported fillna method: {method!r}")
         self.method = method
 
     def transform(
@@ -25,4 +26,4 @@ class FillNAStep(ProcessingStep):
             return factor.ffill().fillna(0)
         elif self.method == "mean":
             return factor.fillna(factor.mean(axis=1), axis=0).fillna(0)
-        return factor.fillna(0)
+        raise AssertionError(f"unreachable fillna method: {self.method!r}")

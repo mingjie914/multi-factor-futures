@@ -7,8 +7,9 @@ import numpy as np
 import pandas as pd
 
 from core.interfaces import DataProvider, DataSource
-from core.types import *
+from core.types import Date, DateIndex, PricePanel, ReturnMatrix, Universe
 from data.cache import Cache
+from data.market_quality import prepare_close_data
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,21 @@ def _forward_returns_on_valid_bars(
     return result
 
 
+def _forward_returns_on_calendar(
+    close: pd.DataFrame, period: int
+) -> pd.DataFrame:
+    """Compute a daily horizon without jumping across missing calendar rows."""
+    period = int(period)
+    if period < 1:
+        raise ValueError("forward-return period must be positive")
+    prices = pd.DataFrame(close).apply(pd.to_numeric, errors="coerce")
+    return prices.shift(-period).div(prices).sub(1.0)
+
+
 class DataManager(DataProvider):
     """统一数据访问层. 聚合 DataSource + Cache, 提供因子计算所需的 DataProvider 接口.
 
-    数据获取优先级: 本地缓存 → DataSource → 回退
+    数据获取优先级: 本地缓存 → DataSource
     写入策略: 每次从 DataSource 取到数据后自动写缓存.
     """
 
@@ -45,11 +57,12 @@ class DataManager(DataProvider):
         config: Optional[dict] = None,
     ) -> None:
         self._source = source
+        self._source_cache_name = str(
+            getattr(source, "cache_namespace", source.__class__.__name__)
+        )
         self._market = market_name
-        self._cache = cache or Cache()
+        self._cache = cache
         self._config = config or {}
-        cache_config = self._config.get("cache", {})
-        self._cache_only = bool(cache_config.get("only", False))
         self._prefetch_signature = None
         self._prefetched_data: Dict[str, pd.DataFrame] = {}
         self._contract_pair_memory: Dict[tuple, Dict[str, pd.DataFrame]] = {}
@@ -84,6 +97,28 @@ class DataManager(DataProvider):
             self._prefetched_data[field] = frame
         return frame
 
+    @staticmethod
+    def _align_field_frame(
+        panel: object,
+        field: str,
+        dates: DateIndex,
+        universe: Universe,
+        *,
+        source_label: str,
+    ) -> pd.DataFrame:
+        if not isinstance(panel, dict):
+            raise TypeError(f"{source_label} must return a field mapping")
+        if field not in panel:
+            raise KeyError(f"{source_label} omitted requested field {field!r}")
+        frame = panel[field]
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"{source_label} field {field!r} must be a DataFrame")
+        result = frame.copy()
+        result.index = pd.DatetimeIndex(result.index)
+        if result.index.has_duplicates or result.columns.has_duplicates:
+            raise ValueError(f"{source_label} field {field!r} has duplicate axes")
+        return result.sort_index().reindex(index=dates, columns=universe)
+
     @classmethod
     def from_config(cls, config) -> "DataManager":
         """从 FrameworkConfig 构造 DataManager (CR-030).
@@ -102,34 +137,23 @@ class DataManager(DataProvider):
 
         dc = config.data
         cache_cfg = dc.cache if isinstance(dc.cache, dict) else {}
+        source_name = dc.source
+        if source_name == "parquet_futures" and cache_cfg.get("enabled", True):
+            raise ValueError(
+                "the generic range cache is not source-fingerprinted and must be "
+                "disabled for parquet_futures; use the source-owned caches instead"
+            )
         cache = Cache(
             cache_dir=cache_cfg.get("path", "./cache"),
             backend=cache_cfg.get("backend", "parquet"),
         ) if cache_cfg.get("enabled", True) else None
 
-        source_name = dc.source
-
-        # 确保数据源模块被 import (触发 @register 装饰器)
-        if source_name in ("akshare_futures", "akshare"):
-            try:
-                from data import akshare_futures_source  # noqa: F401
-            except ImportError:
-                pass
-        elif source_name == "mysql_futures":
-            try:
-                from data import mysql_source  # noqa: F401
-            except ImportError:
-                pass
-        elif source_name == "ddb_futures":
-            try:
-                from data import ddb_source  # noqa: F401
-            except ImportError:
-                pass
-        elif source_name == "parquet_futures":
-            try:
-                from data import parquet_source  # noqa: F401
-            except ImportError:
-                pass
+        # Import built-in sources to trigger registry decorators.  External
+        # plugins may register their own source before calling this factory.
+        if source_name == "parquet_futures":
+            from data import parquet_source  # noqa: F401
+        elif source_name == "random":
+            from data import random_source  # noqa: F401
 
         def _to_dict(obj):
             if obj is None:
@@ -141,25 +165,16 @@ class DataManager(DataProvider):
             return dict(obj)
 
         try:
-            if source_name == "mysql_futures" and dc.mysql:
-                source = create(
-                    "data_source", source_name,
-                    mysql_config=_to_dict(dc.mysql),
-                )
-            elif source_name == "ddb_futures" and dc.ddb:
-                source = create(
-                    "data_source", source_name,
-                    ddb_config=_to_dict(dc.ddb),
-                )
-            elif source_name == "parquet_futures" and dc.parquet:
+            if source_name == "parquet_futures":
+                if dc.parquet is None:
+                    raise ValueError("data.parquet is required for parquet_futures")
                 source = create(
                     "data_source", source_name,
                     parquet_config=_to_dict(dc.parquet),
-                    mysql_config=_to_dict(dc.mysql) if dc.mysql else None,
                 )
             else:
                 source = create("data_source", source_name)
-        except Exception as e:
+        except Exception:
             logger.exception(f"DataManager.from_config: 数据源 '{source_name}' 创建失败")
             raise
 
@@ -173,6 +188,39 @@ class DataManager(DataProvider):
     @property
     def source(self) -> DataSource:
         return self._source
+
+    @property
+    def cache(self) -> Optional[Cache]:
+        return self._cache
+
+    def prepare_close_data(
+        self, close: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Apply the configured strict close-gap policy once for all callers."""
+        return prepare_close_data(
+            close,
+            self._config.get("audited_nontrading_closes", {}),
+        )
+
+    def get_contract_schedule(
+        self, dates: DateIndex, universe: Universe
+    ) -> Optional[pd.DataFrame]:
+        """Return the source's point-in-time concrete-contract schedule."""
+        if dates.empty or len(universe) == 0:
+            return None
+        fetcher = getattr(self._source, "fetch_contract_schedule", None)
+        if not callable(fetcher):
+            return None
+        schedule = fetcher(list(universe), dates.min(), dates.max())
+        if schedule is None:
+            return None
+        if not isinstance(schedule, pd.DataFrame):
+            raise TypeError("contract schedule must be a DataFrame or None")
+        result = schedule.copy()
+        result.index = pd.DatetimeIndex(result.index)
+        if result.index.has_duplicates or result.columns.has_duplicates:
+            raise ValueError("contract schedule must have unique dates and roots")
+        return result.sort_index().reindex(index=dates, columns=universe)
 
     def get(
         self, field: str, dates: DateIndex, universe: Universe
@@ -194,7 +242,7 @@ class DataManager(DataProvider):
         if self._cache and cache_enabled:
             cached = self._cache.get(
                 self._market,
-                self._source.__class__.__name__,
+                self._source_cache_name,
                 field,
                 universe,
                 start,
@@ -205,38 +253,28 @@ class DataManager(DataProvider):
                 return self._remember_prefetch(field, dates, universe, frame)
 
         # 从 DataSource 获取
-        if self._cache_only:
-            logger.warning(
-                "cache-only miss: %s [%s~%s] universe=%s",
-                field, start, end, len(universe),
-            )
-            frame = pd.DataFrame(index=dates, columns=universe, dtype=float)
-            return self._remember_prefetch(field, dates, universe, frame)
         try:
             price_panel = self._source.fetch_price(
                 universe, start, end, [field],
             )
         except Exception:
             logger.exception(f"fetch_price 失败: {field} [{start}~{end}]")
-            price_panel = {}
+            raise
 
-        if field in price_panel:
-            df = price_panel[field]
-        else:
-            df = pd.DataFrame(
-                index=pd.DatetimeIndex([]), columns=universe,
-            )
-
-        # 确保 index 是 DatetimeIndex, 列对齐
-        if not df.empty:
-            df = df.reindex(index=dates, columns=universe)
+        df = self._align_field_frame(
+            price_panel,
+            field,
+            dates,
+            universe,
+            source_label=f"{self._source.__class__.__name__}.fetch_price",
+        )
 
         # 写缓存
         if self._cache and cache_enabled and not df.empty:
             try:
                 self._cache.put(
                     self._market,
-                    self._source.__class__.__name__,
+                    self._source_cache_name,
                     field,
                     universe,
                     start,
@@ -252,11 +290,11 @@ class DataManager(DataProvider):
         self, dates: DateIndex, universe: Universe
     ) -> pd.DataFrame:
         """获取行业分类 (dates × tickers)."""
-        if self._cache_only:
-            return pd.DataFrame(index=dates, columns=universe, dtype=object)
         industry = self._source.fetch_industry(
             universe, dates.min() if not dates.empty else None,
         )
+        if not isinstance(industry, pd.Series):
+            raise TypeError("fetch_industry must return a Series")
         # 扩展为日期维度
         result = pd.DataFrame(index=dates, columns=universe, dtype=object)
         if not industry.empty:
@@ -287,11 +325,6 @@ class DataManager(DataProvider):
         if cached is not None:
             return cached.copy(deep=True)
 
-        if self._cache_only:
-            result = pd.DataFrame(columns=list(requested), dtype=float)
-            self._macro_memory[memory_key] = result
-            return result.copy(deep=True)
-
         try:
             result = self._source.fetch_macro(
                 list(requested), start=start_ts, end=end_ts
@@ -303,9 +336,13 @@ class DataManager(DataProvider):
                 start_ts,
                 end_ts,
             )
-            result = pd.DataFrame(columns=list(requested), dtype=float)
+            raise
 
-        if result is None or result.empty:
+        if result is None:
+            result = pd.DataFrame(columns=list(requested), dtype=float)
+        elif not isinstance(result, pd.DataFrame):
+            raise TypeError("fetch_macro must return a DataFrame or None")
+        elif result.empty:
             result = pd.DataFrame(columns=list(requested), dtype=float)
         else:
             result = result.copy()
@@ -323,13 +360,11 @@ class DataManager(DataProvider):
             pd.Series: index=品种代码, values=上市日期(datetime)
                       若数据源不支持则返回空 Series
         """
-        if self._cache_only:
-            return pd.Series(dtype=object)
         if hasattr(self._source, "fetch_listing_dates"):
-            try:
-                return self._source.fetch_listing_dates(list(universe))
-            except Exception:
-                return pd.Series(dtype=object)
+            result = self._source.fetch_listing_dates(list(universe))
+            if not isinstance(result, pd.Series):
+                raise TypeError("fetch_listing_dates must return a Series")
+            return result
         return pd.Series(dtype=object)
 
     def get_contract_pair(
@@ -365,7 +400,7 @@ class DataManager(DataProvider):
         if self._cache and cache_enabled:
             cached_near = self._cache.get(
                 self._market,
-                self._source.__class__.__name__,
+                self._source_cache_name,
                 f"contract_pair_{field}_near",
                 universe,
                 start,
@@ -373,7 +408,7 @@ class DataManager(DataProvider):
             )
             cached_far = self._cache.get(
                 self._market,
-                self._source.__class__.__name__,
+                self._source_cache_name,
                 f"contract_pair_{field}_far",
                 universe,
                 start,
@@ -390,15 +425,10 @@ class DataManager(DataProvider):
                     "far": pair["far"].copy(deep=True),
                 }
 
-        if self._cache_only:
-            empty = pd.DataFrame(index=dates, columns=universe, dtype=float)
-            pair = {"near": empty.copy(), "far": empty.copy()}
-            self._contract_pair_memory[memory_key] = pair
-            return pair
-
         if not hasattr(self._source, "fetch_contract_pair_prices"):
-            return {"near": pd.DataFrame(index=dates, columns=universe),
-                    "far": pd.DataFrame(index=dates, columns=universe)}
+            raise NotImplementedError(
+                f"{self._source.__class__.__name__} does not provide contract pairs"
+            )
 
         try:
             pair = self._source.fetch_contract_pair_prices(
@@ -406,11 +436,24 @@ class DataManager(DataProvider):
             )
         except Exception:
             logger.exception(f"fetch_contract_pair_prices 失败: {field} [{start}~{end}]")
-            return {"near": pd.DataFrame(index=dates, columns=universe),
-                    "far": pd.DataFrame(index=dates, columns=universe)}
+            raise
 
-        near = pair.get("near", pd.DataFrame())
-        far = pair.get("far", pd.DataFrame())
+        if not isinstance(pair, dict) or not {"near", "far"}.issubset(pair):
+            raise TypeError(
+                "fetch_contract_pair_prices must return near/far DataFrames"
+            )
+
+        near = pair["near"]
+        far = pair["far"]
+        if not isinstance(near, pd.DataFrame) or not isinstance(far, pd.DataFrame):
+            raise TypeError("contract-pair near/far values must be DataFrames")
+        if (
+            near.index.has_duplicates
+            or near.columns.has_duplicates
+            or far.index.has_duplicates
+            or far.columns.has_duplicates
+        ):
+            raise ValueError("contract-pair panels must have unique axes")
 
         if not near.empty:
             near = near.reindex(index=dates, columns=universe)
@@ -420,6 +463,10 @@ class DataManager(DataProvider):
             far = far.reindex(index=dates, columns=universe)
         else:
             far = pd.DataFrame(index=dates, columns=universe)
+        if near.isna().all().all() or far.isna().all().all():
+            raise RuntimeError(
+                f"contract-pair source returned no usable {field} data"
+            )
 
         pair = {"near": near, "far": far}
         self._contract_pair_memory[memory_key] = pair
@@ -432,7 +479,7 @@ class DataManager(DataProvider):
             try:
                 self._cache.put(
                     self._market,
-                    self._source.__class__.__name__,
+                    self._source_cache_name,
                     f"contract_pair_{field}_near",
                     universe,
                     start,
@@ -441,7 +488,7 @@ class DataManager(DataProvider):
                 )
                 self._cache.put(
                     self._market,
-                    self._source.__class__.__name__,
+                    self._source_cache_name,
                     f"contract_pair_{field}_far",
                     universe,
                     start,
@@ -478,20 +525,21 @@ class DataManager(DataProvider):
     def get_forward_returns(
         self, dates: DateIndex, universe: Universe, period: int = 1
     ) -> ReturnMatrix:
-        """获取未来 N 期收益."""
+        """获取严格按日度交易日历对齐的未来 N 期收益."""
         close = self.get("close", dates, universe)
         if close.empty:
-            return pd.DataFrame(index=dates, columns=universe)
-        return _forward_returns_on_valid_bars(close, period)
+            raise RuntimeError("cannot compute forward returns from an empty close panel")
+        # Validate unknown post-listing gaps before marking audited closures.
+        self.prepare_close_data(close)
+        marked = close.apply(pd.to_numeric, errors="coerce").ffill()
+        return _forward_returns_on_calendar(marked, period)
 
     def get_calendar(self, start: Date, end: Date) -> DateIndex:
         """获取交易日历."""
-        if self._cache_only:
-            return pd.date_range(start, end, freq="B")
-        try:
-            return self._source.fetch_calendar(start, end)
-        except Exception:
-            return pd.date_range(start, end, freq="B")
+        calendar = pd.DatetimeIndex(self._source.fetch_calendar(start, end))
+        if calendar.has_duplicates:
+            raise ValueError("trading calendar contains duplicate dates")
+        return calendar.sort_values()
 
     def get_at_frequency(
         self,
@@ -530,23 +578,21 @@ class DataManager(DataProvider):
             price_panel = self._source.fetch_price_at_frequency(
                 universe, start, end, [field], frequency=frequency,
             )
-        except NotImplementedError:
-            raise
         except Exception:
             logger.exception(
                 f"fetch_price_at_frequency 失败: {field} [{start}~{end}] freq={frequency}"
             )
-            price_panel = {}
+            raise
 
-        if field in price_panel:
-            df = price_panel[field]
-        else:
-            df = pd.DataFrame(index=pd.DatetimeIndex([]), columns=universe)
-
-        if not df.empty:
-            df = df.reindex(index=dates, columns=universe)
-
-        return df
+        return self._align_field_frame(
+            price_panel,
+            field,
+            dates,
+            universe,
+            source_label=(
+                f"{self._source.__class__.__name__}.fetch_price_at_frequency"
+            ),
+        )
 
     def prefetch(
         self,
@@ -611,28 +657,37 @@ class FrequencyDataProvider(DataProvider):
             missing,
             frequency=self.frequency,
         )
+        if not isinstance(panel, dict):
+            raise TypeError("fetch_price_at_frequency must return a field mapping")
         for field in missing:
-            frame = panel.get(field)
-            if frame is not None and not frame.empty:
-                result = frame.copy()
-                result.index = pd.DatetimeIndex(result.index)
-                self._panels[field] = result.sort_index().reindex(
-                    columns=self._universe
+            if field not in panel:
+                raise KeyError(
+                    f"fetch_price_at_frequency omitted requested field {field!r}"
                 )
+            frame = panel[field]
+            if not isinstance(frame, pd.DataFrame):
+                raise TypeError(f"intraday field {field!r} must be a DataFrame")
+            result = frame.copy()
+            result.index = pd.DatetimeIndex(result.index)
+            if result.index.has_duplicates or result.columns.has_duplicates:
+                raise ValueError(f"intraday field {field!r} has duplicate axes")
+            self._panels[field] = result.sort_index().reindex(
+                columns=self._universe
+            )
         self._loaded_fields.update(missing)
 
     def get_calendar(self) -> pd.DatetimeIndex:
         self._load(["close"])
         close = self._panels.get("close")
         if close is None or close.empty:
-            return pd.DatetimeIndex([])
+            raise RuntimeError(f"{self.frequency} close calendar is empty")
         return pd.DatetimeIndex(close.index.unique()).sort_values()
 
     def get(self, field: str, dates: DateIndex, universe: Universe) -> pd.DataFrame:
         self._load([field])
         frame = self._panels.get(field)
         if frame is None:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
+            raise KeyError(f"intraday field {field!r} was not loaded")
         return frame.reindex(index=dates, columns=universe)
 
     def get_at_frequency(
@@ -671,8 +726,9 @@ class FrequencyDataProvider(DataProvider):
     def get_contract_pair(
         self, field: str, dates: DateIndex, universe: Universe
     ) -> Dict[str, pd.DataFrame]:
-        empty = pd.DataFrame(np.nan, index=dates, columns=universe)
-        return {"near": empty.copy(), "far": empty.copy()}
+        raise NotImplementedError(
+            f"contract-pair data is not defined on {self.frequency} bars"
+        )
 
     def prefetch(
         self,

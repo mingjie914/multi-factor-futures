@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 
 _CATEGORY_TO_FAMILY = {

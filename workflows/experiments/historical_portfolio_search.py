@@ -29,20 +29,10 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = ROOT / "scripts"
-for path in (ROOT, SCRIPTS):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from external_strategies.guosen_trend_index.production_compare import (  # noqa: E402
-    F6,
-    F10,
-    F13,
-    F14,
-    KEPT47,
-    NEW21,
-    Runner,
-)
+from backtest.metrics import TRADING_DAYS_PER_YEAR  # noqa: E402
 from research.historical_portfolio_search import (  # noqa: E402
     CausalEligibilityEnvironment,
     PortfolioEvaluator,
@@ -57,18 +47,20 @@ from research.historical_portfolio_search import (  # noqa: E402
     robustness_key,
     training_factor_diagnostics,
 )
+from research.portfolio_experiment_support import (  # noqa: E402
+    FACTORS_6F as F6,
+    FACTORS_8F,
+    FACTORS_10F as F10,
+    FACTORS_13F as F13,
+    FACTORS_14F as F14,
+    FactorPanelRunner as Runner,
+    NEW_VALIDATED_21 as NEW21,
+    VALIDATED_47 as KEPT47,
+    configured_futures_cost_model,
+)
 
 
-R8 = [
-    "intraday_ma_count_bullish_20d",
-    "intraday_price_peak_count_20d",
-    "intraday_lowest_time_20d",
-    "intraday_basis_momentum_20d",
-    "intraday_price_delay_20d",
-    "intraday_torrent_down_20d",
-    "intraday_open_close_volume_ratio_20d",
-    "intraday_zero_ret_freq_20d",
-]
+COST_MODEL = configured_futures_cost_model()
 
 OUTER_FOLDS = [
     {
@@ -102,18 +94,25 @@ OUTER_FOLDS = [
 ]
 
 BASE_RECIPE = PortfolioRecipe("lw_abs", 10, 3, "erc")
-R8_ALT_RECIPE = PortfolioRecipe("equal", 12, 0, "inverse_volatility")
-R8_RECIPE_CHALLENGERS = {
+RECIPE_8F_ALT = PortfolioRecipe(
+    "equal",
+    12,
+    0,
+    "inverse_volatility",
+    asset_min_fraction=0.0,
+    asset_max_fraction=1.0,
+)
+RECIPE_CHALLENGERS_8F = {
     "production_method": BASE_RECIPE,
-    "equal_top12_no_cap_inverse_volatility": R8_ALT_RECIPE,
+    "equal_top12_no_cap_inverse_volatility": RECIPE_8F_ALT,
 }
-SEED_FACTOR_SETS = {"6f": F6, "14f": F14, "R8": R8}
+SEED_FACTOR_SETS = {"6f": F6, "14f": F14, "8f": FACTORS_8F}
 KNOWN_FACTOR_SETS = {
     "6f": F6,
     "10f": F10,
     "13f": F13,
     "14f": F14,
-    "R8": R8,
+    "8f": FACTORS_8F,
 }
 
 
@@ -144,7 +143,7 @@ def _rank_recipes_for_fold(
         seed_summaries = []
         for seed_name, factors in factor_sets.items():
             ledger = evaluator.ledger(factors, recipe)
-            summary = robust_summary(ledger, segments)
+            summary = robust_summary(ledger, segments, initial_anchor=True)
             summary["seed"] = seed_name
             seed_summaries.append(summary)
         aggregate = aggregate_robust_summaries(seed_summaries)
@@ -286,9 +285,16 @@ def _search_factor_recipe_pairs(
         factors = candidate["factors"]
         for recipe in recipes:
             ledger = evaluator.ledger(factors, recipe)
-            summary = robust_summary(ledger, segments)
+            summary = robust_summary(ledger, segments, initial_anchor=True)
             train = ledger.loc[fold["train_start"]:fold["train_end"]]
-            annual_turnover = float(train["turnover"].mean() * 242) if len(train) else np.nan
+            annual_turnover = (
+                float(
+                    train["executed_traded_notional"].iloc[1:].mean()
+                    * TRADING_DAYS_PER_YEAR
+                )
+                if len(train) > 1
+                else np.nan
+            )
             rows.append({
                 "fold": fold["fold"],
                 "candidate": candidate.get("candidate", f"beam_{candidate_index}"),
@@ -382,7 +388,9 @@ def _factor_search(
         test_ledger = test_evaluator.ledger_from_weights(test_weights).loc[
             fold["test_start"]:fold["test_end"]
         ]
-        test_metrics = performance_metrics(test_ledger["net_return"])
+        test_metrics = performance_metrics(
+            test_ledger["net_return"], initial_anchor=True
+        )
         decisions.append({
             **dict(fold),
             "selected_candidate": winner["candidate"],
@@ -439,14 +447,19 @@ def _rank_fixed_recipes_for_fold(
     rows = []
     for challenger, recipe in recipes.items():
         ledger = evaluator.ledger(factors, recipe)
-        summary = robust_summary(ledger, segments)
+        summary = robust_summary(ledger, segments, initial_anchor=True)
         train = ledger.loc[fold["train_start"]:fold["train_end"]]
         rows.append({
             "challenger": challenger,
             **recipe.to_dict(),
             **summary,
             "annual_turnover": (
-                float(train["turnover"].mean() * 242) if len(train) else np.nan
+                float(
+                    train["executed_traded_notional"].iloc[1:].mean()
+                    * TRADING_DAYS_PER_YEAR
+                )
+                if len(train) > 1
+                else np.nan
             ),
         })
     return sorted(
@@ -459,11 +472,11 @@ def _rank_fixed_recipes_for_fold(
     )
 
 
-def _r8_recipe_walk_forward(
+def _recipe_walk_forward_8f(
     evaluator: PortfolioEvaluator,
     output: Path,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Freeze the R8 recipe choice per fold after training-only comparison.
+    """Freeze the 8f recipe choice per fold after training-only comparison.
 
     The two recipes are declared before each fold is evaluated.  This makes the
     mechanical selection causal, while the alternative recipe remains a
@@ -476,14 +489,14 @@ def _r8_recipe_walk_forward(
     for fold in OUTER_FOLDS:
         training = evaluator.bounded(fold["train_start"], fold["train_end"])
         ranked = _rank_fixed_recipes_for_fold(
-            training, R8, R8_RECIPE_CHALLENGERS, fold
+            training, FACTORS_8F, RECIPE_CHALLENGERS_8F, fold
         )
         winner = ranked[0]
         recipe = _recipe_from_row(winner)
         training.clear_transient_caches()
 
         testing = evaluator.bounded(fold["test_start"], fold["test_end"])
-        test_weights = testing.weights(R8, recipe).loc[
+        test_weights = testing.weights(FACTORS_8F, recipe).loc[
             fold["test_start"]:fold["test_end"]
         ]
         selected_parts.append(test_weights)
@@ -501,7 +514,7 @@ def _r8_recipe_walk_forward(
             },
             "training_ranking": ranked,
             "test_metrics_diagnostic_only": performance_metrics(
-                test_ledger["net_return"]
+                test_ledger["net_return"], initial_anchor=True
             ),
         })
         testing.clear_transient_caches()
@@ -511,20 +524,20 @@ def _r8_recipe_walk_forward(
     selected_weights = selected_weights.reindex(columns=evaluator.runner.u).fillna(0.0)
     start, end = selected_weights.index.min(), selected_weights.index.max()
     selected_ledger = evaluator.ledger_from_weights(selected_weights).loc[start:end]
-    selected_weights.to_csv(output / "r8_recipe_walk_forward_weights.csv")
-    selected_ledger.to_csv(output / "r8_recipe_walk_forward_ledger.csv")
-    _json_dump(output / "r8_recipe_walk_forward_decisions.json", decisions)
+    selected_weights.to_csv(output / "8f_recipe_walk_forward_weights.csv")
+    selected_ledger.to_csv(output / "8f_recipe_walk_forward_ledger.csv")
+    _json_dump(output / "8f_recipe_walk_forward_decisions.json", decisions)
 
-    ledgers = {"r8_recipe_walk_forward": selected_ledger}
+    ledgers = {"8f_recipe_walk_forward": selected_ledger}
     rows = [{
-        "strategy": "r8_recipe_walk_forward",
+        "strategy": "8f_recipe_walk_forward",
         "evidence": "training_selected_test_frozen",
-        **performance_metrics(selected_ledger["net_return"]),
+        **performance_metrics(selected_ledger["net_return"], initial_anchor=True),
     }]
-    for challenger, recipe in R8_RECIPE_CHALLENGERS.items():
-        weights = evaluator.weights(R8, recipe).loc[start:end]
+    for challenger, recipe in RECIPE_CHALLENGERS_8F.items():
+        weights = evaluator.weights(FACTORS_8F, recipe).loc[start:end]
         ledger = evaluator.ledger_from_weights(weights).loc[start:end]
-        strategy = f"R8_{challenger}"
+        strategy = f"8f_{challenger}"
         ledgers[strategy] = ledger
         rows.append({
             "strategy": strategy,
@@ -532,10 +545,10 @@ def _r8_recipe_walk_forward(
                 "fixed_production_baseline" if recipe == BASE_RECIPE
                 else "fixed_retrospective_hypothesis"
             ),
-            **performance_metrics(ledger["net_return"]),
+            **performance_metrics(ledger["net_return"], initial_anchor=True),
         })
     metrics = pd.DataFrame(rows)
-    metrics.to_csv(output / "r8_recipe_walk_forward_metrics.csv", index=False)
+    metrics.to_csv(output / "8f_recipe_walk_forward_metrics.csv", index=False)
 
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
@@ -546,18 +559,18 @@ def _r8_recipe_walk_forward(
         ax.plot(
             nav.index,
             nav.values,
-            linewidth=2.0 if name == "r8_recipe_walk_forward" else 1.3,
+            linewidth=2.0 if name == "8f_recipe_walk_forward" else 1.3,
             label=(
                 f"{name} | 年化{metric['annual_return']:.1%} "
                 f"夏普{metric['sharpe']:.2f} 回撤{metric['max_drawdown']:.1%}"
             ),
         )
-    ax.set_title("R8组合方法扩展窗口冻结验证（总敞口2，扣费后）")
+    ax.set_title("8f组合方法扩展窗口冻结验证（总敞口2，扣费后）")
     ax.set_ylabel("净值（起点=1000）")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(output / "nav_r8_recipe_walk_forward.png", dpi=160)
+    fig.savefig(output / "nav_8f_recipe_walk_forward.png", dpi=160)
     plt.close(fig)
     return metrics, decisions
 
@@ -572,14 +585,19 @@ def _comparison(
     end = adaptive_weights.index.max()
     rows = []
     navs = {"adaptive_search": adaptive_ledger["nav"]}
-    adaptive_metrics = performance_metrics(adaptive_ledger["net_return"])
+    adaptive_metrics = performance_metrics(
+        adaptive_ledger["net_return"], initial_anchor=True
+    )
     rows.append({"strategy": "adaptive_search", **adaptive_metrics})
     for name, factors in KNOWN_FACTOR_SETS.items():
         weights = evaluator.weights(factors, BASE_RECIPE)
         deployed = pd.DataFrame(0.0, index=evaluator.dates, columns=evaluator.runner.u)
         deployed.loc[start:end] = weights.loc[start:end]
         ledger = evaluator.ledger_from_weights(deployed).loc[start:end]
-        rows.append({"strategy": name, **performance_metrics(ledger["net_return"])})
+        rows.append({
+            "strategy": name,
+            **performance_metrics(ledger["net_return"], initial_anchor=True),
+        })
         navs[name] = ledger["nav"]
 
     full_adaptive = pd.DataFrame(0.0, index=evaluator.dates, columns=evaluator.runner.u)
@@ -587,7 +605,7 @@ def _comparison(
     stress = evaluator.ledger_from_weights(full_adaptive, cost_multiplier=2.0).loc[start:end]
     rows.append({
         "strategy": "adaptive_search_cost_2x",
-        **performance_metrics(stress["net_return"]),
+        **performance_metrics(stress["net_return"], initial_anchor=True),
     })
     metrics = pd.DataFrame(rows)
     metrics.to_csv(output / "comparison_metrics.csv", index=False)
@@ -695,21 +713,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Expanding-window native production method and factor search"
     )
-    parser.add_argument("--output")
+    parser.add_argument("--output", required=True)
     parser.add_argument(
         "--resume",
         action="store_true",
         help="reuse an interrupted run's temporary factor-panel cache",
     )
     parser.add_argument(
-        "--r8-recipe-only",
+        "--8f-recipe-only",
+        dest="recipe_only_8f",
         action="store_true",
-        help="only run the two-recipe expanding-window freeze test for fixed R8",
+        help="only run the two-recipe expanding-window freeze test for fixed 8f",
     )
     args = parser.parse_args()
-    output = Path(args.output) if args.output else (
-        ROOT / "runs" / "historical_portfolio_search" / f"{datetime.now():%Y%m%d_%H%M%S}"
-    )
+    output = Path(args.output)
     if args.resume:
         if not output.is_dir():
             raise FileNotFoundError(f"resume output does not exist: {output}")
@@ -717,12 +734,12 @@ def main() -> None:
         output.mkdir(parents=True, exist_ok=False)
 
     valid_factors = (
-        list(R8) if args.r8_recipe_only
+        list(FACTORS_8F) if args.recipe_only_8f
         else list(dict.fromkeys(F6 + list(KEPT47) + list(NEW21)))
     )
     resolved = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "mode": "r8_recipe_only" if args.r8_recipe_only else "full_search",
+        "mode": "8f_recipe_only" if args.recipe_only_8f else "full_search",
         "factor_library_policy": "current_validated_library_fixed_for_all_historical_folds",
         "valid_factor_count": len(valid_factors),
         "valid_factors": valid_factors,
@@ -731,11 +748,11 @@ def main() -> None:
             {
                 "predeclared_recipes": {
                     name: recipe.to_dict()
-                    for name, recipe in R8_RECIPE_CHALLENGERS.items()
+                    for name, recipe in RECIPE_CHALLENGERS_8F.items()
                 },
                 "search": "training-rank two recipes, freeze winner to next test fold",
             }
-            if args.r8_recipe_only else {
+            if args.recipe_only_8f else {
                 "factor_weight": ["equal", "diag_icir", "lw_abs", "lw_positive"],
                 "top_n": [8, 10, 12],
                 "sector_cap": [0, 3],
@@ -744,15 +761,15 @@ def main() -> None:
             }
         ),
         "factor_search": (
-            {"enabled": False, "fixed_factor_set": "R8"}
-            if args.r8_recipe_only else {
+            {"enabled": False, "fixed_factor_set": "8f"}
+            if args.recipe_only_8f else {
                 "training_only_cluster_correlation": 0.65,
                 "factor_count": [4, 12],
                 "beam_width": 20,
                 "exact_portfolio_candidates_per_fold": 12,
             }
         ),
-        "costs": {"trade_cost_rate": 0.0002, "annual_fee": 0.001},
+        "costs": COST_MODEL.ledger_parameters(),
         "gross_exposure": 2.0,
     }
     resolved_path = output / "resolved_search_config.json"
@@ -764,6 +781,14 @@ def main() -> None:
     if args.resume and panel_cache.is_file():
         print(f"reuse interrupted factor-panel cache: {panel_cache}", flush=True)
         payload = pd.read_pickle(panel_cache)
+        if (
+            payload.get("schema_version") != 3
+            or "close_tradable" not in payload
+            or "contract_schedule" not in payload
+        ):
+            raise ValueError(
+                "stale factor-panel cache: rerun without --resume to rebuild schema 3"
+            )
         environment = CausalEligibilityEnvironment(
             payload["cal"], payload["daily_ret"], payload["sector_of"]
         )
@@ -772,23 +797,26 @@ def main() -> None:
             cal=payload["cal"],
             u=payload["u"],
             daily_ret=payload["daily_ret"],
+            close_tradable=payload["close_tradable"],
+            contract_schedule=payload["contract_schedule"],
             ranks=payload["ranks"],
             ic=payload["ic"],
         )
     else:
         runner = Runner(valid_factors)
         sector_of = dict(runner.env.sector_of)
+        runner.get_contract_schedule()
         runner.env = CausalEligibilityEnvironment(
             runner.cal, runner.daily_ret, sector_of
         )
-        for attribute in ("comp", "fwd"):
-            if hasattr(runner, attribute):
-                delattr(runner, attribute)
         gc.collect()
         pd.to_pickle({
+            "schema_version": 3,
             "cal": runner.cal,
             "u": runner.u,
             "daily_ret": runner.daily_ret,
+            "close_tradable": runner.close_tradable,
+            "contract_schedule": runner.get_contract_schedule(),
             "ranks": runner.ranks,
             "ic": runner.ic,
             "sector_of": sector_of,
@@ -797,11 +825,10 @@ def main() -> None:
         runner,
         start="2016-03-31",
         end="2026-08-06",
-        trade_cost_rate=0.0002,
-        annual_fee=0.001,
+        cost_model=COST_MODEL,
     )
-    if args.r8_recipe_only:
-        metrics, decisions = _r8_recipe_walk_forward(evaluator, output)
+    if args.recipe_only_8f:
+        metrics, decisions = _recipe_walk_forward_8f(evaluator, output)
         if panel_cache.is_file():
             panel_cache.unlink()
         print(json.dumps({
@@ -838,7 +865,7 @@ def main() -> None:
     )
     print("final comparison and cost stress", flush=True)
     metrics = _comparison(evaluator, adaptive_weights, adaptive_ledger, output)
-    _r8_recipe_walk_forward(evaluator, output)
+    _recipe_walk_forward_8f(evaluator, output)
     _write_review(output, decisions, metrics)
     if panel_cache.is_file():
         panel_cache.unlink()

@@ -290,6 +290,8 @@ def test_same_100_asts_preserve_values_ic_direction_and_order(tmp_path):
             )
         ]
 
+    # DAG/分块归约顺序不同会产生约1e-9的浮点噪声；方向与完整排序仍须完全一致。
+    score_atol = 2e-9
     for accelerated in (
         batch_scores, dag_scores, chunk_scores, online_scores,
     ):
@@ -300,11 +302,11 @@ def test_same_100_asts_preserve_values_ic_direction_and_order(tmp_path):
             if np.isnan(old.mean_ic):
                 assert np.isnan(new.mean_ic)
             else:
-                assert abs(old.mean_ic - new.mean_ic) < 1e-10
+                assert abs(old.mean_ic - new.mean_ic) < score_atol
             if np.isneginf(old.fitness):
                 assert np.isneginf(new.fitness)
             else:
-                assert abs(old.fitness - new.fitness) < 1e-10
+                assert abs(old.fitness - new.fitness) < score_atol
         assert ordered(accelerated) == ordered(baseline_scores)
 
 

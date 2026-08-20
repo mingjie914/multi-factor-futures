@@ -102,7 +102,9 @@ class RegressionTest(FactorTest):
     def __init__(self, weighted: bool = False, forward_period: int = 1):
         self.weighted = weighted
         # CR-027: 前向收益天数, 用于 Newey-West HAC 滞后阶数
-        self.forward_period = forward_period
+        if isinstance(forward_period, bool) or int(forward_period) != forward_period or forward_period < 1:
+            raise ValueError("forward_period must be a positive integer")
+        self.forward_period = int(forward_period)
 
     def run(
         self,
@@ -119,11 +121,16 @@ class RegressionTest(FactorTest):
 
         # CR-027: forward_period 可通过 params 覆盖
         forward_period = params.get("forward_period", self.forward_period)
+        if isinstance(forward_period, bool) or int(forward_period) != forward_period or forward_period < 1:
+            raise ValueError("forward_period must be a positive integer")
+        forward_period = int(forward_period)
         # WLS is only valid with weights known before the tested return.  Examples
         # are lagged liquidity or inverse volatility.  Response-derived residual
         # weights are intentionally unsupported because they make a few near-zero
         # residual observations dominate the same cross-section being tested.
         sample_weights = params.get("sample_weights")
+        if self.weighted and sample_weights is None:
+            raise ValueError("sample_weights are required when weighted=True")
 
         for dt in common_dates:
             f_row = factor.loc[dt].dropna()

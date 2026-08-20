@@ -50,9 +50,6 @@ def main():
         "--no-plot", action="store_true",
         help="跳过净值图绘制")
     parser.add_argument(
-        "--cache-only", action="store_true",
-        help="严格离线模式；缓存未命中时不访问数据库")
-    parser.add_argument(
         "--output-dir", default=None,
         help="报告输出目录 (覆盖配置文件)")
     args = parser.parse_args()
@@ -72,8 +69,6 @@ def main():
             cfg.date_range.start = args.start
         if args.end:
             cfg.date_range.end = args.end
-        if args.cache_only:
-            cfg.data.cache["only"] = True
         if args.output_dir:
             cfg.backtest.report_dir = args.output_dir
         runner = PipelineRunner(config=cfg)
@@ -119,7 +114,6 @@ def main():
             "config": config_path,
             "start": runner.config.date_range.start,
             "end": runner.config.date_range.end,
-            "cache_only": bool(args.cache_only),
         },
     )
     print(f"  结构化回测结果 -> {output_dir}")
@@ -134,7 +128,9 @@ def main():
                 version_tag = "current"
             result.plot(save_dir=runner.config.backtest.report_dir, version=version_tag)
             print(f"  子组合净值图 -> {runner.config.backtest.report_dir}/multi_portfolio_nav.png")
-        except Exception:
+        except ImportError as exc:
+            if "matplotlib" not in str(exc).lower():
+                raise
             print("  (MATPLOTLIB 未安装: 跳过净值图。运行 python -m pip install matplotlib)")
 
     print("\n多组合回测完成.")

@@ -26,7 +26,6 @@ def main() -> None:
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--cache-only", action="store_true")
     parser.add_argument(
         "--alpha-type",
         choices=["sector_grouped_ols", "sector_grouped_ridge"],
@@ -44,8 +43,6 @@ def main() -> None:
         config.date_range.start = args.start
     if args.end:
         config.date_range.end = args.end
-    if args.cache_only:
-        config.data.cache["only"] = True
     if args.alpha_type:
         config.alpha.type = args.alpha_type
         params = dict(config.alpha.params)
@@ -87,7 +84,6 @@ def main() -> None:
             "variant": name,
             "start": config.date_range.start,
             "end": config.date_range.end,
-            "cache_only": bool(args.cache_only),
             "alpha_type": config.alpha.type,
             "evidence_level": "historical_cache_segment_diagnostic",
         }

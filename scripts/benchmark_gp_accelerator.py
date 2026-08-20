@@ -4,7 +4,6 @@ import argparse
 import cProfile
 import csv
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
 import gc
 import json
 from pathlib import Path
@@ -161,7 +160,7 @@ def _csv_ints(value: str) -> tuple[int, ...]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--periods", type=int, default=3000)
     parser.add_argument("--symbols", type=int, default=47)
     parser.add_argument("--population", type=int, default=100)
@@ -172,10 +171,7 @@ def main() -> int:
     parser.add_argument("--skip-profile", action="store_true")
     parser.add_argument("--skip-raw-check", action="store_true")
     args = parser.parse_args()
-    output_dir = args.output_dir or (
-        Path("runs/factor_mining/benchmarks")
-        / datetime.now(timezone.utc).strftime("gp_accelerator_%Y%m%dT%H%M%SZ")
-    )
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=False)
 
     panels = make_synthetic_panels(

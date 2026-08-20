@@ -8,6 +8,34 @@ import pandas as pd
 import pytest
 
 
+def test_factor_synthesizer_preserves_cross_sectional_missingness():
+    from factors.synthesizer import FactorSynthesizer
+
+    frame = pd.DataFrame(
+        [[1.0, np.nan, np.nan], [1.0, 1.0, np.nan]],
+        index=pd.date_range("2025-01-02", periods=2, freq="B"),
+        columns=["A", "B", "C"],
+    )
+
+    result = FactorSynthesizer._cross_section_zscore(frame)
+
+    assert result.loc[:, "C"].isna().all()
+    assert np.isnan(result.iloc[0]["B"])
+    assert result.iloc[0]["A"] == 0.0
+
+
+def test_factor_processor_rejects_all_unavailable_final_output():
+    from factors.processor import FactorProcessor
+
+    dates = pd.date_range("2025-01-02", periods=2, freq="B")
+    factor = pd.DataFrame({"A": [1.0, 2.0]}, index=dates)
+    context = SimpleNamespace(
+        eligibility=pd.DataFrame(False, index=dates, columns=["A"])
+    )
+    with pytest.raises(ValueError, match="no finite values"):
+        FactorProcessor([]).process(factor, context)
+
+
 def test_regression_hac_handles_near_sample_length_lag_without_warning():
     from testing.regression import _newey_west_t_stat
 
@@ -86,7 +114,115 @@ def test_factor_lookup_is_point_in_time():
     assert Backtester._factor_frame_asof(factor, pd.Timestamp("2023-12-31")) is None
 
 
-def test_prediction_and_optimizer_failures_hold_previous_weights():
+def test_backtester_fails_closed_on_empty_calendar():
+    from backtest.engine import Backtester
+
+    data = SimpleNamespace(
+        get_calendar=lambda start, end: pd.DatetimeIndex([]),
+    )
+    dates = pd.bdate_range("2024-01-02", periods=2)
+
+    with pytest.raises(RuntimeError, match="交易日历为空"):
+        Backtester()._prepare_backtest_data(
+            data,
+            SimpleNamespace(compute_factors=lambda *args, **kwargs: {}),
+            SimpleNamespace(process_batch=lambda *args, **kwargs: {}),
+            [],
+            {dates[0]: pd.Index(["A"])},
+            dates,
+            SimpleNamespace(),
+        )
+
+
+def test_backtester_fails_closed_on_empty_close():
+    from backtest.engine import Backtester
+
+    dates = pd.bdate_range("2024-01-02", periods=20)
+    universe = pd.Index(["A"])
+    data = SimpleNamespace(
+        get_calendar=lambda start, end: dates,
+        get_forward_returns=lambda requested, assets, period=1: pd.DataFrame(
+            0.0, index=requested, columns=assets
+        ),
+        get=lambda field, requested, assets: pd.DataFrame(columns=assets),
+    )
+
+    def compute_factors(*args, **kwargs):
+        assert hasattr(data, "_factor_eligibility")
+        return {}
+
+    with pytest.raises(RuntimeError, match="close行情为空"):
+        Backtester()._prepare_backtest_data(
+            data,
+            SimpleNamespace(compute_factors=compute_factors),
+            SimpleNamespace(process_batch=lambda *args, **kwargs: {}),
+            [],
+            {dates[0]: universe},
+            pd.DatetimeIndex([dates[0], dates[-1]]),
+            SimpleNamespace(),
+        )
+
+
+def test_backtester_rebalances_only_on_explicit_dates(monkeypatch):
+    from backtest.engine import Backtester
+
+    dates = pd.bdate_range("2024-01-02", periods=15)
+    rebalance_dates = pd.DatetimeIndex([dates[0], dates[-1]])
+    universe = pd.Index(["A"])
+    factors = {"f": pd.DataFrame(1.0, index=dates, columns=universe)}
+    daily_returns = pd.DataFrame(0.0, index=dates, columns=universe)
+    daily_returns.loc[dates[2], "A"] = -0.10
+    forward_returns = pd.DataFrame(0.0, index=dates, columns=universe)
+    backtester = Backtester(cost_model=None)
+    calls = []
+
+    monkeypatch.setattr(
+        backtester,
+        "_prepare_backtest_data",
+        lambda *args, **kwargs: (
+            rebalance_dates,
+            universe,
+            dates,
+            factors,
+            forward_returns,
+            daily_returns,
+        ),
+    )
+
+    def refit(*args, **kwargs):
+        backtester._last_fit_factors = {"f"}
+        return args[3], 0
+
+    monkeypatch.setattr(backtester, "_refit_alpha", refit)
+    monkeypatch.setattr(
+        backtester,
+        "_predict_returns",
+        lambda *args, **kwargs: pd.Series(1.0, index=universe),
+    )
+
+    def optimize(*args, **kwargs):
+        calls.append(pd.Timestamp(args[5]))
+        return pd.Series(1.0, index=universe)
+
+    monkeypatch.setattr(backtester, "_optimize_period", optimize)
+
+    backtester.run(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        ["f"],
+        {date: universe for date in rebalance_dates},
+        rebalance_dates,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        [],
+    )
+
+    assert calls == list(rebalance_dates)
+
+
+def test_prediction_and_optimizer_failures_abort_formal_backtest():
     from backtest.engine import Backtester
 
     class BrokenAlpha:
@@ -102,24 +238,21 @@ def test_prediction_and_optimizer_failures_hold_previous_weights():
     factors = {"f": pd.DataFrame([[1.0, -1.0], [2.0, -2.0]], index=dates, columns=universe)}
     previous = pd.Series([0.2, -0.1], index=universe)
     backtester = Backtester()
+    backtester._last_fit_factors = {"f"}
 
-    prediction = backtester._predict_returns(BrokenAlpha(), factors, dates[-1], universe)
-    assert prediction is None
-    result = backtester._optimize_period(
-        pd.Series([0.01, -0.01], index=universe),
-        SimpleNamespace(),
-        previous,
-        [],
-        BrokenOptimizer(),
-        dates[-1],
-        universe,
-        0.1,
-    )
-    pd.testing.assert_series_equal(result, previous)
-    assert {entry["stage"] for entry in backtester._failure_ledger} == {
-        "prediction",
-        "optimization",
-    }
+    with pytest.raises(RuntimeError, match="alpha prediction failed"):
+        backtester._predict_returns(BrokenAlpha(), factors, dates[-1], universe)
+    with pytest.raises(RuntimeError, match="portfolio optimization failed"):
+        backtester._optimize_period(
+            pd.Series([0.01, -0.01], index=universe),
+            SimpleNamespace(),
+            previous,
+            [],
+            BrokenOptimizer(),
+            dates[-1],
+            universe,
+            0.1,
+        )
 
 
 def test_solver_rejects_inaccurate_status_by_default(monkeypatch):
@@ -155,6 +288,43 @@ def test_erc_matches_requested_risk_contributions():
     np.testing.assert_allclose(contribution_share, budget, atol=5e-4)
     assert weights.sum() == pytest.approx(1.0)
     assert np.all(weights > 0)
+
+
+def test_covariance_validation_rejects_materially_indefinite_matrix():
+    from optimization.solver_utils import validated_psd_covariance
+
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        validated_psd_covariance(np.array([[1.0, 2.0], [2.0, 1.0]]))
+
+
+@pytest.mark.parametrize("budget", [np.array([0.0, 0.0]), np.array([1.0, -0.1])])
+def test_erc_rejects_invalid_risk_budget(budget):
+    from optimization.risk_budgeting import RiskBudgetingOptimizer
+
+    with pytest.raises(ValueError, match="risk budget"):
+        RiskBudgetingOptimizer._erc_weights(np.eye(2), budget)
+
+
+def test_optimizers_reject_missing_expected_returns():
+    from optimization.mean_variance import MeanVarianceOptimizer
+    from optimization.risk_budgeting import RiskBudgetingOptimizer
+
+    class IdentityRisk:
+        def covariance(self, date, universe):
+            return pd.DataFrame(np.eye(len(universe)), index=universe, columns=universe)
+
+    universe = pd.Index(["A", "B"])
+    for optimizer in (MeanVarianceOptimizer(), RiskBudgetingOptimizer()):
+        with pytest.raises(ValueError, match="expected returns"):
+            optimizer.optimize(
+                pd.Series({"A": 0.1}),
+                IdentityRisk(),
+                pd.Series(dtype=float),
+                [],
+                None,
+                pd.Timestamp("2025-01-02"),
+                universe,
+            )
 
 
 def test_meta_target_volatility_survives_relative_weight_normalisation(monkeypatch):
@@ -207,27 +377,113 @@ def test_meta_projection_enforces_aggregate_underlying_limits():
     assert abs(aggregate.sum()) <= 0.25 + 1e-7
 
 
-def test_subportfolio_weight_history_becomes_effective_next_trading_day():
+def test_meta_projection_enforces_sleeve_bounds_on_fast_path():
+    from optimization.meta_optimizer import UnderlyingExposureController
+
+    controller = UnderlyingExposureController([], min_weight=0.4, max_weight=0.6)
+    applied, diagnostics = controller.apply(
+        np.array([0.9, 0.1]), np.eye(2), ["A", "B"]
+    )
+
+    assert diagnostics["constraint_adjusted"] is True
+    np.testing.assert_allclose(applied.sum(), 1.0, atol=1e-6)
+    assert np.all(applied >= 0.4 - 1e-6)
+    assert np.all(applied <= 0.6 + 1e-6)
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        ({"type": "turnover", "limit": 0.3}, "unsupported aggregate"),
+        ({"type": "leverage", "limit": -1.0}, "invalid leverage"),
+        (
+            {"type": "net_exposure", "lower": 0.5, "upper": -0.5},
+            "invalid net_exposure",
+        ),
+    ],
+)
+def test_meta_projection_rejects_invalid_aggregate_constraints(spec, message):
+    from optimization.meta_optimizer import UnderlyingExposureController
+
+    with pytest.raises(ValueError, match=message):
+        UnderlyingExposureController([spec])
+
+
+def test_meta_optimizer_rejects_unsorted_return_dates():
+    from optimization.meta_optimizer import MetaOptimizer
+
+    dates = pd.DatetimeIndex(["2025-01-03", "2025-01-02"])
+    returns = pd.DataFrame([[0.1, 0.0], [0.0, 0.1]], index=dates, columns=["a", "b"])
+    with pytest.raises(ValueError, match="unique and sorted"):
+        MetaOptimizer().optimize(returns)
+
+
+def test_subportfolio_cube_rejects_missing_effective_ledger():
     from pipeline.runner import PipelineRunner
 
     dates = pd.date_range("2024-01-02", periods=3, freq="B")
-    decision_dates = pd.DatetimeIndex([dates[0] - pd.offsets.BDay(1), dates[1]])
     result = SimpleNamespace(
-        weights_history=pd.DataFrame(
-            {"A": [1.0, 2.0]}, index=decision_dates
+        weights_history=pd.DataFrame({"A": [1.0]}, index=[dates[0]]),
+        costs=pd.Series(dtype=float),
+    )
+    raw = [{"config": SimpleNamespace(name="sleeve"), "result": result}]
+    with pytest.raises(ValueError, match="audited effective-weight ledger"):
+        PipelineRunner._build_effective_exposure_cube(raw, dates, ["sleeve"])
+
+
+def test_subportfolio_cube_prefers_drifted_ledger_exposure():
+    from pipeline.runner import PipelineRunner
+
+    dates = pd.date_range("2024-01-02", periods=3, freq="B")
+    ledger_weights = pd.DataFrame({"A": [0.0, 0.5, 0.6]}, index=dates)
+    result = SimpleNamespace(
+        weights_history=pd.DataFrame({"A": [0.5]}, index=[dates[0]]),
+        research_ledger=SimpleNamespace(
+            effective_weights=ledger_weights,
+            daily=pd.DataFrame(
+                {
+                    "trade_cost": 0.0,
+                    "holding_cost": 0.0,
+                    "executed_traded_notional": 0.0,
+                },
+                index=dates,
+            ),
         ),
         costs=pd.Series(dtype=float),
     )
     raw = [{"config": SimpleNamespace(name="sleeve"), "result": result}]
-    cube, instruments, _ = PipelineRunner._build_effective_exposure_cube(
+
+    cube, instruments, *_ = PipelineRunner._build_effective_exposure_cube(
         raw, dates, ["sleeve"]
     )
 
     assert instruments == ["A"]
-    np.testing.assert_allclose(cube[:, 0, 0], [1.0, 1.0, 2.0])
+    np.testing.assert_allclose(cube[:, 0, 0], [0.0, 0.5, 0.6])
 
 
-def test_meta_combination_nets_opposite_bottom_trades_and_costs():
+def test_turnover_budget_reserves_mandatory_dynamic_universe_exits():
+    from optimization.constraints import TurnoverConstraint, turnover_transition
+    from optimization.hierarchical_asset_risk_parity import (
+        HierarchicalAssetRiskParityOptimizer,
+    )
+
+    current = pd.Series({"A": 0.10, "OLD": 0.20})
+    previous, forced_exit = turnover_transition(current, ["A"])
+    assert previous.to_dict() == {"A": 0.10}
+    assert forced_exit == pytest.approx(0.20)
+
+    optimizer = HierarchicalAssetRiskParityOptimizer()
+    constrained = optimizer._apply_hard_constraints(
+        pd.Series({"A": 0.50}),
+        current,
+        [TurnoverConstraint(limit=0.30)],
+        current_drawdown=0.0,
+    )
+    assert constrained["A"] == pytest.approx(0.20)
+    assert forced_exit + abs(constrained["A"] - current["A"]) == pytest.approx(0.30)
+
+
+def test_meta_combination_keeps_audited_sleeve_costs_without_false_drift_netting():
     from optimization.costs import SimpleFuturesCost
     from pipeline.runner import PipelineRunner
 
@@ -237,24 +493,43 @@ def test_meta_combination_nets_opposite_bottom_trades_and_costs():
     for name, exposure in [("long", 1.0), ("short", -1.0)]:
         result = SimpleNamespace(
             weights_history=pd.DataFrame({"A": [exposure]}, index=[decision_date]),
+            research_ledger=SimpleNamespace(
+                effective_weights=pd.DataFrame(
+                    {"A": [exposure, exposure]}, index=dates
+                ),
+                daily=pd.DataFrame(
+                    {
+                        "trade_cost": [0.001, 0.0],
+                        "holding_cost": [0.0, 0.0],
+                        "executed_traded_notional": [1.0, 0.0],
+                    },
+                    index=dates,
+                ),
+            ),
             costs=pd.Series([0.001, 0.0], index=dates),
+            nav=pd.Series(
+                1.0, index=pd.DatetimeIndex([decision_date]).append(dates)
+            ),
         )
         sub_results.append({"config": SimpleNamespace(name=name), "result": result})
 
     runner = PipelineRunner.__new__(PipelineRunner)
     runner.cost_model = SimpleFuturesCost()
     runner.config = SimpleNamespace(
-        optimization=SimpleNamespace(constraints=[])
+        # Turnover is enforced inside each sleeve and must not be inherited by
+        # the aggregate underlying-exposure controller.
+        optimization=SimpleNamespace(
+            constraints=[{"type": "turnover", "limit": 0.30}]
+        )
     )
     meta_cfg = SimpleNamespace(
         underlying_constraints=[],
         enforce_underlying_constraints=True,
-        net_underlying_costs=True,
         min_weight=0.0,
         max_weight=1.0,
     )
-    # Each standalone sleeve return contains its own opening cost. Their equal
-    # and opposite bottom positions net to zero in the aggregate portfolio.
+    # This research framework has no order/fill engine, so it preserves each
+    # sleeve's audited cost instead of claiming exact cross-sleeve execution netting.
     returns = pd.DataFrame(
         {"long": [-0.001, 0.0], "short": [-0.001, 0.0]}, index=dates
     )
@@ -263,11 +538,26 @@ def test_meta_combination_nets_opposite_bottom_trades_and_costs():
         returns, desired, sub_results, meta_cfg, 1.0
     )
 
-    np.testing.assert_allclose(nav.to_numpy(), [1.0, 1.0])
-    np.testing.assert_allclose(runner._meta_cost_history.to_numpy(), [0.0, 0.0])
+    np.testing.assert_allclose(nav.to_numpy(), [1.0, 0.999, 0.999])
+    np.testing.assert_allclose(runner._meta_cost_history.to_numpy(), [0.001, 0.0])
     np.testing.assert_allclose(
         runner._meta_underlying_weights_history["A"].to_numpy(), [0.0, 0.0]
     )
+
+
+def test_dynamic_constraints_require_explicit_runtime_context():
+    import cvxpy as cp
+
+    from optimization.constraints import (
+        DrawdownControlConstraint,
+        LeverageConstraint,
+    )
+
+    variables = {"w": cp.Variable(2)}
+    with pytest.raises(ValueError, match="vol-target.*context"):
+        LeverageConstraint(limit=2.0, vol_target=0.10).apply(None, variables, None)
+    with pytest.raises(ValueError, match="drawdown-control.*context"):
+        DrawdownControlConstraint().apply(None, variables, None)
 
 
 def test_factor_turnover_is_scale_invariant_and_position_based():
@@ -300,16 +590,18 @@ def test_regression_wls_requires_ex_ante_weights_and_clips_them():
     )
     returns = factor * 0.02
 
-    ols = RegressionTest(weighted=False).run(factor, returns)
-    weighted_without_input = RegressionTest(weighted=True).run(factor, returns)
-    pd.testing.assert_frame_equal(
-        ols.factor_returns, weighted_without_input.factor_returns
-    )
+    with pytest.raises(ValueError, match="sample_weights are required"):
+        RegressionTest(weighted=True).run(factor, returns)
 
     extreme = pd.Series(np.geomspace(1e-9, 1e9, len(assets)), index=assets)
     clipped = RegressionTest._weights_for_date(extreme, dates[0], assets)
     assert clipped.mean() == pytest.approx(1.0)
     assert clipped.max() / clipped.min() <= 100.0 + 1e-8
+
+    weighted = RegressionTest(weighted=True).run(
+        factor, returns, sample_weights=extreme
+    )
+    np.testing.assert_allclose(weighted.factor_returns["factor_return"], 0.02)
 
 
 def test_ridge_alpha_selection_is_time_ordered_and_coefficients_shrink():
@@ -419,7 +711,7 @@ def test_family_equal_weight_alpha_balances_families_not_factor_counts():
 
 
 def test_sector_top_n_hysteresis_retains_boundary_name():
-    from signals.selection import SectorForecastSelector
+    from optimization.asset_selection import SectorForecastSelector
 
     selector = SectorForecastSelector(
         mode="hysteresis_top_n",
@@ -436,7 +728,7 @@ def test_sector_top_n_hysteresis_retains_boundary_name():
 
 
 def test_soft_sector_quota_equalizes_forecast_gross_by_sector():
-    from signals.selection import SectorForecastSelector
+    from optimization.asset_selection import SectorForecastSelector
 
     selector = SectorForecastSelector(
         mode="soft_quota",
@@ -457,6 +749,26 @@ def test_rebalance_dates_use_actual_last_trading_day():
     assert all(date.weekday() < 5 for date in weekly)
     assert pd.Timestamp("2024-03-29") in monthly
     assert pd.Timestamp("2024-03-31") not in monthly
+    with pytest.raises(ValueError, match="unsupported rebalance frequency"):
+        PipelineRunner._rebalance_dates_from_calendar(calendar, "monthyl")
+
+
+def test_pipeline_runner_rejects_intraday_frequency_before_initialization():
+    from core.config import load_config
+    from pipeline.runner import PipelineRunner
+
+    with pytest.raises(ValueError, match="daily-only"):
+        PipelineRunner(config=load_config("config/default.yaml"), frequency="15min")
+
+
+def test_parquet_factory_rejects_stale_generic_range_cache():
+    from core.config import load_config
+    from data.manager import DataManager
+
+    config = load_config("config/default.yaml")
+    config.data.cache = {"enabled": True, "backend": "parquet", "path": "./cache"}
+    with pytest.raises(ValueError, match="not source-fingerprinted"):
+        DataManager.from_config(config)
 
 
 def test_horizon_ensemble_adds_only_configured_neighbour():
@@ -476,14 +788,20 @@ def test_canonical_sector_map_is_shared_by_research_alpha_and_execution():
     from core.sectors import SECTOR_MAP, SECTOR_NAMES, instruments_in_sectors
     from alpha.ols import SectorGroupedOLSModel
     from factors.library.cross_commodity import SECTOR_MAP as factor_sector_map
+    from factors.library.intraday import _SECTOR_MAP as intraday_sector_map
+    from strategies.combined import SECTOR_OF as production_selection_groups
     from workflows.factor_adaptivity import SECTOR_MAP as research_sector_map
 
     assert SECTOR_MAP == SectorGroupedOLSModel._SECTOR_MAP
-    assert SECTOR_MAP == factor_sector_map == research_sector_map
+    assert SECTOR_MAP == factor_sector_map == intraday_sector_map == research_sector_map
     assert SECTOR_MAP["CU"] == "nonferrous"
     assert SECTOR_MAP["AU"] == "precious"
     assert SECTOR_MAP["IF"] == "stock_index"
     assert SECTOR_MAP["T"] == "bond"
+    assert SECTOR_MAP["SA"] == "energy"
+    assert production_selection_groups["SA"] == "能化"
+    assert production_selection_groups["AU"] == "有色"
+    assert production_selection_groups["T"] == "金融"
     assert {"stock_index", "bond", "nonferrous", "precious"}.issubset(
         SECTOR_NAMES
     )
@@ -548,7 +866,7 @@ def test_asset_selector_hard_gates_optimizer_universe():
     assert target["AU"] == 0.0
 
 
-def test_mean_variance_does_not_charge_or_penalize_diagnostic_turnover():
+def test_mean_variance_receives_declared_marginal_turnover_cost():
     from optimization.costs import SimpleFuturesCost, marginal_turnover_cost_rate
     from optimization.mean_variance import MeanVarianceOptimizer
 
@@ -564,7 +882,7 @@ def test_mean_variance_does_not_charge_or_penalize_diagnostic_turnover():
     costs = SimpleFuturesCost()
     assert marginal_turnover_cost_rate(
         costs, universe, pd.Timestamp("2025-01-01")
-    ) == pytest.approx(0.0)
+    ) == pytest.approx(0.0002)
 
     weights = MeanVarianceOptimizer(cost_penalty=0.5).optimize(
         pd.Series({"A": 0.01, "B": -0.01}),
@@ -610,12 +928,12 @@ def test_risk_model_is_low_dimensional_psd_ordered_and_point_in_time():
     )
 
 
-def test_risk_model_asset_covariance_fallback_and_annualisation():
+def test_risk_model_documented_asset_covariance_path_and_annualisation():
     from risk.barra_futures import BarraFuturesModel
 
     dates, assets, returns, _ = _risk_fixture(seed=13)
-    # No sector/style data and fewer assets than factor-regression requirements
-    # force the asset-covariance path without producing a constant diagonal.
+    # A valid momentum style but too few assets for the cross-sectional model
+    # selects the documented asset-covariance path without hiding missing data.
     small_assets = assets[:3]
     small_returns = returns[small_assets]
 
@@ -624,15 +942,16 @@ def test_risk_model_asset_covariance_fallback_and_annualisation():
             return pd.DataFrame(index=dates, columns=universe, dtype=float)
 
         def get_industry(self, dates, universe):
-            return pd.DataFrame(index=dates, columns=universe, dtype=object)
+            return pd.DataFrame("other", index=dates, columns=universe, dtype=object)
 
         def get_contract_pair(self, field, dates, universe):
             return {"near": pd.DataFrame(), "far": pd.DataFrame()}
 
-    model = BarraFuturesModel(style_factors=["carry"]).estimate(
+    model = BarraFuturesModel(style_factors=["momentum"]).estimate(
         EmptyData(), {}, small_returns
     )
     covariance = model.covariance(dates[-1], small_assets)
+    assert model.last_covariance_mode == "asset_shrinkage"
     assert np.isfinite(covariance.to_numpy()).all()
     assert np.linalg.eigvalsh(covariance.to_numpy()).min() >= -1e-10
     assert np.count_nonzero(np.triu(covariance.to_numpy(), 1)) > 0
@@ -756,6 +1075,89 @@ def test_parallel_factor_engine_preserves_alignment_and_values(monkeypatch):
         assert parallel[name].index.equals(dates)
         assert parallel[name].columns.equals(universe)
         pd.testing.assert_frame_equal(parallel[name], sequential[name])
+
+
+def test_factor_engine_is_strict_by_default_and_tolerant_only_when_explicit(
+    monkeypatch,
+):
+    import factors.engine as engine_module
+
+    dates = pd.date_range("2024-01-01", periods=3, freq="B")
+    universe = pd.Index(["RB"])
+
+    class Data:
+        def prefetch(self, *args, **kwargs):
+            return None
+
+    class BrokenFactor:
+        name = "broken_factor"
+
+        def dependencies(self):
+            return ["close"]
+
+        def compute(self, data, requested_dates, requested_universe):
+            raise RuntimeError("source exploded")
+
+    monkeypatch.setattr(
+        engine_module,
+        "registry_get",
+        lambda kind, name: BrokenFactor,
+    )
+
+    with pytest.raises(engine_module.FactorComputationError, match="broken_factor"):
+        engine_module.FactorEngine(Data()).compute_factors(
+            ["broken_factor"], dates, universe
+        )
+
+    tolerant = engine_module.FactorEngine(Data(), tolerant=True)
+    result = tolerant.compute_factors(["broken_factor"], dates, universe)
+    assert result["broken_factor"].isna().all().all()
+    assert tolerant.failures
+    assert tolerant.failures[-1]["factor"] == "broken_factor"
+
+    class MissingFactor(BrokenFactor):
+        name = "missing_factor"
+
+        def compute(self, data, requested_dates, requested_universe):
+            return pd.DataFrame(
+                np.nan, index=requested_dates, columns=requested_universe
+            )
+
+    monkeypatch.setattr(
+        engine_module,
+        "registry_get",
+        lambda kind, name: MissingFactor,
+    )
+    with pytest.raises(engine_module.FactorComputationError, match="no finite values"):
+        engine_module.FactorEngine(Data()).compute_factors(
+            ["missing_factor"], dates, universe
+        )
+
+
+def test_factor_engine_validates_optimized_spec_batch_outputs(monkeypatch):
+    import factors.engine as engine_module
+    import factors.spec_factor as spec_factor_module
+    import factors.specs as specs_module
+
+    dates = pd.date_range("2024-01-01", periods=3, freq="B")
+    universe = pd.Index(["RB"])
+    monkeypatch.setattr(
+        specs_module,
+        "SPEC_BY_SLUG",
+        {"spec_nan": {"slug": "spec_nan"}},
+    )
+    monkeypatch.setattr(
+        spec_factor_module,
+        "compute_spec_factors_batch",
+        lambda *args, **kwargs: {
+            "spec_nan": pd.DataFrame(np.nan, index=dates, columns=universe)
+        },
+    )
+
+    with pytest.raises(engine_module.FactorComputationError, match="no finite values"):
+        engine_module.FactorEngine(SimpleNamespace())._compute_spec_factors_optimized(
+            ["spec_nan"], dates, universe
+        )
 
 
 def test_default_config_does_not_load_legacy_report_artifacts():
@@ -1150,14 +1552,17 @@ def test_nested_walkforward_cluster_deduplication_selects_best_member():
     assert "f_short_a" not in selected
 
 
-def test_walkforward_coverage_grace_starts_from_first_business_day():
-    from workflows.walkforward import _business_day_coverage_bounds
+def test_walkforward_coverage_grace_uses_supplied_exchange_calendar():
+    from workflows.walkforward import _calendar_coverage_bounds
 
-    latest_start, earliest_end = _business_day_coverage_bounds(
-        "2023-07-01", "2024-06-30", grace_days=5
+    calendar = pd.bdate_range("2023-07-01", "2024-06-30").difference(
+        pd.DatetimeIndex(["2023-07-05", "2024-06-20"])
     )
-    assert latest_start == pd.Timestamp("2023-07-10")
-    assert earliest_end == pd.Timestamp("2024-06-21")
+    latest_start, earliest_end = _calendar_coverage_bounds(
+        calendar, "2023-07-01", "2024-06-30", grace_bars=5
+    )
+    assert latest_start == calendar[5]
+    assert earliest_end == calendar[-6]
 
 
 def test_nested_walkforward_fold_test_ranges_are_unique(monkeypatch, tmp_path):
@@ -1185,44 +1590,13 @@ def test_nested_walkforward_fold_test_ranges_are_unique(monkeypatch, tmp_path):
         run_root=tmp_path / "run",
         candidate_factors=["momentum_20d"],
         build_correlation=False,
+        calendar=pd.bdate_range("2018-01-01", "2024-12-31"),
     )
     assert len(observed) > 0, "expected at least one fold to pass sampling"
     # Extract fold names: "xxx_折N" -> extract "折N"
     fold_names = [name.rsplit("_", 1)[-1] for name in observed]
     assert len(fold_names) == len(set(fold_names)), "fold names must be unique"
     assert len(results) == len(observed)
-
-
-def test_ddb_dominant_contract_is_t_minus_one_and_roll_is_continuous():
-    from data.ddb_source import DDBSource
-
-    dates = pd.date_range("2024-01-01", periods=4, freq="B")
-    contracts = ["RB2401.SHF", "RB2405.SHF"]
-    volume = pd.DataFrame(
-        [[100, 10], [20, 200], [10, 300], [5, 400]],
-        index=dates,
-        columns=contracts,
-    )
-    close = pd.DataFrame(
-        [[100, 200], [101, 202], [102, 204], [103, 206]],
-        index=dates,
-        columns=contracts,
-    )
-    source = DDBSource({"dominant_lag_days": 1})
-    schedule = source._build_daily_dominant_contract(volume)["RB"]
-    assert pd.isna(schedule.iloc[0])
-    assert schedule.iloc[1] == "RB2401.SHF"
-    assert schedule.iloc[2] == "RB2405.SHF"
-
-    scales = source._build_roll_scales(close, {"RB": schedule})
-    continuous = source._aggregate_to_root_by_daily_volume(
-        close,
-        {"RB": schedule},
-        roll_scales=scales,
-        adjust_prices=True,
-    )["RB"]
-    # Roll-day return equals the new contract's own return from t-1 to t.
-    assert continuous.iloc[2] / continuous.iloc[1] - 1 == pytest.approx(204 / 202 - 1)
 
 
 def test_roll_adjustment_uses_latest_common_close_and_fails_without_overlap():
@@ -1253,52 +1627,6 @@ def test_roll_adjustment_uses_latest_common_close_and_fails_without_overlap():
         )
 
 
-def test_ddb_minute_roll_is_ratio_adjusted_before_resampling(monkeypatch):
-    from data.ddb_source import DDBSource
-
-    source = DDBSource({"dominant_lag_days": 1})
-    rows = []
-    daily = [
-        ("2024-01-01", {"RB2401": (100.0, 100), "RB2405": (200.0, 10)}),
-        ("2024-01-02", {"RB2401": (101.0, 5), "RB2405": (202.0, 500)}),
-        ("2024-01-03", {"RB2401": (102.0, 5), "RB2405": (204.0, 500)}),
-    ]
-    for day, contracts in daily:
-        for contract, (price, volume) in contracts.items():
-            rows.append({
-                "TradeDate": day, "InstrumentID": contract, "Time": "15:00:00",
-                "OpenPrice": price, "HighPrice": price, "LowPrice": price,
-                "ClosePrice": price, "Volume": volume,
-                "Turnover": price * volume,
-            })
-    monkeypatch.setattr(source, "_query", lambda script: pd.DataFrame(rows))
-
-    panel = source.fetch_price_at_frequency(
-        ["RB"], "2024-01-02", "2024-01-03", ["close"], "1min"
-    )["close"]
-
-    assert panel.loc["2024-01-03 15:00", "RB"] / panel.loc[
-        "2024-01-02 15:00", "RB"
-    ] - 1 == pytest.approx(204.0 / 202.0 - 1.0)
-
-
-def test_mysql_daily_refuses_legacy_full_window_contract_fallback(monkeypatch):
-    from data.mysql_source import MySQLSource
-
-    source = object.__new__(MySQLSource)
-    monkeypatch.setattr(
-        source, "_get_table_config",
-        lambda name: {"columns": {"close": "S_DQ_CLOSE"}},
-    )
-    monkeypatch.setattr(
-        source, "_fetch_main_contract_mapping",
-        lambda *args, **kwargs: pd.DataFrame(),
-    )
-    assert not hasattr(source, "_fetch_price_legacy")
-    with pytest.raises(RuntimeError, match="refusing.*legacy fallback"):
-        source.fetch_price(["RB"], "2024-01-01", "2024-12-31", ["close"])
-
-
 def test_walkforward_assignment_excludes_insufficient_sample_factor():
     from core.config import load_config
     from workflows.walkforward import _assign_fold_factors
@@ -1322,139 +1650,3 @@ def test_walkforward_assignment_excludes_insufficient_sample_factor():
     _assign_fold_factors(config, Bundle(), drop_empty_sleeves=True)
     selected = {factor for sub in config.sub_portfolios for factor in sub.factors}
     assert selected == {"eligible"}
-
-
-def test_ddb_minute_bars_filter_to_one_t_minus_one_contract(monkeypatch):
-    from data.ddb_source import DDBSource
-
-    source = DDBSource({"dominant_lag_days": 1})
-    rows = []
-    for day, volumes in [
-        ("2024-01-01", {"RB2401": 100, "RB2405": 10}),
-        ("2024-01-02", {"RB2401": 5, "RB2405": 500}),
-    ]:
-        for contract, volume in volumes.items():
-            for minute, price in [("14:59:00", 100.0), ("15:00:00", 101.0)]:
-                rows.append(
-                    {
-                        "TradeDate": day,
-                        "InstrumentID": contract,
-                        "Time": minute,
-                        "OpenPrice": price,
-                        "HighPrice": price,
-                        "LowPrice": price,
-                        "ClosePrice": price,
-                        "Volume": volume,
-                        "Turnover": volume * price,
-                    }
-                )
-    monkeypatch.setattr(source, "_query", lambda script: pd.DataFrame(rows))
-    bars = source.fetch_minute_bars(
-        ["RB"], "2024-01-02", "2024-01-02", frequency="1min"
-    )
-    assert len(bars) == 2
-    assert bars.index.get_level_values("root").unique().tolist() == ["RB"]
-    # Previous day selected RB2401, whose requested-day volume is 5 per bar.
-    assert bars["volume"].tolist() == [5, 5]
-
-
-def test_intraday_features_use_amount_and_actual_thirty_minutes():
-    from data.ddb_source import DDBSource
-
-    datetimes = pd.to_datetime(
-        ["2024-01-02 14:00", "2024-01-02 14:30", "2024-01-02 15:00"]
-    )
-    index = pd.MultiIndex.from_arrays(
-        [datetimes, ["RB", "RB", "RB"]], names=["datetime", "root"]
-    )
-    bars = pd.DataFrame(
-        {
-            "open": [90.0, 100.0, 130.0],
-            "high": [90.0, 100.0, 130.0],
-            "low": [90.0, 100.0, 130.0],
-            "close": [90.0, 100.0, 130.0],
-            "volume": [1.0, 1.0, 1.0],
-            "amount": [90.0, 100.0, 130.0],
-        },
-        index=index,
-    )
-    features = DDBSource._compute_intraday_features_from_bars(
-        bars, ["tail_momentum", "amihud_illiquidity"]
-    )
-    assert features["tail_momentum"].iloc[0, 0] == pytest.approx((130 - 100) / 130)
-    expected_amihud = (abs(100 / 90 - 1) + abs(130 / 100 - 1)) / (90 + 100 + 130)
-    assert features["amihud_illiquidity"].iloc[0, 0] == pytest.approx(expected_amihud)
-
-
-def test_mysql_endpoint_failover_uses_ordered_fallback(monkeypatch):
-    import data.mysql_source as mysql_module
-
-    class Connection:
-        def __init__(self, fails):
-            self.fails = fails
-
-        def __enter__(self):
-            if self.fails:
-                raise OSError("endpoint unavailable")
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def execute(self, statement):
-            return 1
-
-    class Engine:
-        def __init__(self, fails):
-            self.fails = fails
-            self.disposed = False
-
-        def connect(self):
-            return Connection(self.fails)
-
-        def dispose(self):
-            self.disposed = True
-
-    created_urls = []
-
-    def fake_create_engine(url, **kwargs):
-        created_urls.append(url)
-        return Engine("wind-primary" in url)
-
-    monkeypatch.setattr(mysql_module, "create_engine", fake_create_engine)
-    source = mysql_module.MySQLSource(
-        {
-            "endpoints": [
-                {
-                    "name": "wind",
-                    "host": "wind-primary",
-                    "user": "user",
-                    "password": "pw",
-                    "database": "wind",
-                }
-            ],
-            "fallbacks": [
-                {
-                    "name": "aliyun-rds",
-                    "host": "rds-fallback",
-                    "user": "user",
-                    "password": "pw",
-                    "database": "wind",
-                }
-            ],
-        }
-    )
-    assert source.engine is not None
-    assert source.active_endpoint_name == "aliyun-rds"
-    assert "wind-primary" in created_urls[0]
-    assert "rds-fallback" in created_urls[1]
-
-
-def test_ddb_source_constructs_through_framework_config():
-    from core.config import load_config
-    from data.manager import DataManager
-
-    config = load_config("config/default.yaml")
-    config.data.source = "ddb_futures"
-    manager = DataManager.from_config(config)
-    assert manager.source.__class__.__name__ == "DDBSource"

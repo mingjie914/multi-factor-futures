@@ -38,6 +38,7 @@ class ICTestResult(TestResult):
         self.n_obs = n_obs
 
     def to_dict(self) -> dict:
+        primary_ic = self.ic_series if len(self.ic_series) else self.rank_ic_series
         return {
             "ic_mean": self.ic_mean,
             "ic_std": self.ic_std,
@@ -46,7 +47,7 @@ class ICTestResult(TestResult):
             "t_stat": self.t_stat,
             "n_obs": self.n_obs,
             "forward_period": self.forward_period,
-            "ic_pos_ratio": (self.ic_series > 0).mean() if len(self.ic_series) > 0 else 0.0,
+            "ic_pos_ratio": (primary_ic > 0).mean() if len(primary_ic) > 0 else 0.0,
             "ic_decay": self.ic_decay,
         }
 
@@ -85,7 +86,9 @@ class ICTest(FactorTest):
         self._decay_periods = (
             list(decay_periods) if decay_periods is not None else [1, 5, 10, 20]
         )
-        self._forward_period = forward_period
+        if isinstance(forward_period, bool) or int(forward_period) != forward_period or forward_period < 1:
+            raise ValueError("forward_period must be a positive integer")
+        self._forward_period = int(forward_period)
 
     def run(
         self,
@@ -93,6 +96,10 @@ class ICTest(FactorTest):
         forward_returns: ReturnMatrix,
         universe: UniverseSchedule = None,** params,
     ) -> ICTestResult:
+        forward_period = params.get("forward_period", self._forward_period)
+        if isinstance(forward_period, bool) or int(forward_period) != forward_period or forward_period < 1:
+            raise ValueError("forward_period must be a positive integer")
+        forward_period = int(forward_period)
         common_dates = factor.index.intersection(forward_returns.index)
         f = factor.loc[common_dates]
         r = forward_returns.loc[common_dates]
@@ -127,7 +134,7 @@ class ICTest(FactorTest):
         ir = ic_mean / ic_std if ic_std > 0 else 0.0
 
         # Newey-West 调整 IR (处理重叠收益导致的自相关)
-        ir_nw, t_stat = _newey_west_ir(primary_series, self._forward_period)
+        ir_nw, t_stat = _newey_west_ir(primary_series, forward_period)
 
         # IC decay (autocorrelation at various lags)
         decay: Dict[int, float] = {}
@@ -156,7 +163,7 @@ class ICTest(FactorTest):
             ic_mean, ic_std, ir,
             ir_newey_west=ir_nw,
             t_stat=t_stat,
-            forward_period=self._forward_period,
+            forward_period=forward_period,
             n_obs=len(ic_list),
         )
 

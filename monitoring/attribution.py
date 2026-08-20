@@ -5,8 +5,8 @@
 
 数据源:
 - 因子层: 信号组合收益(前 N 多头 - 后 N 空头, 方向化), 复用 factor_health.signal_portfolio_returns;
-- 板块/品种层: ResearchReturnLedger 产物 research_*.csv(asset_returns / effective_weights / contributions),
-  取自 runs/wf_intraday_6/折N/portfolio/sub_portfolios/*/.
+- 板块/品种层: 最近可用的 ResearchReturnLedger 产物
+  research_*.csv(asset_returns / effective_weights / contributions).
 
 纯增量模块; 遵守持仓展示规则(品种逐行、上多下空、按权重绝对值降序).
 """
@@ -23,23 +23,19 @@ from monitoring.factor_health import directed_score, signal_portfolio_returns
 
 
 def _load_ledger_csv(ledger_dir: str | Path) -> dict[str, pd.DataFrame]:
-    """读取 research_*.csv 三件套; 缺失时返回空 DataFrame."""
+    """读取完整 research ledger 三件套，显式路径缺失时失败关闭."""
     d = Path(ledger_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(f"research ledger directory is missing: {d}")
     frames: dict[str, pd.DataFrame] = {}
     for key, fname in (("returns", "research_asset_returns.csv"),
                        ("weights", "research_effective_weights.csv"),
                        ("contributions", "research_return_contributions.csv")):
         p = d / fname
-        frames[key] = io.read_csv(p) if p.exists() else pd.DataFrame()
+        if not p.is_file():
+            raise FileNotFoundError(f"research ledger file is missing: {p}")
+        frames[key] = io.read_csv(p)
     return frames
-
-
-def _split_long_short(weights: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """按权重符号拆分多头/空头(零权重剔除)."""
-    w = weights.dropna()
-    long = w[w > 1e-12]
-    short = w[w < -1e-12]
-    return long, short
 
 
 def _period_slice(contrib: pd.DataFrame, start: pd.Timestamp | None,

@@ -88,8 +88,22 @@ class NeutralizeStep(ProcessingStep):
 
         # Dynamic classifications are uncommon but supported without changing
         # the public processing contract.
-        values = result.stack(dropna=False).rename("value")
-        labels = industry.stack(dropna=False).rename("industry")
+        # Build the complete long index directly.  ``stack(dropna=False)``
+        # changed contract in pandas 3, while this preserves the same NaN rows
+        # on every supported pandas version.
+        long_index = pd.MultiIndex.from_arrays(
+            [
+                result.index.repeat(len(result.columns)),
+                np.tile(result.columns.to_numpy(), len(result.index)),
+            ],
+            names=[result.index.name, result.columns.name],
+        )
+        values = pd.Series(
+            result.to_numpy().reshape(-1), index=long_index, name="value"
+        )
+        labels = pd.Series(
+            industry.to_numpy().reshape(-1), index=long_index, name="industry"
+        )
         long = pd.concat([values, labels], axis=1)
         groups = long.groupby(
             [long.index.get_level_values(0), "industry"], sort=False

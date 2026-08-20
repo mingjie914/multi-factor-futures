@@ -1,7 +1,4 @@
-"""PipelineRunner — 端到端多因子 pipeline 编排器.
-
-所有可选依赖的导入均为惰性(在方法内部导入), 避免 import 时因缺包崩溃.
-"""
+"""PipelineRunner — 端到端多因子研究与目标权重编排器."""
 from __future__ import annotations
 
 import logging
@@ -11,12 +8,11 @@ from typing import Dict, List, Optional, Any
 import pandas as pd
 import numpy as np
 
-from core.types import *
+from core.types import DateIndex, Universe
 from core.config import load_config, FrameworkConfig
 from core.period import PeriodContext
 from core.registry import create, list_registered
 from data.manager import DataManager
-from data.cache import Cache
 from factors.engine import FactorEngine
 from factors.processor import (
     FactorProcessor,
@@ -27,11 +23,19 @@ from factors.processor import (
 logger = logging.getLogger(__name__)
 
 
+def _require_trade_calendar(calendar, start, end) -> pd.DatetimeIndex:
+    """Return a real exchange calendar or fail before research/backtesting."""
+    dates = pd.DatetimeIndex(calendar)
+    if dates.empty:
+        raise RuntimeError(f"交易日历为空: {start} ~ {end}")
+    return dates
+
+
 class PipelineRunner:
     """端到端多因子 pipeline 编排器.
 
     从配置文件构建完整的数据→因子→检验→预测→风险→优化→回测流程.
-    所有可选模块在对应方法内部惰性导入, 缺依赖时仅功能降级, 不崩框架.
+    已配置组件必须成功构造；正式链路不替换模型或静默跳过约束.
 
     Usage:
         runner = PipelineRunner("config/default.yaml")
@@ -47,8 +51,8 @@ class PipelineRunner:
         Args:
             config_path: 配置文件路径 (与 config 二选一)
             config: 已加载的 FrameworkConfig 对象 (优先于 config_path)
-            frequency: 周期单位 ("daily"/"1min"/"5min"/"15min"/"30min"/"hourly").
-                       默认为 daily, 传入后全流程所有 bar 计数和年化均以此为基准.
+            frequency: 本编排器当前只支持 ``daily``。非日度因子研究使用
+                       ``workflows.research`` 的 FrequencyDataProvider 路径。
         """
         if config is not None:
             self.config = config
@@ -57,6 +61,11 @@ class PipelineRunner:
         else:
             raise ValueError("必须提供 config_path 或 config 参数")
         self.period_ctx = PeriodContext.from_string(frequency)
+        if not self.period_ctx.is_daily:
+            raise ValueError(
+                "PipelineRunner is daily-only; use the frequency-aware research "
+                "workflow for intraday bars"
+            )
         self._setup_logging()
         self.research_artifacts = None
         self._adaptivity_artifact_df = None
@@ -74,14 +83,13 @@ class PipelineRunner:
         self._build_alpha_layer()
         self._build_risk_layer()
         self._build_optimization_layer()
-        self._build_signal_layer()
         self._build_backtest_layer()
 
         registered = {k: list(v.keys()) for k, v in list_registered().items()}
         logger.info(f"初始化完成. 已注册: {registered}")
 
     # ------------------------------------------------------------------
-    # 以下 internal 方法每个都可以单独失败, 不影响整体启动
+    # Component construction
     # ------------------------------------------------------------------
 
     def _setup_logging(self):
@@ -95,12 +103,8 @@ class PipelineRunner:
             logger.info("研究产物 bundle 未启用；板块筛选与相关性聚类不加载")
             return
         raw_path = str(getattr(artifact_cfg, "path", "") or "").strip()
-        required = bool(getattr(artifact_cfg, "required", False))
         if not raw_path:
-            if required:
-                raise ValueError("research_artifacts.enabled=true 但 path 为空")
-            logger.warning("研究产物 bundle 路径为空，跳过加载")
-            return
+            raise ValueError("research_artifacts.enabled=true 但 path 为空")
 
         from research.artifacts import ResearchArtifactBundle, canonical_config_hash
 
@@ -111,37 +115,31 @@ class PipelineRunner:
         expected_hash = None
         if bool(getattr(artifact_cfg, "strict_config_hash", True)):
             expected_hash = canonical_config_hash(self.config)
-        try:
-            bundle = ResearchArtifactBundle.load(
-                bundle_path,
-                decision_date=self.config.date_range.start,
-                expected_config_hash=expected_hash,
-            )
-            from core.sectors import taxonomy_sha256
-            from research.validation import validation_policy_sha256
+        bundle = ResearchArtifactBundle.load(
+            bundle_path,
+            decision_date=self.config.date_range.start,
+            expected_config_hash=expected_hash,
+        )
+        from core.sectors import taxonomy_sha256
+        from research.validation import validation_policy_sha256
 
-            metadata = dict(bundle.manifest.get("metadata", {}) or {})
-            expected_governance = {
-                "validation_policy_sha256": validation_policy_sha256(
-                    self.config.validation_policy
-                ),
-                "taxonomy_sha256": taxonomy_sha256(),
-            }
-            mismatches = {
-                key: {"expected": value, "actual": metadata.get(key)}
-                for key, value in expected_governance.items()
-                if metadata.get(key) != value
-            }
-            if mismatches:
-                raise ValueError(
-                    "research artifact governance hash mismatch; full P0 replay "
-                    f"required: {mismatches}"
-                )
-        except Exception:
-            if required:
-                raise
-            logger.warning("研究产物 bundle 校验失败，相关研究增强已禁用", exc_info=True)
-            return
+        metadata = dict(bundle.manifest.get("metadata", {}) or {})
+        expected_governance = {
+            "validation_policy_sha256": validation_policy_sha256(
+                self.config.validation_policy
+            ),
+            "taxonomy_sha256": taxonomy_sha256(),
+        }
+        mismatches = {
+            key: {"expected": value, "actual": metadata.get(key)}
+            for key, value in expected_governance.items()
+            if metadata.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                "research artifact governance hash mismatch; full P0 replay "
+                f"required: {mismatches}"
+            )
 
         self.research_artifacts = bundle
         if bundle.has("factor_adaptivity_summary"):
@@ -159,84 +157,15 @@ class PipelineRunner:
         )
 
     def _build_data_layer(self):
-        dc = self.config.data
-        cache_cfg = dc.cache if isinstance(dc.cache, dict) else {}
-        self.cache = Cache(
-            cache_dir=cache_cfg.get("path", "./cache"),
-            backend=cache_cfg.get("backend", "parquet"),
-        ) if cache_cfg.get("enabled", True) else None
-
-        source_name = dc.source
-
-        # 确保数据源模块被 import (触发 @register 装饰器)
-        if source_name in ("akshare_futures", "akshare"):
-            try:
-                from data import akshare_futures_source  # noqa: F401
-            except ImportError:
-                raise ImportError(
-                    "akshare 未安装。运行: python -m pip install akshare")
-        elif source_name == "mysql_futures":
-            try:
-                from data import mysql_source  # noqa: F401
-            except ImportError:
-                raise ImportError(
-                    "pymysql/sqlalchemy 未安装。运行: python -m pip install pymysql sqlalchemy")
-        elif source_name == "ddb_futures":
-            try:
-                from data import ddb_source  # noqa: F401
-            except ImportError as exc:
-                raise ImportError("DolphinDB 数据源模块导入失败") from exc
-        elif source_name == "parquet_futures":
-            try:
-                from data import parquet_source  # noqa: F401
-            except ImportError as exc:
-                raise ImportError("Parquet 数据源模块导入失败") from exc
-        elif source_name == "random":
-            from data import random_source  # noqa: F401
-
-        try:
-            if source_name == "mysql_futures" and dc.mysql:
-                source = create("data_source", source_name,
-                                mysql_config=self._to_dict(dc.mysql))
-            elif source_name == "ddb_futures" and dc.ddb:
-                source = create("data_source", source_name,
-                                ddb_config=self._to_dict(dc.ddb))
-            elif source_name == "parquet_futures" and dc.parquet:
-                source = create(
-                    "data_source", source_name,
-                    parquet_config=self._to_dict(dc.parquet),
-                    mysql_config=self._to_dict(dc.mysql) if dc.mysql else None,
-                )
-            else:
-                source = create("data_source", source_name)
-        except Exception as e:
-            logger.warning(f"数据源 '{source_name}' 创建失败: {e}", exc_info=True)
-            raise
-
-        self.data_manager = DataManager(
-            source=source,
-            market_name=self.config.market,
-            cache=self.cache,
-            config=self._to_dict(dc) if not isinstance(dc, dict) else dc,
-        )
-        logger.info(f"数据层: source={source_name}")
+        self.data_manager = DataManager.from_config(self.config)
+        self.cache = self.data_manager.cache
+        logger.info(f"数据层: source={self.config.data.source}")
 
     def _build_factor_layer(self):
         self.factor_engine = FactorEngine(self.data_manager)
 
-        # 注册内置因子
-        try:
-            from factors.library import (  # noqa: F401
-                technical_factors, term_structure_factors,
-                volume_oi_factors, cross_commodity, cross_frequency)
-        except Exception as e:
-            logger.warning(f"内置因子注册失败: {e}", exc_info=True)
-
-        # 注册处理步骤
-        try:
-            from processing import winsorize, standardize, neutralize, fillna  # noqa: F401
-        except Exception as e:
-            logger.warning(f"处理步骤注册失败: {e}", exc_info=True)
+        from factors import library as _factor_library  # noqa: F401
+        from processing import fillna, neutralize, standardize, winsorize  # noqa: F401
 
         proc_configs = []
         for s in self.config.processing:
@@ -281,111 +210,78 @@ class PipelineRunner:
     def _build_alpha_layer(self):
         alpha_cfg = self.config.alpha
         params = self._to_dict(alpha_cfg.params) if hasattr(alpha_cfg, 'params') else {}
-        try:
-            if alpha_cfg.type in (
-                "ols", "ridge", "ic_weighted", "sector_grouped_ols",
-                "sector_grouped_ridge",
-                "family_equal_weight",
-            ):
-                from alpha import family, ols  # noqa: F401
-            self.alpha_model = create("return_model", alpha_cfg.type, **params)
-            logger.info(f"收益模型: {alpha_cfg.type}")
-        except Exception as e:
-            logger.warning(f"收益模型 '{alpha_cfg.type}' 创建失败, 使用空模型: {e}", exc_info=True)
-            from alpha.ols import OLSModel
-            self.alpha_model = OLSModel(**params)
+        from alpha import family, ols  # noqa: F401
+
+        self.alpha_model = create("return_model", alpha_cfg.type, **params)
+        logger.info(f"收益模型: {alpha_cfg.type}")
 
     def _build_risk_layer(self):
         risk_cfg = self.config.risk
-        try:
-            if risk_cfg.type == "barra_futures":
-                from risk import barra_futures  # noqa: F401
-            self.risk_model = create(
-                "risk_model", risk_cfg.type,
-                style_factors=risk_cfg.style_factors,
-                estimation_window=risk_cfg.estimation_window,
-                covariance_estimator=risk_cfg.covariance_estimator,
-            )
-            logger.info(f"风险模型: {risk_cfg.type}")
-        except Exception as e:
-            logger.warning(f"风险模型创建失败: {e}", exc_info=True)
-            self.risk_model = None
+        from risk import barra_futures  # noqa: F401
+
+        self.risk_model = create(
+            "risk_model", risk_cfg.type,
+            style_factors=risk_cfg.style_factors,
+            estimation_window=risk_cfg.estimation_window,
+            covariance_estimator=risk_cfg.covariance_estimator,
+        )
+        logger.info(f"风险模型: {risk_cfg.type}")
 
     def _build_optimization_layer(self):
         opt_cfg = self.config.optimization
-        try:
-            if opt_cfg.type == "mean_variance":
-                from optimization import mean_variance  # noqa: F401
+        from optimization import (  # noqa: F401
+            constraints,
+            hierarchical_asset_risk_parity,
+            mean_variance,
+            risk_budgeting,
+        )
 
-                self.optimizer = create(
-                    "optimizer", opt_cfg.type,
-                    risk_aversion=opt_cfg.risk_aversion,
-                    cost_penalty=opt_cfg.cost_penalty,
-                )
-            elif opt_cfg.type == "risk_budgeting":
-                self.optimizer = create(
-                    "optimizer", opt_cfg.type,
-                    cost_penalty=opt_cfg.cost_penalty,
-                )
-            elif opt_cfg.type == "hierarchical_asset_risk_parity":
-                from optimization import hierarchical_asset_risk_parity  # noqa: F401
+        if opt_cfg.type == "mean_variance":
+            self.optimizer = create(
+                "optimizer", opt_cfg.type,
+                risk_aversion=opt_cfg.risk_aversion,
+                cost_penalty=opt_cfg.cost_penalty,
+            )
+        elif opt_cfg.type == "risk_budgeting":
+            self.optimizer = create(
+                "optimizer", opt_cfg.type,
+                cost_penalty=opt_cfg.cost_penalty,
+            )
+        elif opt_cfg.type == "hierarchical_asset_risk_parity":
+            params = self._to_dict(
+                opt_cfg.hierarchical_asset_risk_parity
+            )
+            self.optimizer = create(
+                "optimizer", opt_cfg.type, **params
+            )
+        else:
+            raise ValueError(f"unsupported optimizer type: {opt_cfg.type!r}")
 
-                params = self._to_dict(
-                    opt_cfg.hierarchical_asset_risk_parity
-                )
-                self.optimizer = create(
-                    "optimizer", opt_cfg.type, **params
-                )
-            else:
-                # 通用: 尝试传所有参数, 失败则只传 cost_penalty
-                try:
-                    self.optimizer = create(
-                        "optimizer", opt_cfg.type,
-                        risk_aversion=opt_cfg.risk_aversion,
-                        cost_penalty=opt_cfg.cost_penalty,
-                    )
-                except TypeError:
-                    self.optimizer = create(
-                        "optimizer", opt_cfg.type,
-                        cost_penalty=opt_cfg.cost_penalty,
-                    )
-            optimizer_role = getattr(
-                self.optimizer, "allocation_role", "general_optimizer"
-            )
-            deployment_status = getattr(
-                self.optimizer, "deployment_status", "research_only"
-            )
-            logger.info(
-                "组合优化器: %s | 使用场景: %s | 状态: %s",
+        optimizer_role = getattr(
+            self.optimizer, "allocation_role", "general_optimizer"
+        )
+        deployment_status = getattr(
+            self.optimizer, "deployment_status", "research_only"
+        )
+        logger.info(
+            "组合优化器: %s | 使用场景: %s | 状态: %s",
+            opt_cfg.type,
+            optimizer_role,
+            deployment_status,
+        )
+        if deployment_status == "research_only":
+            logger.warning(
+                "优化器 %s 仅用于研究对照，不属于正式组合路径",
                 opt_cfg.type,
-                optimizer_role,
-                deployment_status,
             )
-            if deployment_status == "research_only":
-                logger.warning(
-                    "优化器 %s 仅用于研究对照，不属于正式组合路径",
-                    opt_cfg.type,
-                )
-        except Exception as e:
-            logger.warning(f"优化器创建失败, 使用等权回退: {e}", exc_info=True)
-            self.optimizer = None
-
-        # 确保约束模块被导入 (触发 @register 装饰器)
-        try:
-            from optimization import constraints  # noqa: F401
-        except Exception as e:
-            logger.warning(f"约束模块导入失败: {e}", exc_info=True)
 
         self.constraints = []
         for c in opt_cfg.constraints:
             ctype = c.get("type", "")
+            if not ctype:
+                raise ValueError("constraint type must not be empty")
             params = {k: v for k, v in c.items() if k != "type"}
-            try:
-                self.constraints.append(create("constraint", ctype, **params))
-            except Exception as e:
-                logger.warning(
-                    f"约束 '{ctype}' 创建失败: {e}", exc_info=True
-                )
+            self.constraints.append(create("constraint", ctype, **params))
 
         self.dynamic_risk_controller = None
         dynamic_cfg = getattr(opt_cfg, "dynamic_risk_limits", None)
@@ -411,56 +307,11 @@ class PipelineRunner:
 
         logger.info(f"优化器: {opt_cfg.type}, {len(self.constraints)} 约束")
 
-    def _build_signal_layer(self):
-        sig_cfg = self.config.signals
-        try:
-            from signals.modes import trend_following  # noqa: F401
-            self.signal_generator = create("signal_generator", sig_cfg.mode)
-        except Exception as e:
-            logger.warning(f"信号生成器创建失败: {e}", exc_info=True)
-            self.signal_generator = None
-
-        sizer_params = (self._to_dict(sig_cfg.position_sizer_params)
-                        if hasattr(sig_cfg, 'position_sizer_params') else {})
-        sizer_params.setdefault("periods_per_year", getattr(
-            self, "period_ctx", PeriodContext()
-        ).bars_per_year)
-        try:
-            from signals import position_sizing  # noqa: F401
-            self.position_sizer = create("position_sizer", sig_cfg.position_sizer,
-                                         **sizer_params)
-        except Exception as e:
-            logger.warning(f"仓位管理器创建失败: {e}", exc_info=True)
-            self.position_sizer = None
-
-        self.sl_tp_rules = []
-        try:
-            from signals import sl_tp  # noqa: F401
-            for rule in sig_cfg.sl_tp_rules:
-                rtype = rule.get("type", "")
-                rparams = {k: v for k, v in rule.items() if k != "type"}
-                try:
-                    self.sl_tp_rules.append(
-                        create("sl_tp_rule", rtype, **rparams))
-                except KeyError:
-                    logger.warning(f"SLTP 规则 '{rtype}' 未注册, 跳过")
-        except Exception as e:
-            logger.warning(f"SLTP 规则加载失败: {e}", exc_info=True)
-
-        output_cfg = sig_cfg.output if isinstance(sig_cfg.output, dict) else {}
-        try:
-            from signals.output import SignalOutput
-            self.signal_output = SignalOutput(
-                output_dir=output_cfg.get("path", "./signals_output"))
-        except Exception as e:
-            logger.warning(f"信号输出初始化失败: {e}", exc_info=True)
-            self.signal_output = None
-
     def _new_asset_selector(self):
         cfg = getattr(self.config, "asset_selection", None)
         if cfg is None or not cfg.enabled:
             return None
-        from signals.selection import SectorForecastSelector
+        from optimization.asset_selection import SectorForecastSelector
 
         return SectorForecastSelector(
             mode=cfg.mode,
@@ -471,40 +322,21 @@ class PipelineRunner:
 
     def _build_backtest_layer(self):
         bt_cfg = self.config.backtest
-        try:
-            from backtest.engine import Backtester
-            self.backtester = Backtester(
-                rebalance_freq=bt_cfg.rebalance_freq,
-                cost_model=self.cost_model,
-                market_name=self.config.market,
-            )
-            self.backtester.asset_selector = self._new_asset_selector()
-            self.backtester.dynamic_risk_controller = self.dynamic_risk_controller
-            self.backtester.universe_selection_config = (
-                self.config.universe_selection
-            )
-        except Exception as e:
-            logger.warning(f"回测引擎初始化失败: {e}", exc_info=True)
-            self.backtester = None
+        from backtest.engine import Backtester
+        self.backtester = Backtester(
+            rebalance_freq=bt_cfg.rebalance_freq,
+            cost_model=self.cost_model,
+            market_name=self.config.market,
+        )
+        self.backtester.asset_selector = self._new_asset_selector()
+        self.backtester.dynamic_risk_controller = self.dynamic_risk_controller
+        self.backtester.universe_selection_config = (
+            self.config.universe_selection
+        )
 
     # ------------------------------------------------------------------
     # 公开方法
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _monthly_freq() -> str:
-        """返回月末频率字符串, 兼容不同 pandas 版本.
-
-        CR-025: 旧实现以 pandas 1.5 为边界返回 'ME', 但实际版本兼容边界
-        不符合 pandas 频率别名演进 (不同小版本/补丁版行为不一致).
-        改用 try/except 实际探测 'ME' 是否可用, 避免依赖版本号推断.
-        """
-        import pandas as pd
-        try:
-            pd.date_range("2024-01-01", "2024-03-01", freq="ME")
-            return "ME"
-        except ValueError:
-            return "M"
 
     @staticmethod
     def _rebalance_dates_from_calendar(
@@ -514,6 +346,9 @@ class PipelineRunner:
         dates = pd.DatetimeIndex(calendar).drop_duplicates().sort_values()
         if len(dates) == 0:
             return dates
+        frequency = str(frequency).lower()
+        if frequency not in {"daily", "weekly", "monthly"}:
+            raise ValueError(f"unsupported rebalance frequency: {frequency!r}")
         if frequency == "daily":
             return dates
         period_frequency = "W-FRI" if frequency == "weekly" else "M"
@@ -544,27 +379,47 @@ class PipelineRunner:
         """
         listing_dates = self.data_manager.get_listing_dates(universe)
 
-        # 无法获取上市日期 → 使用静态 universe
         if listing_dates is None or listing_dates.empty:
-            logger.info(f"无法获取品种上市日期, 使用静态 universe ({len(universe)} 个品种)")
-            # CR-004: 即使静态 universe, key 也要映射到有效交易日
-            return {self._snap_to_trade_day(d): universe for d in dates}
+            raise RuntimeError("无法获取品种上市日期，拒绝构造动态品种池")
 
-        # 对齐到 universe 顺序, NaT 填充为极早日期 (视为已上市)
-        listing_aligned = listing_dates.reindex(universe).fillna(pd.Timestamp("1900-01-01"))
-        listing_vals = listing_aligned.values
+        listing_aligned = listing_dates.reindex(universe)
+        missing_listing = listing_aligned[listing_aligned.isna()].index.tolist()
+        if missing_listing:
+            raise RuntimeError(
+                "以下品种缺少可验证的上市日期: " + ", ".join(map(str, missing_listing))
+            )
+        listing_vals = pd.to_datetime(listing_aligned).to_numpy(
+            dtype="datetime64[ns]"
+        )
 
         # 按上市日期排序，用 searchsorted 实现 O(n log n) 计算
         sort_idx = np.argsort(listing_vals)
         sorted_listing = listing_vals[sort_idx]
         sorted_universe_labels = universe[sort_idx]
 
-        # CR-004修复: 将每个调仓日映射到唯一的有效交易日 (作为 schedule key)
-        # 与 backtest/engine.py 中 _prepare_backtest_data 的 snap 逻辑一致,
-        # 取"不晚于 d 的最近交易日"; 若 d 早于日历起点, 取下一个交易日.
+        requested_dates = pd.DatetimeIndex(dates)
+        if requested_dates.tz is not None:
+            requested_dates = requested_dates.tz_localize(None)
+        calendar_start = requested_dates.min() - pd.Timedelta(days=10)
+        calendar_end = requested_dates.max() + pd.Timedelta(days=10)
+        calendar = _require_trade_calendar(
+            self.data_manager.get_calendar(calendar_start, calendar_end),
+            calendar_start,
+            calendar_end,
+        )
+        if calendar.tz is not None:
+            calendar = calendar.tz_localize(None)
+
+        # Map all dates against one calendar read instead of reading it once
+        # per rebalance date.
         universe_schedule: Dict[pd.Timestamp, pd.Index] = {}
-        for d in dates:
-            trade_d = self._snap_to_trade_day(d)
+        for d in requested_dates:
+            position = int(calendar.searchsorted(d, side="right")) - 1
+            if position < 0:
+                position = int(calendar.searchsorted(d, side="left"))
+            if position >= len(calendar):
+                raise RuntimeError(f"无法将 {d.date()} 映射到有效交易日")
+            trade_d = pd.Timestamp(calendar[position])
             # 已上市品种: 上市日 <= trade_d
             cutoff_pos = int(np.searchsorted(
                 sorted_listing, np.datetime64(trade_d), side='right'
@@ -577,7 +432,7 @@ class PipelineRunner:
                 universe_schedule[trade_d] = eligible
 
         # 日志: 显示起始日过滤情况
-        start_ts = pd.Timestamp(dates[0])
+        start_ts = requested_dates[0]
         not_yet_listed = [
             r for r in universe
             if pd.Timestamp(listing_aligned[r]) > start_ts
@@ -598,33 +453,6 @@ class PipelineRunner:
 
         return universe_schedule
 
-    def _snap_to_trade_day(self, d: Date) -> pd.Timestamp:
-        """CR-004: 将任意日期映射到唯一的有效交易日.
-
-        取"不晚于 d 的最近交易日"; 若 d 早于日历起点, 取下一个交易日.
-        与 backtest/engine.py 中 _prepare_backtest_data 的 snap 逻辑一致,
-        确保 universe_schedule 的 key 与回测循环中的 rebalance_date 对齐.
-        """
-        d = pd.Timestamp(d)
-        if d.tzinfo is not None:
-            d = d.tz_localize(None)
-        # 取足够宽的日历范围 (前后各 10 天缓冲)
-        try:
-            cal = self.data_manager.get_calendar(
-                d - pd.Timedelta(days=10), d + pd.Timedelta(days=10)
-            )
-            if hasattr(cal, 'tz') and cal.tz is not None:
-                cal = cal.tz_localize(None)
-        except Exception:
-            cal = pd.DatetimeIndex([])
-        if len(cal) == 0:
-            return d
-        before = cal[cal <= d]
-        if len(before) > 0:
-            return pd.Timestamp(before[-1])
-        after = cal[cal >= d]
-        return pd.Timestamp(after[0]) if len(after) > 0 else d
-
     def run_factor_research(self, dates: DateIndex = None,
                             universe: Universe = None) -> Dict[str, Any]:
         """仅跑因子检验."""
@@ -641,19 +469,35 @@ class PipelineRunner:
                 universe = self.data_manager.get_universe(ref_date)
 
         if len(universe) == 0:
-            logger.warning("universe 为空, 使用默认品种列表")
-            universe = pd.Index(["RB", "CU", "AU", "AG", "AL", "ZN", "PB", "NI", "SN", "HC"])
+            raise ValueError("因子研究 universe 为空")
 
         logger.info(f"步骤1/5: 获取交易日历 {dr.start} ~ {dr.end}")
-        full_dates = self.data_manager.get_calendar(dr.start, dr.end)
-        if full_dates.empty:
-            logger.warning("日历数据为空, 使用 pandas 生成交易日历")
-            full_dates = pd.date_range(dr.start, dr.end, freq="B")
+        if dates is None:
+            full_dates = _require_trade_calendar(
+                self.data_manager.get_calendar(dr.start, dr.end), dr.start, dr.end
+            )
+        else:
+            full_dates = pd.DatetimeIndex(dates)
+            if (
+                full_dates.empty
+                or full_dates.has_duplicates
+                or not full_dates.is_monotonic_increasing
+            ):
+                raise ValueError("factor-research dates must be non-empty, unique and sorted")
+            calendar = _require_trade_calendar(
+                self.data_manager.get_calendar(full_dates[0], full_dates[-1]),
+                full_dates[0],
+                full_dates[-1],
+            )
+            invalid = full_dates[~full_dates.isin(calendar)]
+            if len(invalid):
+                raise ValueError(
+                    "factor-research dates contain non-trading days: "
+                    + ", ".join(str(pd.Timestamp(value).date()) for value in invalid[:5])
+                )
         logger.info(f"  交易日历: {len(full_dates)} 天")
 
-        freq = self._monthly_freq()
-        research_dates = pd.date_range(dr.start, dr.end, freq=freq)
-        research_dates = full_dates[full_dates.isin(research_dates)]
+        research_dates = self._rebalance_dates_from_calendar(full_dates, "monthly")
         if len(research_dates) < 10:
             logger.info(f"月度日期只有 {len(research_dates)} 个, 改用每20个交易日取一个")
             research_dates = full_dates[::20]
@@ -676,17 +520,17 @@ class PipelineRunner:
             f"步骤3/5: 计算因子矩阵 — {len(self.config.factors)} 个因子 × "
             f"{len(universe)} 品种 × {len(full_dates)} 天"
         )
-        factor_names = self.config.factors
-        raw = self.factor_engine.compute_factors(factor_names, full_dates, universe, parallel=False)
-        logger.info(f"  因子矩阵计算完成: {len(raw)} 个因子")
-
-        logger.info(f"步骤4/5: 因子处理 + 前向收益计算")
         ctx = build_processing_context(
             self.data_manager,
             full_dates,
             universe,
             self.config.universe_selection,
         )
+        factor_names = self.config.factors
+        raw = self.factor_engine.compute_factors(factor_names, full_dates, universe, parallel=False)
+        logger.info(f"  因子矩阵计算完成: {len(raw)} 个因子")
+
+        logger.info(f"步骤4/5: 因子处理 + 前向收益计算")
         processed = self.processor.process_batch(raw, ctx)
         fwd_ret = self.data_manager.get_forward_returns(full_dates, universe, period=forward_period)
         if ctx.eligibility is not None:
@@ -708,7 +552,9 @@ class PipelineRunner:
                         fwd_ret_subset = fwd_ret.loc[research_dates]
                         fname_results[test_name] = test.run(matrix_subset, fwd_ret_subset, {})
                 except Exception as e:
-                    logger.warning(f"因子 {name} {test_name} 检验失败: {e}", exc_info=True)
+                    raise RuntimeError(
+                        f"因子 {name!r} 的 {test_name!r} 检验失败: {e}"
+                    ) from e
             results[name] = fname_results
 
         # 保存因子筛选结果到 JSON
@@ -730,7 +576,7 @@ class PipelineRunner:
                 len(results),
             )
         except Exception as e:
-            logger.warning(f"保存筛选结果失败: {e}", exc_info=True)
+            raise RuntimeError(f"保存因子筛选结果失败: {e}") from e
 
         logger.info(f"因子研究完成: {len(results)} 个因子")
         return results
@@ -740,12 +586,18 @@ class PipelineRunner:
         """端到端全流程."""
         dr = self.config.date_range
         if dates is None:
-            calendar = self.data_manager.get_calendar(dr.start, dr.end)
-            if len(calendar) == 0:
-                calendar = pd.date_range(dr.start, dr.end, freq="B")
+            calendar = _require_trade_calendar(
+                self.data_manager.get_calendar(dr.start, dr.end), dr.start, dr.end
+            )
             dates = self._rebalance_dates_from_calendar(
                 calendar, self.config.backtest.rebalance_freq
             )
+        else:
+            dates = pd.DatetimeIndex(dates)
+            if dates.has_duplicates or not dates.is_monotonic_increasing:
+                raise ValueError("backtest rebalance dates must be unique and sorted")
+        if len(dates) == 0:
+            raise ValueError("backtest rebalance dates are empty")
 
         # 优先使用 config 中配置的 universe, 否则从数据源获取
         if universe is None or len(universe) == 0:
@@ -785,19 +637,7 @@ class PipelineRunner:
             risk_model=self.risk_model,
             optimizer=self.optimizer,
             constraints=self.constraints,
-            signal_generator=self.signal_generator,
-            position_sizer=self.position_sizer,
-            sl_tp_rules=self.sl_tp_rules,
         )
-
-    def export_signals(self, result, fmt: str = "csv"):
-        if self.signal_output is None:
-            logger.warning("信号输出未初始化, 跳过导出")
-            return
-        path = f"./signals_output/final_signals.{fmt}"
-        if fmt == "csv":
-            result.export_signals(path)
-        logger.info(f"信号已导出: {path}")
 
     # ------------------------------------------------------------------
     # 多频率子组合叠加
@@ -818,18 +658,26 @@ class PipelineRunner:
         Returns:
             MultiPortfolioResult: 包含各子组合结果和叠加后的组合结果.
         """
-        from backtest.engine import BacktestResult, MultiPortfolioResult
+        from backtest.engine import MultiPortfolioResult
 
         sub_configs = self.config.sub_portfolios
         if not sub_configs:
             raise ValueError("sub_portfolios 配置为空, 请先在 config 中配置子组合")
+        names = [str(config.name).strip() for config in sub_configs]
+        if any(not name for name in names) or len(names) != len(set(names)):
+            raise ValueError("sub-portfolio names must be non-empty and unique")
 
         n_sub = len(sub_configs)
         total_capital = 1.0
         dr = self.config.date_range
         universe = pd.Index(self.config.universe)
+        if universe.empty or universe.has_duplicates:
+            raise ValueError("multi-portfolio universe must be non-empty and unique")
         sub_results: List[dict] = []
         sub_returns: Dict[str, pd.Series] = {}
+        all_dates = _require_trade_calendar(
+            self.data_manager.get_calendar(dr.start, dr.end), dr.start, dr.end
+        )
 
         # 因子合成器: 聚类内等权合成, 降低多重共线性
         # 从 factor_correlation.json 加载聚类映射, 按子组合过滤
@@ -838,6 +686,11 @@ class PipelineRunner:
         for idx, sp_cfg in enumerate(sub_configs):
             # 读取周期单位 (新增字段, 默认 "daily", 向后兼容)
             sp_frequency = getattr(sp_cfg, "frequency", "daily")
+            if PeriodContext.from_string(sp_frequency).is_daily is False:
+                raise ValueError(
+                    f"sub-portfolio {sp_cfg.name!r} requests {sp_frequency!r}, but "
+                    "PipelineRunner multi-portfolio accounting is daily-only"
+                )
             logger.info(
                 f"\n{'='*60}\n"
                 f"子组合 {idx+1}/{n_sub}: {sp_cfg.name}\n"
@@ -847,9 +700,6 @@ class PipelineRunner:
             )
 
             # 生成该子组合的调仓日期
-            all_dates = self.data_manager.get_calendar(dr.start, dr.end)
-            if len(all_dates) == 0:
-                all_dates = pd.date_range(dr.start, dr.end, freq="B")
             rebalance_dates = self._rebalance_dates_from_calendar(
                 all_dates, sp_cfg.rebalance_freq
             )
@@ -895,7 +745,7 @@ class PipelineRunner:
                 window=60, min_ic=0.02, decay_tolerance=1, reactivation_ic=0.03
             )
 
-            # 方案B: 为子组合创建独立的 alpha_model (带分板块因子集)
+            # 为子组合创建独立的 alpha_model（可带分板块因子集）。
             alpha_cfg = self.config.alpha
             alpha_params = (self._to_dict(alpha_cfg.params)
                             if hasattr(alpha_cfg, 'params') else {})
@@ -928,9 +778,6 @@ class PipelineRunner:
                 risk_model=self.risk_model,
                 optimizer=self.optimizer,
                 constraints=sub_constraints,
-                signal_generator=None,
-                position_sizer=None,
-                sl_tp_rules=None,
             )
 
             logger.info(f"子组合 '{sp_cfg.name}' 完成: {result.summary()}")
@@ -949,7 +796,18 @@ class PipelineRunner:
             )
         else:
             # 不启用元优化器: 用固定 capital_weight
-            weights = np.array([sp.capital_weight for sp in sub_configs])
+            weights = np.asarray(
+                [sp.capital_weight for sp in sub_configs], dtype=float
+            )
+            if (
+                not np.isfinite(weights).all()
+                or np.any(weights < 0.0)
+                or float(weights.sum()) <= 0.0
+            ):
+                raise ValueError(
+                    "fixed sub-portfolio capital weights must be finite, "
+                    "non-negative and have positive mass"
+                )
             weights = weights / weights.sum()
             combined_nav, weight_history = self._fixed_weight_combine(
                 sub_returns, sub_results, weights, meta_cfg, total_capital
@@ -979,41 +837,6 @@ class PipelineRunner:
         )
         logger.info(f"\n组合叠加完成: {combined.combined_result.summary()}")
         return combined
-
-    def run_defensive_sleeve(self):
-        """Run the optional defensive sleeve as an isolated standalone benchmark."""
-        cfg = self.config.defensive_sleeve
-        if not cfg.enabled:
-            raise RuntimeError(
-                "defensive_sleeve is disabled; enable it explicitly for a standalone experiment"
-            )
-        if cfg.integration_mode != "standalone":
-            raise ValueError(
-                "only standalone defensive sleeve mode is allowed before locked-OOS promotion"
-            )
-        from strategies.defensive_trend_risk_parity import DefensiveTrendRiskParity
-
-        dr = self.config.date_range
-        dates = self.data_manager.get_calendar(dr.start, dr.end)
-        if len(dates) == 0:
-            dates = pd.date_range(dr.start, dr.end, freq="B")
-        universe = pd.Index(cfg.universe or self.config.universe)
-        prices = self.data_manager.get("close", dates, universe)
-        strategy = DefensiveTrendRiskParity(
-            lookbacks=cfg.lookbacks,
-            rebalance_freq=cfg.rebalance_freq,
-            volatility_window=cfg.volatility_window,
-            top_n_per_sector=cfg.top_n_per_sector,
-            exit_buffer=cfg.exit_buffer,
-            allocation=cfg.allocation,
-            covariance_shrinkage=cfg.covariance_shrinkage,
-            target_volatility=cfg.target_volatility,
-            asset_cap=cfg.asset_cap,
-            sector_cap=cfg.sector_cap,
-            turnover_cap=cfg.turnover_cap,
-            annual_fee=cfg.annual_fee,
-        )
-        return strategy.run(prices, cost_model=self.cost_model)
 
     def recombine_multi_portfolio(
         self,
@@ -1079,7 +902,7 @@ class PipelineRunner:
         return result
 
     def _build_sector_factor_map(self, sp_cfg) -> dict:
-        """基于适配性研究为子组合生成分板块因子映射 (方案B).
+        """基于适配性研究为子组合生成分板块因子映射.
 
         从已校验的 ResearchArtifactBundle 加载适配性数据,
         为每个板块筛选该子组合中对该板块有效的因子 (valid_sectors 包含该板块).
@@ -1205,7 +1028,7 @@ class PipelineRunner:
         return sleeve_name in {sub.name for sub in targets}
 
     def _build_sub_alpha_model(self, sp_cfg, alpha_cfg, alpha_params):
-        """为子组合创建独立的 alpha_model (方案B: 分板块因子集).
+        """为子组合创建独立的 alpha_model（可选分板块因子集）.
 
         若适配性数据可用且 alpha 类型为 sector_grouped_ols,
         创建带 sector_factor_map 的独立模型实例; 否则回退到全局模型.
@@ -1232,7 +1055,7 @@ class PipelineRunner:
             sub_alpha = create("return_model", alpha_cfg.type, **sub_params)
             total_factors = sum(len(v) for v in sector_factor_map.values())
             logger.info(
-                f"  方案B: 分板块因子集已加载 "
+                f"  分板块因子集已加载 "
                 f"({len(sector_factor_map)}/{len(sp_cfg.factors)} 板块, "
                 f"共 {total_factors} 个板块-因子组合)"
             )
@@ -1249,16 +1072,6 @@ class PipelineRunner:
         Returns:
             FactorSynthesizer 实例或 None.
         """
-        import os
-        try:
-            from factors.synthesizer import (
-                FactorSynthesizer,
-                build_cluster_map_from_json,
-            )
-        except ImportError:
-            logger.debug("FactorSynthesizer 模块不可用, 跳过因子合成")
-            return None
-
         # 检查配置开关 (默认启用)
         synth_cfg = getattr(self.config, 'factor_synthesis', None)
         if synth_cfg is None:
@@ -1272,48 +1085,47 @@ class PipelineRunner:
             logger.info("因子合成已在配置中禁用")
             return None
 
+        from factors.synthesizer import (
+            FactorSynthesizer,
+            build_cluster_map_from_json,
+        )
+
         if self.research_artifacts is None or not self.research_artifacts.has(
             "factor_correlation"
         ):
-            logger.info(
-                "研究 bundle 不含 factor_correlation，跳过因子合成"
+            raise RuntimeError(
+                "因子合成已启用，但研究 bundle 不含 factor_correlation"
             )
-            return None
         corr_path = str(self.research_artifacts.path_for("factor_correlation"))
 
-        try:
-            cluster_map, standalone, flip_signs = build_cluster_map_from_json(
-                corr_path, min_cluster_size=2
-            )
-            if not cluster_map:
-                logger.info("无可用聚类 (所有因子独立), 跳过因子合成")
-                return None
-
-            # 日内确认配置 (方案A): 从 config.factor_synthesis.confirm_map 读取
-            # pydantic 模型: confirm_map 是 List[ConfirmMapEntry]
-            confirm_map = {}
-            if isinstance(synth_cfg, dict):
-                for item in synth_cfg.get('confirm_map', []):
-                    target = item.get('target')
-                    confirm = item.get('confirm')
-                    weight = float(item.get('weight', 0.3))
-                    if target and confirm:
-                        confirm_map[target] = (confirm, weight)
-            elif hasattr(synth_cfg, 'confirm_map'):
-                for item in (synth_cfg.confirm_map or []):
-                    target = getattr(item, 'target', None)
-                    confirm = getattr(item, 'confirm', None)
-                    weight = float(getattr(item, 'weight', 0.3))
-                    if target and confirm:
-                        confirm_map[target] = (confirm, weight)
-
-            synthesizer = FactorSynthesizer(
-                cluster_map, flip_signs=flip_signs, confirm_map=confirm_map
-            )
-            return synthesizer
-        except Exception:
-            logger.warning("构建因子合成器失败, 跳过合成", exc_info=True)
+        cluster_map, _standalone, flip_signs = build_cluster_map_from_json(
+            corr_path, min_cluster_size=2
+        )
+        if not cluster_map:
+            logger.info("无可用聚类 (所有因子独立), 不执行因子合成")
             return None
+
+        # 日内确认配置从 config.factor_synthesis.confirm_map 读取。
+        # pydantic 模型: confirm_map 是 List[ConfirmMapEntry]
+        confirm_map = {}
+        if isinstance(synth_cfg, dict):
+            for item in synth_cfg.get('confirm_map', []):
+                target = item.get('target')
+                confirm = item.get('confirm')
+                weight = float(item.get('weight', 0.3))
+                if target and confirm:
+                    confirm_map[target] = (confirm, weight)
+        elif hasattr(synth_cfg, 'confirm_map'):
+            for item in (synth_cfg.confirm_map or []):
+                target = getattr(item, 'target', None)
+                confirm = getattr(item, 'confirm', None)
+                weight = float(getattr(item, 'weight', 0.3))
+                if target and confirm:
+                    confirm_map[target] = (confirm, weight)
+
+        return FactorSynthesizer(
+            cluster_map, flip_signs=flip_signs, confirm_map=confirm_map
+        )
 
     def _build_sub_constraints(self, sp_cfg) -> list:
         """构建子组合内部约束.
@@ -1339,11 +1151,10 @@ class PipelineRunner:
         constraints = []
         for c in constraint_configs:
             ctype = c.get("type", "")
+            if not ctype:
+                raise ValueError("子组合约束 type 不能为空")
             params = {k: v for k, v in c.items() if k != "type"}
-            try:
-                constraints.append(create("constraint", ctype, **params))
-            except Exception as e:
-                logger.warning(f"子组合约束 '{ctype}' 创建失败: {e}", exc_info=True)
+            constraints.append(create("constraint", ctype, **params))
         return constraints
 
     def _meta_optimize_weights(
@@ -1385,12 +1196,8 @@ class PipelineRunner:
         n_days = len(all_dates)
         n_sub = len(sub_configs)
 
-        # 预分配 numpy 数组 (避免逐日 list.append)
-        returns_arr = returns_df[names].values  # (n_days, n_sub)
-        returns_arr = np.nan_to_num(returns_arr)  # NaN → 0, 一次性处理
+        # 预分配输出数组，避免逐日 list.append。
         desired_weight_arr = np.empty((n_days, n_sub), dtype=np.float64)
-        failures: List[dict] = []
-
         # 初始等权
         current_w = np.ones(n_sub) / n_sub
         capital_scale = 1.0
@@ -1403,8 +1210,6 @@ class PipelineRunner:
                     returns_df, current_weights=current_w, date=all_dates[i]
                 )
                 capital_scale = meta_opt.last_capital_scale
-                if meta_opt.last_failure is not None:
-                    failures.append(dict(meta_opt.last_failure))
                 last_reweight = i
 
             desired_weight_arr[i] = current_w * capital_scale
@@ -1415,7 +1220,6 @@ class PipelineRunner:
             sub_results,
             meta_cfg,
             total_capital,
-            initial_failures=failures,
         )
 
         logger.info(
@@ -1461,29 +1265,23 @@ class PipelineRunner:
         """Precompute point-in-time annual covariances with one market-data read."""
         dates = pd.DatetimeIndex(dates)
         instruments = pd.Index(instruments)
-        if len(dates) == 0 or len(instruments) == 0 or not hasattr(self, "data_manager"):
-            return None
+        if len(dates) == 0 or len(instruments) == 0:
+            raise ValueError("动态风险协方差需要非空日期和品种")
         window = max(int(getattr(config, "risk_window", 60)), 20)
         shrinkage = float(np.clip(
             getattr(config, "covariance_shrinkage", 0.30), 0.0, 1.0
         ))
         start = dates[0] - pd.Timedelta(days=window * 2)
-        try:
-            calendar = self.data_manager.get_calendar(start, dates[-1])
-            if len(calendar) == 0:
-                calendar = pd.date_range(start, dates[-1], freq="B")
-            history_dates = pd.DatetimeIndex(calendar).sort_values().unique()
-            close = self.data_manager.get("close", history_dates, instruments)
-            returns = close.reindex(
-                index=history_dates, columns=instruments
-            ).pct_change(fill_method=None)
-        except Exception as exc:
-            logger.warning(
-                "Aggregate dynamic-risk covariance prefetch failed: %s: %s",
-                type(exc).__name__, exc,
-            )
-            return None
+        history_dates = _require_trade_calendar(
+            self.data_manager.get_calendar(start, dates[-1]), start, dates[-1]
+        ).sort_values().unique()
+        close = self.data_manager.get("close", history_dates, instruments)
+        returns, _ = self.data_manager.prepare_close_data(close.reindex(
+            index=history_dates, columns=instruments
+        ))
 
+        # The strict close-gap policy has already rejected unexplained internal
+        # gaps. Remaining NaNs are only pre-listing or first-observation anchors.
         values = np.nan_to_num(
             returns.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -1527,29 +1325,75 @@ class PipelineRunner:
         *,
         initial_failures: List[dict] = None,
     ) -> tuple:
-        """Build a net aggregate path from sleeve returns and bottom positions.
+        """Build a net aggregate path from audited sleeve returns and positions.
 
-        Sub-portfolio returns already contain standalone transaction costs.  When
-        bottom weights are available, those embedded costs are added back and a
-        single cost is charged on the aggregate target change.  This prevents
-        double charging and allows opposite trades from different sleeves to net.
+        Each sleeve keeps its own execution and holding costs.  The aggregate
+        layer charges only costs caused by changing the sleeve allocation.
         """
         from optimization.meta_optimizer import UnderlyingExposureController
         from core.sectors import SECTOR_MAP
 
         names = list(returns_df.columns)
         dates = pd.DatetimeIndex(returns_df.index)
-        returns_arr = returns_df[names].fillna(0.0).to_numpy(dtype=float)
+        if dates.empty:
+            raise ValueError("cannot combine sub-portfolios without return bars")
+        start_dates = []
+        for item in sub_results:
+            nav = getattr(item["result"], "nav", None)
+            if nav is None or nav.dropna().empty:
+                raise ValueError(
+                    f"sub-portfolio {item['config'].name!r} has no NAV anchor"
+                )
+            nav = nav.dropna().sort_index()
+            if nav.index.has_duplicates:
+                raise ValueError(
+                    f"sub-portfolio {item['config'].name!r} has duplicate NAV dates"
+                )
+            start_dates.append(pd.Timestamp(nav.index[0]))
+        anchor_date = min(start_dates)
+        if anchor_date >= dates[0]:
+            raise ValueError("sub-portfolio NAV anchor must precede combined returns")
+        raw_returns = returns_df[names].replace([np.inf, -np.inf], np.nan)
+        for name in names:
+            first_valid = raw_returns[name].first_valid_index()
+            if first_valid is None:
+                raise ValueError(f"sub-portfolio {name!r} has no return observations")
+            active = raw_returns.loc[first_valid:, name]
+            if active.isna().any():
+                first_gap = active.index[active.isna()][0]
+                raise ValueError(
+                    f"sub-portfolio {name!r} has an internal return gap at "
+                    f"{pd.Timestamp(first_gap).date()}"
+                )
+        # A sleeve contributes zero only before its own first valid return.
+        returns_arr = raw_returns.fillna(0.0).to_numpy(dtype=float)
         desired = np.asarray(desired_weight_arr, dtype=float)
         if desired.shape != returns_arr.shape:
             raise ValueError("desired sleeve weights do not align with sleeve returns")
 
-        exposure_cube, instruments, embedded_costs = self._build_effective_exposure_cube(
-            sub_results, dates, names
-        )
+        (
+            exposure_cube,
+            instruments,
+            embedded_trade_costs,
+            embedded_holding_costs,
+            embedded_turnovers,
+        ) = self._build_effective_exposure_cube(sub_results, dates, names)
         constraint_specs = list(getattr(meta_cfg, "underlying_constraints", []) or [])
         if not constraint_specs:
-            constraint_specs = list(self.config.optimization.constraints)
+            configured = list(self.config.optimization.constraints)
+            constraint_specs = [
+                spec for spec in configured
+                if str(spec.get("type", "")) in UnderlyingExposureController._SUPPORTED
+            ]
+            omitted = sorted({
+                str(spec.get("type", "")) for spec in configured
+                if str(spec.get("type", "")) not in UnderlyingExposureController._SUPPORTED
+            })
+            if omitted:
+                logger.info(
+                    "叠加层仅继承可映射约束，以下子组合约束不在此层重复应用: %s",
+                    ", ".join(omitted),
+                )
         enforce = bool(getattr(meta_cfg, "enforce_underlying_constraints", True))
         controller = UnderlyingExposureController(
             constraint_specs if enforce else [],
@@ -1570,14 +1414,24 @@ class PipelineRunner:
                 days=max(int(getattr(dynamic_cfg, "atr_window", 20)) * 2, 40)
             )
             atr_dates = self.data_manager.get_calendar(atr_start, dates[-1])
-            if len(atr_dates) == 0:
-                atr_dates = pd.date_range(atr_start, dates[-1], freq="B")
+            atr_dates = _require_trade_calendar(
+                atr_dates, atr_start, dates[-1]
+            )
             dynamic_controller.prepare_data(
                 self.data_manager, atr_dates, instruments
             )
             dynamic_covariances = self._build_underlying_covariance_path(
                 dates, instruments, dynamic_cfg
             )
+            missing_covariance = [
+                str(pd.Timestamp(date).date())
+                for date, covariance in zip(dates, dynamic_covariances)
+                if covariance is None
+            ]
+            if missing_covariance:
+                raise RuntimeError(
+                    "动态风险协方差历史不足: " + ", ".join(missing_covariance[:5])
+                )
 
         n_days, n_sub = returns_arr.shape
         n_assets = len(instruments)
@@ -1592,14 +1446,7 @@ class PipelineRunner:
         failures = list(initial_failures or [])
         diagnostics: List[dict] = []
 
-        previous_aggregate = np.zeros(n_assets, dtype=float)
         previous_sleeve_weights: Optional[np.ndarray] = None
-        can_net_costs = bool(
-            n_assets
-            and np.any(np.abs(exposure_cube) > 0)
-            and getattr(meta_cfg, "net_underlying_costs", True)
-            and self.cost_model is not None
-        )
 
         for i, date in enumerate(dates):
             matrix = exposure_cube[i]
@@ -1607,34 +1454,9 @@ class PipelineRunner:
             try:
                 applied, diag = controller.apply(requested, matrix, instruments)
             except Exception as exc:
-                failure = {
-                    "stage": "aggregate_exposure_projection",
-                    "date": str(pd.Timestamp(date).date()),
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "fallback": "hold_previous_if_feasible_else_zero",
-                }
-                failures.append(failure)
-                logger.warning(
-                    "底层暴露投影失败 @ %s: %s: %s",
-                    pd.Timestamp(date).date(),
-                    type(exc).__name__,
-                    exc,
-                )
-                candidate = (
-                    previous_sleeve_weights.copy()
-                    if previous_sleeve_weights is not None
-                    else np.zeros(n_sub, dtype=float)
-                )
-                candidate_diag = controller.diagnostics(matrix @ candidate, instruments)
-                if candidate_diag["feasible"]:
-                    applied, diag = candidate, candidate_diag
-                else:
-                    applied = np.zeros(n_sub, dtype=float)
-                    diag = controller.diagnostics(matrix @ applied, instruments)
-                diag["constraint_adjusted"] = True
-                diag["requested_capital_scale"] = float(requested.sum())
-                diag["applied_capital_scale"] = float(applied.sum())
+                raise RuntimeError(
+                    f"底层暴露投影失败 @ {pd.Timestamp(date).date()}: {exc}"
+                ) from exc
 
             if (
                 dynamic_controller is not None
@@ -1672,68 +1494,52 @@ class PipelineRunner:
             aggregate = matrix @ applied
             applied_weights[i] = applied
             aggregate_weights[i] = aggregate
-            turnover[i] = float(np.abs(aggregate - previous_aggregate).sum())
+            allocation_only_previous = aggregate
             if previous_sleeve_weights is not None:
                 allocation_only_previous = matrix @ previous_sleeve_weights
                 meta_turnover[i] = float(
                     np.abs(aggregate - allocation_only_previous).sum()
                 )
 
-            embedded_cost = float(applied @ embedded_costs[i])
+            embedded_trade_cost = float(applied @ embedded_trade_costs[i])
+            embedded_holding_cost = float(applied @ embedded_holding_costs[i])
+            embedded_cost = embedded_trade_cost + embedded_holding_cost
+            embedded_turnover = float(applied @ embedded_turnovers[i])
+            turnover[i] = embedded_turnover + meta_turnover[i]
             net_sleeve_return = float(applied @ returns_arr[i])
-            if can_net_costs:
-                target_series = pd.Series(aggregate, index=instruments, dtype=float)
-                previous_series = pd.Series(
-                    previous_aggregate, index=instruments, dtype=float
-                )
+            meta_trade_cost = 0.0
+            if meta_turnover[i] > 1e-12 and self.cost_model is not None:
                 try:
-                    aggregate_trade_cost = float(
+                    meta_trade_cost = float(
                         self.cost_model.estimate_cost(
-                            target_series, previous_series, pd.Timestamp(date)
+                            pd.Series(aggregate, index=instruments, dtype=float),
+                            pd.Series(
+                                allocation_only_previous,
+                                index=instruments,
+                                dtype=float,
+                            ),
+                            pd.Timestamp(date),
                         )
                     )
                 except Exception as exc:
                     failures.append({
-                        "stage": "aggregate_cost_estimation",
+                        "stage": "meta_reallocation_cost_estimation",
                         "date": str(pd.Timestamp(date).date()),
                         "error_type": type(exc).__name__,
                         "message": str(exc),
-                        "fallback": "abort_invalid_net_result",
+                        "fallback": "abort_invalid_result",
                     })
                     raise RuntimeError(
-                        f"aggregate transaction cost failed at {date}: {exc}"
+                        f"meta reallocation cost failed at {date}: {exc}"
                     ) from exc
-                if not np.isfinite(aggregate_trade_cost) or aggregate_trade_cost < 0:
+                if not np.isfinite(meta_trade_cost) or meta_trade_cost < 0:
                     raise RuntimeError(
-                        f"aggregate transaction cost is invalid at {date}: {aggregate_trade_cost}"
+                        f"meta reallocation cost is invalid at {date}: {meta_trade_cost}"
                     )
-                holding_estimator = getattr(
-                    self.cost_model, "estimate_holding_cost", None
-                )
-                aggregate_holding_cost = (
-                    float(holding_estimator(target_series, pd.Timestamp(date)))
-                    if holding_estimator is not None and i > 0
-                    else 0.0
-                )
-                if (
-                    not np.isfinite(aggregate_holding_cost)
-                    or aggregate_holding_cost < 0
-                ):
-                    raise RuntimeError(
-                        f"aggregate holding cost is invalid at {date}: "
-                        f"{aggregate_holding_cost}"
-                    )
-                aggregate_cost = aggregate_trade_cost + aggregate_holding_cost
-                # Convert standalone sleeve net returns back to gross, then deduct
-                # one cost on the actual aggregate bottom trade.
-                combined_returns[i] = net_sleeve_return + embedded_cost - aggregate_cost
-                costs[i] = aggregate_cost
-                trade_costs[i] = aggregate_trade_cost
-                holding_costs[i] = aggregate_holding_cost
-            else:
-                combined_returns[i] = net_sleeve_return
-                costs[i] = embedded_cost
-                trade_costs[i] = embedded_cost
+            combined_returns[i] = net_sleeve_return - meta_trade_cost
+            costs[i] = embedded_cost + meta_trade_cost
+            trade_costs[i] = embedded_trade_cost + meta_trade_cost
+            holding_costs[i] = embedded_holding_cost
 
             diagnostics.append({
                 "date": str(pd.Timestamp(date).date()),
@@ -1742,12 +1548,15 @@ class PipelineRunner:
                 "aggregate_turnover": float(turnover[i]),
                 "transaction_cost": float(costs[i]),
                 "embedded_sleeve_cost": embedded_cost,
+                "meta_reallocation_cost": meta_trade_cost,
             })
-            previous_aggregate = aggregate
             previous_sleeve_weights = applied
 
         combined_ret_series = pd.Series(combined_returns, index=dates)
-        combined_nav = total_capital * (1.0 + combined_ret_series).cumprod()
+        combined_nav = pd.concat([
+            pd.Series([float(total_capital)], index=[anchor_date]),
+            float(total_capital) * (1.0 + combined_ret_series).cumprod(),
+        ])
         weight_df = pd.DataFrame(applied_weights, index=dates, columns=names)
         underlying_df = pd.DataFrame(
             aggregate_weights, index=dates, columns=instruments
@@ -1775,47 +1584,108 @@ class PipelineRunner:
         dates: pd.DatetimeIndex,
         names: List[str],
     ) -> tuple:
-        """Align recorded decisions to the next trading day's effective weights."""
+        """Build sleeve exposures, costs, and executed turnover from audited ledgers."""
         results_by_name = {
             item["config"].name: item["result"] for item in sub_results
         }
+        def recorded_exposure(result) -> pd.DataFrame:
+            ledger = getattr(result, "research_ledger", None)
+            effective = getattr(ledger, "effective_weights", None)
+            if effective is None or effective.empty:
+                raise ValueError(
+                    "sub-portfolio result has no audited effective-weight ledger"
+                )
+            return effective
+
         instruments = sorted({
             str(column)
             for name in names
-            for column in results_by_name[name].weights_history.columns
+            for column in recorded_exposure(results_by_name[name]).columns
         })
         n_days, n_assets, n_sub = len(dates), len(instruments), len(names)
         cube = np.zeros((n_days, n_assets, n_sub), dtype=float)
-        embedded_costs = np.zeros((n_days, n_sub), dtype=float)
+        embedded_trade_costs = np.zeros((n_days, n_sub), dtype=float)
+        embedded_holding_costs = np.zeros((n_days, n_sub), dtype=float)
+        embedded_turnovers = np.zeros((n_days, n_sub), dtype=float)
 
         for sleeve_index, name in enumerate(names):
             result = results_by_name[name]
-            history = result.weights_history.copy()
-            if not history.empty:
-                history.index = pd.DatetimeIndex(history.index)
-                if history.index.has_duplicates:
-                    history = history.groupby(level=0).last()
-                timeline = dates.union(history.index).sort_values()
-                # Backtester records a target on decision date after that day's
-                # return; shift once so it becomes effective on the next date.
-                effective = (
-                    history.reindex(timeline)
-                    .ffill()
-                    .shift(1)
-                    .reindex(dates)
-                    .reindex(columns=instruments)
-                    .fillna(0.0)
+            ledger = getattr(result, "research_ledger", None)
+            ledger_weights = getattr(ledger, "effective_weights", None)
+            if ledger_weights is None or ledger_weights.empty:
+                raise ValueError(
+                    f"sub-portfolio {name!r} has no audited effective-weight ledger"
                 )
-                cube[:, :, sleeve_index] = effective.to_numpy(dtype=float)
+            effective = ledger_weights.copy()
+            effective.index = pd.DatetimeIndex(effective.index)
+            if effective.index.has_duplicates or effective.columns.has_duplicates:
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger has duplicate axes"
+                )
+            effective = effective.sort_index()
+            if not np.isfinite(effective.to_numpy(dtype=float)).all():
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger contains NaN/Inf exposures"
+                )
+            first_exposure = effective.index.min()
+            required_dates = dates[dates >= first_exposure]
+            missing_dates = required_dates.difference(effective.index)
+            if len(missing_dates):
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger has an internal date gap at "
+                    f"{pd.Timestamp(missing_dates[0]).date()}"
+                )
+            effective = effective.reindex(
+                index=dates, columns=instruments
+            ).fillna(0.0)
+            cube[:, :, sleeve_index] = effective.to_numpy(dtype=float)
 
-            cost_series = getattr(result, "costs", pd.Series(dtype=float))
-            if cost_series is not None and not cost_series.empty:
-                cost_series = cost_series.copy()
-                cost_series.index = pd.DatetimeIndex(cost_series.index)
-                embedded_costs[:, sleeve_index] = (
-                    cost_series.reindex(dates).fillna(0.0).to_numpy(dtype=float)
+            daily = getattr(ledger, "daily", None)
+            required_columns = {
+                "trade_cost",
+                "holding_cost",
+                "executed_traded_notional",
+            }
+            if daily is None or not required_columns.issubset(daily.columns):
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger has no audited cost/turnover fields"
                 )
-        return cube, instruments, embedded_costs
+            daily = daily.copy()
+            daily.index = pd.DatetimeIndex(daily.index)
+            if daily.index.has_duplicates:
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger daily rows have duplicate dates"
+                )
+            daily = daily.sort_index()
+            missing_daily_dates = required_dates.difference(daily.index)
+            if len(missing_daily_dates):
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger daily rows have an internal gap at "
+                    f"{pd.Timestamp(missing_daily_dates[0]).date()}"
+                )
+            fields = daily.loc[:, sorted(required_columns)].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            if (
+                not np.isfinite(fields.to_numpy(dtype=float)).all()
+                or bool((fields < 0.0).any().any())
+            ):
+                raise ValueError(
+                    f"sub-portfolio {name!r} ledger costs/turnover are invalid"
+                )
+            fields = fields.reindex(dates).fillna(0.0)
+            embedded_trade_costs[:, sleeve_index] = fields["trade_cost"]
+            embedded_holding_costs[:, sleeve_index] = fields["holding_cost"]
+            embedded_turnovers[:, sleeve_index] = fields[
+                "executed_traded_notional"
+            ]
+        return (
+            cube,
+            instruments,
+            embedded_trade_costs,
+            embedded_holding_costs,
+            embedded_turnovers,
+        )
 
     # ------------------------------------------------------------------
     # 工具方法

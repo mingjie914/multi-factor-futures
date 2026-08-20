@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from core.interfaces import DataProvider, DataSource
-from core.types import *
+from core.types import PricePanel
 
 # Re-export for convenient importing from data.base
 __all__ = [

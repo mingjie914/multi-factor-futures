@@ -14,11 +14,11 @@ from __future__ import annotations
 import sys
 import os
 import json
+import logging
 import time
 import argparse
 import copy
 from pathlib import Path
-from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -57,13 +57,18 @@ def compute_metrics(nav: pd.Series) -> dict:
     }
 
 
-def _business_day_coverage_bounds(start, end, grace_days: int = 5):
-    """Return latest allowed start and earliest allowed end for coverage checks."""
-    business_days = pd.bdate_range(pd.Timestamp(start), pd.Timestamp(end))
-    if business_days.empty:
-        raise ValueError(f"test range contains no business days: {start}~{end}")
-    grace = pd.offsets.BDay(max(int(grace_days), 0))
-    return business_days[0] + grace, business_days[-1] - grace
+def _calendar_coverage_bounds(
+    calendar, start, end, grace_bars: int = 5
+):
+    """Return coverage bounds on the supplied exchange calendar."""
+    dates = pd.DatetimeIndex(calendar)
+    dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+    if dates.empty:
+        raise ValueError(f"test range contains no exchange bars: {start}~{end}")
+    grace = max(int(grace_bars), 0)
+    if 2 * grace >= len(dates):
+        raise ValueError("coverage grace consumes the complete test range")
+    return dates[grace], dates[-grace - 1] if grace else dates[-1]
 
 
 def _candidate_factor_names() -> list[str]:
@@ -345,7 +350,6 @@ def _build_fold_bundle(
     train_config = copy.deepcopy(base_config)
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
-    train_config.research_artifacts.required = False
     warmup_days = int(
         base_config.validation_policy.warmup_days_by_frequency.get(frequency, 252)
     )
@@ -430,7 +434,6 @@ def _load_existing_fold_bundle(
     train_config = copy.deepcopy(base_config)
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
-    train_config.research_artifacts.required = False
     bundle = ResearchArtifactBundle.load(
         output_dir,
         decision_date=pd.Timestamp(train_end) + pd.Timedelta(days=1),
@@ -657,6 +660,7 @@ def walk_forward_4fold(
     reuse_artifacts: bool = False,
     frequency: str = "daily",
     is_intraday: bool = False,
+    calendar=None,
 ):
     """Nested walk-forward with rolling test folds sized by bar counts.
 
@@ -668,6 +672,11 @@ def walk_forward_4fold(
 
     policy = base_config.validation_policy
     ctx = PeriodContext.from_string(frequency)
+    if not ctx.is_daily:
+        raise ValueError(
+            "portfolio walk-forward accounting is daily-only; non-daily factor "
+            "research must remain in the frequency-aware screening workflow"
+        )
     _freq_key = (
         "daily_intraday"
         if is_intraday and ctx.unit.value == "daily"
@@ -678,8 +687,22 @@ def walk_forward_4fold(
     step_bars = int(policy.wf_step_bars_by_frequency.get(_freq_key, 125))
 
     configured_end = pd.Timestamp(base_config.date_range.end)
-    configured_start = pd.Timestamp(base_config.date_range.start).date().isoformat()
-    calendar = pd.bdate_range(configured_start, configured_end.date().isoformat())
+    configured_start = pd.Timestamp(base_config.date_range.start)
+    if calendar is None:
+        from data.manager import DataManager
+
+        calendar_manager = DataManager.from_config(base_config)
+        calendar = calendar_manager.get_calendar(configured_start, configured_end)
+    calendar = pd.DatetimeIndex(calendar)
+    if (
+        calendar.empty
+        or calendar.has_duplicates
+        or not calendar.is_monotonic_increasing
+    ):
+        raise ValueError("walk-forward calendar must be non-empty, unique and sorted")
+    calendar = calendar[
+        (calendar >= configured_start) & (calendar <= configured_end)
+    ]
     segments = _build_rolling_folds(
         calendar, train_bars, test_bars, step_bars,
         frequency=_freq_key,
@@ -711,8 +734,7 @@ def walk_forward_4fold(
     if not candidate_factors:
         raise RuntimeError("没有已注册候选因子")
     if run_root is None:
-        run_id = datetime.now().strftime("nested_wf_%Y%m%d_%H%M%S")
-        run_root = Path(_PROJECT_ROOT) / "runs" / run_id
+        raise ValueError("run_root is required; automatic run directories are disabled")
     run_root = Path(run_root).resolve()
     if reuse_artifacts:
         if not run_root.is_dir():
@@ -726,8 +748,14 @@ def walk_forward_4fold(
 
         from research.sample_policy import assess_sample_counts
 
-        train_dates = pd.bdate_range(train_start, train_end)
-        test_dates = pd.bdate_range(test_start, test_end)
+        train_dates = calendar[
+            (calendar >= pd.Timestamp(train_start))
+            & (calendar <= pd.Timestamp(train_end))
+        ]
+        test_dates = calendar[
+            (calendar >= pd.Timestamp(test_start))
+            & (calendar <= pd.Timestamp(test_end))
+        ]
         sample_assessment = assess_sample_counts(
             len(train_dates), len(test_dates),
             policy=base_config.validation_policy,
@@ -775,7 +803,6 @@ def walk_forward_4fold(
             cfg.date_range.end = test_end
             cfg.research_artifacts.enabled = True
             cfg.research_artifacts.path = str(fold_dir)
-            cfg.research_artifacts.required = True
             cfg.research_artifacts.strict_config_hash = False  # WF test config differs from training
             # Validate the frozen research inputs before applying fold-specific
             # portfolio outputs such as selected factors and empty-sleeve removal.
@@ -797,8 +824,8 @@ def walk_forward_4fold(
             expected_end = pd.Timestamp(test_end)
             actual_start = pd.Timestamp(nav.index.min())
             actual_end = pd.Timestamp(nav.index.max())
-            latest_allowed_start, earliest_allowed_end = _business_day_coverage_bounds(
-                expected_start, expected_end, grace_days=5
+            latest_allowed_start, earliest_allowed_end = _calendar_coverage_bounds(
+                calendar, expected_start, expected_end, grace_bars=5
             )
             if actual_start > latest_allowed_start:
                 raise RuntimeError(
@@ -1154,7 +1181,6 @@ def main():
         default=None,
         help="覆盖 Alpha 模型用于候选比较",
     )
-    parser.add_argument("--cache-only", action="store_true", help="严格仅使用本地缓存")
     parser.add_argument(
         "--is-intraday", action="store_true",
         help="使用 daily_intraday 参数进行 WF（适用于日内聚合为日频的因子）",
@@ -1169,8 +1195,8 @@ def main():
         help="候选因子逗号分隔；默认使用全部已注册因子",
     )
     parser.add_argument(
-        "--run-root", default=None,
-        help="冻结运行目录；默认 runs/nested_wf_时间戳",
+        "--run-root", required=True,
+        help="显式冻结运行目录",
     )
     parser.add_argument(
         "--no-correlation", action="store_true",
@@ -1191,8 +1217,6 @@ def main():
     if not os.path.isabs(config_path):
         config_path = os.path.join(_PROJECT_ROOT, config_path)
     base_config = load_config(config_path)
-    if args.cache_only:
-        base_config.data.cache["only"] = True
     if args.end:
         base_config.date_range.end = pd.Timestamp(args.end).date().isoformat()
     if args.practical_profile:
@@ -1224,9 +1248,7 @@ def main():
         fold_numbers = [
             int(item.strip()) for item in args.folds.split(",") if item.strip()
         ]
-    run_root = Path(args.run_root).resolve() if args.run_root else (
-        Path(_PROJECT_ROOT) / "runs" / datetime.now().strftime("nested_wf_%Y%m%d_%H%M%S")
-    )
+    run_root = Path(args.run_root).resolve()
 
     all_results = {}
 

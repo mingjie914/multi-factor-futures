@@ -67,8 +67,8 @@ def _fetch_intraday_ohlcv(
 ) -> Dict[str, pd.DataFrame]:
     """从 DataManager 的底层 DataSource 获取分钟级 OHLCV.
 
-    当 DataSource 为 DDBSource 时, 调用 fetch_price_at_frequency().
-    其他数据源或 DDB 不可用时返回空字典 (优雅降级).
+    通过支持目标频率的本地 Parquet 数据提供器读取；发现扫描中缺少该频率时
+    返回空字典，正式选中因子会由严格计算链拒绝全缺失输出。
 
     Args:
         data: DataManager 实例 (需暴露 .source 属性)
@@ -77,37 +77,32 @@ def _fetch_intraday_ohlcv(
         freq: 分钟频率 ("15min" / "30min" / "60min")
 
     Returns:
-        {field: DataFrame(index=分钟时间戳, columns=tickers)} 或 {} (不可用)
+        {field: DataFrame(index=分钟时间戳, columns=tickers)} 或 {} (缺少该频率)
     """
-    try:
-        requested_frequency = _normalise_frequency(freq)
-        provider_frequency = getattr(data, "frequency", None)
-        if provider_frequency is not None:
-            if _normalise_frequency(provider_frequency) != requested_frequency:
-                return {}
-            return {
-                field: data.get(field, dates, universe)
-                for field in _DEFAULT_SPEC_FIELDS
-            }
+    requested_frequency = _normalise_frequency(freq)
+    provider_frequency = getattr(data, "frequency", None)
+    if provider_frequency is not None:
+        if _normalise_frequency(provider_frequency) != requested_frequency:
+            return {}
+        return {
+            field: data.get(field, dates, universe)
+            for field in _DEFAULT_SPEC_FIELDS
+        }
 
-        source = getattr(data, "source", None)
-        if source is None:
-            return {}
-        # 检查是否为 DDBSource (避免硬依赖, 用 duck-typing)
-        if not hasattr(source, "fetch_price_at_frequency"):
-            return {}
-        start = dates.min()
-        end = dates.max()
-        fields = ["open", "high", "low", "close", "volume"]
-        panel = source.fetch_price_at_frequency(
-            list(universe), start, end, fields, frequency=freq,
-        )
-        return panel if panel else {}
-    except Exception:
-        logging.getLogger("multi_factor").debug(
-            "分钟级 OHLCV 获取失败 (DDB 可能不可用)", exc_info=True,
-        )
+    source = getattr(data, "source", None)
+    if source is None or not hasattr(source, "fetch_price_at_frequency"):
         return {}
+    start = dates.min()
+    end = dates.max()
+    fields = ["open", "high", "low", "close", "volume"]
+    panel = source.fetch_price_at_frequency(
+        list(universe), start, end, fields, frequency=freq,
+    )
+    if panel is None:
+        return {}
+    if not isinstance(panel, dict):
+        raise TypeError("intraday price source must return a field mapping")
+    return panel
 
 
 def _resample_to_daily(
@@ -138,7 +133,7 @@ def _resample_to_daily(
     )
     locations = trading_calendar.searchsorted(targets, side="left")
     trading_dates = np.full(
-        len(targets), np.datetime64("NaT"), dtype="datetime64[ns]"
+        len(targets), np.datetime64("NaT", "ns"), dtype="datetime64[ns]"
     )
     valid = locations < len(trading_calendar)
     trading_dates[valid] = trading_calendar.to_numpy()[locations[valid]]
@@ -285,11 +280,11 @@ def compute_base_df(
     Returns:
         dates × tickers 的因子值 DataFrame.
     """
-    close = ohlcv["close"].astype(float, copy=False)
-    open_ = ohlcv["open"].astype(float, copy=False)
-    high = ohlcv["high"].astype(float, copy=False)
-    low = ohlcv["low"].astype(float, copy=False)
-    volume = ohlcv["volume"].astype(float, copy=False)
+    close = ohlcv["close"].astype(float)
+    open_ = ohlcv["open"].astype(float)
+    high = ohlcv["high"].astype(float)
+    low = ohlcv["low"].astype(float)
+    volume = ohlcv["volume"].astype(float)
     ret = ohlcv.get("_return_1d")
     if ret is None:
         ret = close.pct_change(fill_method=None)
@@ -341,7 +336,7 @@ def compute_base_df(
             0, np.nan
         ) - 1
 
-    # --- 技术指标类 (Technical Indicators, 来自 DolphinDB alpha_db 推导) ---
+    # --- 技术指标类 (Technical Indicators, 历史 alpha_db 公式参考) ---
     # fast/slow 参数从 params 读取 (已在 SPEC 模板中定义)
     fast = int(params.get("fast", max(3, w // 3)))
     slow = int(params.get("slow", max(5, w)))
@@ -542,7 +537,7 @@ def compute_base_df(
         return slope / close.replace(0, np.nan)
 
     if base == "trend_strength":
-        # 夏普式趋势强度: close.pct_change(w) / std(ret, w)
+        # 夏普式趋势强度: close.pct_change(w, fill_method=None) / std(ret, w)
         ret_w = close.pct_change(w, fill_method=None)
         vol = ret.rolling(w, min_periods=_minp(w)).std(ddof=0)
         return ret_w / vol.replace(0, np.nan)
@@ -554,11 +549,11 @@ def compute_base_df(
         return displacement / path.replace(0, np.nan)
 
     if base == "return":
-        # 收益率: close.pct_change(w)
+        # 收益率: close.pct_change(w, fill_method=None)
         return close.pct_change(w, fill_method=None)
 
     if base == "skip_return":
-        # 跳期动量: close.shift(w//2).pct_change(w), 规避短期反转
+        # 跳期动量: close.shift(w//2).pct_change(w, fill_method=None), 规避短期反转
         skip = max(1, w // 2)
         return close.shift(skip).pct_change(w, fill_method=None)
 
@@ -617,7 +612,7 @@ def compute_base_df(
         return dv / dv_ma.replace(0, np.nan) - 1
 
     if base == "price_volume_corr":
-        # 量价相关: ret.rolling(w).corr(volume.pct_change())
+        # 量价相关: ret.rolling(w).corr(volume.pct_change(fill_method=None))
         vol_ret = volume.pct_change(fill_method=None)
         return ret.rolling(w, min_periods=_minp(w)).corr(vol_ret)
 
@@ -755,7 +750,7 @@ class SpecFactor(Factor):
         transform = self.spec.get("transform", "raw")
         freq = self.spec.get("frequency", "daily")
 
-        # 分钟级因子: 从 DDB 获取分钟 OHLCV, 计算后按日重采样
+        # 分钟级因子: 从本地 Parquet 获取分钟 OHLCV, 计算后按日重采样
         if freq != "daily":
             return self._compute_intraday(
                 data, dates, universe, base, transform, params, freq,
@@ -771,23 +766,18 @@ class SpecFactor(Factor):
             ohlcv_data[f] = df
 
         # 向量化计算 base + transform (所有品种同时)
-        try:
-            signal = compute_base_df(base, params, ohlcv_data)
-            transformed = apply_transform_df(signal, transform, params, ohlcv_data)
-            result = _apply_spec_decision_lag(
-                transformed, self.spec
-            ).reindex(index=dates, columns=universe)
-            return result
-        except Exception:
-            logging.getLogger("multi_factor").exception(f"SpecFactor '{self.name}' 计算失败")
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        signal = compute_base_df(base, params, ohlcv_data)
+        transformed = apply_transform_df(signal, transform, params, ohlcv_data)
+        return _apply_spec_decision_lag(
+            transformed, self.spec
+        ).reindex(index=dates, columns=universe)
 
     def _compute_intraday(
         self, data, dates, universe, base, transform, params, freq,
     ) -> pd.DataFrame:
         """分钟级因子计算: 获取分钟数据 → base+transform → 按日重采样.
 
-        当 DDB 不可用时返回 NaN (优雅降级).
+        缺少目标分钟频率时返回 NaN；正式流程的严格因子引擎会拒绝全缺失结果。
         """
         # 1. 获取分钟级 OHLCV
         minute_ohlcv = _fetch_intraday_ohlcv(data, dates, universe, freq=freq)
@@ -795,16 +785,10 @@ class SpecFactor(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
 
         # 2. 向量化计算 base + transform (在分钟级数据上)
-        try:
-            signal = compute_base_df(base, params, minute_ohlcv)
-            transformed = apply_transform_df(
-                signal, transform, params, minute_ohlcv,
-            )
-        except Exception:
-            logging.getLogger("multi_factor").exception(
-                f"SpecFactor '{self.name}' 分钟级计算失败"
-            )
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        signal = compute_base_df(base, params, minute_ohlcv)
+        transformed = apply_transform_df(
+            signal, transform, params, minute_ohlcv,
+        )
 
         return _finalize_intraday_result(
             transformed, data, dates, universe, self.spec
@@ -864,16 +848,10 @@ def _create_compute_method(spec: dict):
             minute_ohlcv = _fetch_intraday_ohlcv(data, dates, universe, freq=freq)
             if not minute_ohlcv:
                 return pd.DataFrame(np.nan, index=dates, columns=universe)
-            try:
-                signal = compute_base_df(base, params, minute_ohlcv)
-                transformed = apply_transform_df(
-                    signal, transform, params, minute_ohlcv,
-                )
-            except Exception:
-                logging.getLogger("multi_factor").exception(
-                    f"动态 SpecFactor '{spec['slug']}' 分钟级计算失败"
-                )
-                return pd.DataFrame(np.nan, index=dates, columns=universe)
+            signal = compute_base_df(base, params, minute_ohlcv)
+            transformed = apply_transform_df(
+                signal, transform, params, minute_ohlcv,
+            )
             return _finalize_intraday_result(
                 transformed, data, dates, universe, spec
             )
@@ -887,16 +865,11 @@ def _create_compute_method(spec: dict):
                 return pd.DataFrame(np.nan, index=dates, columns=universe)
             ohlcv_data[f] = df
 
-        try:
-            signal = compute_base_df(base, params, ohlcv_data)
-            transformed = apply_transform_df(signal, transform, params, ohlcv_data)
-            result = _apply_spec_decision_lag(
-                transformed, spec
-            ).reindex(index=dates, columns=universe)
-            return result
-        except Exception:
-            logging.getLogger("multi_factor").exception(f"动态 SpecFactor 计算失败")
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        signal = compute_base_df(base, params, ohlcv_data)
+        transformed = apply_transform_df(signal, transform, params, ohlcv_data)
+        return _apply_spec_decision_lag(
+            transformed, spec
+        ).reindex(index=dates, columns=universe)
 
     return compute
 
@@ -926,6 +899,8 @@ def _compute_intraday_spec_factors_batch(
     dates,
     universe,
     period_ctx=None,
+    *,
+    tolerant: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """Compute non-daily SPEC groups without falling back to daily OHLCV."""
     log = logging.getLogger("multi_factor")
@@ -954,9 +929,17 @@ def _compute_intraday_spec_factors_batch(
                 )
             continue
 
-        minute_ohlcv = _fetch_intraday_ohlcv(
-            data, dates, universe, freq=frequency
-        )
+        try:
+            minute_ohlcv = _fetch_intraday_ohlcv(
+                data, dates, universe, freq=frequency
+            )
+        except Exception:
+            if not tolerant:
+                raise
+            log.warning(
+                "SPEC batch: %s data load failed", frequency, exc_info=True
+            )
+            minute_ohlcv = {}
         if not minute_ohlcv:
             log.warning(
                 "SPEC batch: %s data unavailable; %d factors remain invalid",
@@ -970,7 +953,7 @@ def _compute_intraday_spec_factors_batch(
             continue
 
         minute_ohlcv["_return_1d"] = minute_ohlcv["close"].astype(
-            float, copy=False
+            float
         ).pct_change(fill_method=None)
 
         groups: Dict[tuple, list] = {}
@@ -984,6 +967,8 @@ def _compute_intraday_spec_factors_batch(
                     period_ctx,
                 )
             except Exception:
+                if not tolerant:
+                    raise
                 log.warning(
                     "Intraday SPEC base '%s' failed", key[0], exc_info=True
                 )
@@ -1006,6 +991,8 @@ def _compute_intraday_spec_factors_batch(
                         transformed, data, dates, universe, spec
                     )
                 except Exception:
+                    if not tolerant:
+                        raise
                     log.warning(
                         "Intraday SPEC '%s' failed", spec["slug"], exc_info=True
                     )
@@ -1021,6 +1008,8 @@ def compute_spec_factors_batch(
     dates,
     universe,
     period_ctx=None,
+    *,
+    tolerant: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """批量计算 SPEC 因子 (性能优化版本).
 
@@ -1060,7 +1049,12 @@ def compute_spec_factors_batch(
     if intraday_specs:
         result.update(
             _compute_intraday_spec_factors_batch(
-                intraday_specs, data, dates, universe, period_ctx
+                intraday_specs,
+                data,
+                dates,
+                universe,
+                period_ctx,
+                tolerant=tolerant,
             )
         )
     specs = daily_specs
@@ -1079,6 +1073,8 @@ def compute_spec_factors_batch(
         try:
             df = data.get(f, dates, universe)
         except Exception:
+            if not tolerant:
+                raise
             log.warning(
                 "SPEC batch: source field '%s' failed to load", f,
                 exc_info=True,
@@ -1093,7 +1089,7 @@ def compute_spec_factors_batch(
 
     if "close" in ohlcv_data:
         ohlcv_data["_return_1d"] = ohlcv_data["close"].astype(
-            float, copy=False
+            float
         ).pct_change(fill_method=None)
 
     # 2. 按 (base, window, fast, slow) 分组
@@ -1132,6 +1128,8 @@ def compute_spec_factors_batch(
         try:
             signal = compute_base_df(base_name, ref_params, ohlcv_data, period_ctx)
         except Exception:
+            if not tolerant:
+                raise
             log.warning(
                 f"SPEC 批量计算: base '{base_name}' 计算失败, 组内 "
                 f"{len(group_specs)} 个因子返回 NaN",
@@ -1166,6 +1164,8 @@ def compute_spec_factors_batch(
                         index=dates, columns=universe
                     )
             except Exception:
+                if not tolerant:
+                    raise
                 log.warning(
                     f"SPEC 批量计算: 因子 '{slug}' transform '{transform}' 失败, 返回 NaN",
                     exc_info=True,

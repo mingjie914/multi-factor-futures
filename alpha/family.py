@@ -11,7 +11,7 @@ from core.registry import register
 from core.types import Date, ExpectedReturns, FactorMatrix, ReturnMatrix, Universe, UniverseSchedule
 from factors.utils import stack_factors_and_returns
 from research.governance import factor_family
-from alpha.ols import OLSModel
+from alpha.ols import OLSModel, _prediction_matrix
 
 
 @register("return_model", "family_equal_weight")
@@ -24,6 +24,10 @@ class FamilyEqualWeightModel(ReturnModel):
         max_factors_per_family: int = 0,
         family_map: Optional[Mapping[str, str]] = None,
     ):
+        if int(ic_window) < 0:
+            raise ValueError("ic_window must be non-negative")
+        if int(max_factors_per_family) < 0:
+            raise ValueError("max_factors_per_family must be non-negative")
         self.ic_window = int(ic_window)
         self.max_factors_per_family = int(max_factors_per_family)
         self.family_map = dict(family_map or {})
@@ -38,10 +42,13 @@ class FamilyEqualWeightModel(ReturnModel):
         universe: UniverseSchedule = None,
     ) -> "FamilyEqualWeightModel":
         if not factors:
-            return self
+            raise ValueError("family alpha fit requires at least one factor")
+        self._fitted = False
+        self._selected = {}
+        self._directions = {}
         merged, names, _, _, _ = stack_factors_and_returns(factors, forward_returns)
         if merged.empty:
-            return self
+            raise ValueError("family alpha fit has no complete observations")
         dates = merged.index.get_level_values(0).unique()
         if self.ic_window > 0:
             merged = merged.loc[dates[-self.ic_window:]]
@@ -51,7 +58,9 @@ class FamilyEqualWeightModel(ReturnModel):
 
         grouped: Dict[str, list[tuple[str, float]]] = {}
         for index, name in enumerate(names):
-            value = float(ic[index]) if np.isfinite(ic[index]) else 0.0
+            if not np.isfinite(ic[index]):
+                raise ValueError(f"family alpha IC is invalid for factor {name!r}")
+            value = float(ic[index])
             family = factor_family(name, self.family_map)
             grouped.setdefault(family, []).append((name, value))
         self._selected = {}
@@ -73,15 +82,18 @@ class FamilyEqualWeightModel(ReturnModel):
         date: Date,
     ) -> ExpectedReturns:
         if not self._fitted:
-            return pd.Series(0.0, index=universe)
+            raise RuntimeError("family alpha model is not fitted")
+        selected_names = list(self._directions)
+        exposure_frame = pd.DataFrame(
+            _prediction_matrix(factors, selected_names, universe, date),
+            index=universe,
+            columns=selected_names,
+        )
         family_forecasts = []
         for names in self._selected.values():
             exposures = []
             for name in names:
-                frame = factors.get(name)
-                if frame is None or date not in frame.index:
-                    continue
-                row = frame.loc[date].reindex(universe).astype(float)
+                row = exposure_frame[name]
                 std = float(row.std(ddof=0))
                 standardized = (
                     (row - float(row.mean())) / std if std > 1e-12 else row * 0.0
@@ -90,5 +102,8 @@ class FamilyEqualWeightModel(ReturnModel):
             if exposures:
                 family_forecasts.append(pd.concat(exposures, axis=1).mean(axis=1))
         if not family_forecasts:
-            return pd.Series(0.0, index=universe)
-        return pd.concat(family_forecasts, axis=1).mean(axis=1).reindex(universe).fillna(0.0)
+            raise RuntimeError("family alpha produced no family forecasts")
+        result = pd.concat(family_forecasts, axis=1).mean(axis=1).reindex(universe)
+        if result.isna().any():
+            raise RuntimeError("family alpha prediction contains missing values")
+        return result

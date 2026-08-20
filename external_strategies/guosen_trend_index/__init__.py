@@ -1,4 +1,4 @@
-"""Guosen China Assets Trend Allocation Index-style adapter."""
+"""Branch B1: Guosen China Assets Trend Allocation Index-style adapter."""
 
 from .strategy import (
     ExternalBacktestResult,

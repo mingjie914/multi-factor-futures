@@ -56,10 +56,13 @@ def read_csv(path: str | Path, index_col: int | str | None = 0) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(path, index_col=index_col)
     # monitoring 面板 index 均为交易日, 统一解析为 DatetimeIndex
-    try:
-        df.index = pd.DatetimeIndex(df.index)
-    except Exception:
-        pass
+    if index_col is not None:
+        try:
+            df.index = pd.to_datetime(df.index, errors="raise")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"monitoring CSV index must be parseable as dates: {path}"
+            ) from exc
     return df
 
 
@@ -104,14 +107,22 @@ def save_signals(signals: dict[str, pd.DataFrame], returns: pd.DataFrame, close:
 
 def load_signals() -> dict[str, pd.DataFrame]:
     """加载信号面板; 无数据时返回空 dict."""
-    meta = read_json(SIGNALS_DIR / "signals_meta.json", default={})
+    meta_path = SIGNALS_DIR / "signals_meta.json"
+    meta = read_json(meta_path, default={})
+    if not meta:
+        return {}
     factors = meta.get("factors", [])
+    if not isinstance(factors, list) or not factors or len(factors) != len(set(factors)):
+        raise ValueError(f"invalid monitoring signal manifest: {meta_path}")
     out: dict[str, pd.DataFrame] = {}
     for name in factors:
         p = SIGNALS_DIR / f"signal_{name}.csv"
+        if not p.is_file():
+            raise FileNotFoundError(f"monitoring signal file is missing: {p}")
         df = read_csv(p)
-        if not df.empty:
-            out[name] = df
+        if df.empty:
+            raise ValueError(f"monitoring signal file is empty: {p}")
+        out[name] = df
     return out
 
 

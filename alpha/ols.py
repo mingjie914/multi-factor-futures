@@ -36,6 +36,10 @@ def _fit_linear_coefficients(
     """Fit OLS/Ridge without penalizing the intercept."""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).reshape(-1)
+    if X.ndim != 2 or X.shape[0] != y.size or X.shape[0] == 0 or X.shape[1] == 0:
+        raise ValueError("linear fit requires non-empty aligned 2D inputs")
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError("linear fit inputs contain NaN/Inf")
     alpha = float(ridge_alpha)
     if alpha < 0:
         raise ValueError("ridge_alpha must be non-negative")
@@ -80,7 +84,7 @@ def _select_ridge_alpha_time_series(
     date_values = pd.DatetimeIndex(dates)
     unique_dates = date_values.unique().sort_values()
     if len(unique_dates) < 20:
-        return candidates[len(candidates) // 2]
+        raise ValueError("ridge validation requires at least 20 distinct dates")
 
     n_folds = max(int(n_folds), 1)
     initial = max(int(len(unique_dates) * 0.5), 10)
@@ -138,9 +142,31 @@ def _select_ridge_alpha_time_series(
         if values
     }
     if not valid_scores:
-        return candidates[len(candidates) // 2]
+        raise RuntimeError("ridge validation produced no usable fold")
     # Prefer the stronger regularizer when validation losses are exactly tied.
     return min(valid_scores, key=lambda alpha: (valid_scores[alpha], -alpha))
+
+
+def _prediction_matrix(
+    factors: Dict[str, FactorMatrix],
+    factor_names: List[str],
+    universe: Universe,
+    date: Date,
+) -> np.ndarray:
+    """Build an exact, finite point-in-time factor matrix in fitted order."""
+    missing = [name for name in factor_names if name not in factors]
+    if missing:
+        raise ValueError("prediction factors are missing: " + ", ".join(missing))
+    columns = []
+    for name in factor_names:
+        frame = factors[name]
+        if not isinstance(frame, pd.DataFrame) or date not in frame.index:
+            raise ValueError(f"factor {name!r} has no observation at {date}")
+        row = pd.to_numeric(frame.loc[date].reindex(universe), errors="coerce")
+        if row.isna().any() or not np.isfinite(row.to_numpy(dtype=float)).all():
+            raise ValueError(f"factor {name!r} contains missing/non-finite exposure at {date}")
+        columns.append(row.to_numpy(dtype=float))
+    return np.column_stack(columns)
 
 
 @register("return_model", "ols")
@@ -177,6 +203,7 @@ class OLSModel(ReturnModel):
         self._direction_adaptive = direction_adaptive
         # 保存 fit 时的因子方向 (用于 predict 时保持一致)
         self._factor_directions: np.ndarray | None = None
+        self._factor_names: list[str] = []
 
     def fit(
         self,
@@ -187,13 +214,16 @@ class OLSModel(ReturnModel):
         """一次性池化回归: stack 所有因子和收益 → 对齐 → lstsq."""
         factor_names = sorted(factors.keys())
         if not factor_names:
-            return self
+            raise ValueError("OLS fit requires at least one factor")
+        self._fitted = False
+        self._coef = None
+        self._factor_names = factor_names
 
         merged, factor_names, X_vals, y_vals, _ = stack_factors_and_returns(
             factors, forward_returns
         )
         if len(merged) < len(factor_names) + 5:
-            return self
+            raise ValueError("OLS fit has insufficient complete observations")
 
         if self._fit_intercept:
             X_vals = np.column_stack([np.ones(X_vals.shape[0]), X_vals])
@@ -299,17 +329,8 @@ class OLSModel(ReturnModel):
         date: Date,
     ) -> ExpectedReturns:
         if not self._fitted or self._coef is None:
-            return pd.Series(0.0, index=universe)
-
-        xs = []
-        for name in sorted(factors.keys()):
-            f = factors[name]
-            if date in f.index:
-                xs.append(f.loc[date])
-        if not xs:
-            return pd.Series(0.0, index=universe)
-
-        X = pd.concat(xs, axis=1).reindex(universe).fillna(0).values
+            raise RuntimeError("OLS model is not fitted")
+        X = _prediction_matrix(factors, self._factor_names, universe, date)
         # CR-010: 因子矩阵保持原始方向, 系数自然携带正负号, 不再乘 _factor_directions
         pred = X @ self._coef + self._intercept
         return pd.Series(pred, index=universe)
@@ -342,12 +363,15 @@ class RidgeModel(OLSModel):
     ) -> "RidgeModel":
         factor_names = sorted(factors.keys())
         if not factor_names:
-            return self
+            raise ValueError("Ridge fit requires at least one factor")
+        self._fitted = False
+        self._coef = None
+        self._factor_names = factor_names
         merged, factor_names, X_vals, y_vals, _ = stack_factors_and_returns(
             factors, forward_returns
         )
         if len(merged) < len(factor_names) + 5:
-            return self
+            raise ValueError("Ridge fit has insufficient complete observations")
         alpha = self._ridge_alpha
         if self._ridge_alphas:
             alpha = _select_ridge_alpha_time_series(
@@ -400,8 +424,10 @@ class ICWeightedModel(ReturnModel):
         ic_window: int = 60,
         ic_decay: int = 0,
     ):
-        self._ic_window = ic_window
-        self._ic_decay = ic_decay
+        if int(ic_window) < 0 or int(ic_decay) < 0:
+            raise ValueError("ic_window and ic_decay must be non-negative")
+        self._ic_window = int(ic_window)
+        self._ic_decay = int(ic_decay)
         self._factor_ics: Dict[str, float] = {}
         # CR-010: 删除 _factor_directions, IC 本身已带符号, 无需单独记录方向
         self._fitted = False
@@ -415,13 +441,15 @@ class ICWeightedModel(ReturnModel):
         """计算每个因子的近期 IC 作为合成权重."""
         factor_names = sorted(factors.keys())
         if not factor_names:
-            return self
+            raise ValueError("IC-weighted fit requires at least one factor")
+        self._fitted = False
+        self._factor_ics = {}
 
         merged, factor_names, _, _, _ = stack_factors_and_returns(
             factors, forward_returns
         )
         if len(merged) < 20:
-            return self
+            raise ValueError("IC-weighted fit requires at least 20 complete observations")
 
         # 取近期数据
         if self._ic_window > 0:
@@ -435,18 +463,35 @@ class ICWeightedModel(ReturnModel):
         X_raw = recent_data[factor_names].values
         y_raw = recent_data["fwd_ret"].values
 
-        # 计算每个因子的 IC
-        ics = OLSModel._compute_ic_vector(X_raw, y_raw, len(factor_names))
-
-        # 指数衰减加权 (若启用)
-        if self._ic_decay > 0 and self._ic_window > 0:
-            # 对近 ic_window 天的数据做指数衰减
-            # 这里简化: 用半衰期调整 IC 权重
-            decay_factor = np.exp(-np.log(2) / self._ic_decay)
-            ics = ics * decay_factor
+        if self._ic_decay > 0:
+            row_dates = pd.DatetimeIndex(recent_data.index.get_level_values(0))
+            unique_dates = row_dates.unique().sort_values()
+            date_positions = pd.Series(
+                np.arange(len(unique_dates), dtype=float), index=unique_dates
+            )
+            ages = (len(unique_dates) - 1.0) - date_positions.reindex(row_dates).to_numpy()
+            observation_weights = np.power(0.5, ages / self._ic_decay)
+            observation_weights /= observation_weights.sum()
+            x_mean = observation_weights @ X_raw
+            y_mean = float(observation_weights @ y_raw)
+            centered_x = X_raw - x_mean
+            centered_y = y_raw - y_mean
+            numerator = (observation_weights[:, None] * centered_x).T @ centered_y
+            x_variance = np.sum(
+                observation_weights[:, None] * centered_x**2, axis=0
+            )
+            y_variance = float(np.sum(observation_weights * centered_y**2))
+            denominator = np.sqrt(x_variance * y_variance)
+            ics = np.full(len(factor_names), np.nan)
+            valid = denominator > 0.0
+            ics[valid] = numerator[valid] / denominator[valid]
+        else:
+            ics = OLSModel._compute_ic_vector(X_raw, y_raw, len(factor_names))
 
         for i, name in enumerate(factor_names):
-            ic = float(ics[i]) if not np.isnan(ics[i]) else 0.0
+            if not np.isfinite(ics[i]):
+                raise ValueError(f"IC estimate is invalid for factor {name!r}")
+            ic = float(ics[i])
             # CR-010: IC 本身已带符号 (ic<0 时权重为负), 不再单独记录方向
             self._factor_ics[name] = ic
 
@@ -461,28 +506,19 @@ class ICWeightedModel(ReturnModel):
     ) -> ExpectedReturns:
         """用 IC 加权合成因子暴露作为预期收益."""
         if not self._fitted:
-            return pd.Series(0.0, index=universe)
+            raise RuntimeError("IC-weighted model is not fitted")
 
         # 收集当日因子暴露
-        factor_exposures: Dict[str, pd.Series] = {}
-        for name in sorted(factors.keys()):
-            f = factors[name]
-            if date in f.index:
-                factor_exposures[name] = f.loc[date].reindex(universe).fillna(0)
-
-        if not factor_exposures:
-            return pd.Series(0.0, index=universe)
+        factor_names = sorted(self._factor_ics)
+        matrix = _prediction_matrix(factors, factor_names, universe, date)
 
         # CR-010: IC 已带符号, 权重 w=ic/Σ|ic| 自然含正负号, 不再乘 direction
         # result = Σ (IC_i × exposure_i) / Σ|IC_i|
-        total_w = sum(abs(v) for v in self._factor_ics.values()) or 1.0
-        result = pd.Series(0.0, index=universe)
-        for name, exposure in factor_exposures.items():
-            ic = self._factor_ics.get(name, 0.0)
-            w = ic / total_w
-            result += w * exposure
-
-        return result
+        total_w = sum(abs(v) for v in self._factor_ics.values())
+        if total_w <= 0.0:
+            raise RuntimeError("IC-weighted model has zero aggregate IC magnitude")
+        weights = np.array([self._factor_ics[name] / total_w for name in factor_names])
+        return pd.Series(matrix @ weights, index=universe, dtype=float)
 
 
 @register("return_model", "sector_grouped_ols")
@@ -502,14 +538,13 @@ class SectorGroupedOLSModel(ReturnModel):
         min_samples_per_sector: 每个板块最小样本数, 不足则回退到全局池化.
         fallback_to_global: 板块样本不足时是否回退到全局池化模型.
         sector_factor_map: 分板块因子集映射 {sector: [factor_name, ...]}.
-            方案B核心: 每个板块只用适配性研究确认的有效因子拟合,
+            板块因子子集机制: 每个板块只用适配性研究确认的有效因子拟合,
             过滤无效因子以降低噪声. None 或空字典表示所有板块使用全部因子
             (向后兼容). 未在 map 中的板块也使用全部因子.
     """
 
-    # 板块映射 (8板块细分: 股指/国债分开, 有色/贵金属分开)
-    # 细分依据: 股指期货与国债期货的因子-收益关系截然不同
-    #           有色金属(工业金属)与贵金属的驱动因素不同
+    # Canonical mapping is a class attribute used by _get_sector and exposed
+    # for consistency checks across research and execution.
     from core.sectors import SECTOR_MAP as _SECTOR_MAP
 
     def __init__(
@@ -524,10 +559,16 @@ class SectorGroupedOLSModel(ReturnModel):
         ridge_alphas: Optional[List[float]] = None,
         ridge_cv_folds: int = 3,
     ):
+        if int(min_samples_per_sector) <= 0:
+            raise ValueError("min_samples_per_sector must be positive")
+        if float(ridge_alpha) < 0.0:
+            raise ValueError("ridge_alpha must be non-negative")
+        if int(ridge_cv_folds) <= 0:
+            raise ValueError("ridge_cv_folds must be positive")
         self._fit_intercept = fit_intercept
         self._min_samples = min_samples_per_sector
         self._fallback_to_global = fallback_to_global
-        # 方案B: 分板块因子集 {sector: [factor_name, ...]}
+        # 分板块因子集 {sector: [factor_name, ...]}
         self._sector_factor_map: Dict[str, List[str]] = sector_factor_map or {}
         self._factor_weight_caps = {
             str(name): float(cap)
@@ -563,12 +604,15 @@ class SectorGroupedOLSModel(ReturnModel):
     ) -> "SectorGroupedOLSModel":
         """按板块分组拟合 OLS.
 
-        方案B: 若 sector_factor_map 已配置, 每个板块只用该板块的有效因子
+        若 sector_factor_map 已配置, 每个板块只用该板块的有效因子
         子集拟合, 过滤无效因子以降低噪声. 未配置的板块使用全部因子.
         """
         factor_names = sorted(factors.keys())
         if not factor_names:
-            return self
+            raise ValueError("sector model fit requires at least one factor")
+        self._fitted = False
+        self._sector_models = {}
+        self.selected_alpha_ = {}
         self._factor_names = factor_names
         self._factor_cap_vector = np.asarray(
             [self._factor_weight_caps.get(name, 1.0) for name in factor_names],
@@ -579,7 +623,18 @@ class SectorGroupedOLSModel(ReturnModel):
             factors, forward_returns
         )
         if len(merged) < len(factor_names) + 5:
-            return self
+            raise ValueError("sector model fit has insufficient complete observations")
+        configured_missing = sorted({
+            name
+            for names in self._sector_factor_map.values()
+            for name in names
+            if name not in factor_names
+        })
+        if configured_missing:
+            raise ValueError(
+                "sector_factor_map references missing factors: "
+                + ", ".join(configured_missing)
+            )
 
         # 全局模型 (回退用) — 使用全部因子
         row_dates = pd.DatetimeIndex(merged.index.get_level_values(0))
@@ -614,7 +669,7 @@ class SectorGroupedOLSModel(ReturnModel):
                 }
                 continue
 
-            # 方案B: 获取该板块的有效因子子集
+            # 获取该板块的有效因子子集
             sec_factor_names = self._sector_factor_map.get(sec)
             if sec_factor_names:
                 # 只保留在 factor_names 中存在的因子
@@ -626,9 +681,8 @@ class SectorGroupedOLSModel(ReturnModel):
                 # 未配置该板块的因子集, 使用全部因子
                 sec_indices = list(range(len(factor_names)))
 
-            # 确保因子子集不为空
             if not sec_indices:
-                sec_indices = list(range(len(factor_names)))
+                raise ValueError(f"sector {sec!r} has an empty factor set")
 
             if n_sec < self._min_samples:
                 # 样本不足, 使用全局模型 (但只取该板块有效因子列)
@@ -638,34 +692,40 @@ class SectorGroupedOLSModel(ReturnModel):
                         "intercept": self._global_intercept,
                         "factor_indices": sec_indices,
                     }
-                continue
+                    continue
+                raise ValueError(
+                    f"sector {sec!r} has insufficient samples: "
+                    f"{n_sec} < {self._min_samples}"
+                )
 
             # 只取该板块有效因子的列
             X_sec = X_vals[mask][:, sec_indices]
             y_sec = y_vals[mask]
-            try:
-                sector_alpha = self._choose_ridge_alpha(
-                    X_sec, y_sec, row_dates[mask]
-                )
-                coef_s, intercept_s = _fit_linear_coefficients(
-                    X_sec,
-                    y_sec,
-                    fit_intercept=self._fit_intercept,
-                    ridge_alpha=sector_alpha,
-                )
-                self.selected_alpha_[sec] = sector_alpha
+            sector_dates = row_dates[mask]
+            if self._ridge_alphas and len(pd.unique(sector_dates)) < 20:
+                if not self._fallback_to_global:
+                    raise ValueError(
+                        f"sector {sec!r} has fewer than 20 distinct dates for ridge validation"
+                    )
                 self._sector_models[sec] = {
-                    "coef": coef_s,
-                    "intercept": intercept_s,
+                    "coef": self._global_coef[sec_indices].copy(),
+                    "intercept": self._global_intercept,
                     "factor_indices": sec_indices,
                 }
-            except Exception:
-                if self._fallback_to_global:
-                    self._sector_models[sec] = {
-                        "coef": self._global_coef[sec_indices].copy(),
-                        "intercept": self._global_intercept,
-                        "factor_indices": sec_indices,
-                    }
+                continue
+            sector_alpha = self._choose_ridge_alpha(X_sec, y_sec, sector_dates)
+            coef_s, intercept_s = _fit_linear_coefficients(
+                X_sec,
+                y_sec,
+                fit_intercept=self._fit_intercept,
+                ridge_alpha=sector_alpha,
+            )
+            self.selected_alpha_[sec] = sector_alpha
+            self._sector_models[sec] = {
+                "coef": coef_s,
+                "intercept": intercept_s,
+                "factor_indices": sec_indices,
+            }
 
         self._fitted = True
         return self
@@ -690,31 +750,11 @@ class SectorGroupedOLSModel(ReturnModel):
     ) -> ExpectedReturns:
         """按品种所属板块使用对应系数预测.
 
-        方案B: 每个品种使用其板块的因子子集和对应系数进行预测.
+        每个品种使用其板块的因子子集和对应系数进行预测.
         """
         if not self._fitted or self._global_coef is None:
-            return pd.Series(0.0, index=universe)
-
-        # 收集当日因子暴露
-        xs = []
-        for name in self._factor_names:
-            f = factors.get(name)
-            if f is not None and date in f.index:
-                xs.append(f.loc[date])
-            elif f is not None:
-                frame = f if f.index.is_monotonic_increasing else f.sort_index()
-                pos = int(frame.index.searchsorted(pd.Timestamp(date), side="right")) - 1
-                if pos < 0:
-                    raise ValueError(
-                        f"factor {name!r} has no observation available as of {date}"
-                    )
-                xs.append(frame.iloc[pos])
-            else:
-                xs.append(pd.Series(0.0, index=universe, name=name))
-        if not xs:
-            return pd.Series(0.0, index=universe)
-
-        X = pd.concat(xs, axis=1).reindex(universe).fillna(0).values
+            raise RuntimeError("sector model is not fitted")
+        X = _prediction_matrix(factors, self._factor_names, universe, date)
         X = X * self._factor_cap_vector[None, :]
 
         # 按品种板块选择系数 + 因子子集
@@ -726,7 +766,8 @@ class SectorGroupedOLSModel(ReturnModel):
                 indices = model["factor_indices"]
                 result[i] = X[i][indices] @ model["coef"] + model["intercept"]
             else:
-                # 回退: 使用全局模型 (全部因子)
+                if not self._fallback_to_global:
+                    raise RuntimeError(f"sector {sec!r} has no fitted model")
                 result[i] = X[i] @ self._global_coef + self._global_intercept
 
         return pd.Series(result, index=universe)

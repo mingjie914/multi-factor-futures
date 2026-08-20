@@ -1,6 +1,6 @@
 """日内分钟级因子 SPEC 定义 (15分钟频率).
 
-本模块定义 frequency="15min" 的 SPEC 因子, 使用 DolphinDB 分钟K线数据计算.
+本模块定义 frequency="15min" 的 SPEC 因子, 使用本地分钟 Parquet 计算.
 与日度 SPEC (factors/specs/*.py) 的区别:
 - frequency 字段为 "15min"
 - slug 后缀用 "p" (period) 而非 "d" (day), 避免与日度因子混淆
@@ -24,13 +24,13 @@ base 因子 (复用现有日度 base, 在分钟级数据上计算):
 8 个 base × 8 种 transform × 3 种窗口 = 192 个因子
 
 数据依赖:
-- 需要 DolphinDB 分钟K线数据 (data.source = ddb_futures 或 DDBSource 可用)
-- 当 DDB 不可用时, 因子返回 NaN (优雅降级, 不影响回测)
+- 需要已发布的本地15分钟Parquet
+- 发现扫描中缺失数据返回 NaN；正式选中因子缺失依赖时失败关闭
 - 计算后按日重采样 (取每日最后一个bar的值), 输出日度DataFrame
 
 集成方式:
 - SpecFactor.compute 根据 frequency 字段路由: "15min" 走分钟数据路径
-- 分钟数据通过 DDBSource.fetch_price_at_frequency() 获取
+- 分钟数据通过 DataManager/FrequencyDataProvider 获取
 - 计算结果按日聚合后, 与日度因子无缝共存
 """
 from __future__ import annotations

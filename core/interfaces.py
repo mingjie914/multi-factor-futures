@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol
 
 import numpy as np  # noqa: F401
 import pandas as pd
@@ -18,13 +18,9 @@ from core.types import (
     ExpectedReturns,
     FactorMatrix,
     IndustryMapping,
-    MarketState,
     NAVSeries,
-    Position,
     PricePanel,
     ReturnMatrix,
-    Signal,
-    SignalFrame,
     SpecificRisk,
     TickerIndex,
     Universe,
@@ -244,8 +240,8 @@ class DataSource(abc.ABC):
         """Fetch price data at a specific frequency (周期感知接口).
 
         默认实现: 当 frequency == "daily" 时回退到 fetch_price (日度数据),
-        否则抛出 NotImplementedError. 子类 (如 DolphinDB 数据源) 可重写
-        以支持 15min / 30min / hourly 等日内周期.
+        否则抛出 NotImplementedError. 支持分钟数据的 Parquet 数据源可重写
+        该接口.
 
         Args:
             tickers: 标的列表
@@ -264,8 +260,22 @@ class DataSource(abc.ABC):
             return self.fetch_price(tickers, start, end, fields)
         raise NotImplementedError(
             f"{self.__class__.__name__} 不支持 frequency={frequency!r}, "
-            f"仅支持 daily. 请使用 DolphinDB 等支持分钟数据的源."
+            f"仅支持 daily. 请使用支持该周期的 Parquet 数据源."
         )
+
+    def fetch_contract_schedule(
+        self,
+        tickers: TickerIndex,
+        start: Date,
+        end: Date,
+    ) -> Optional[pd.DataFrame]:
+        """Return concrete contracts effective by root/date when available.
+
+        Sources that expose only an opaque continuous series return ``None``.
+        Formal futures ledgers can then distinguish an unavailable contract
+        schedule from a genuine no-roll interval.
+        """
+        return None
 
     def fetch_macro(
         self,
@@ -491,7 +501,7 @@ class CostModel(abc.ABC):
         current_weights: WeightVector,
         date: Date,
     ) -> float:
-        """Estimate the total cost of transitioning from current to target."""
+        """Estimate transition cost on the date the target becomes effective."""
         ...
 
     def estimate_holding_cost(
@@ -501,77 +511,6 @@ class CostModel(abc.ABC):
     ) -> float:
         """Estimate a daily portfolio-level carry or management fee."""
         return 0.0
-
-
-# ---------------------------------------------------------------------------
-# Signal generator
-# ---------------------------------------------------------------------------
-
-
-class SignalGenerator(abc.ABC):
-    """Generates trading signals from target weights and market state."""
-
-    name: str = ""
-    mode: str = ""
-
-    @abc.abstractmethod
-    def generate(
-        self,
-        target_weights: WeightVector,
-        current_positions: pd.DataFrame,
-        factor_snapshot: Dict[str, pd.Series],
-        market_state: MarketState,
-        mode_params: Dict,
-        date: Date,
-    ) -> SignalFrame:
-        """Generate a frame of trading signals for the given date."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Position sizer
-# ---------------------------------------------------------------------------
-
-
-class PositionSizer(abc.ABC):
-    """Determines contract / share quantity from a target weight."""
-
-    @abc.abstractmethod
-    def size(
-        self,
-        target_weight: float,
-        price: float,
-        account_value: float,
-        ticker: str,
-        point_value: float,
-    ) -> int:
-        """Return the number of contracts / shares to trade."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Stop-loss / take-profit rule
-# ---------------------------------------------------------------------------
-
-
-class SLTPRule(abc.ABC):
-    """A rule that decides whether a position should be closed."""
-
-    name: str = ""
-
-    @abc.abstractmethod
-    def should_close(
-        self,
-        position: Position,
-        market_state: MarketState,
-        entry_context: Dict,
-    ) -> Tuple[bool, str]:
-        """Evaluate whether *position* should be closed.
-
-        Returns:
-            A tuple of (should_close, reason).
-        """
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +584,6 @@ class BacktestResult(Protocol):
         """Plot backtest performance charts and optionally save them."""
         ...
 
-    def export_signals(self, path: str) -> None:
-        """Export all generated signals to a file."""
+    def export_target_weights(self, path: str, as_of=None) -> str:
+        """Export a deterministic close-observed target-weight snapshot."""
         ...

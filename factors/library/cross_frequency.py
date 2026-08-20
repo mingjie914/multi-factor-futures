@@ -15,9 +15,9 @@
     8. daily_mom_x_amihud:           日度动量 × Amihud非流动性 (趋势+流动性确认)
 
 数据依赖:
-    - 日度 OHLCV: 通过 DataManager.get(close/volume) 获取 (MySQL 或 DDB)
-    - 日内特征: 通过 DataManager.get(intraday_field) 获取 (仅 DDBSource)
-    - 当 DDB 不可用时, 日内字段返回 NaN, 因子优雅降级为 NaN
+    - 日度 OHLCV: 通过 DataManager 从本地日线 Parquet 获取
+    - 日内特征: 通过 DataManager 从本地分钟 Parquet 聚合获取
+    - 发现扫描允许缺失因子保持 NaN；正式选中因子必须通过严格完整性检查
 
 计算逻辑:
     1. 获取日度因子值 (如 5日收益率)
@@ -76,10 +76,7 @@ class CrossFrequencyFactorBase(Factor):
         if daily_raw is None or daily_raw.empty or daily_raw.isna().all().all():
             return pd.DataFrame(np.nan, index=dates, columns=universe)
 
-        try:
-            daily_signal = self._compute_daily(daily_raw)
-        except Exception:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily_signal = self._compute_daily(daily_raw)
 
         # 2. 获取日内特征数据
         if not self.intraday_field:
@@ -87,7 +84,7 @@ class CrossFrequencyFactorBase(Factor):
 
         intraday_raw = data.get(self.intraday_field, dates, universe)
         if intraday_raw is None or intraday_raw.empty or intraday_raw.isna().all().all():
-            # DDB 不可用, 日内字段全 NaN, 优雅降级
+            # 发现扫描保持缺失；正式选中因子由严格计算链拒绝。
             return pd.DataFrame(np.nan, index=dates, columns=universe)
 
         # 3. 日内特征滚动均值

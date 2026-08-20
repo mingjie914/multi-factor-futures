@@ -1,6 +1,4 @@
-r"""验证所有模块可正确导入.
-用法: D:\veighna_studio\python.exe tests\test_import.py
-"""
+r"""验证正式模块可使用当前项目解释器正确导入."""
 from __future__ import annotations
 import sys
 import os
@@ -27,23 +25,20 @@ def test_imports():
 
     # L0
     try:
-        from core.types import (MarketState, Position, Signal,
-                                FactorMatrix, ReturnMatrix, WeightVector, NAVSeries)
+        from core.types import FactorMatrix, ReturnMatrix, WeightVector, NAVSeries
         from core.interfaces import (Factor, DataProvider, DataSource, RiskModel, Optimizer)
         from core.registry import register, get, create, list_registered, register_factor
         from core.market import Market
-        from core.mode import StrategyMode
         from core.logger import setup_logger
         print("  [PASS] Core (L0)")
     except Exception as e:
         _record_failure("L0", "Core", e)
 
-    # L1 — data (akshare 是惰性导入, 不影响)
+    # L1 — data
     try:
         from data.cache import Cache
         from data.manager import DataManager
-        from data.mysql_source import MySQLSource
-        from data import akshare_futures_source  # noqa: F401 — 不触发 akshare import
+        from data.parquet_source import ParquetFuturesSource
         print("  [PASS] Data (L1)")
     except Exception as e:
         _record_failure("L1", "Data", e)
@@ -62,7 +57,6 @@ def test_imports():
         from testing.layered import LayeredBacktest
         from testing.regression import RegressionTest
         from alpha.ols import OLSModel
-        from alpha.combiner import combine_equal
         from risk.barra_futures import BarraFuturesModel
         print("  [PASS] Testing + Alpha + Risk (L3)")
     except Exception as e:
@@ -73,13 +67,10 @@ def test_imports():
         from optimization.mean_variance import MeanVarianceOptimizer
         from optimization.constraints import LongOnlyConstraint, TurnoverConstraint
         from optimization.costs import SimpleFuturesCost
-        from signals.modes.trend_following import TrendFollowingGenerator
-        from signals.position_sizing import ATRBasedSizer
-        from signals.sl_tp import TakeProfitRule, HardStopLossRule
-        from signals.output import SignalOutput
-        print("  [PASS] Optimization + Signals (L4)")
+        from optimization.asset_selection import SectorForecastSelector
+        print("  [PASS] Optimization (L4)")
     except Exception as e:
-        _record_failure("L4", "Optimization + Signals", e)
+        _record_failure("L4", "Optimization", e)
 
     # L5
     try:

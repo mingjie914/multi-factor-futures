@@ -39,7 +39,8 @@ def compute_annual_return(nav: pd.Series, periods_per_year: int = TRADING_DAYS_P
     if len(nav) < 2:
         return 0.0
     total_ret = nav.iloc[-1] / nav.iloc[0] - 1
-    n_years = len(nav) / periods_per_year
+    # N marked NAV observations span N-1 return intervals.
+    n_years = (len(nav) - 1) / periods_per_year
     return float((1 + total_ret) ** (1 / n_years) - 1) if n_years > 0 else 0.0
 
 
@@ -93,14 +94,14 @@ def compute_split_metrics(
     minimum_train_bars: int = 750,
     minimum_test_bars: int = 250,
 ) -> Dict[str, Dict[str, float]]:
-    """样本外验证: 将回测期间按 train_ratio 分割, 分别计算前段(训练期)和后段(测试期)指标.
+    """历史分段诊断: 按 train_ratio 分割回测期间并分别计算前后段指标.
 
-    用于检测过拟合: 若测试期绩效显著低于训练期, 说明策略可能过拟合.
+    该结果只是固定历史样本内的分段诊断，不是真正的未见样本外验证。
 
     Args:
         nav: 日度净值序列.
         returns: 日度收益序列 (可选, 默认从 nav 推导).
-        train_ratio: 训练期占比 (默认 0.6, 即前 60% 为训练期).
+        train_ratio: 前段占比 (默认 0.75, 即前 75% 为前段).
         periods_per_year: 年化频率 (日度=252).
 
     Returns:
@@ -122,12 +123,15 @@ def compute_split_metrics(
     # 训练期: 从起点到 split_idx (归一化 nav 从 1 开始)
     nav_train = nav.iloc[:split_idx]
     nav_train = nav_train / nav_train.iloc[0]
-    ret_train = ret.iloc[:split_idx]
+    ret = ret.reindex(nav.index)
+    ret_train = ret.iloc[1:split_idx]
 
     # 测试期: 从 split_idx 到终点 (归一化 nav 从 1 开始)
     nav_test = nav.iloc[split_idx:]
     nav_test = nav_test / nav_test.iloc[0]
-    ret_test = ret.iloc[split_idx:]
+    # The first test NAV is the segment anchor; its return belongs to the
+    # preceding train-to-test boundary and must not be counted in either side.
+    ret_test = ret.iloc[split_idx + 1:]
 
     return {
         "train": compute_all_metrics(

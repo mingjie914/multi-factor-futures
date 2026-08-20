@@ -26,7 +26,8 @@ class BarraFuturesModel(RiskModel):
     derived from historical daily returns and market data using a fixed set of
     styles (momentum, volatility, skewness, liquidity and carry), plus sector
     dummies. When the cross-sectional factor model cannot be estimated, the
-    model falls back to a shrunk asset covariance matrix.
+    model uses a documented shrunk asset-covariance path when the
+    cross-sectional factor model cannot be identified.
 
     ``forward_returns`` keeps its historical interface name for compatibility,
     but callers must pass one-period historical returns. The backtester does so
@@ -41,7 +42,6 @@ class BarraFuturesModel(RiskModel):
         "liquidity",
     )
     _MIN_VARIANCE = 1e-8
-    _FALLBACK_DAILY_VARIANCE = 1e-4
 
     def __init__(
         self,
@@ -51,6 +51,15 @@ class BarraFuturesModel(RiskModel):
     ):
         requested = style_factors or list(self._DEFAULT_STYLES)
         self._configured_style_factors = tuple(str(name).lower() for name in requested)
+        unknown = sorted(set(self._configured_style_factors) - set(self._DEFAULT_STYLES))
+        if unknown:
+            raise ValueError("unknown risk style factors: " + ", ".join(unknown))
+        if not self._configured_style_factors:
+            raise ValueError("at least one risk style factor is required")
+        if int(estimation_window) < 20:
+            raise ValueError("estimation_window must be at least 20")
+        if str(covariance_estimator).lower() not in {"sample", "shrinkage"}:
+            raise ValueError("covariance_estimator must be 'sample' or 'shrinkage'")
         self._style_factors = list(self._configured_style_factors)
         self._window = max(int(estimation_window), 20)
         self._cov_method = str(covariance_estimator).lower()
@@ -69,6 +78,7 @@ class BarraFuturesModel(RiskModel):
         self._prefetched_dates = pd.DatetimeIndex([])
         self._prefetched_assets = pd.Index([])
         self._prefetched_market: Dict[str, object] = {}
+        self.last_covariance_mode: Optional[str] = None
 
     def prepare_data(
         self, data: DataProvider, dates, assets
@@ -87,30 +97,18 @@ class BarraFuturesModel(RiskModel):
         market: Dict[str, object] = {}
         if "liquidity" in self._configured_style_factors:
             for field in ("volume", "close"):
-                try:
-                    market[field] = data.get(field, dates, assets).reindex(
-                        index=dates, columns=assets
-                    )
-                except Exception:
-                    market[field] = None
+                market[field] = data.get(field, dates, assets).reindex(
+                    index=dates, columns=assets
+                )
         if "carry" in self._configured_style_factors:
-            try:
-                pair = data.get_contract_pair("close", dates, assets)
-                market["near"] = pair.get("near", pd.DataFrame()).reindex(
-                    index=dates, columns=assets
-                )
-                market["far"] = pair.get("far", pd.DataFrame()).reindex(
-                    index=dates, columns=assets
-                )
-            except Exception:
-                market["near"] = None
-                market["far"] = None
-        try:
-            market["industry"] = data.get_industry(dates, assets).reindex(
-                index=dates, columns=assets
-            )
-        except Exception:
-            market["industry"] = None
+            pair = data.get_contract_pair("close", dates, assets)
+            if not isinstance(pair, dict) or "near" not in pair or "far" not in pair:
+                raise TypeError("risk carry source must return near/far panels")
+            market["near"] = pair["near"].reindex(index=dates, columns=assets)
+            market["far"] = pair["far"].reindex(index=dates, columns=assets)
+        market["industry"] = data.get_industry(dates, assets).reindex(
+            index=dates, columns=assets
+        )
 
         self._prefetched_provider_id = id(data)
         self._prefetched_dates = dates
@@ -136,11 +134,19 @@ class BarraFuturesModel(RiskModel):
 
         returns = self._clean_returns(forward_returns)
         if returns.empty:
-            return self
+            raise ValueError("risk model requires non-empty historical returns")
         self._asset_returns = returns
         self._asset_return_var = self._variance_asof(returns, returns.index[-1])
 
         exposures = self._build_risk_exposures(data, returns)
+        missing_styles = [
+            name for name in self._configured_style_factors if name not in exposures
+        ]
+        if missing_styles:
+            raise RuntimeError(
+                "risk model could not build configured styles: "
+                + ", ".join(missing_styles)
+            )
         self._exposures = exposures
         self._risk_factor_names = list(exposures)
         self._style_factors = [
@@ -172,13 +178,16 @@ class BarraFuturesModel(RiskModel):
         self._asset_return_var = None
         self._factor_cov_cache = {}
         self._asset_cov_cache = {}
+        self.last_covariance_mode = None
 
     def _clean_returns(self, returns: ReturnMatrix) -> pd.DataFrame:
         if returns is None or returns.empty:
             return pd.DataFrame()
         frame = returns.copy()
         frame.index = self._normalise_index(frame.index)
-        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        if frame.index.has_duplicates:
+            raise ValueError("risk return history contains duplicate dates")
+        frame = frame.sort_index()
         frame = frame.apply(pd.to_numeric, errors="coerce")
         frame = frame.replace([np.inf, -np.inf], np.nan)
         frame = frame.dropna(axis=1, how="all")
@@ -247,71 +256,53 @@ class BarraFuturesModel(RiskModel):
     def _load_liquidity(
         self, data: DataProvider, dates: pd.DatetimeIndex, assets: pd.Index
     ) -> Optional[pd.DataFrame]:
-        try:
-            cached_volume = self._prefetched_market.get("volume")
-            cached_close = self._prefetched_market.get("close")
-            if isinstance(cached_volume, pd.DataFrame) and isinstance(cached_close, pd.DataFrame):
-                volume = cached_volume.reindex(index=dates, columns=assets)
-                close = cached_close.reindex(index=dates, columns=assets)
-            else:
-                volume = data.get("volume", dates, assets).reindex(index=dates, columns=assets)
-                close = data.get("close", dates, assets).reindex(index=dates, columns=assets)
-            traded_value_proxy = close.abs() * volume.clip(lower=0)
-            result = np.log1p(traded_value_proxy).rolling(20, min_periods=10).mean()
-            return result if result.notna().any().any() else None
-        except Exception:
-            return None
+        cached_volume = self._prefetched_market.get("volume")
+        cached_close = self._prefetched_market.get("close")
+        if isinstance(cached_volume, pd.DataFrame) and isinstance(cached_close, pd.DataFrame):
+            volume = cached_volume.reindex(index=dates, columns=assets)
+            close = cached_close.reindex(index=dates, columns=assets)
+        else:
+            volume = data.get("volume", dates, assets).reindex(index=dates, columns=assets)
+            close = data.get("close", dates, assets).reindex(index=dates, columns=assets)
+        traded_value_proxy = close.abs() * volume.clip(lower=0)
+        result = np.log1p(traded_value_proxy).rolling(20, min_periods=10).mean()
+        return result if result.notna().any().any() else None
 
     def _load_carry(
         self, data: DataProvider, dates: pd.DatetimeIndex, assets: pd.Index
     ) -> Optional[pd.DataFrame]:
-        try:
-            cached_near = self._prefetched_market.get("near")
-            cached_far = self._prefetched_market.get("far")
-            if isinstance(cached_near, pd.DataFrame) and isinstance(cached_far, pd.DataFrame):
-                near = cached_near.reindex(index=dates, columns=assets)
-                far = cached_far.reindex(index=dates, columns=assets)
-            else:
-                pair = data.get_contract_pair("close", dates, assets)
-                near = pair.get("near", pd.DataFrame()).reindex(index=dates, columns=assets)
-                far = pair.get("far", pd.DataFrame()).reindex(index=dates, columns=assets)
-            valid = (near > 0) & (far > 0)
-            carry = np.log(near.where(valid) / far.where(valid))
-            carry = carry.rolling(5, min_periods=3).mean()
-            return carry if carry.notna().any().any() else None
-        except Exception:
-            return None
+        cached_near = self._prefetched_market.get("near")
+        cached_far = self._prefetched_market.get("far")
+        if isinstance(cached_near, pd.DataFrame) and isinstance(cached_far, pd.DataFrame):
+            near = cached_near.reindex(index=dates, columns=assets)
+            far = cached_far.reindex(index=dates, columns=assets)
+        else:
+            pair = data.get_contract_pair("close", dates, assets)
+            if not isinstance(pair, dict) or "near" not in pair or "far" not in pair:
+                raise TypeError("risk carry source must return near/far panels")
+            near = pair["near"].reindex(index=dates, columns=assets)
+            far = pair["far"].reindex(index=dates, columns=assets)
+        valid = (near > 0) & (far > 0)
+        carry = np.log(near.where(valid) / far.where(valid))
+        carry = carry.rolling(5, min_periods=3).mean()
+        return carry if carry.notna().any().any() else None
 
     def _sector_exposures(
         self, data: DataProvider, dates: pd.DatetimeIndex, assets: pd.Index
     ) -> Dict[str, pd.DataFrame]:
-        try:
-            cached_industry = self._prefetched_market.get("industry")
-            if isinstance(cached_industry, pd.DataFrame):
-                industry = cached_industry.reindex(index=dates, columns=assets)
-            else:
-                industry = data.get_industry(dates, assets).reindex(index=dates, columns=assets)
-        except Exception:
-            industry = pd.DataFrame(index=dates, columns=assets, dtype=object)
+        cached_industry = self._prefetched_market.get("industry")
+        if isinstance(cached_industry, pd.DataFrame):
+            industry = cached_industry.reindex(index=dates, columns=assets)
+        else:
+            industry = data.get_industry(dates, assets).reindex(index=dates, columns=assets)
 
-        if industry.empty or industry.notna().sum().sum() == 0:
-            try:
-                from core.sectors import SECTOR_MAP
-
-                labels = pd.Series(
-                    [SECTOR_MAP.get(str(asset), "other") for asset in assets],
-                    index=assets,
-                )
-                industry = pd.DataFrame(
-                    np.tile(labels.to_numpy(), (len(dates), 1)),
-                    index=dates,
-                    columns=assets,
-                )
-            except Exception:
-                return {}
-
-        industry = industry.astype(object).where(industry.notna(), "other")
-        industry = industry.apply(lambda col: col.map(lambda value: str(value).strip() or "other"))
+        if industry.empty or industry.isna().any().any():
+            raise RuntimeError("risk industry classification is missing")
+        industry = industry.astype(object).apply(
+            lambda col: col.map(lambda value: str(value).strip())
+        )
+        if industry.eq("").any().any():
+            raise RuntimeError("risk industry classification contains empty labels")
         first_labels = industry.iloc[0]
         first_counts = first_labels.value_counts()
         if first_counts.empty:
@@ -355,10 +346,15 @@ class BarraFuturesModel(RiskModel):
             design = np.column_stack([np.ones(len(x_valid)), x_valid])
             try:
                 beta, _, _, _ = np.linalg.lstsq(design, y_valid, rcond=None)
-            except np.linalg.LinAlgError:
-                continue
+            except np.linalg.LinAlgError as exc:
+                raise RuntimeError(
+                    f"risk cross-sectional regression failed at {returns.index[row]}"
+                ) from exc
             if not np.isfinite(beta).all():
-                continue
+                raise RuntimeError(
+                    f"risk cross-sectional regression is non-finite at "
+                    f"{returns.index[row]}"
+                )
             coefficient_values[row] = beta[1:]
             residual_values[row, valid] = y_valid - design @ beta
 
@@ -395,19 +391,11 @@ class BarraFuturesModel(RiskModel):
     ) -> pd.DataFrame:
         universe = pd.Index(universe)
         if self._asset_returns is None or self._asset_returns.empty:
-            return pd.DataFrame(
-                np.eye(len(universe)) * self._FALLBACK_DAILY_VARIANCE,
-                index=universe,
-                columns=universe,
-            )
+            raise RuntimeError("asset covariance requested before risk-model fit")
         date = self._timestamp(date)
         available = self._asset_returns.index[self._asset_returns.index <= date]
         if len(available) == 0:
-            return pd.DataFrame(
-                np.eye(len(universe)) * self._FALLBACK_DAILY_VARIANCE,
-                index=universe,
-                columns=universe,
-            )
+            raise RuntimeError(f"no asset-return history is available as of {date.date()}")
         use_date = available[-1]
         if use_date not in self._asset_cov_cache:
             history = self._asset_returns.loc[:use_date].iloc[-self._window :]
@@ -433,7 +421,8 @@ class BarraFuturesModel(RiskModel):
 
         sample = np.cov(values, rowvar=False, ddof=1)
         sample = np.asarray(sample, dtype=float)
-        sample = np.nan_to_num(sample, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(sample).all():
+            raise RuntimeError("risk covariance contains NaN/Inf")
         if self._cov_method == "shrinkage":
             delta = self._ledoit_wolf_intensity(values, sample)
             sample = (1.0 - delta) * sample + delta * np.diag(np.diag(sample))
@@ -446,19 +435,13 @@ class BarraFuturesModel(RiskModel):
         self, covariance: Optional[pd.DataFrame], universe: pd.Index
     ) -> pd.DataFrame:
         if covariance is None or covariance.empty:
-            return pd.DataFrame(
-                np.eye(len(universe)) * self._FALLBACK_DAILY_VARIANCE,
-                index=universe,
-                columns=universe,
-            )
+            raise RuntimeError("asset covariance estimation produced no matrix")
         aligned = covariance.reindex(index=universe, columns=universe)
         known_diag = np.diag(covariance.to_numpy(dtype=float))
         known_diag = known_diag[np.isfinite(known_diag) & (known_diag > 0)]
-        fill_variance = (
-            float(np.median(known_diag))
-            if known_diag.size
-            else self._FALLBACK_DAILY_VARIANCE
-        )
+        if not known_diag.size:
+            raise RuntimeError("asset covariance has no positive variance estimate")
+        fill_variance = float(np.median(known_diag))
         values = aligned.to_numpy(dtype=float)
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         missing_assets = ~pd.Index(universe).isin(covariance.index)
@@ -500,7 +483,7 @@ class BarraFuturesModel(RiskModel):
             valid = variance[np.isfinite(variance) & (variance > 0)]
             if not valid.empty:
                 return variance.fillna(float(valid.median())).clip(lower=self._MIN_VARIANCE)
-        return pd.Series(self._FALLBACK_DAILY_VARIANCE, index=universe, dtype=float)
+        raise RuntimeError("specific variance is unavailable")
 
     @staticmethod
     def _timestamp(date: Date) -> pd.Timestamp:
@@ -542,6 +525,7 @@ class BarraFuturesModel(RiskModel):
             else None
         )
         if factor_covariance is None or factor_covariance.empty:
+            self.last_covariance_mode = "asset_shrinkage"
             return self._asset_covariance_asof(date, universe)
 
         names = list(factor_covariance.columns)
@@ -550,21 +534,23 @@ class BarraFuturesModel(RiskModel):
                 [self._exposures[name].loc[exposure_date].rename(name) for name in names],
                 axis=1,
             ).reindex(universe).fillna(0.0)
-        except (KeyError, ValueError):
-            return self._asset_covariance_asof(date, universe)
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("risk factor exposure lookup failed") from exc
 
         x_values = exposure_matrix.to_numpy(dtype=float)
         f_values = factor_covariance.to_numpy(dtype=float)
         if not np.isfinite(x_values).all() or not np.isfinite(f_values).all():
-            return self._asset_covariance_asof(date, universe)
+            raise RuntimeError("risk factor covariance inputs contain NaN/Inf")
         covariance = x_values @ self._ensure_psd(f_values) @ x_values.T
         covariance += np.diag(
             self._specific_variance_asof(exposure_date, universe).to_numpy(dtype=float)
         )
-        covariance = np.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(covariance).all():
+            raise RuntimeError("risk factor covariance output contains NaN/Inf")
         covariance = self._ensure_psd(covariance)
         diagonal = np.maximum(np.diag(covariance), self._MIN_VARIANCE)
         np.fill_diagonal(covariance, diagonal)
+        self.last_covariance_mode = "factor_model"
         return pd.DataFrame(covariance, index=universe, columns=universe)
 
     def _latest_exposure_date(self, date: Date) -> Optional[pd.Timestamp]:
@@ -596,15 +582,11 @@ class BarraFuturesModel(RiskModel):
             return values
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         values = (values + values.T) / 2.0
-        try:
-            eigenvalues, eigenvectors = np.linalg.eigh(values)
-            if eigenvalues.min() < tol:
-                eigenvalues = np.maximum(eigenvalues, tol)
-                values = (eigenvectors * eigenvalues) @ eigenvectors.T
-                values = (values + values.T) / 2.0
-        except np.linalg.LinAlgError:
-            diagonal = np.maximum(np.diag(values), tol)
-            values = np.diag(diagonal)
+        eigenvalues, eigenvectors = np.linalg.eigh(values)
+        if eigenvalues.min() < tol:
+            eigenvalues = np.maximum(eigenvalues, tol)
+            values = (eigenvectors * eigenvalues) @ eigenvectors.T
+            values = (values + values.T) / 2.0
         return values
 
     def specific_risk(self, date: Date, universe: Universe) -> SpecificRisk:

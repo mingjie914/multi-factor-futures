@@ -64,6 +64,30 @@ def test_leaf_signal_divides_by_volatility_exactly_once():
     assert weights["I"] == pytest.approx(0.5)
 
 
+def test_hierarchical_optimizer_rejects_missing_forecast():
+    optimizer = _optimizer()
+    names = pd.Index(["RB", "I"])
+    with pytest.raises(ValueError, match="expected returns"):
+        optimizer.optimize(
+            pd.Series({"RB": 1.0}),
+            _StaticRiskModel(pd.DataFrame(np.eye(2), index=names, columns=names)),
+            pd.Series(dtype=float),
+            [],
+            None,
+            pd.Timestamp("2025-01-02"),
+            names,
+        )
+
+
+def test_asset_selector_rejects_missing_forecast():
+    from optimization.asset_selection import SectorForecastSelector
+
+    with pytest.raises(ValueError, match="missing or non-finite"):
+        SectorForecastSelector(mode="hard_top_n").apply(
+            pd.Series({"RB": 1.0, "I": np.nan})
+        )
+
+
 def test_commodity_sector_layer_uses_covariance_risk_parity():
     covariance = np.diag([0.20**2, 0.10**2])
     weights = _run(_optimizer(), {"RB": 1.0, "CU": 1.0}, covariance)
@@ -155,6 +179,18 @@ def test_hard_limits_take_precedence_when_previous_weights_are_invalid():
     assert weights.sum() <= 0.20 + 1e-12
 
 
+def test_unsupported_constraint_cannot_be_silently_ignored():
+    from optimization.constraints import WeightSumConstraint
+
+    with pytest.raises(ValueError, match="does not support constraints: weight_sum"):
+        _run(
+            _optimizer(),
+            {"RB": 1.0},
+            np.array([[0.10**2]]),
+            constraints=[WeightSumConstraint(target=1.0)],
+        )
+
+
 def test_default_config_enables_three_layer_optimizer_at_ten_percent():
     from core.config import FrameworkConfig, load_config
 
@@ -223,3 +259,26 @@ def test_obsolete_sector_optimizer_is_not_registered():
         HierarchicalAssetRiskParityOptimizer.deployment_status
         == "formal_default"
     )
+
+
+def test_hierarchical_optimizer_rejects_invalid_risk_budgets():
+    from optimization.hierarchical_asset_risk_parity import (
+        HierarchicalAssetRiskParityOptimizer,
+    )
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        HierarchicalAssetRiskParityOptimizer(asset_class_budgets={"stock": -0.1})
+    with pytest.raises(ValueError, match="must be finite"):
+        HierarchicalAssetRiskParityOptimizer(target_volatility=float("nan"))
+
+
+def test_hierarchical_optimizer_rejects_invalid_covariance():
+    from optimization.hierarchical_asset_risk_parity import (
+        HierarchicalAssetRiskParityOptimizer,
+    )
+
+    optimizer = HierarchicalAssetRiskParityOptimizer()
+    with pytest.raises(ValueError, match="square"):
+        optimizer._ensure_psd(np.ones((2, 3)))
+    with pytest.raises(ValueError, match="finite"):
+        optimizer._ensure_psd(np.array([[1.0, np.nan], [np.nan, 1.0]]))

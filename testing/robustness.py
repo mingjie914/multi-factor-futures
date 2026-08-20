@@ -15,12 +15,10 @@
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
-
 from core.registry import register
 from core.types import FactorMatrix, ReturnMatrix, UniverseSchedule
 from testing.base import FactorTest, TestResult
@@ -246,10 +244,7 @@ class RobustnessTest(FactorTest):
         Returns:
             {板块名: IC均值} 字典 (样本不足的板块被跳过)
         """
-        try:
-            from core.sectors import SECTOR_MAP
-        except ImportError:
-            return {}
+        from core.sectors import SECTOR_MAP
 
         # 按板块分组品种
         tickers = f_aligned.columns

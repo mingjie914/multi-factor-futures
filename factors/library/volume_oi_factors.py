@@ -102,7 +102,7 @@ class OIChangeRate5D(Factor):
     """持仓量5日变化率因子.
 
     计算逻辑:
-        1. change_rate = oi.pct_change(5)
+        1. change_rate = oi.pct_change(5, fill_method=None)
         2. 返回最近 5 个交易日的持仓量变化率
 
     含义:

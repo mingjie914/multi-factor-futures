@@ -4,7 +4,7 @@ import hashlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -17,8 +17,9 @@ from data.manager import DataManager
 
 log = logging.getLogger(__name__)
 
-# 千级因子场景下的内存安全阈值: 单因子矩阵过大时启用分块计算
-_MAX_MATRIX_ELEMENTS = 5_000_000  # 5M 个元素 ≈ 1000 因子 × 1200 天 × 40 品种 → 每个因子 ~48K 元素
+
+class FactorComputationError(RuntimeError):
+    """A configured factor could not be computed without changing semantics."""
 
 
 class FactorEngine:
@@ -31,12 +32,67 @@ class FactorEngine:
     - parallel=False 默认串行, 100 因子以下串行最稳定
     """
 
-    def __init__(self, data_manager: DataManager):
+    def __init__(self, data_manager: DataManager, *, tolerant: bool = False):
         self._data = data_manager
+        self._tolerant = bool(tolerant)
         self._frequency = normalise_frequency(
             getattr(data_manager, "frequency", "daily")
         )
         self._factor_cache: Dict[str, FactorMatrix] = {}
+        self._failure_ledger: list[dict[str, str]] = []
+
+    @property
+    def failures(self) -> tuple[dict[str, str], ...]:
+        """Failures observed in explicit discovery-only tolerant mode."""
+        return tuple(dict(item) for item in self._failure_ledger)
+
+    @staticmethod
+    def _nan_matrix(dates: DateIndex, universe: Universe) -> FactorMatrix:
+        return pd.DataFrame(np.nan, index=dates, columns=universe, dtype=float)
+
+    def _handle_failure(
+        self,
+        stage: str,
+        factor_name: str,
+        exc: Exception,
+        dates: DateIndex,
+        universe: Universe,
+    ) -> FactorMatrix:
+        message = f"factor {factor_name!r} failed during {stage}: {exc}"
+        if not self._tolerant:
+            raise FactorComputationError(message) from exc
+        self._failure_ledger.append({
+            "factor": str(factor_name),
+            "stage": str(stage),
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        log.warning(message, exc_info=True)
+        return self._nan_matrix(dates, universe)
+
+    @staticmethod
+    def _validate_result(
+        factor_name: str,
+        result: object,
+        dates: DateIndex,
+        universe: Universe,
+    ) -> FactorMatrix:
+        if not isinstance(result, pd.DataFrame):
+            raise TypeError("factor compute() must return a DataFrame")
+        if result.index.has_duplicates or result.columns.has_duplicates:
+            raise ValueError("factor output axes must be unique")
+        if result.empty:
+            raise ValueError("factor returned an empty matrix")
+        aligned = result.reindex(index=dates, columns=universe)
+        try:
+            aligned = aligned.apply(pd.to_numeric, errors="raise")
+        except (TypeError, ValueError) as exc:
+            raise TypeError("factor output must be numeric") from exc
+        values = aligned.to_numpy(dtype=float, copy=False)
+        if np.isinf(values).any():
+            raise ValueError("factor output contains infinite values")
+        if not np.isfinite(values).any():
+            raise ValueError("factor output contains no finite values")
+        return aligned.astype(float)
 
     @staticmethod
     def _cache_key(factor: Factor, dates: DateIndex, universe: Universe) -> str:
@@ -64,31 +120,37 @@ class FactorEngine:
         self, factor: Factor, dates: DateIndex, universe: Universe
     ) -> FactorMatrix:
         """计算单个因子矩阵."""
-        validate_factor_contract(
-            factor, provider_frequency=self._frequency
-        )
-        cache_key = self._cache_key(factor, dates, universe)
-        if cache_key in self._factor_cache:
-            cached = self._factor_cache[cache_key]
-            # CR-017: 读取缓存后校验索引和列集合是否匹配 (防止哈希碰撞误命中)
-            if cached.index.equals(pd.Index(dates)) and cached.columns.equals(
-                pd.Index(universe)
-            ):
-                return cached
-            # 索引或列集合不匹配, 视为缓存未命中, 重新计算
+        if len(dates) == 0 or len(universe) == 0:
+            raise ValueError("factor request dates and universe must be non-empty")
         try:
-            result = factor.compute(self._data, dates, universe)
-            if result.empty:
-                result = pd.DataFrame(np.nan, index=dates, columns=universe)
-            else:
-                result = result.reindex(index=dates, columns=universe)
+            validate_factor_contract(
+                factor, provider_frequency=self._frequency
+            )
+        except ValueError as exc:
+            if not self._tolerant:
+                raise
+            return self._handle_failure(
+                "contract_validation", factor.name, exc, dates, universe
+            )
+        try:
+            cache_key = self._cache_key(factor, dates, universe)
+            cached = self._factor_cache.get(cache_key)
+            if cached is not None and cached.index.equals(
+                pd.Index(dates)
+            ) and cached.columns.equals(pd.Index(universe)):
+                return cached
+            result = self._validate_result(
+                factor.name,
+                factor.compute(self._data, dates, universe),
+                dates,
+                universe,
+            )
             self._factor_cache[cache_key] = result
             return result
-        except Exception:
-            log.warning(
-                f"因子 '{factor.name}' 计算失败", exc_info=True
+        except Exception as exc:
+            return self._handle_failure(
+                "compute", factor.name, exc, dates, universe
             )
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
 
     def compute_factors(
         self,
@@ -112,52 +174,58 @@ class FactorEngine:
         Returns:
             {factor_name: FactorMatrix} 字典.
         """
-        # Scope raw-data reads to this exact batch. This makes every declared
-        # dependency, including unavailable fields, a single source/cache read.
-        prefetch_factors = []
-        for name in factor_names:
+        names = [str(name) for name in factor_names]
+        if len(names) != len(set(names)):
+            raise ValueError("factor_names must be unique")
+        if not names:
+            return {}
+        if len(dates) == 0 or len(universe) == 0:
+            raise ValueError("factor request dates and universe must be non-empty")
+        if pd.Index(dates).has_duplicates or pd.Index(universe).has_duplicates:
+            raise ValueError("factor request dates and universe must be unique")
+
+        result: Dict[str, FactorMatrix] = {}
+        factors_by_name: Dict[str, Factor] = {}
+        for name in names:
             try:
-                prefetch_factors.append(registry_get("factor", name)())
-            except (KeyError, TypeError):
-                continue
-        for factor in prefetch_factors:
-            validate_factor_contract(
-                factor, provider_frequency=self._frequency
+                factor = registry_get("factor", name)()
+                validate_factor_contract(
+                    factor, provider_frequency=self._frequency
+                )
+                factors_by_name[name] = factor
+            except Exception as exc:
+                result[name] = self._handle_failure(
+                    "registration", name, exc, dates, universe
+                )
+
+        active_names = [name for name in names if name in factors_by_name]
+        if not active_names:
+            return result
+
+        # Scope raw-data reads to this exact batch. Each declared dependency is
+        # loaded once and reused by both SPEC and ordinary factors.
+        try:
+            self._data.prefetch(
+                [factors_by_name[name] for name in active_names], dates, universe
             )
-        try:
-            self._data.prefetch(prefetch_factors, dates, universe)
-        except Exception:
-            log.debug("factor dependency prefetch failed", exc_info=True)
+        except Exception as exc:
+            if not self._tolerant:
+                raise FactorComputationError(
+                    f"factor dependency prefetch failed: {exc}"
+                ) from exc
+            self._failure_ledger.append({
+                "factor": "*batch*",
+                "stage": "prefetch",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            log.warning("factor dependency prefetch failed", exc_info=True)
 
-        # 性能优化: SPEC 因子走批量路径 (按 base 分组, 避免重复计算)
-        # 检测 SPEC 因子并路由到 compute_spec_factors_batch
         spec_result, non_spec_names = self._compute_spec_factors_optimized(
-            factor_names, dates, universe
+            active_names, dates, universe
         )
+        result.update(spec_result)
 
-        if not non_spec_names:
-            return spec_result
-
-        # 非 SPEC 因子走原有路径
-        factors_obj = []
-        for name in non_spec_names:
-            try:
-                cls = registry_get("factor", name)
-                factors_obj.append(cls())
-            except KeyError:
-                log.warning(f"因子 '{name}' 未注册, 跳过")
-                continue
-
-        if not factors_obj:
-            return spec_result
-
-        # 预取所有依赖字段 (批量拉取减少 IO)
-        try:
-            self._data.prefetch(factors_obj)
-        except Exception:
-            log.debug("预取失败", exc_info=True)
-
-        # 千级因子: 分块计算, 避免一次性加载所有因子到内存
+        factors_obj = [factors_by_name[name] for name in non_spec_names]
         n_factors = len(factors_obj)
         if n_factors > chunk_size:
             log.info(
@@ -167,14 +235,24 @@ class FactorEngine:
             non_spec_result = self._compute_chunked(
                 factors_obj, dates, universe, parallel, max_workers, chunk_size
             )
-        else:
+        elif factors_obj:
             non_spec_result = self._compute_batch(
                 factors_obj, dates, universe, parallel, max_workers
             )
+        else:
+            non_spec_result = {}
 
-        result = dict(spec_result)
         result.update(non_spec_result)
-        return result
+        for name in names:
+            if name not in result:
+                result[name] = self._handle_failure(
+                    "result_validation",
+                    name,
+                    RuntimeError("factor result is missing from the batch"),
+                    dates,
+                    universe,
+                )
+        return {name: result[name] for name in names}
 
     def _compute_spec_factors_optimized(
         self,
@@ -217,17 +295,43 @@ class FactorEngine:
         try:
             from factors.spec_factor import compute_spec_factors_batch
             spec_result = compute_spec_factors_batch(
-                spec_specs, self._data, dates, universe
+                spec_specs,
+                self._data,
+                dates,
+                universe,
+                tolerant=self._tolerant,
             )
-        except Exception:
+        except Exception as exc:
+            if not self._tolerant:
+                raise FactorComputationError(
+                    f"SPEC factor batch failed: {exc}"
+                ) from exc
+            self._failure_ledger.append({
+                "factor": "*spec_batch*",
+                "stage": "compute",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
             log.warning(
-                "SPEC 批量计算失败, 回退到逐因子路径", exc_info=True
+                "SPEC batch failed; tolerant discovery will retry individually",
+                exc_info=True,
             )
-            # 回退: 将 SPEC 因子加入非 SPEC 列表, 走原路径
             non_spec_names = list(factor_names)
             return {}, non_spec_names
 
-        return spec_result, non_spec_names
+        validated: Dict[str, FactorMatrix] = {}
+        for spec in spec_specs:
+            name = str(spec["slug"])
+            try:
+                if name not in spec_result:
+                    raise RuntimeError("SPEC batch omitted the requested factor")
+                validated[name] = self._validate_result(
+                    name, spec_result[name], dates, universe
+                )
+            except Exception as exc:
+                validated[name] = self._handle_failure(
+                    "result_validation", name, exc, dates, universe
+                )
+        return validated, non_spec_names
 
     def _compute_batch(
         self,
@@ -249,13 +353,7 @@ class FactorEngine:
                 }
                 for future in as_completed(futures):
                     name = futures[future]
-                    try:
-                        result[name] = future.result()
-                    except Exception:
-                        log.warning(f"因子 '{name}' 并行计算失败", exc_info=True)
-                        result[name] = pd.DataFrame(
-                            np.nan, index=dates, columns=universe
-                        )
+                    result[name] = future.result()
         else:
             for f in factors_obj:
                 result[f.name] = self.compute_factor(f, dates, universe)

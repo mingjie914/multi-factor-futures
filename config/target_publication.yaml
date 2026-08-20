@@ -1,0 +1,8 @@
+# End-of-day target-weight publication approval gate.
+# This framework does not create, route, or reconcile orders.
+schema_version: 1
+enabled: false
+approval_status: disabled
+approved_study_id: ""
+protocol_sha256: ""
+deployment_package: ""

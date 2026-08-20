@@ -93,6 +93,35 @@ def test_batched_ic_preserves_ties_and_missing_value_semantics():
         pd.testing.assert_series_equal(batch[name], expected)
 
 
+def test_ic_uses_only_pairwise_complete_cross_section():
+    from scipy.stats import spearmanr
+    from alpha.ic_monitor import ICMonitor
+
+    date = pd.Timestamp("2024-01-02")
+    columns = list("ABCDE")
+    factor = pd.DataFrame([[1.0, 2.0, 3.0, 4.0, np.nan]], index=[date], columns=columns)
+    returns = pd.DataFrame([[np.nan, 4.0, 3.0, 2.0, 1.0]], index=[date], columns=columns)
+
+    actual = ICMonitor()._compute_daily_ic(factor, returns).loc[date]
+    expected = spearmanr([2.0, 3.0, 4.0], [4.0, 3.0, 2.0]).statistic
+
+    assert actual == pytest.approx(expected)
+
+
+def test_ic_requires_three_pairwise_observations_and_inactivates_unavailable_factor():
+    from alpha.ic_monitor import ICMonitor
+
+    date = pd.Timestamp("2024-01-02")
+    factor = pd.DataFrame([[1.0, 2.0, np.nan]], index=[date], columns=list("ABC"))
+    returns = pd.DataFrame([[2.0, 1.0, 0.0]], index=[date], columns=list("ABC"))
+    monitor = ICMonitor(decay_tolerance=2)
+
+    monitor.update({"factor": factor}, returns)
+
+    assert np.isnan(monitor._ic_history["factor"].loc[date])
+    assert monitor.inactive_factors == {"factor"}
+
+
 def test_vectorized_layered_backtest_matches_qcut_reference():
     from testing.layered import LayeredBacktest
 
@@ -132,6 +161,34 @@ def test_vectorized_layered_backtest_matches_qcut_reference():
             pd.Series(values, index=pd.DatetimeIndex(valid_dates)),
             check_freq=False,
         )
+
+
+def test_layered_rejects_invalid_annualization_inputs():
+    from testing.layered import LayeredBacktest
+
+    with pytest.raises(ValueError, match="n_groups"):
+        LayeredBacktest(n_groups=0)
+    with pytest.raises(ValueError, match="holding_period"):
+        LayeredBacktest(holding_period=0)
+    with pytest.raises(ValueError, match="periods_per_year"):
+        LayeredBacktest().run(
+            pd.DataFrame([[1.0, 2.0]], columns=["A", "B"]),
+            pd.DataFrame([[0.1, 0.2]], columns=["A", "B"]),
+            periods_per_year=0,
+        )
+
+
+def test_layered_does_not_turn_missing_group_returns_into_zero():
+    from testing.layered import LayeredBacktest
+
+    factor = pd.DataFrame([[1.0, 2.0, 3.0, 4.0]], columns=list("ABCD"))
+    returns = pd.DataFrame([[0.1, 0.2, np.nan, np.nan]], columns=list("ABCD"))
+
+    result = LayeredBacktest(n_groups=2).run(factor, returns)
+
+    assert result.group_returns["Q1"].iloc[0] == pytest.approx(0.15)
+    assert pd.isna(result.group_returns["Q2"].iloc[0])
+    assert pd.isna(result.group_returns["long_short"].iloc[0])
 
 
 def _reference_ridge_choice(X, y, dates, alphas, fit_intercept, n_folds):
@@ -226,6 +283,34 @@ def test_aggregate_dynamic_risk_scale_preserves_sleeve_mix():
     assert diagnostics["max_asset_vol_proxy"] <= 0.03 + 1e-12
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"hard_asset_cap": np.nan},
+        {"gross_cap": -1.0},
+        {"periods_per_year": 0.0},
+        {"atr_window": 1},
+    ],
+)
+def test_dynamic_risk_limits_reject_invalid_parameters(overrides):
+    from optimization.risk_limits import VolatilityRiskCapController
+
+    params = {"asset_vol_budget": 0.03, "sector_vol_budget": 0.06, **overrides}
+    with pytest.raises(ValueError):
+        VolatilityRiskCapController(**params)
+
+
+def test_dynamic_risk_limits_reject_missing_weight_alignment():
+    from optimization.risk_limits import VolatilityRiskCapController
+
+    controller = VolatilityRiskCapController(
+        asset_vol_budget=0.03, sector_vol_budget=0.06
+    )
+    covariance = pd.DataFrame(np.eye(2), index=["A", "B"], columns=["A", "B"])
+    with pytest.raises(ValueError, match="missing or non-finite"):
+        controller.apply(pd.Series({"A": 0.1}), covariance, ["A", "B"])
+
+
 def test_barra_prefetch_reuses_slow_market_fields():
     from risk.barra_futures import BarraFuturesModel
 
@@ -268,37 +353,72 @@ def test_barra_prefetch_reuses_slow_market_fields():
     assert data.industry_calls == 1
 
 
-def test_cost_configuration_prorates_annual_policy_without_turnover_charge():
-    from optimization.costs import SimpleFuturesCost
+def test_barra_rejects_duplicate_return_dates():
+    from risk.barra_futures import BarraFuturesModel
+
+    dates = pd.DatetimeIndex(["2025-01-02", "2025-01-02"])
+    returns = pd.DataFrame({"A": [0.01, -0.02]}, index=dates)
+    with pytest.raises(ValueError, match="duplicate dates"):
+        BarraFuturesModel()._clean_returns(returns)
+
+
+def test_barra_rejects_missing_industry_classification():
+    from risk.barra_futures import BarraFuturesModel
+
+    dates = pd.date_range("2025-01-02", periods=2, freq="B")
+    assets = pd.Index(["A", "B"])
+
+    class MissingIndustry:
+        @staticmethod
+        def get_industry(requested_dates, universe):
+            return pd.DataFrame(np.nan, index=requested_dates, columns=universe)
+
+    with pytest.raises(RuntimeError, match="classification is missing"):
+        BarraFuturesModel()._sector_exposures(MissingIndustry(), dates, assets)
+
+
+def test_cost_configuration_charges_turnover_and_prorates_roll_allowance():
+    from optimization.costs import SimpleAShareCost, SimpleFuturesCost
 
     model = SimpleFuturesCost(
-        annual_transaction_cost=0.0002,
+        turnover_cost_rate=0.0002,
         annual_roll_cost=0.00105,
     )
     target = pd.Series({"A": 0.6, "B": -0.4})
     current = pd.Series({"A": 0.1, "B": -0.2})
     date = pd.Timestamp("2025-01-02")
-    assert model.estimate_cost(target, current, date) == pytest.approx(0.0)
+    assert model.estimate_cost(target, current, date) == pytest.approx(0.7 * 0.0002)
     assert model.estimate_holding_cost(target, date) == pytest.approx(
-        (0.0002 + 0.00105) / 252.0
+        0.00105 / 252.0
     )
 
     with pytest.raises(TypeError):
         SimpleFuturesCost(commission_rate=0.0002)
+    with pytest.raises(ValueError, match="finite"):
+        model.estimate_cost(
+            pd.Series({"A": np.nan}), pd.Series({"A": 0.0}), date
+        )
+
+    equity = SimpleAShareCost(
+        commission=0.0003,
+        stamp_duty_sell=0.001,
+        slippage=0.0,
+    )
+    assert equity.estimate_cost(
+        pd.Series({"A": 0.0}),
+        pd.Series({"A": 0.0, "B": 0.5}),
+        date,
+    ) == pytest.approx(0.5 * (0.0003 + 0.001))
 
 
-def test_default_config_registers_shadow_supertrend_and_new_costs():
+def test_default_config_registers_costs_and_dynamic_risk_limits():
     from core.config import load_config
 
     config = load_config("config/default.yaml")
-    assert config.costs.annual_transaction_cost == pytest.approx(0.0002)
+    assert config.costs.turnover_cost_rate == pytest.approx(0.0002)
     assert config.costs.annual_fee == pytest.approx(0.0)
     assert config.costs.annual_roll_cost == pytest.approx(0.00105)
     assert config.costs.cost_stage == "post_screen_backtest"
-    assert config.supertrend_sleeve.enabled is True
-    assert config.supertrend_sleeve.integration_mode == "shadow"
-    assert config.supertrend_sleeve.capital_weight == pytest.approx(0.0)
-    assert config.supertrend_sleeve.rebalance_on_flip is False
     assert config.optimization.dynamic_risk_limits.enabled is True
     assert config.meta_optimizer.underlying_dynamic_risk_limits.enabled is True
 
@@ -314,7 +434,23 @@ def test_meta_combination_charges_management_fee_once_after_netting():
     for name, exposure in (("long", 1.0), ("short", -1.0)):
         result = SimpleNamespace(
             weights_history=pd.DataFrame({"A": [exposure]}, index=[decision]),
+            research_ledger=SimpleNamespace(
+                effective_weights=pd.DataFrame(
+                    {"A": [exposure, exposure]}, index=dates
+                ),
+                daily=pd.DataFrame(
+                    {
+                        "trade_cost": [0.0, 0.0],
+                        "holding_cost": [0.0, daily_fee],
+                        "executed_traded_notional": [0.0, 0.0],
+                    },
+                    index=dates,
+                ),
+            ),
             costs=pd.Series([0.0, daily_fee], index=dates),
+            nav=pd.Series(
+                1.0, index=pd.DatetimeIndex([decision]).append(dates)
+            ),
         )
         sub_results.append({"config": SimpleNamespace(name=name), "result": result})
 
@@ -324,7 +460,6 @@ def test_meta_combination_charges_management_fee_once_after_netting():
     meta_cfg = SimpleNamespace(
         underlying_constraints=[],
         enforce_underlying_constraints=True,
-        net_underlying_costs=True,
         min_weight=0.0,
         max_weight=1.0,
         underlying_dynamic_risk_limits=SimpleNamespace(enabled=False),
@@ -419,6 +554,29 @@ def test_ic_test_skips_unrequested_spearman_and_decay(monkeypatch):
     assert result.ic_decay == {}
 
 
+def test_ic_test_reports_primary_spearman_positive_ratio():
+    from testing.ic_test import ICTest
+
+    dates = pd.date_range("2024-01-02", periods=12, freq="B")
+    columns = pd.Index([f"A{i}" for i in range(12)])
+    factor = pd.DataFrame(np.tile(np.arange(12, dtype=float), (12, 1)), index=dates, columns=columns)
+    returns = factor.copy()
+
+    result = ICTest(methods=["spearman"]).run(factor, returns)
+
+    assert result.ic_mean == pytest.approx(1.0)
+    assert result.to_dict()["ic_pos_ratio"] == pytest.approx(1.0)
+
+
+def test_weighted_regression_requires_ex_ante_weights():
+    from testing.regression import RegressionTest
+
+    factor = pd.DataFrame([[1.0] * 10])
+    returns = pd.DataFrame([[0.1] * 10])
+    with pytest.raises(ValueError, match="sample_weights"):
+        RegressionTest(weighted=True).run(factor, returns)
+
+
 def test_data_manager_prefetch_reuses_positive_and_negative_fields():
     from data.manager import DataManager
 
@@ -509,6 +667,7 @@ def test_cache_covering_lookup_loads_only_selected_parquet(monkeypatch, tmp_path
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(pd, "read_parquet", counted)
+    files_before = set(tmp_path.glob("*.parquet"))
     result = cache.get(
         "futures", "Source", "close", ["A", "B"],
         full_dates[5], full_dates[20],
@@ -516,56 +675,4 @@ def test_cache_covering_lookup_loads_only_selected_parquet(monkeypatch, tmp_path
     assert len(calls) == 1
     assert result.shape == (16, 2)
     assert result.to_numpy().mean() == pytest.approx(1.0)
-
-
-def test_mysql_contract_pair_vectorized_root_split_and_memory_cache(monkeypatch):
-    from data.mysql_source import MySQLSource
-
-    source = MySQLSource(
-        {
-            "tables": {
-                "commodity_eod": {
-                    "table_name": "prices",
-                    "columns": {
-                        "date": "TRADE_DT",
-                        "ticker": "S_INFO_WINDCODE",
-                        "close": "S_DQ_CLOSE",
-                    },
-                }
-            }
-        }
-    )
-    rows = pd.DataFrame(
-        {
-            "TRADE_DT": [
-                "20240102", "20240102", "20240103", "20240103",
-                "20240102", "20240102", "20240103", "20240103",
-                "20240102",
-            ],
-            "S_INFO_WINDCODE": [
-                "A2401.DCE", "A2405.DCE", "A2401.DCE", "A2405.DCE",
-                "AP2401.CZC", "AP2405.CZC", "AP2401.CZC", "AP2405.CZC",
-                "A.DCE",
-            ],
-            "S_DQ_CLOSE": [10, 11, 12, 13, 20, 21, 22, 23, 999],
-        }
-    )
-    calls = []
-
-    def fake_read_sql(sql):
-        calls.append(sql)
-        return rows.copy()
-
-    monkeypatch.setattr(source, "_read_sql", fake_read_sql)
-    first = source.fetch_contract_pair_prices(
-        ["A", "AP"], "2024-01-02", "2024-01-03", field="close"
-    )
-    second = source.fetch_contract_pair_prices(
-        ["A", "AP"], "2024-01-02", "2024-01-03", field="close"
-    )
-
-    assert len(calls) == 1
-    assert first["near"]["A"].tolist() == [10, 12]
-    assert first["far"]["A"].tolist() == [11, 13]
-    assert first["near"]["AP"].tolist() == [20, 22]
-    pd.testing.assert_frame_equal(first["near"], second["near"])
+    assert set(tmp_path.glob("*.parquet")) == files_before

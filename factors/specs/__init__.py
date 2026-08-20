@@ -6,6 +6,8 @@ enumeration cannot be mistaken for production approval.
 """
 from __future__ import annotations
 
+from collections import Counter
+
 from factors.specs.oscillator import SPECS as _OSC_SPECS
 from factors.specs.volatility import SPECS as _VOL_SPECS
 from factors.specs.pattern import SPECS as _PAT_SPECS
@@ -43,6 +45,11 @@ SPECS_BY_CATEGORY = {
 
 # 全部因子 slug 列表
 ALL_SLUGS = [s["slug"] for s in ALL_SPECS]
+_DUPLICATE_SLUGS = sorted(
+    slug for slug, count in Counter(ALL_SLUGS).items() if count > 1
+)
+if _DUPLICATE_SLUGS:
+    raise ValueError(f"duplicate SPEC factor slugs: {_DUPLICATE_SLUGS[:10]}")
 SPEC_BY_SLUG = {spec["slug"]: spec for spec in ALL_SPECS}
 
 
@@ -56,14 +63,8 @@ def register_all_spec_factors() -> list:
 
     registered = []
     for spec in ALL_SPECS:
-        try:
-            register_spec_factor(spec)
-            registered.append(spec["slug"])
-        except Exception as e:
-            import logging
-            logging.getLogger("multi_factor").warning(
-                f"注册 SPEC 因子 '{spec['slug']}' 失败: {e}"
-            )
+        register_spec_factor(spec)
+        registered.append(spec["slug"])
     return registered
 
 

@@ -78,14 +78,14 @@ def test_intraday_turnover_is_aggregated_by_trading_day():
     assert sum(result.mean_absolute_weights.values()) == pytest.approx(1.0)
 
 
-def test_validation_cost_is_fixed_annual_rate_and_roll_is_deferred():
+def test_validation_cost_scales_with_turnover_and_roll_is_deferred():
     from optimization.costs import factor_cost_coverage
 
     low_turnover = factor_cost_coverage(
         gross_annual_alpha=0.001,
         annual_half_turnover=0.1,
         annual_roll_cost=0.00105,
-        annual_transaction_cost=0.0002,
+        turnover_cost_rate=0.0002,
         include_roll_cost=False,
         cost_stage="factor_validation",
         safety_margin=1.5,
@@ -94,31 +94,31 @@ def test_validation_cost_is_fixed_annual_rate_and_roll_is_deferred():
         gross_annual_alpha=0.001,
         annual_half_turnover=1000.0,
         annual_roll_cost=0.00105,
-        annual_transaction_cost=0.0002,
+        turnover_cost_rate=0.0002,
         include_roll_cost=False,
         cost_stage="factor_validation",
         safety_margin=1.5,
     )
 
-    assert low_turnover["annual_trading_cost"] == pytest.approx(0.0002)
-    assert high_turnover["annual_trading_cost"] == pytest.approx(0.0002)
+    assert low_turnover["annual_trading_cost"] == pytest.approx(0.00004)
+    assert high_turnover["annual_trading_cost"] == pytest.approx(0.4)
     assert low_turnover["annual_roll_cost_charged"] == pytest.approx(0.0)
     assert low_turnover["transaction_cost_mode"] == (
-        "fixed_annual_exposure_rate"
+        "full_traded_notional_times_rate"
     )
     assert low_turnover["complete"] is True
     assert low_turnover["passes"] is True
 
     post_screen = factor_cost_coverage(
         gross_annual_alpha=0.01,
-        annual_half_turnover=999.0,
-        annual_transaction_cost=0.0002,
+        annual_half_turnover=1.0,
+        turnover_cost_rate=0.0002,
         annual_roll_cost=0.00105,
         include_roll_cost=True,
         safety_margin=1.5,
     )
     assert post_screen["annual_roll_cost_charged"] == pytest.approx(0.00105)
-    assert post_screen["total_annual_cost"] == pytest.approx(0.00125)
+    assert post_screen["total_annual_cost"] == pytest.approx(0.00145)
 
 
 def test_calendar_year_robustness_uses_natural_years_and_minimum_history():
@@ -289,6 +289,29 @@ def test_observation_factor_cap_scales_only_that_factor_contribution():
     base = uncapped.predict({"signal": factor}, pd.Index(factor.columns), dates[-1])
     limited = capped.predict({"signal": factor}, pd.Index(factor.columns), dates[-1])
     np.testing.assert_allclose(limited.to_numpy(), base.to_numpy() * 0.5)
+
+
+def test_sector_model_does_not_hide_unexpected_fit_failure(monkeypatch):
+    from alpha.ols import SectorGroupedOLSModel
+
+    dates = pd.date_range("2024-01-02", periods=40, freq="B")
+    factor = pd.DataFrame(
+        np.tile(np.asarray([-1.0, 1.0]), (len(dates), 1)),
+        index=dates,
+        columns=["RB", "HC"],
+    )
+    model = SectorGroupedOLSModel(
+        min_samples_per_sector=1,
+        fallback_to_global=True,
+        ridge_alphas=[0.0, 0.1],
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("unexpected sector fit failure")
+
+    monkeypatch.setattr(model, "_choose_ridge_alpha", fail)
+    with pytest.raises(RuntimeError, match="unexpected sector fit failure"):
+        model.fit({"signal": factor}, factor * 0.02)
 
 
 def test_fold_survival_cannot_claim_promotion_before_new_locked_oos():

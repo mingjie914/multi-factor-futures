@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from backtest.research_ledger import build_close_marked_ledger
+from data.market_quality import prepare_close_data
+
 
 @dataclass(frozen=True)
 class GuosenTrendIndexSpec:
@@ -94,10 +97,39 @@ def load_snapshot(path: str | Path) -> tuple[GuosenTrendIndexSpec, dict[str, Fac
     )
     if not 0.0 < spec.selection_pct <= 1.0:
         raise ValueError("selection_pct must be in (0, 1]")
+    if len(set(spec.universe)) != len(spec.universe):
+        raise ValueError("universe roots must be unique")
+    if (
+        not np.isfinite(spec.target_volatility)
+        or spec.target_volatility <= 0.0
+        or spec.volatility_window < 2
+        or spec.minimum_risk_observations < 2
+        or spec.minimum_risk_observations > spec.volatility_window
+        or spec.periods_per_year <= 0
+    ):
+        raise ValueError("invalid volatility or annualization settings")
+    if spec.correlation_window is not None and spec.correlation_window < 2:
+        raise ValueError("correlation_window must be at least 2 when enabled")
+    if (
+        not np.isfinite(spec.correlation_multiplier_cap)
+        or spec.correlation_multiplier_cap <= 0.0
+        or not np.isfinite(spec.transaction_cost_rate)
+        or spec.transaction_cost_rate < 0.0
+        or not np.isfinite(spec.annual_management_fee)
+        or spec.annual_management_fee < 0.0
+    ):
+        raise ValueError("invalid correlation or cost settings")
     if spec.factor_chunk_overlap >= spec.factor_chunk_size:
         raise ValueError("factor_chunk_overlap must be smaller than factor_chunk_size")
     if not 1 <= spec.expected_final_holdings <= len(spec.universe):
         raise ValueError("expected_final_holdings must fit inside the universe")
+    if set(spec.asset_caps) != set(spec.universe):
+        raise ValueError("asset_caps must cover the universe exactly")
+    caps = np.asarray(list(spec.asset_caps.values()), dtype=float)
+    if not np.isfinite(caps).all() or np.any(caps < 0.0):
+        raise ValueError("asset caps must be finite and non-negative")
+    if int(np.count_nonzero(caps > 0.0)) < spec.expected_final_holdings:
+        raise ValueError("positive asset caps cannot support expected_final_holdings")
     factor_sets = {
         str(name): _parse_factor_set(str(name), factors)
         for name, factors in raw["factor_sets"].items()
@@ -108,10 +140,25 @@ def load_snapshot(path: str | Path) -> tuple[GuosenTrendIndexSpec, dict[str, Fac
 class GuosenTrendIndexBacktester:
     """Standalone adapter; the production framework never imports this class."""
 
-    def __init__(self, data_manager, factor_engine, spec: GuosenTrendIndexSpec):
+    def __init__(
+        self,
+        data_manager,
+        factor_engine,
+        spec: GuosenTrendIndexSpec,
+        audited_nontrading_closes=None,
+    ):
         self.data_manager = data_manager
         self.factor_engine = factor_engine
         self.spec = spec
+        self.audited_nontrading_closes = audited_nontrading_closes or {}
+
+    def _prepare_close_data(
+        self, close: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        prepare = getattr(self.data_manager, "prepare_close_data", None)
+        if callable(prepare):
+            return prepare(close)
+        return prepare_close_data(close, self.audited_nontrading_closes)
 
     def compute_factor_values(
         self, factor_names: list[str], dates: pd.DatetimeIndex
@@ -164,15 +211,18 @@ class GuosenTrendIndexBacktester:
         result = pd.Series(0.0, index=self.spec.universe, dtype=float)
         if len(selected) == 0:
             return result
-        history = risk_history.reindex(columns=selected).dropna(how="all")
-        if len(history) < self.spec.minimum_risk_observations:
-            return result
+        history = risk_history.reindex(columns=selected).tail(
+            self.spec.volatility_window
+        )
+        counts = history.notna().sum(axis=0)
         volatility = (
-            history.tail(self.spec.volatility_window).std(ddof=1)
+            history.std(ddof=1)
             * np.sqrt(self.spec.periods_per_year)
         )
         volatility = volatility.replace([np.inf, -np.inf, 0.0], np.nan)
-        valid = volatility.dropna().index
+        valid = volatility.index[
+            counts.ge(self.spec.minimum_risk_observations) & volatility.notna()
+        ]
         if len(valid) == 0:
             return result
         history = history.reindex(columns=valid)
@@ -194,7 +244,32 @@ class GuosenTrendIndexBacktester:
     ) -> dict[str, pd.DataFrame]:
         """Build each factor portfolio before cross-factor aggregation."""
         dates = pd.DatetimeIndex(close.index)
-        daily_returns = close.pct_change(fill_method=None)
+        required = list(dict.fromkeys(
+            name for variants in factor_set.values() for name, _ in variants
+        ))
+        missing = sorted(set(required) - set(factor_values))
+        if missing:
+            raise KeyError(f"factor values are missing configured factors: {missing}")
+        normalized_values = {}
+        expected_columns = pd.Index(self.spec.universe)
+        for name in required:
+            frame = factor_values[name]
+            if frame.index.has_duplicates or frame.columns.has_duplicates:
+                raise ValueError(f"factor {name!r} has duplicate dates or roots")
+            if not dates.isin(frame.index).all() or not expected_columns.isin(
+                frame.columns
+            ).all():
+                raise ValueError(f"factor {name!r} does not cover close dates and universe")
+            try:
+                aligned = frame.reindex(
+                    index=dates, columns=expected_columns
+                ).astype(float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"factor {name!r} must be numeric") from exc
+            if np.isinf(aligned.to_numpy(dtype=float)).any():
+                raise ValueError(f"factor {name!r} contains infinity")
+            normalized_values[name] = aligned
+        daily_returns, _ = self._prepare_close_data(close)
         portfolios = {
             group_name: pd.DataFrame(
                 0.0, index=dates, columns=self.spec.universe, dtype=float
@@ -210,9 +285,7 @@ class GuosenTrendIndexBacktester:
             for group_name, variants in factor_set.items():
                 per_parameter = []
                 for name, direction in variants:
-                    frame = factor_values.get(name)
-                    if frame is None or date not in frame.index:
-                        continue
+                    frame = normalized_values[name]
                     one = self._one_factor_weights(frame.loc[date], direction, history)
                     if one.gt(0.0).any():
                         per_parameter.append(one)
@@ -257,7 +330,43 @@ class GuosenTrendIndexBacktester:
         close: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         portfolios = self.build_factor_portfolios(factor_values, factor_set, close)
-        return self.combine_factor_portfolios(portfolios)
+        weights, diagnostics = self.combine_factor_portfolios(portfolios)
+        self._validate_expected_holdings(weights, close)
+        return weights, diagnostics
+
+    def _validate_expected_holdings(
+        self,
+        weights: pd.DataFrame,
+        close: pd.DataFrame,
+    ) -> None:
+        """Require all risk-eligible roots promised by the frozen snapshot."""
+        returns, _ = self._prepare_close_data(close)
+        caps = pd.Series(self.spec.asset_caps, dtype=float).reindex(self.spec.universe)
+        actual = weights.gt(1e-12).sum(axis=1)
+        for position, date in enumerate(weights.index):
+            history = returns.iloc[:position + 1]
+            if self.spec.execution_lag_days == 0:
+                history = history.iloc[:-1]
+            window = history.tail(self.spec.volatility_window)
+            volatility = window.std(ddof=1).replace(
+                [np.inf, -np.inf, 0.0], np.nan
+            )
+            eligible = (
+                window.notna().sum(axis=0).ge(
+                    self.spec.minimum_risk_observations
+                )
+                & volatility.notna()
+                & caps.gt(0.0)
+            )
+            expected = min(
+                self.spec.expected_final_holdings,
+                int(eligible.sum()),
+            )
+            if int(actual.loc[date]) != expected:
+                raise RuntimeError(
+                    f"{date:%Y-%m-%d} final holdings={int(actual.loc[date])}, "
+                    f"expected={expected} from risk-eligible universe"
+                )
 
     def project_weights_to_gross(
         self,
@@ -316,11 +425,31 @@ class GuosenTrendIndexBacktester:
         close: pd.DataFrame,
         diagnostics: Optional[pd.DataFrame] = None,
         base_value: float = 1000.0,
+        contract_schedule: Optional[pd.DataFrame] = None,
     ) -> ExternalBacktestResult:
         close = close.reindex(columns=self.spec.universe).sort_index()
-        signal_weights = signal_weights.reindex(
-            index=close.index, columns=self.spec.universe
-        ).fillna(0.0)
+        if close.index.has_duplicates:
+            raise ValueError("close dates must be unique")
+        if signal_weights.index.has_duplicates or signal_weights.columns.has_duplicates:
+            raise ValueError("signal weights must have unique dates and roots")
+        if (
+            set(signal_weights.index) != set(close.index)
+            or set(signal_weights.columns) != set(self.spec.universe)
+        ):
+            raise ValueError("signal weights must exactly cover close dates and universe")
+        try:
+            signal_weights = signal_weights.reindex(
+                index=close.index, columns=self.spec.universe
+            ).astype(float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("signal weights must be numeric") from exc
+        if not np.isfinite(signal_weights.to_numpy(dtype=float)).all():
+            raise ValueError("signal weights contain NaN or infinity")
+        caps = pd.Series(self.spec.asset_caps, dtype=float).reindex(self.spec.universe)
+        if signal_weights.lt(-1e-12).any().any():
+            raise ValueError("Guosen adapter accepts long-only signal weights")
+        if signal_weights.gt(caps + 1e-12, axis="columns").any().any():
+            raise ValueError("signal weights exceed configured asset caps")
         if diagnostics is None:
             diagnostics = pd.DataFrame(
                 {
@@ -330,28 +459,45 @@ class GuosenTrendIndexBacktester:
                 index=close.index,
             )
         else:
-            diagnostics = diagnostics.reindex(close.index).fillna(0).astype(int)
-        weights = signal_weights.shift(self.spec.execution_lag_days).fillna(0.0)
-        asset_returns = close.pct_change(fill_method=None)
-        gross_returns = (weights * asset_returns).sum(axis=1, min_count=1).fillna(0.0)
-        turnover = weights.diff().abs().sum(axis=1)
-        if len(turnover):
-            turnover.iloc[0] = float(weights.iloc[0].abs().sum())
-        trade_cost = turnover * self.spec.transaction_cost_rate
-        management_cost = pd.Series(
-            self.spec.annual_management_fee / self.spec.periods_per_year,
-            index=weights.index,
-            dtype=float,
+            required = {"active_factors", "selected_assets"}
+            if diagnostics.index.has_duplicates or not required.issubset(
+                diagnostics.columns
+            ):
+                raise ValueError("diagnostics must have unique dates and required columns")
+            if set(diagnostics.index) != set(close.index):
+                raise ValueError("diagnostics must exactly cover close dates")
+            diagnostics = diagnostics.reindex(close.index).astype(int)
+
+        # A row is a close-T decision target.  ``execution_lag_days`` adds
+        # optional *extra* decision bars; the ledger always makes that target
+        # effective for the following close-to-close return.
+        targets = signal_weights.shift(self.spec.execution_lag_days).fillna(0.0)
+        asset_returns, close_tradable = self._prepare_close_data(close)
+        ledger = build_close_marked_ledger(
+            targets,
+            asset_returns,
+            trade_cost_rate=self.spec.transaction_cost_rate,
+            annual_fee=self.spec.annual_management_fee,
+            periods_per_year=self.spec.periods_per_year,
+            contract_schedule=contract_schedule,
+            decision_tradable=close_tradable,
+            initial_nav=base_value,
         )
-        costs = trade_cost.add(management_cost, fill_value=0.0)
-        net_returns = gross_returns - costs
-        nav = base_value * (1.0 + net_returns).cumprod()
+        daily = ledger.daily
+        weights = ledger.effective_weights.reindex(columns=self.spec.universe)
+        gross_returns = daily["gross_return"].copy()
+        net_returns = daily["net_return"].copy()
+        turnover = daily["executed_traded_notional"].copy()
+        costs = daily["trade_cost"].add(daily["holding_cost"])
+        nav = daily["nav_after"].copy()
         nav.name = "index_level"
         net_returns.name = "net_return"
         gross_returns.name = "gross_return"
         turnover.name = "turnover"
         costs.name = "cost"
-        diagnostics = diagnostics.shift(self.spec.execution_lag_days).fillna(0).astype(int)
+        diagnostics = diagnostics.shift(
+            self.spec.execution_lag_days + 1
+        ).fillna(0).astype(int)
         return ExternalBacktestResult(
             nav=nav,
             returns=net_returns,
@@ -368,6 +514,7 @@ class GuosenTrendIndexBacktester:
         factor_set: Mapping[str, tuple[FactorVariant, ...]],
         close: pd.DataFrame,
         base_value: float = 1000.0,
+        contract_schedule: Optional[pd.DataFrame] = None,
     ) -> ExternalBacktestResult:
         close = close.reindex(columns=self.spec.universe).sort_index()
         signal_weights, diagnostics = self.build_signal_weights(
@@ -378,4 +525,5 @@ class GuosenTrendIndexBacktester:
             close,
             diagnostics=diagnostics,
             base_value=base_value,
+            contract_schedule=contract_schedule,
         )

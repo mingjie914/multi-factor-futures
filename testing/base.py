@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Optional
 
-import numpy as np
-import pandas as pd
-
-from core.types import FactorMatrix, NAVSeries, ReturnMatrix, UniverseSchedule
+from core.types import FactorMatrix, ReturnMatrix, UniverseSchedule
 
 
 class TestResult(ABC):

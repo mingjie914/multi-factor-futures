@@ -1,6 +1,6 @@
 """日内因子 (分钟数据聚合为日度值).
 
-依赖 DDB 分钟K线数据, 通过 DDBSource.fetch_intraday_features() 聚合为日度字段:
+依赖本地分钟 Parquet，由框架按精确合约根和因果主力日程聚合为日度字段:
 - vwap: 成交量加权均价
 - intraday_return: 日内收益 (close-open)/open
 - overnight_gap: 隔夜跳空 (open-prev_close)/prev_close
@@ -10,8 +10,8 @@
 - amihud_illiquidity: Amihud非流动性
 - tail_momentum: 尾盘动量
 
-当数据源不支持日内字段时 (如 MySQLSource), 因子返回 NaN, 不影响回测.
-因子自动降级: 无日内数据时被 IC 检验过滤掉.
+发现扫描中缺少日内字段时因子返回 NaN 并被检验过滤；正式选中因子缺少依赖时
+失败关闭，不会静默进入回测。
 
 ═══════════════════════════════════════════════════════════════════════════════
 跨日因子总览 (依赖跨交易日数据, 非纯日内):
@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import glob
 import os
 
 import numpy as np
@@ -37,6 +38,7 @@ import re
 
 from core.interfaces import Factor
 from core.registry import register_factor
+from core.sectors import SECTOR_MAP as _SECTOR_MAP
 
 # ────────────────────────────────────────────────────────────────────────────
 # Bottleneck 加速的 rolling 薄封装 (可选加速, 数值等价已验证).
@@ -329,161 +331,81 @@ class IntradayReversal5d(IntradayFactorBase):
     def _transform(self, df: pd.DataFrame) -> pd.DataFrame:
         return -df.rolling(self.WINDOW, min_periods=3).mean()
 
-_MINUTE_FIELDS = ["open", "high", "low", "close", "volume", "amount", "position"]
-
-_LOCAL_MINUTE_ROOT = r"E:\程明杰公司内容\期货行情数据\本地表"
-
-_FREQ_DIR_MAP = {
-    "1min": "futureshistoryprices1m",
-    "5min": "futureshistoryprices5m",
-    "15min": "futureshistoryprices15m",
-    # ⚠ 注意: 本地无独立 30min 数据, 此映射实际返回的是 15min bar (无重采样).
-    # 需要真 30min 时, 请勿直接请求 freq="30min"; 应因子内自聚合:
-    #   _get_minute_panel(..., freq="1min", force_1min=True) 后 .resample("30min")
-    #   (close 取 last / volume 取 sum). 参见 #517/#528/#531/#532 的【用法说明】.
-    "30min": "futureshistoryprices15m",
-    "daily": "futureshistoryprices1d",
-    "1d": "futureshistoryprices1d",
-}
-
-
-_RAW_CACHE: dict = {}
-_MAX_RAW_CACHE_ENTRIES = 4
-
-
-def _read_local_raw(dates, universe, freq="1min"):
-    """读取本地 Parquet 并按根代码映射, 返回含 _ts/root 列的原始数据 (共享读取).
-
-    供 _read_local_minute (OHLCV聚合) 与 _read_local_term (期限结构) 复用.
-    读取失败或无匹配合约时返回 None.
-    带内存缓存 (按 freq + 日期范围), 消除多因子重复读 parquet 的瓶颈.
-    """
-    import logging
-    log = logging.getLogger("multi_factor")
-    dates = pd.DatetimeIndex(dates)
-    # 缓存 key: freq + 日期范围 + universe (数据已按 universe 过滤, 防跨品种池污染)
-    _dmin = pd.Timestamp(dates.min())
-    _dmax = pd.Timestamp(dates.max())
-    _ukey = tuple(sorted(str(s).upper() for s in universe))
-    cache_key = (freq, str(_dmin.date()), str(_dmax.date()), _ukey)
-    if cache_key in _RAW_CACHE:
-        return _RAW_CACHE[cache_key]
-    subdir = _FREQ_DIR_MAP.get(freq)
-    if subdir is None:
-        return None
-    base = os.path.join(_LOCAL_MINUTE_ROOT, subdir)
-    if not os.path.isdir(base):
-        return None
-    start = pd.Timestamp(dates.min())
-    end = pd.Timestamp(dates.max())
-    months = pd.date_range(start.replace(day=1), end.replace(day=1), freq="MS")
-    frames = []
-    for month in months:
-        partition = "year_month=" + month.strftime("%Y-%m")
-        pdir = os.path.join(base, partition)
-        if not os.path.isdir(pdir):
-            continue
-        # 读取分区内全部 parquet 分片: data_0~data_N.parquet (1m/15m/1d 多分片)
-        # 或 part.parquet (5m)。仅读 data_0 会漏掉多分片月份 (如 2024-11 的 data_0~data_3)。
-        import glob as _glob
-        parquet_files = sorted(_glob.glob(os.path.join(pdir, "data_*.parquet")))
-        if not parquet_files:
-            parquet_files = sorted(_glob.glob(os.path.join(pdir, "part.parquet")))
-        for parquet_path in parquet_files:
-            try:
-                # 列裁剪: 只读因子计算实际需要的列 (省 exchange/type/trade_date/year_month 4列, ~30% IO)
-                cols = ["trade_datetime", "symbol", "open", "high", "low", "close",
-                        "volume", "amount", "position"]
-                df = pd.read_parquet(parquet_path, columns=cols)
-                ts = pd.to_datetime(df["trade_datetime"])
-                df = df.loc[(ts >= start) & (ts <= end)]
-                if not df.empty:
-                    frames.append(df)
-            except Exception:
-                log.debug("读取 %s 失败", parquet_path, exc_info=True)
-    if not frames:
-        return None
-    all_data = pd.concat(frames, ignore_index=True)
-    if all_data.empty:
-        return None
-    universe_set = set(str(u).upper() for u in universe)
-    # 为每个合约分配根代码 (前缀匹配)，统一转大写并优先匹配长代码避免前缀碰撞
-    universe_sorted = sorted(universe_set, key=len, reverse=True)
-    symbol_root: dict[str, str] = {}
-    for sym in all_data["symbol"].unique():
-        sym_upper = str(sym).upper()
-        for ut in universe_sorted:
-            if sym_upper.startswith(ut):
-                symbol_root[sym] = ut
-                break
-    if not symbol_root:
-        return None
-    all_data = all_data[all_data["symbol"].isin(symbol_root)]
-    all_data["root"] = all_data["symbol"].map(symbol_root)
-    ts = pd.to_datetime(all_data["trade_datetime"])
-    # 交易日归属: 仅凌晨段 (00:00-07:59, 即前一夜盘尾) 归入前一交易日
-    # 例: 周五夜盘 21:00-周六 02:30 的 bar (自然日周六 00:00-02:30) 归入周五
-    # 日盘 (08:00 后) 保持当天; 与 1d 表 trade_date 对齐
-    all_data["_ts"] = ts.where(ts.dt.hour >= 8, ts - pd.Timedelta(hours=8))
-    # 存入缓存 (LRU: 超限淘汰最旧)
-    if len(_RAW_CACHE) >= _MAX_RAW_CACHE_ENTRIES:
-        _RAW_CACHE.pop(next(iter(_RAW_CACHE)))
-    _RAW_CACHE[cache_key] = all_data
-    return all_data
-
-
-def _read_local_minute(dates, universe, freq="1min"):
-    """从本地 Parquet 读取分钟/日度 OHLCV 面板, 按根代码聚合."""
-    all_data = _read_local_raw(dates, universe, freq=freq)
-    if all_data is None:
-        return {}
-    ts = all_data["_ts"]
-    panel = {}
-    if "close" in all_data.columns and "volume" in all_data.columns:
-        vol = all_data["volume"].replace(0, np.nan)
-        vwap_close = (all_data["close"] * vol).groupby([ts, all_data["root"]]).sum() / vol.groupby([ts, all_data["root"]]).sum()
-        panel["close"] = vwap_close.unstack(level="root")
-        panel["close"].index = pd.DatetimeIndex(panel["close"].index)
-    for field in ["open", "high", "low"]:
-        if field in all_data.columns:
-            s = all_data[field].groupby([ts, all_data["root"]]).mean()
-            s = s.unstack(level="root")
-            s.index = pd.DatetimeIndex(s.index)
-            panel[field] = s
-    for field in ["volume", "amount"]:
-        if field in all_data.columns:
-            s = all_data[field].groupby([ts, all_data["root"]]).sum()
-            s = s.unstack(level="root")
-            s.index = pd.DatetimeIndex(s.index)
-            panel[field] = s
-    if "position" in all_data.columns:
-        # 持仓量(OI)是存量: 每个 (ts, root, symbol) 取该分钟最后一笔,
-        # 再在 (ts, root) 内取持仓最大的合约(主力合约)的 position 作为该 root 的代表值.
-        pos = (all_data.sort_values("_ts")
-               .groupby(["_ts", "root", "symbol"])["position"].last().reset_index())
-        idx = pos.groupby(["_ts", "root"])["position"].idxmax()
-        main_pos = pos.loc[idx].set_index(["_ts", "root"])["position"]
-        s = main_pos.unstack(level="root")
-        s.index = pd.DatetimeIndex(s.index)
-        panel["position"] = s
-    return panel
+_MINUTE_FIELDS = ["open", "high", "low", "close", "volume", "amount", "oi"]
 
 
 _PANEL_CACHE: dict = {}
-_MAX_PANEL_CACHE_ENTRIES = 8
+# One active request normally needs the configured 5-minute panel plus an
+# occasional force-1-minute panel.  Retaining older full-history panels only
+# inflates the research working set and does not improve within-batch reuse.
+_MAX_PANEL_CACHE_ENTRIES = 2
+_MAX_SEAT_CACHE_ENTRIES = 8
 
 
-def _panel_cache_key(dates, universe, freq):
+def _panel_cache_key(dates, universe, freq, source_key="local"):
     d0 = pd.Timestamp(dates.min())
     d1 = pd.Timestamp(dates.max())
-    return (d0, d1, tuple(sorted(str(u) for u in universe)), freq)
+    return (
+        d0,
+        d1,
+        tuple(str(u) for u in universe),
+        freq,
+        source_key,
+    )
 
 
-# 日内数据频率开关: "1min" (默认) 或 "5min" (加速, 已验证因子值/回测 100% 一致)
-# 2026-08-06 准入验证 (scripts/verify_5min_switch.py) 全部 PASS:
-#   覆盖一致 / 6因子值相对差 0.00% 方向一致 100% / 回测夏普 2.15 完全相同
-#   且 5min 回测 67s vs 1min 555s (8倍加速)
-# 切换: 设 _INTRADAY_FREQ = "5min" 后, 所有 _get_minute_panel(freq="1min") 自动用 5min 数据
+def _source_cache_namespace(data):
+    source = getattr(data, "source", None)
+    namespace = getattr(
+        source,
+        "cache_namespace",
+        source.__class__.__name__ if source is not None else data.__class__.__name__,
+    )
+    # Keep the source itself in the key.  An integer id alone can be reused as
+    # soon as a short-lived source is collected, which can cross-contaminate a
+    # later source instance in the same process.
+    owner = source if source is not None else data
+    return str(namespace), owner
+
+
+def _remember_panel(cache_key, panel):
+    if len(_PANEL_CACHE) >= _MAX_PANEL_CACHE_ENTRIES:
+        _PANEL_CACHE.pop(next(iter(_PANEL_CACHE)))
+    _PANEL_CACHE[cache_key] = panel
+    return panel
+
+
+def _normalise_intraday_panel(panel, source=None):
+    """Validate source fields and apply the shared exchange-session clock."""
+    if not isinstance(panel, dict):
+        raise TypeError("intraday source must return a field mapping")
+    result = dict(panel)
+    if "oi" in result and "position" not in result:
+        result["position"] = result.pop("oi")
+    mapper = getattr(source, "trading_session_index", None)
+    mapped_from = None
+    mapped_to = None
+    for field, frame in list(result.items()):
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"intraday field {field!r} must be a DataFrame")
+        normalized = frame.copy()
+        normalized.index = pd.DatetimeIndex(normalized.index)
+        if callable(mapper) and not normalized.empty:
+            if mapped_from is not None and normalized.index.equals(mapped_from):
+                normalized.index = mapped_to
+            else:
+                mapped_from = normalized.index
+                mapped_to = mapper(mapped_from)
+                normalized.index = mapped_to
+        if normalized.index.has_duplicates or normalized.columns.has_duplicates:
+            raise ValueError(f"intraday field {field!r} has duplicate axes")
+        result[field] = normalized.sort_index()
+    return result
+
+
+# 日内数据频率开关。正式配置提供独立 5min 数据；旧绩效比较已因底层
+# 合约/账本审计失效，不再把历史夏普写作该频率选择的正确性证据。
+# 设 _INTRADAY_FREQ = "5min" 后，未强制 1min 的请求统一走 5min。
 _INTRADAY_FREQ = "5min"
 
 # 需强制真 1min 的因子: 在因子 compute 内显式调用
@@ -494,7 +416,7 @@ _INTRADAY_FREQ = "5min"
 def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
     """获取分钟级 OHLCV 面板.
 
-    优先级: 本地 Parquet > data.get_at_frequency() > DDBSource.
+    优先级: 已配置的频率数据源 > 自定义 Provider.
     带模块级缓存: 同一 (日期区间, 品种池, 频率) 组合只读一次 Parquet,
     多个因子共享面板, 避免 N 因子重复读取 N 次.
 
@@ -503,55 +425,58 @@ def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
       未声明 force_1min, 则改用 _INTRADAY_FREQ (默认降采样到 5min)
     - force_1min=True: 强制用真 1min (不降采样)
     - 因子请求 freq="5min"/其他: 直接用请求频率 (不映射)
-    - freq="30min" 陷阱: 管道无 30min 数据 (_FREQ_DIR_MAP["30min"]=15min 目录),
-      请求 30min 会静默拿到 15min bar. 因子需用 1min + resample("30min") 自聚合
-      (见 #517/#528/#531/#532). 这里显式报错防误用.
+    - 30min 由正式 Parquet 数据源从 15min bar 显式重采样，不存在目录冒充.
     """
-    import logging
-    log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    if freq == "30min":
-        raise ValueError(
-            "freq='30min' 无直接数据源 (_FREQ_DIR_MAP['30min']=15min 目录). "
-            "请改用 freq='1min' + resample('30min') 因子内自聚合 "
-            "(参考 #517/#528/#531/#532)."
-        )
     # 准入映射: 请求 1min -> 若开关开启且非强制真1min, 用开关频率
     if freq == "1min" and _INTRADAY_FREQ != "1min" and not force_1min:
         freq = _INTRADAY_FREQ
-    cache_key = _panel_cache_key(dates, universe, freq)
+    source = getattr(data, "source", None)
+    cache_key = _panel_cache_key(
+        dates, universe, freq, _source_cache_namespace(data)
+    )
     if cache_key in _PANEL_CACHE:
         return _PANEL_CACHE[cache_key]
-    # 1) 本地 Parquet
-    try:
-        panel = _read_local_minute(dates, universe, freq=freq)
-        if panel:
-            if len(_PANEL_CACHE) >= _MAX_PANEL_CACHE_ENTRIES:
-                _PANEL_CACHE.pop(next(iter(_PANEL_CACHE)))
-            _PANEL_CACHE[cache_key] = panel
-            return panel
-    except Exception:
-        log.debug("本地分钟数据读取失败, 回退", exc_info=True)
-    # 2) data.get_at_frequency
-    try:
-        panel = {}
-        for field in _MINUTE_FIELDS:
-            frame = data.get_at_frequency(field, dates, universe, frequency=freq)
-            if frame is not None and not frame.empty:
-                panel[field] = frame
-        if panel:
-            return panel
-    except Exception:
-        pass
-    # 3) DDBSource
-    source = getattr(data, "source", None)
+
+    # 1) 已配置数据源。ParquetFuturesSource 在这里完成精确根解析、滞后选约和复权；
+    # 标准日内因子不得再把同根全部合约聚合成一个伪合约。
     if source is not None and hasattr(source, "fetch_price_at_frequency"):
         try:
-            return source.fetch_price_at_frequency(
-                list(universe), dates.min(), dates.max(), _MINUTE_FIELDS, frequency=freq,
+            panel = source.fetch_price_at_frequency(
+                list(universe),
+                dates.min(),
+                dates.max(),
+                _MINUTE_FIELDS,
+                frequency=freq,
             ) or {}
-        except Exception:
-            log.debug("DDB 获取失败", exc_info=True)
+        except NotImplementedError:
+            panel = None
+        except Exception as exc:
+            raise RuntimeError(
+                "配置分钟数据源读取失败，拒绝切换到其他数据源"
+            ) from exc
+        if panel is not None:
+            panel = _normalise_intraday_panel(panel, source)
+            return _remember_panel(cache_key, panel) if panel else {}
+
+    # 2) 频率感知 Provider（主要用于独立测试或自定义数据源）。
+    if hasattr(data, "get_at_frequency"):
+        try:
+            panel = {}
+            for field in _MINUTE_FIELDS:
+                frame = data.get_at_frequency(
+                    field, dates, universe, frequency=freq
+                )
+                if frame is not None and not frame.empty:
+                    panel[field] = frame
+        except NotImplementedError:
+            panel = {}
+        except Exception as exc:
+            raise RuntimeError("分钟 Provider 读取失败") from exc
+        if panel:
+            return _remember_panel(
+                cache_key, _normalise_intraday_panel(panel)
+            )
     return {}
 
 
@@ -560,7 +485,7 @@ def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _TERM_CACHE: dict = {}
-_MAX_TERM_CACHE_ENTRIES = 8
+_MAX_TERM_CACHE_ENTRIES = 2
 
 
 from functools import lru_cache
@@ -579,8 +504,8 @@ def _expiry_ym(sym):
     return yy, mm
 
 
-def _read_local_term(dates, universe, freq="1min"):
-    """从本地 Parquet 读取主连/次连合约面板 (期限结构).
+def _read_local_term(data, dates, universe, freq="1min"):
+    """从正式 Parquet 数据源读取近月/次近月合约面板 (期限结构).
 
     对每个 (datetime, root):
       - 排除合成合约 (8888/9998/9999, 其持仓/价格语义与真实合约不同);
@@ -598,19 +523,44 @@ def _read_local_term(dates, universe, freq="1min"):
       - roll_yield_annualized: (near-far)/far * 365/remaining_days (正=近月升水/backwardation);
       - rollover_flag: near 到期月相对上一根 bar 变化(换月点)±1 根 K 线标记为 1, 其余 0.
     """
-    _SYN_SUFFIXES = ("8888", "9998", "9999")
-
-    all_data = _read_local_raw(dates, universe, freq=freq)
+    source = getattr(data, "source", None)
+    fetcher = getattr(source, "fetch_contract_curve_at_frequency", None)
+    if source is not None and not callable(fetcher):
+        raise RuntimeError(
+            "configured data source does not provide concrete contract curves"
+        )
+    if not callable(fetcher):
+        return {}
+    all_data = fetcher(
+        list(universe),
+        pd.DatetimeIndex(dates).min(),
+        pd.DatetimeIndex(dates).max(),
+        ["close", "position", "volume"],
+        frequency=freq,
+    )
     if all_data is None or "position" not in all_data.columns:
         return {}
-    # 排除合成合约
-    concrete = all_data[~all_data["symbol"].astype(str).str.endswith(_SYN_SUFFIXES)].copy()
+    mapper = getattr(source, "trading_session_index", None)
+    if not callable(mapper):
+        raise RuntimeError("contract-curve source does not expose session mapping")
+    all_data = all_data.copy()
+    all_data["_ts"] = mapper(all_data["trade_datetime"])
+    # 数据源已只保留完整 ROOT+YYMM 合约；这里再次验证到期月，防止
+    # 未来自定义数据源绕过统一读取边界。
+    concrete = all_data[all_data["symbol"].map(_expiry_ym).notna()].copy()
     if concrete.empty:
         return {}
     # 每个 (ts, root, symbol) 取最后一笔 position (持仓是存量)
     per_symbol = (concrete.sort_values("_ts")
                   .groupby(["_ts", "root", "symbol"], as_index=False)
                   .agg({"close": "last", "position": "last", "volume": "sum"}))
+    close = pd.to_numeric(per_symbol["close"], errors="coerce")
+    position = pd.to_numeric(per_symbol["position"], errors="coerce")
+    per_symbol = per_symbol.loc[
+        close.gt(0.0) & np.isfinite(close) & position.gt(0.0)
+    ].copy()
+    if per_symbol.empty:
+        return {}
     # 解析到期月并取最近两月
     per_symbol["_expiry"] = per_symbol["symbol"].map(_expiry_ym)
     per_symbol = per_symbol.dropna(subset=["_expiry"])
@@ -676,28 +626,28 @@ def _read_local_term(dates, universe, freq="1min"):
 
 
 def _get_term_structure_panel(data, dates, universe, freq="1min", force_1min=False):
-    """获取期限结构面板 (主连+次连), 优先本地 Parquet, 带缓存.
+    """获取期限结构面板 (近月+次近月), 仅走已配置数据源, 带缓存.
 
     频率准入 (与 _get_minute_panel 一致): 请求 1min 且全局 _INTRADAY_FREQ 非 1min
     且未强制真 1min 时, 改用 _INTRADAY_FREQ (term 因子吃 5min 加速).
     """
-    import logging
-    log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
     if freq == "1min" and _INTRADAY_FREQ != "1min" and not force_1min:
         freq = _INTRADAY_FREQ
-    cache_key = _panel_cache_key(dates, universe, freq) + ("term",)
+    cache_key = _panel_cache_key(
+        dates, universe, freq, _source_cache_namespace(data)
+    ) + ("term",)
     if cache_key in _TERM_CACHE:
         return _TERM_CACHE[cache_key]
     try:
-        panel = _read_local_term(dates, universe, freq=freq)
+        panel = _read_local_term(data, dates, universe, freq=freq)
         if panel:
             if len(_TERM_CACHE) >= _MAX_TERM_CACHE_ENTRIES:
                 _TERM_CACHE.pop(next(iter(_TERM_CACHE)))
             _TERM_CACHE[cache_key] = panel
             return panel
-    except Exception:
-        log.debug("本地期限结构读取失败", exc_info=True)
+    except Exception as exc:
+        raise RuntimeError("本地期限结构读取失败") from exc
     return {}
 
 
@@ -706,170 +656,117 @@ def _get_term_structure_panel(data, dates, universe, freq="1min", force_1min=Fal
 # settle → 1d 的 settle_price 字段; oi → 1d 的 position 字段
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FIELD_TO_1D_COL = {"settle": "settle_price", "oi": "position"}
+_FIELD_TO_1D_COL = {"settle": "settle", "oi": "oi"}
 
 
 def _read_local_daily(data, dates, universe, field="settle"):
-    """获取日度结算/持仓面板, 从 futureshistoryprices1d 读取.
-
-    settle 对应 1d 的 settle_price (结算价, 日度概念), oi 对应 position.
-    对每个 (date, root) 取持仓(oi)最大的主力合约的字段值.
-    数据不可得时返回全 NaN (因子自动降级).
-    """
-    import logging
-    log = logging.getLogger("multi_factor")
+    """获取与正式因果合约日程一致的日度结算价或持仓量面板."""
     dates = pd.DatetimeIndex(dates)
     col = _FIELD_TO_1D_COL.get(field)
     if col is None:
-        return pd.DataFrame(np.nan, index=dates, columns=universe)
-    # 1) 数据源优先 (未来数据源支持 settle_price/position 时自动生效)
-    #    注: 该分支无法获取 symbol 级信息, 不执行 B 阶段的合成排除/换月日 NaN/日期对齐;
-    #    换月清洗仅作用于本地 1d Parquet 分支. 当前无数据源实现, 无实际影响.
-    try:
-        frame = data.get(col, dates, universe)
-        if frame is not None and not frame.empty and frame.notna().any().any():
-            return frame.reindex(index=dates, columns=universe)
-    except Exception:
-        pass
-    # 2) 本地 1d Parquet (futureshistoryprices1d)
-    try:
-        raw = _read_local_raw(dates, universe, freq="daily")
-        if raw is None or raw.empty or col not in raw.columns:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        _cols = ["_ts", "root", "position", "symbol"]
-        if "trade_date" in raw.columns:
-            _cols.insert(1, "trade_date")
-        if col not in _cols:  # oi 时 col=position 已在列中, 避免重复列名
-            _cols.append(col)
-        if "position" not in raw.columns:  # dropna(subset=["position"]) 的前提
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = raw[_cols].copy()
-        # bug 修正(2026-08, B 阶段): 1d 数据的 _ts 为"前一自然日 16:00"(bar 时间),
-        # 直接 normalize 会把交易日标签错位一天(前视/滞后); 改用 trade_date 交易日对齐
-        if "trade_date" in raw.columns:
-            df["_ts"] = pd.to_datetime(df["trade_date"]).dt.normalize()
-        else:
-            df["_ts"] = pd.to_datetime(df["_ts"]).dt.normalize()
-        df = df.dropna(subset=["position"])
-        if df.empty:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        # bug 修正(2026-08, B 阶段): 排除合成/连续合约(00/01M/8888/纯根名),
-        # 只保留可解析出合法到期月(YYMM, 月份 1-12)的具体合约, 避免主力取到合成价
-        df = df[df["symbol"].map(_expiry_ym).notna()]
-        if df.empty:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        # 取每 (date, root) 持仓最大的主力合约的字段值
-        idx = df.groupby(["_ts", "root"])["position"].idxmax()
-        main = df.loc[idx]
-        # bug 修正(2026-08, B 阶段): 主力合约切换日(换月日)该字段置 NaN,
-        # 消除跨合约结算价/持仓跳变对日度因子的伪信号污染.
-        # 注意: ①不能用 shift(1) 按索引对齐(main 索引不连续), 用 numpy 位置对比;
-        #       ②必须按 (日期, 品种) 单元格置 NaN, 不能整行置 NaN(否则误伤当日
-        #       未换月的其他品种, 多品种 universe 下会大面积全 NaN).
-        roll_cells = set()
-        mm = main.sort_values("_ts")
-        for _root, _g in mm.groupby("root"):
-            syms = _g["symbol"].astype(str).to_numpy()
-            tss = pd.to_datetime(_g["_ts"].to_numpy())
-            for i in range(1, len(syms)):
-                if syms[i] and syms[i - 1] and syms[i] != syms[i - 1]:
-                    roll_cells.add((pd.Timestamp(tss[i]).normalize(), _root))
-        pivot = main.pivot(index="_ts", columns="root", values=col)
-        pivot.index = pd.DatetimeIndex(pivot.index)
-        pivot = pivot.reindex(index=dates, columns=universe)
-        for _d, _r in roll_cells:
-            if _d in pivot.index and _r in pivot.columns:
-                pivot.loc[_d, _r] = np.nan
-        return pivot
-    except Exception:
-        log.debug("1d %s 读取失败", col, exc_info=True)
-        return pd.DataFrame(np.nan, index=dates, columns=universe)
+        raise ValueError(f"unsupported local daily field: {field!r}")
+    frame = data.get(col, dates, universe)
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(f"daily field {col!r} must be a DataFrame")
+    if frame.index.has_duplicates or frame.columns.has_duplicates:
+        raise ValueError(f"daily field {col!r} has duplicate axes")
+    return frame.reindex(index=dates, columns=universe)
 
 
-def _get_rollover_calendar(dates, universe):
-    """换月日历: 每品种主力合约切换日(换月日)列表. B 阶段新增, 独立数据产物.
-
-    判定口径与 _read_local_daily 修复后一致: 排除合成/连续合约, 每交易日取
-    持仓最大的具体合约(symbol 可解析 YYMM), 主力 symbol 变化日即换月日.
-    Returns: dict[root] -> pd.DatetimeIndex(换月交易日, 升序)
-    """
+def _get_rollover_calendar(data, dates, universe):
+    """从正式的 T-1 因果持仓合约日程派生有效换月日."""
     empty = {u: pd.DatetimeIndex([]) for u in universe}
-    try:
-        raw = _read_local_raw(dates, universe, freq="daily")
-        if raw is None or "position" not in raw.columns or "trade_date" not in raw.columns:
-            return empty
-        df = raw[["trade_date", "root", "position", "symbol"]].copy()
-        df["td"] = pd.to_datetime(df["trade_date"]).dt.normalize()
-        df = df.dropna(subset=["position"])
-        df = df[df["symbol"].map(_expiry_ym).notna()]
-        if df.empty:
-            return empty
-        for root, g in df.groupby("root"):
-            top = (g.sort_values(["td", "position"], ascending=[True, False])
-                    .groupby("td").head(1).sort_values("td"))
-            syms = top["symbol"].astype(str).to_numpy()
-            tds = pd.to_datetime(top["td"].to_numpy())
-            days = []
-            for i in range(1, len(syms)):
-                if syms[i] and syms[i - 1] and syms[i] != syms[i - 1]:
-                    days.append(pd.Timestamp(tds[i]).normalize())
-            empty[root] = pd.DatetimeIndex(sorted(days))
+    getter = getattr(data, "get_contract_schedule", None)
+    if not callable(getter):
         return empty
-    except Exception:
+    schedule = getter(pd.DatetimeIndex(dates), pd.Index(universe))
+    if schedule is None:
         return empty
+    if not isinstance(schedule, pd.DataFrame):
+        raise TypeError("contract schedule must be a DataFrame or None")
+    if schedule.index.has_duplicates or schedule.columns.has_duplicates:
+        raise ValueError("contract schedule has duplicate axes")
+    schedule = schedule.reindex(index=pd.DatetimeIndex(dates), columns=universe)
+    for root in universe:
+        observed = schedule[root].dropna().astype(str)
+        if len(observed) < 2:
+            continue
+        changes = observed.ne(observed.shift(1))
+        changes.iloc[0] = False
+        empty[root] = pd.DatetimeIndex(observed.index[changes]).sort_values()
+    return empty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 席位数据管道 (日度, futuresseatdata/derive_product_daily): 品种级多空持仓汇总
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SEAT_ROOT = os.path.join(_LOCAL_MINUTE_ROOT, "futuresseatdata", "derive_product_daily")
 _SEAT_FIELDS = ["total_long", "total_short", "net_position", "long_change", "short_change", "seat_count"]
 _SEAT_CACHE: dict = {}
 
 
-def _read_local_seat(dates, universe):
+def _configured_seat_root(data):
+    source = getattr(data, "source", None)
+    root = getattr(source, "root_path", None)
+    dataset = getattr(source, "seat_dataset", None)
+    if root is None or not dataset:
+        return None
+    return os.path.join(os.fspath(root), os.fspath(dataset))
+
+
+def _read_seat_partitions(base, dates, date_col, label):
+    dates = pd.DatetimeIndex(dates)
+    start = pd.Timestamp(dates.min())
+    end = pd.Timestamp(dates.max())
+    frames = []
+    for month in pd.date_range(
+        start.replace(day=1), end.replace(day=1), freq="MS"
+    ):
+        partition_path = os.path.join(
+            base, "year_month=" + month.strftime("%Y-%m")
+        )
+        if not os.path.isdir(partition_path):
+            continue
+        for parquet_path in sorted(glob.glob(os.path.join(partition_path, "*.parquet"))):
+            try:
+                frame = pd.read_parquet(parquet_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{label} partition read failed: {parquet_path}"
+                ) from exc
+            missing = sorted({date_col, "root"} - set(frame.columns))
+            if missing:
+                raise ValueError(
+                    f"{label} partition missing required columns {missing}: "
+                    f"{parquet_path}"
+                )
+            timestamps = pd.to_datetime(frame[date_col])
+            frame = frame.loc[(timestamps >= start) & (timestamps <= end)]
+            if not frame.empty:
+                frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def _read_local_seat(data, dates, universe):
     """读取席位日度面板 (品种级多空汇总), 返回 {field: DataFrame(dates×universe)}.
 
     席位数据仅日度频率, 每交易日每条 (2020-03 起). 数据不可得时字段缺失.
     """
-    import logging
-    log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    if not os.path.isdir(_SEAT_ROOT):
+    seat_base = _configured_seat_root(data)
+    if seat_base is None:
         return {}
-    start = pd.Timestamp(dates.min())
-    end = pd.Timestamp(dates.max())
-    months = pd.date_range(start.replace(day=1), end.replace(day=1), freq="MS")
-    frames = []
-    for month in months:
-        partition = "year_month=" + month.strftime("%Y-%m")
-        parquet_path = os.path.join(_SEAT_ROOT, partition, "data_0.parquet")
-        if not os.path.exists(parquet_path):
-            continue
-        try:
-            df = pd.read_parquet(parquet_path)
-            td = pd.to_datetime(df["trade_date"])
-            df = df.loc[(td >= start) & (td <= end)]
-            if not df.empty:
-                frames.append(df)
-        except Exception:
-            log.debug("席位读取失败 %s", parquet_path, exc_info=True)
-    if not frames:
+    seat_root = os.path.join(seat_base, "derive_product_daily")
+    if not os.path.isdir(seat_root):
         return {}
-    all_data = pd.concat(frames, ignore_index=True)
-    if all_data.empty:
+    all_data = _read_seat_partitions(
+        seat_root, dates, "trade_date", "seat"
+    )
+    if all_data is None:
         return {}
-    universe_sorted = sorted({str(u).upper() for u in universe}, key=len, reverse=True)
-    root_map: dict[str, str] = {}
-    for r in all_data["root"].unique():
-        r_up = str(r).upper()
-        for ut in universe_sorted:
-            if r_up.startswith(ut):
-                root_map[r] = ut
-                break
-    all_data["_root"] = all_data["root"].map(root_map)
-    all_data = all_data[all_data["_root"].notna()]
+    universe_set = {str(u).upper() for u in universe}
+    all_data["_root"] = all_data["root"].astype(str).str.upper()
+    all_data = all_data[all_data["_root"].isin(universe_set)]
     if all_data.empty:
         return {}
     panel = {}
@@ -884,27 +781,24 @@ def _read_local_seat(dates, universe):
 
 def _get_seat_panel(data, dates, universe):
     """获取席位日度面板 (带缓存). 返回 {field: DataFrame}."""
-    import logging
-    log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    cache_key = _panel_cache_key(dates, universe, "daily") + ("seat",)
+    cache_key = _panel_cache_key(
+        dates, universe, "daily", _source_cache_namespace(data)
+    ) + ("seat",)
     if cache_key in _SEAT_CACHE:
         return _SEAT_CACHE[cache_key]
-    try:
-        panel = _read_local_seat(dates, universe)
-        if panel:
-            if len(_SEAT_CACHE) >= _MAX_PANEL_CACHE_ENTRIES:
-                _SEAT_CACHE.pop(next(iter(_SEAT_CACHE)))
-            _SEAT_CACHE[cache_key] = panel
-            return panel
-    except Exception:
-        log.debug("本地席位读取失败", exc_info=True)
+    panel = _read_local_seat(data, dates, universe)
+    if panel:
+        if len(_SEAT_CACHE) >= _MAX_SEAT_CACHE_ENTRIES:
+            _SEAT_CACHE.pop(next(iter(_SEAT_CACHE)))
+        _SEAT_CACHE[cache_key] = panel
+        return panel
     return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 通用席位表管道: 支持全部 6 张表 (product_daily/product_seat/main_contract_seat/
-#   raw_seat_position/delivery_summary/delivery_seat)
+# 通用席位表管道: 支持当前因子实际消费的 5 张表
+# (product_daily/product_seat/main_contract_seat/raw_seat_position/delivery_summary)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SEAT_TABLE_DIRS = {
@@ -913,58 +807,43 @@ _SEAT_TABLE_DIRS = {
     "main_contract_seat": "derive_main_contract_seat",
     "raw_seat": "raw_seat_position",
     "delivery_summary": "delivery_summary",
-    "delivery_seat": "delivery_seat",
 }
 _SEAT_DETAIL_CACHE: dict = {}
 
 
-def _read_local_seat_table(dates, universe, table):
+def clear_transient_data_caches() -> None:
+    """Release regenerable in-memory source panels after a research batch."""
+
+    _PANEL_CACHE.clear()
+    _TERM_CACHE.clear()
+    _SEAT_CACHE.clear()
+    _SEAT_DETAIL_CACHE.clear()
+
+
+def _read_local_seat_table(data, dates, universe, table):
     """通用读取席位表, 返回过滤+root映射后的原始 DataFrame (含 _ts/_root).
 
     delivery 表日期列用 delivery_date, 其余用 trade_date.
     """
-    import logging
-    log = logging.getLogger("multi_factor")
     subdir = _SEAT_TABLE_DIRS.get(table)
     if subdir is None:
         return None
-    base = os.path.join(_LOCAL_MINUTE_ROOT, "futuresseatdata", subdir)
+    seat_base = _configured_seat_root(data)
+    if seat_base is None:
+        return None
+    base = os.path.join(seat_base, subdir)
     if not os.path.isdir(base):
         return None
     dates = pd.DatetimeIndex(dates)
     date_col = "delivery_date" if "delivery" in table else "trade_date"
-    start = pd.Timestamp(dates.min())
-    end = pd.Timestamp(dates.max())
-    months = pd.date_range(start.replace(day=1), end.replace(day=1), freq="MS")
-    frames = []
-    for month in months:
-        partition = "year_month=" + month.strftime("%Y-%m")
-        parquet_path = os.path.join(base, partition, "data_0.parquet")
-        if not os.path.exists(parquet_path):
-            continue
-        try:
-            df = pd.read_parquet(parquet_path)
-            td = pd.to_datetime(df[date_col])
-            df = df.loc[(td >= start) & (td <= end)]
-            if not df.empty:
-                frames.append(df)
-        except Exception:
-            log.debug("席位表 %s 读取失败 %s", table, parquet_path, exc_info=True)
-    if not frames:
+    all_data = _read_seat_partitions(
+        base, dates, date_col, f"seat table {table!r}"
+    )
+    if all_data is None:
         return None
-    all_data = pd.concat(frames, ignore_index=True)
-    if all_data.empty:
-        return None
-    universe_sorted = sorted({str(u).upper() for u in universe}, key=len, reverse=True)
-    root_map: dict[str, str] = {}
-    for r in all_data["root"].unique():
-        r_up = str(r).upper()
-        for ut in universe_sorted:
-            if r_up.startswith(ut):
-                root_map[r] = ut
-                break
-    all_data["_root"] = all_data["root"].map(root_map)
-    all_data = all_data[all_data["_root"].notna()]
+    universe_set = {str(u).upper() for u in universe}
+    all_data["_root"] = all_data["root"].astype(str).str.upper()
+    all_data = all_data[all_data["_root"].isin(universe_set)]
     if all_data.empty:
         return None
     all_data["_ts"] = pd.to_datetime(all_data[date_col])
@@ -973,21 +852,18 @@ def _read_local_seat_table(dates, universe, table):
 
 def _get_seat_table(data, dates, universe, table):
     """获取席位表原始数据 (带缓存). 返回 DataFrame 或 None."""
-    import logging
-    log = logging.getLogger("multi_factor")
     dates = pd.DatetimeIndex(dates)
-    cache_key = _panel_cache_key(dates, universe, "daily") + ("seat", table)
+    cache_key = _panel_cache_key(
+        dates, universe, "daily", _source_cache_namespace(data)
+    ) + ("seat", table)
     if cache_key in _SEAT_DETAIL_CACHE:
         return _SEAT_DETAIL_CACHE[cache_key]
-    try:
-        df = _read_local_seat_table(dates, universe, table)
-        if df is not None:
-            if len(_SEAT_DETAIL_CACHE) >= _MAX_PANEL_CACHE_ENTRIES * 2:
-                _SEAT_DETAIL_CACHE.pop(next(iter(_SEAT_DETAIL_CACHE)))
-            _SEAT_DETAIL_CACHE[cache_key] = df
-            return df
-    except Exception:
-        log.debug("席位表 %s 读取失败", table, exc_info=True)
+    df = _read_local_seat_table(data, dates, universe, table)
+    if df is not None:
+        if len(_SEAT_DETAIL_CACHE) >= _MAX_SEAT_CACHE_ENTRIES * 2:
+            _SEAT_DETAIL_CACHE.pop(next(iter(_SEAT_DETAIL_CACHE)))
+        _SEAT_DETAIL_CACHE[cache_key] = df
+        return df
     return None
 
 
@@ -1020,34 +896,8 @@ def _seat_to_panel(all_data, field, agg="last"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 跨品种/板块辅助: 板块映射 + 板块内截面 z-score
+# 跨品种/板块辅助: 规范细分类 + 板块内截面 z-score
 # ═══════════════════════════════════════════════════════════════════════════════
-
-_SECTOR_MAP = {
-    # 黑色系
-    "RB": "black", "HC": "black", "I": "black", "J": "black", "JM": "black",
-    "SF": "black", "SM": "black", "FG": "black",
-    # 能化
-    "MA": "chem", "TA": "chem", "PP": "chem", "L": "chem", "V": "chem",
-    "EG": "chem", "FU": "chem", "BU": "chem", "SC": "chem", "RU": "chem",
-    "EB": "chem", "PG": "chem", "UR": "chem",
-    # 有色
-    "CU": "metal", "AL": "metal", "ZN": "metal", "NI": "metal",
-    "SN": "metal", "PB": "metal", "SS": "metal",
-    # 贵金属
-    "AU": "precious", "AG": "precious",
-    # 农产品
-    "A": "agri", "M": "agri", "Y": "agri", "P": "agri", "C": "agri",
-    "CS": "agri", "CF": "agri", "SR": "agri", "OI": "agri", "RM": "agri",
-    "JD": "agri", "AP": "agri",
-    # 股指
-    "IF": "index", "IC": "index", "IH": "index", "IM": "index",
-    # 国债
-    "T": "bond", "TF": "bond", "TL": "bond", "TS": "bond",
-    # 生猪
-    "LH": "agri",
-}
-
 
 def _sector_zscore(df):
     """按板块分组的截面 z-score (板块内≥2个品种才计算, 否则全 NaN)."""
@@ -1187,7 +1037,7 @@ class VpCorrIntraday(Factor):
             common = grp_close.columns.intersection(grp_vol.columns)
             if len(common) < 1:
                 continue
-            ret = grp_close[common].pct_change().iloc[1:]
+            ret = grp_close[common].pct_change(fill_method=None).iloc[1:]
             vol = grp_vol[common].iloc[1:]
             if len(ret) < 5:
                 continue
@@ -1226,7 +1076,7 @@ class VpCorrIntradayEod(Factor):
         if "close" not in panel or "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close_1m, vol_1m = panel["close"], panel["volume"]
-        ret_1m = close_1m.pct_change()
+        ret_1m = close_1m.pct_change(fill_method=None)
         roll_window = 10
         results: dict = {}
         for col in close_1m.columns.intersection(vol_1m.columns):
@@ -1320,10 +1170,15 @@ class IntradayRealisedSkewness20d(Factor):
             daily_close = data.get("close", dates, universe)
             if daily_close is None or daily_close.empty:
                 return pd.DataFrame(np.nan, index=dates, columns=universe)
-            ret = daily_close.pct_change()
+            ret = daily_close.pct_change(fill_method=None)
             skew = ret.rolling(20, min_periods=10).skew()
-            return _roll20_mean_std(_mean_distance(skew)).reindex(index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+            return (
+                _roll20_mean_std(_mean_distance(skew))
+                .reindex(dates)
+                .shift(1)
+                .reindex(columns=universe)
+            )
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         results: dict = {}
         for dt, grp in ret_1m.groupby(day):
@@ -1361,7 +1216,7 @@ class IntradayCVaR20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         vol_1m = panel["volume"]
         day = ret_1m.index.normalize()
         cvar_results: dict = {}
@@ -1416,7 +1271,7 @@ class IntradayOverconfidence20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         cp_results: dict = {}
         for dt in sorted(set(day)):
@@ -1530,7 +1385,7 @@ class IntradayJumpIntensity20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close_1m = panel["close"]
-        ret_simple = close_1m.pct_change()
+        ret_simple = close_1m.pct_change(fill_method=None)
         ret_log = np.log(close_1m / close_1m.shift(1))
         jump = (ret_simple - ret_log).abs()
         day = jump.index.normalize()
@@ -1569,7 +1424,7 @@ class IntradayDTWS20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         dtws: dict = {}
         for dt in sorted(set(day)):
@@ -1863,7 +1718,7 @@ class IntradayTorrent20d(Factor):
                 a = a.loc[idx] if isinstance(a, pd.Series) else pd.Series(a.values[:len(idx)], index=idx)
                 n5_vol = v.rolling(5).sum()
                 is_fangliang = n5_vol > n5_vol.shift(1)
-                ret_trend = c.pct_change(5).fillna(0)
+                ret_trend = c.pct_change(5, fill_method=None).fillna(0)
                 fangliang_diedie = is_fangliang & (ret_trend <= 0)
                 if not fangliang_diedie.any():
                     continue
@@ -2071,7 +1926,7 @@ class IntradayReversalIntensity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         intensities: dict = {}
         for dt in sorted(set(day)):
@@ -2296,7 +2151,7 @@ class IntradayOpenVpCorr20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         corrs: dict = {}
         for dt in sorted(set(day)):
@@ -2467,7 +2322,7 @@ class IntradayRetVolCoupling20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         couplings: dict = {}
         for dt in sorted(set(day)):
@@ -2530,7 +2385,7 @@ class IntradayPriceVolumeElasticity20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         elasticities: dict = {}
         for dt in sorted(set(day)):
@@ -2721,7 +2576,7 @@ class IntradayUpDownVolumeAsymmetry20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         asymmetries: dict = {}
         for dt in sorted(set(day)):
@@ -3050,7 +2905,7 @@ class IntradayVolatilitySmile20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         smiles: dict = {}
         for dt in sorted(set(day)):
@@ -3181,7 +3036,7 @@ class IntradayLargeOrderImpact20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         impacts: dict = {}
         for dt in sorted(set(day)):
@@ -3252,7 +3107,7 @@ class IntradayVolumePriceEntropy20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         entropies: dict = {}
         for dt in sorted(set(day)):
@@ -3320,7 +3175,7 @@ class IntradaySignedVolumeRatio20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -3378,7 +3233,7 @@ class IntradaySemivarianceRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         semivars: dict = {}
         for dt in sorted(set(day)):
@@ -3429,7 +3284,7 @@ class IntradayMicroLeverage20d(Factor):
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         high, low, close = panel["high"], panel["low"], panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         amplitude = (high - low) / close.replace(0, np.nan)
         day = ret_1m.index.normalize()
         leverages: dict = {}
@@ -3487,7 +3342,7 @@ class IntradayPriceRunDuration20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         durations: dict = {}
         for dt in sorted(set(day)):
@@ -3569,7 +3424,7 @@ class IntradayParkinsonVolRatio20d(Factor):
                 if len(log_hl) < 10:
                     continue
                 parkinson = float(np.sqrt((log_hl ** 2).sum() / (4.0 * len(log_hl) * np.log(2.0))))
-                cc_vol = c.pct_change().dropna().std(ddof=0)
+                cc_vol = c.pct_change(fill_method=None).dropna().std(ddof=0)
                 if cc_vol < 1e-12:
                     vals[col] = 0.0
                 else:
@@ -3660,7 +3515,7 @@ class IntradayKyleLambda20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         lambdas: dict = {}
         for dt in sorted(set(day)):
@@ -3716,7 +3571,7 @@ class IntradayRollSpread20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         spreads: dict = {}
         for dt in sorted(set(day)):
@@ -3766,7 +3621,7 @@ class IntradayRealizedCovariance20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         covariances: dict = {}
         for dt in sorted(set(day)):
@@ -3887,7 +3742,7 @@ class IntradayJumpRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -3940,7 +3795,7 @@ class IntradayContinuousVol20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         vols: dict = {}
         for dt in sorted(set(day)):
@@ -3988,7 +3843,7 @@ class IntradayRealizedQuarticity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         quartics: dict = {}
         for dt in sorted(set(day)):
@@ -4036,7 +3891,7 @@ class IntradayDownsideSemivariance20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         downside: dict = {}
         for dt in sorted(set(day)):
@@ -4083,7 +3938,7 @@ class IntradaySignedJump20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         signed_jumps: dict = {}
         for dt in sorted(set(day)):
@@ -4133,7 +3988,7 @@ class IntradayRealizedKurtosis20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         kurtosis: dict = {}
         for dt in sorted(set(day)):
@@ -4185,7 +4040,7 @@ class IntradayAutocorrRet20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         autocorrs: dict = {}
         for dt in sorted(set(day)):
@@ -4237,7 +4092,7 @@ class IntradayVolatilityClustering20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         clusters: dict = {}
         for dt in sorted(set(day)):
@@ -4308,7 +4163,7 @@ class IntradayVarianceRatio5m20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         vrs: dict = {}
         for dt in sorted(set(day)):
@@ -4372,7 +4227,7 @@ class IntradayVarianceRatio30m20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         vrs: dict = {}
         for dt in sorted(set(day)):
@@ -4419,7 +4274,7 @@ class IntradayDirectionPersistence20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         persist: dict = {}
         for dt in sorted(set(day)):
@@ -4545,7 +4400,7 @@ class IntradayOrderFlowImbalance20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         imbalances: dict = {}
         for dt in sorted(set(day)):
@@ -4601,7 +4456,7 @@ class IntradayInformedTrading20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         informed: dict = {}
         for dt in sorted(set(day)):
@@ -4658,7 +4513,7 @@ class IntradayAmihudTrend20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         trends: dict = {}
         for dt in sorted(set(day)):
@@ -4718,7 +4573,7 @@ class IntradayImpactAsymmetry20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         asym: dict = {}
         for dt in sorted(set(day)):
@@ -5300,7 +5155,7 @@ class IntradayPermutationEntropy20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         entropies: dict = {}
         for dt in sorted(set(day)):
@@ -5797,7 +5652,7 @@ class IntradayVolRatio53020d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -5860,7 +5715,7 @@ class IntradayVolSegmentConsistency20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         consistencies: dict = {}
         for dt in sorted(set(day)):
@@ -5980,7 +5835,7 @@ class IntradayVolPersistence20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         persist: dict = {}
         for dt in sorted(set(day)):
@@ -6034,7 +5889,7 @@ class IntradayVolOfVol20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         vov: dict = {}
         for dt in sorted(set(day)):
@@ -6535,7 +6390,7 @@ class IntradayGambling20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         gamblings: dict = {}
         for dt in sorted(set(day)):
@@ -6591,7 +6446,7 @@ class IntradayLotteryMax20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         maxs: dict = {}
         for dt in sorted(set(day)):
@@ -7019,7 +6874,7 @@ class IntradayTrendOccupancy20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         occupancies: dict = {}
         for dt in sorted(set(day)):
@@ -7072,7 +6927,7 @@ class IntradayShockContinuation20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         continuations: dict = {}
         for dt in sorted(set(day)):
@@ -7132,7 +6987,7 @@ class IntradayVolatilityCooling20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         coolings: dict = {}
         for dt in sorted(set(day)):
@@ -7306,7 +7161,7 @@ class IntradayShockAsymmetry20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         asym: dict = {}
         for dt in sorted(set(day)):
@@ -7463,7 +7318,7 @@ class IntradayOpenSurge20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change().abs()
+        ret_1m = panel["close"].pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         surges: dict = {}
         for dt in sorted(set(day)):
@@ -7779,7 +7634,7 @@ class IntradayVolatilityBreakout20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         daily_vol: dict = {}
         for dt in sorted(set(day)):
@@ -7881,7 +7736,7 @@ class IntradayTailRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         tails: dict = {}
         for dt in sorted(set(day)):
@@ -7932,7 +7787,7 @@ class IntradayAbsRetRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -7984,7 +7839,7 @@ class IntradayExtremeConc20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         concs: dict = {}
         for dt in sorted(set(day)):
@@ -8033,7 +7888,7 @@ class IntradayProfitLossRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -8084,7 +7939,7 @@ class IntradayKurtosisTail20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         tails: dict = {}
         for dt in sorted(set(day)):
@@ -8244,7 +8099,7 @@ class IntradayObvSlope20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         slopes: dict = {}
         for dt in sorted(set(day)):
@@ -8438,7 +8293,7 @@ class IntradayChoppiness20d(Factor):
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         high, low, close = panel["high"], panel["low"], panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         chops: dict = {}
         for dt in sorted(set(day)):
@@ -8565,7 +8420,7 @@ class IntradayLiquidityVolRatio20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -8620,7 +8475,7 @@ class IntradayAmihudStability20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         stabilities: dict = {}
         for dt in sorted(set(day)):
@@ -8794,7 +8649,7 @@ class IntradayPanicStrength20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         panics: dict = {}
         for dt in sorted(set(day)):
@@ -8852,7 +8707,7 @@ class IntradayEuphoriaStrength20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         euphorias: dict = {}
         for dt in sorted(set(day)):
@@ -9303,7 +9158,7 @@ class IntradayRiskAdjMomentum20d(Factor):
         if not {"open", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         open_px, close = panel["open"], panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = close.index.normalize()
         rarms: dict = {}
         for dt in sorted(set(day)):
@@ -9473,7 +9328,7 @@ class IntradayOrderFlowVariability20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         variabilities: dict = {}
         for dt in sorted(set(day)):
@@ -9583,7 +9438,7 @@ class IntradayUpMinuteRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -9685,7 +9540,7 @@ class IntradayZeroRetFreq20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         freqs: dict = {}
         for dt in sorted(set(day)):
@@ -9733,7 +9588,7 @@ class IntradaySignedRunBalance20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         balances: dict = {}
         for dt in sorted(set(day)):
@@ -9783,7 +9638,7 @@ class IntradayExtremeFreqBalance20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         balances: dict = {}
         for dt in sorted(set(day)):
@@ -10117,7 +9972,7 @@ class IntradayVolRatio2h20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         ratios: dict = {}
         for dt in sorted(set(day)):
@@ -10168,7 +10023,7 @@ class IntradayVolQuarterTrend20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         trends: dict = {}
         for dt in sorted(set(day)):
@@ -10223,7 +10078,7 @@ class IntradayVolatilityDrift20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         drifts: dict = {}
         for dt in sorted(set(day)):
@@ -10274,7 +10129,7 @@ class IntradayRvHalfLife20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         half_lives: dict = {}
         for dt in sorted(set(day)):
@@ -10333,7 +10188,7 @@ class IntradayVolUpside20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         upsides: dict = {}
         for dt in sorted(set(day)):
@@ -10384,7 +10239,7 @@ class IntradayTickActivity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         activities: dict = {}
         for dt in sorted(set(day)):
@@ -10545,7 +10400,7 @@ class IntradayImbalanceAcceleration20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         accelerations: dict = {}
         for dt in sorted(set(day)):
@@ -10599,7 +10454,7 @@ class IntradayRetDistributionPeak20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         peaks: dict = {}
         for dt in sorted(set(day)):
@@ -10649,7 +10504,7 @@ class IntradayTrendFollowScore20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         scores: dict = {}
         for dt in sorted(set(day)):
@@ -10940,7 +10795,7 @@ class IntradayRunLengthMedian20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         medians: dict = {}
         for dt in sorted(set(day)):
@@ -10998,7 +10853,7 @@ class IntradayRunLengthSkew20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         skews: dict = {}
         for dt in sorted(set(day)):
@@ -11117,7 +10972,7 @@ class IntradayVolRegimeSwitches20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         switches: dict = {}
         for dt in sorted(set(day)):
@@ -11172,7 +11027,7 @@ class IntradayVolRegimeDurationRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         durations: dict = {}
         for dt in sorted(set(day)):
@@ -11225,7 +11080,7 @@ class IntradaySkewStability20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         stabilities: dict = {}
         for dt in sorted(set(day)):
@@ -11289,7 +11144,7 @@ class IntradayQuantileSkew20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         qskews: dict = {}
         for dt in sorted(set(day)):
@@ -11340,7 +11195,7 @@ class IntradayTemporalConsistency20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         consistencies: dict = {}
         for dt in sorted(set(day)):
@@ -11555,7 +11410,7 @@ class IntradayLzComplexity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         complexities: dict = {}
         for dt in sorted(set(day)):
@@ -11662,7 +11517,7 @@ class IntradayVolVolumeRegime20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         day = ret_1m.index.normalize()
         regimes: dict = {}
         for dt in sorted(set(day)):
@@ -11774,7 +11629,7 @@ class IntradayTailCluster20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         clusters: dict = {}
         for dt in sorted(set(day)):
@@ -11830,7 +11685,7 @@ class IntradayExtremeTiming20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         timings: dict = {}
         for dt in sorted(set(day)):
@@ -11968,7 +11823,7 @@ class IntradayCloseSlopeR220d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 以下为自创因子补充批次 (由 microstructure_batch.py + effective_variants.py 合并而来)
+# 以下为历史 K/V 兼容名批次，现已集中维护在本文件。
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _finalize(daily: pd.DataFrame, dates, universe, window: int = 20) -> pd.DataFrame:
@@ -11980,15 +11835,6 @@ def _finalize(daily: pd.DataFrame, dates, universe, window: int = 20) -> pd.Data
         daily.rolling(window, min_periods=5).mean()
         .reindex(dates).shift(1).reindex(columns=universe)
     )
-
-
-def _daily_agg(panel_key: str, panel, day, agg):
-    """按日聚合面板中某个字段."""
-    frame = panel[panel_key]
-    return pd.DataFrame({
-        dt: agg(frame.loc[day == dt])
-        for dt in sorted(set(day)) if len(frame.loc[day == dt]) > 10
-    }).T
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -12011,7 +11857,7 @@ class RealizedKurtosis20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change()
+        ret = panel["close"].pct_change(fill_method=None)
         day = ret.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12048,8 +11894,8 @@ class OvernightIntradayVol20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
         daily_close = close.groupby(close.index.normalize()).last()
-        overnight = daily_close.pct_change().abs()  # 相邻日收盘的隔夜变动代理
-        intraday_vol = daily_close.pct_change().rolling(5, min_periods=3).std(ddof=0)
+        overnight = daily_close.pct_change(fill_method=None).abs()  # 相邻日收盘的隔夜变动代理
+        intraday_vol = daily_close.pct_change(fill_method=None).rolling(5, min_periods=3).std(ddof=0)
         ratio = overnight / intraday_vol.replace(0, np.nan)
         return _finalize(ratio, dates, universe)
 
@@ -12073,7 +11919,7 @@ class JumpPersistence20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change()
+        ret = panel["close"].pct_change(fill_method=None)
         day = ret.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12112,7 +11958,7 @@ class IntradayAmihud20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "amount" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change().abs()
+        ret = panel["close"].pct_change(fill_method=None).abs()
         amt = panel["amount"].replace(0, np.nan)
         amihud = ret / amt
         day = amihud.index.normalize()
@@ -12145,7 +11991,7 @@ class LiquidityElasticity20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
         vol = panel["volume"]
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         day = close.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12159,7 +12005,7 @@ class LiquidityElasticity20d(Factor):
                 if len(idx) < 30:
                     continue
                 cc, vv = cc.loc[idx], vv.loc[idx]
-                rr = cc.pct_change()
+                rr = cc.pct_change(fill_method=None)
                 vol_spike = vv > (vv.mean() + 2 * vv.std(ddof=0))
                 if not vol_spike.any():
                     continue
@@ -12238,7 +12084,7 @@ class TailReturnRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change()
+        ret = panel["close"].pct_change(fill_method=None)
         day = ret.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12280,7 +12126,7 @@ class VolClustering20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change()
+        ret = panel["close"].pct_change(fill_method=None)
         day = ret.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12318,7 +12164,7 @@ class MicroPriceImpact20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "amount" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = panel["close"].pct_change().abs()
+        ret = panel["close"].pct_change(fill_method=None).abs()
         amt = panel["amount"].replace(0, np.nan)
         day = ret.index.normalize()
         daily = {}
@@ -12361,7 +12207,7 @@ class SignedVolumePressure20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
         vol = panel["volume"]
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         day = close.index.normalize()
         daily = {}
         for dt in sorted(set(day)):
@@ -12375,7 +12221,7 @@ class SignedVolumePressure20d(Factor):
                 if len(idx) < 20:
                     continue
                 cc, vv = cc.loc[idx], vv.loc[idx]
-                rr = cc.pct_change().fillna(0)
+                rr = cc.pct_change(fill_method=None).fillna(0)
                 buy = vv[rr > 0].sum()
                 sell = vv[rr < 0].sum()
                 total = buy + sell
@@ -12404,13 +12250,13 @@ class _VariantBase(Factor):
         return transformed.reindex(index=dates, columns=universe)
 
 
-def _v_v_cs_rank(df: pd.DataFrame) -> pd.DataFrame:
-    """截面 rank (0~1)."""
+def _v_cs_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Return each date's cross-sectional percentile rank."""
     return df.rank(axis=1, pct=True)
 
 
-def _v_v_cs_zscore(df: pd.DataFrame) -> pd.DataFrame:
-    """截面 z-score."""
+def _v_cs_zscore(df: pd.DataFrame) -> pd.DataFrame:
+    """Return each date's cross-sectional population z-score."""
     mean = df.mean(axis=1)
     std = df.std(axis=1, ddof=0).replace(0, np.nan)
     return df.sub(mean, axis=0).div(std, axis=0)
@@ -13280,7 +13126,7 @@ class IntradayOiPriceSensitivity20d(Factor):
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         oi_change = position.diff()
         day = ret_1m.index.normalize()
         sensitivities: dict = {}
@@ -14122,7 +13968,7 @@ class IntradayOiPriceDivergence20d(Factor):
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         oi_change = position.diff()
         day = ret_1m.index.normalize()
         divergences: dict = {}
@@ -14613,7 +14459,7 @@ class IntradayTermVolSpread20d(Factor):
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         near, far = panel["near_close"], panel["far_close"]
-        ret_n, ret_f = near.pct_change(), far.pct_change()
+        ret_n, ret_f = near.pct_change(fill_method=None), far.pct_change(fill_method=None)
         day = ret_n.index.normalize()
         spreads: dict = {}
         for dt in sorted(set(day)):
@@ -14924,7 +14770,7 @@ class IntradayOiVolPriceCorr20d(Factor):
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         oi_change = position.diff()
         day = ret_abs.index.normalize()
         corrs: dict = {}
@@ -15030,7 +14876,7 @@ class IntradayPriceOiLead20d(Factor):
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         oi_change = position.diff()
         day = ret_1m.index.normalize()
         leads: dict = {}
@@ -15090,7 +14936,7 @@ class IntradayVolOiCorr20d(Factor):
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         day = ret_abs.index.normalize()
         corrs: dict = {}
         for dt in sorted(set(day)):
@@ -15404,7 +15250,7 @@ class IntradayOiTorrent20d(Factor):
         if not {"close", "volume", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume, position = panel["close"], panel["volume"], panel["position"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         oi_change = position.diff()
         day = ret_1m.index.normalize()
         torrents: dict = {}
@@ -15469,7 +15315,7 @@ class IntradayOiHerding20d(Factor):
         if not {"close", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         oi_change = position.diff()
         day = ret_1m.index.normalize()
         herdings: dict = {}
@@ -16355,8 +16201,8 @@ class IntradayOiPriceTrendAlign20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"].groupby(panel["close"].index.normalize()).last()
         oi = panel["position"].groupby(panel["position"].index.normalize()).last()
-        p_ret = close.pct_change(20)
-        oi_chg = oi.pct_change(20)
+        p_ret = close.pct_change(20, fill_method=None)
+        oi_chg = oi.pct_change(20, fill_method=None)
         score = np.sign(p_ret) * np.sign(oi_chg)
         return score.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -16365,6 +16211,22 @@ class IntradayOiPriceTrendAlign20d(Factor):
 # 242. intraday_oi_surge_reversal_20d — OI 突增反转
 #     OI 单日突增(>2σ)后 5 日价格反转. 增仓过热 → 反向. 方向: 负向.
 # ═══════════════════════════════════════════════════════════════════════════════
+def _oi_surge_forward_score(panel, dates, universe):
+    """Estimate the historical five-day OI-surge relation without look-ahead."""
+    if "position" not in panel or "close" not in panel:
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    oi = panel["position"].groupby(panel["position"].index.normalize()).last()
+    close = panel["close"].groupby(panel["close"].index.normalize()).last()
+    oi_ret = oi.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+    oi_std = oi_ret.rolling(20, min_periods=10).std().replace(0, np.nan)
+    surge = (oi_ret - oi_ret.rolling(20, min_periods=10).mean()) / oi_std
+    forward_return = close.pct_change(5, fill_method=None).shift(-5)
+    score = (surge * forward_return).rolling(20, min_periods=5).mean()
+    # A relation stamped S needs the S+5 close; one further bar preserves the
+    # library convention that a close-T observation is published for T+1.
+    return score.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(6)
+
+
 @register_factor("intraday_oi_surge_reversal_20d", category="intraday_advanced")
 class IntradayOiSurgeReversal20d(Factor):
     """OI突增后价格反转."""
@@ -16378,17 +16240,9 @@ class IntradayOiSurgeReversal20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "position" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        oi = panel["position"].groupby(panel["position"].index.normalize()).last()
-        close = panel["close"].groupby(panel["close"].index.normalize()).last()
-        oi_ret = oi.pct_change()
-        oi_std = oi_ret.rolling(20, min_periods=10).std().replace(0, np.nan)
-        surge = (oi_ret - oi_ret.rolling(20, min_periods=10).mean()) / oi_std
-        fwd_ret = close.pct_change(5).shift(-5)
-        score = (surge * fwd_ret).rolling(20, min_periods=5).mean()
-        return score.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+        return _oi_surge_forward_score(
+            _get_minute_panel(data, dates, universe, freq="1min"), dates, universe
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -16556,7 +16410,7 @@ class IntradayOiTrendMomentum20d(Factor):
         if "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         oi = panel["position"].groupby(panel["position"].index.normalize()).last()
-        mom = oi.pct_change(20)
+        mom = oi.pct_change(20, fill_method=None)
         return mom.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -16582,8 +16436,8 @@ class IntradayTermVolRatio20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         near = panel["near_close"].groupby(panel["near_close"].index.normalize()).last()
         far = panel["far_close"].groupby(panel["far_close"].index.normalize()).last()
-        n_vol = near.pct_change().rolling(20, min_periods=10).std()
-        f_vol = far.pct_change().rolling(20, min_periods=10).std()
+        n_vol = near.pct_change(fill_method=None).rolling(20, min_periods=10).std()
+        f_vol = far.pct_change(fill_method=None).rolling(20, min_periods=10).std()
         ratio = n_vol / f_vol.replace(0, np.nan)
         return ratio.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -16643,7 +16497,7 @@ class IntradayOiSurgeConfirm20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         oi = panel["position"].groupby(panel["position"].index.normalize()).last()
         vol = panel["volume"].groupby(panel["volume"].index.normalize()).sum()
-        oi_ret = oi.pct_change().replace([np.inf, -np.inf], np.nan)
+        oi_ret = oi.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
         oi_std = oi_ret.rolling(20, min_periods=10).std().replace(0, np.nan)
         surge_z = (oi_ret - oi_ret.rolling(20, min_periods=10).mean()) / oi_std
         vol_ratio = vol / vol.rolling(20, min_periods=10).mean().replace(0, np.nan)
@@ -16682,7 +16536,7 @@ class IntradayOiReversionVol20d(Factor):
         mean = oi.rolling(20, min_periods=10).mean()
         std = oi.rolling(20, min_periods=10).std().replace(0, np.nan)
         z = (oi - mean) / std
-        vol = close.pct_change().rolling(20, min_periods=10).std().replace(0, np.nan)
+        vol = close.pct_change(fill_method=None).rolling(20, min_periods=10).std().replace(0, np.nan)
         score = z * (1.0 / vol)
         return score.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -16880,7 +16734,7 @@ class IntradayOiHerdingZ20d(Factor):
         if "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         oi = panel["position"].groupby(panel["position"].index.normalize()).last()
-        oi_ret = oi.pct_change().replace([np.inf, -np.inf], np.nan)
+        oi_ret = oi.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
         std = oi_ret.rolling(20, min_periods=10).std().replace(0, np.nan)
         z = (oi_ret - oi_ret.rolling(20, min_periods=10).mean()) / std
         # 连续同号 z 的最长 run
@@ -16954,17 +16808,9 @@ class IntradayOiSurgeFollow20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "position" not in panel or "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        oi = panel["position"].groupby(panel["position"].index.normalize()).last()
-        close = panel["close"].groupby(panel["close"].index.normalize()).last()
-        oi_ret = oi.pct_change().replace([np.inf, -np.inf], np.nan)
-        oi_std = oi_ret.rolling(20, min_periods=10).std().replace(0, np.nan)
-        surge = (oi_ret - oi_ret.rolling(20, min_periods=10).mean()) / oi_std
-        fwd_ret = close.pct_change(5).shift(-5)
-        score = (surge * fwd_ret).rolling(20, min_periods=5).mean()
-        return score.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+        return _oi_surge_forward_score(
+            _get_minute_panel(data, dates, universe, freq="1min"), dates, universe
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -17146,14 +16992,14 @@ class IntradayDfTest20d(Factor):
     def _df_tstat(series):
         """Dickey-Fuller 检验 t 统计量绝对值.
 
-        优先 statsmodels.adfuller (E:/Python/Pythonenv 已装 0.14.6);
+        优先使用当前环境中的 statsmodels.adfuller；
         缺失时回退手动 OLS 实现 (Python312 兼容).
         """
         try:
             from statsmodels.tsa.stattools import adfuller
             res = adfuller(series, autolag="AIC", regresults=False)
             return float(abs(res[0]))
-        except Exception:
+        except (ImportError, ValueError, np.linalg.LinAlgError):
             pass
         # 手动 OLS Dickey-Fuller: Δy_t = a + b·y_{t-1} + e
         y = np.asarray(series, dtype=float)
@@ -17165,7 +17011,7 @@ class IntradayDfTest20d(Factor):
         X = np.column_stack([np.ones(len(y_lag)), y_lag])
         try:
             beta, res, rank, sv = np.linalg.lstsq(X, dy, rcond=None)
-        except Exception:
+        except np.linalg.LinAlgError:
             return 0.0
         resid = dy - X @ beta
         n, k = X.shape
@@ -17348,7 +17194,7 @@ class IntradayVolRegimePersist20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         daily_vol: dict = {}
         for dt in sorted(set(day)):
@@ -17464,7 +17310,7 @@ class IntradayVpCorrStability20d(Factor):
                 common = c.index.intersection(v.index)
                 if len(common) < 30:
                     continue
-                rc = c.loc[common].pct_change()
+                rc = c.loc[common].pct_change(fill_method=None)
                 vc = v.loc[common]
                 if rc.std(ddof=0) < 1e-12 or vc.std(ddof=0) < 1e-12:
                     vals[col] = 0.0
@@ -17946,7 +17792,7 @@ class IntradaySettleSurgeZ20d(Factor):
         settle = _read_local_daily(data, dates, universe, "settle")
         if settle is None or settle.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = settle.pct_change().replace([np.inf, -np.inf], np.nan)
+        ret = settle.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
         mean = ret.rolling(20, min_periods=5).mean()
         std = ret.rolling(20, min_periods=5).std().replace(0, np.nan)
         z = (ret - mean) / std
@@ -18010,7 +17856,7 @@ class IntradayRetTransitionBias20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         biases: dict = {}
         for dt in sorted(set(day)):
@@ -18068,7 +17914,7 @@ class IntradayVolStateTrend20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         trends: dict = {}
         for dt in sorted(set(day)):
@@ -18289,7 +18135,7 @@ class IntradayVolumeTrendShare20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         shares: dict = {}
         for dt in sorted(set(day)):
@@ -18408,7 +18254,7 @@ class IntradaySkewPath20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         paths: dict = {}
         for dt in sorted(set(day)):
@@ -18710,7 +18556,7 @@ class IntradayVolVolumeLead20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         day = ret_abs.index.normalize()
         leads: dict = {}
         for dt in sorted(set(day)):
@@ -18767,7 +18613,7 @@ class IntradayElasticityPath20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         day = ret_abs.index.normalize()
         paths: dict = {}
         for dt in sorted(set(day)):
@@ -19377,7 +19223,7 @@ class IntradayVolLiqInteraction20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -19432,7 +19278,7 @@ class IntradayAmihudVolRatio20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         ratios: dict = {}
@@ -19490,7 +19336,7 @@ class IntradayLiqDryInVol20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         ratios: dict = {}
@@ -19551,7 +19397,7 @@ class IntradayVolBreakoutLiq20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         daily: dict = {}
@@ -19604,7 +19450,7 @@ class IntradayAmihudVolCorr20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         corrs: dict = {}
@@ -19714,7 +19560,7 @@ class IntradayCrossVol20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         daily_vol: dict = {}
         for dt in sorted(set(day)):
@@ -19762,7 +19608,7 @@ class IntradayCrossMomentum20d(Factor):
         close = data.get("close", dates, universe)
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        mom5 = close.pct_change(5)
+        mom5 = close.pct_change(5, fill_method=None)
         z = mom5.apply(lambda row: (row - row.mean()) / (row.std(ddof=0) + 1e-12), axis=1)
         return z.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -19958,7 +19804,7 @@ class IntradaySignedImbalanceZ20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         daily_imb: dict = {}
         for dt in sorted(set(day)):
@@ -20013,7 +19859,7 @@ class IntradayImbalanceVol20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         ret_abs = ret_1m.abs()
         day = ret_1m.index.normalize()
         relations: dict = {}
@@ -20142,7 +19988,7 @@ class IntradayOpenStateTrend20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         trends: dict = {}
         for dt in sorted(set(day)):
@@ -20200,7 +20046,7 @@ class IntradayLiqShockFreq20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -20248,7 +20094,7 @@ class IntradayAmihudSlope20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -20294,7 +20140,7 @@ class IntradayVolLiqDivergence20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -20346,7 +20192,7 @@ class IntradayVolSurgeLiqBefore20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -20405,7 +20251,7 @@ class IntradayLiqResilience20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change().abs()
+        ret_abs = close.pct_change(fill_method=None).abs()
         amihud = ret_abs / (amount + 1e-12)
         day = ret_abs.index.normalize()
         interactions: dict = {}
@@ -21038,7 +20884,7 @@ class IntradayVolVolumeSync20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret = close.pct_change()
+        ret = close.pct_change(fill_method=None)
         day = ret.index.normalize()
         interactions: dict = {}
         for dt in sorted(set(day)):
@@ -21104,7 +20950,7 @@ class IntradayMomentumVolAdjusted20d(Factor):
                 if len(c) < 60:
                     continue
                 ret_day = c.iloc[-1] / c.iloc[0] - 1
-                vol = c.pct_change().std(ddof=0)
+                vol = c.pct_change(fill_method=None).std(ddof=0)
                 if vol == 0 or pd.isna(vol):
                     continue
                 vals[col] = float(ret_day / vol)
@@ -21150,7 +20996,7 @@ class IntradayPathSmoothness20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 60:
                     continue
-                d2 = c.pct_change().diff()
+                d2 = c.pct_change(fill_method=None).diff()
                 rough = d2.pow(2).sum()
                 if rough == 0 or pd.isna(rough):
                     continue
@@ -21242,7 +21088,7 @@ class IntradaySectorMomentum20d(Factor):
         close = data.get("close", dates, universe)
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        mom5 = close.pct_change(5)
+        mom5 = close.pct_change(5, fill_method=None)
         z = _sector_zscore(mom5.reindex(index=pd.DatetimeIndex(dates)))
         return z.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -21272,7 +21118,7 @@ class IntradaySectorSync20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         syncs: dict = {}
         for dt in sorted(set(day)):
@@ -21384,7 +21230,7 @@ class IntradaySectorVolSpill20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         daily_vol: dict = {}
         for dt in sorted(set(day)):
@@ -21518,7 +21364,7 @@ class IntradayCrossLeadLag20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change()
+        ret_1m = panel["close"].pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         leads: dict = {}
         for dt in sorted(set(day)):
@@ -21576,7 +21422,7 @@ class IntradayCrossRankMomentum20d(Factor):
         close = data.get("close", dates, universe)
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret5 = close.pct_change(5)
+        ret5 = close.pct_change(5, fill_method=None)
         rank = ret5.rank(axis=1, pct=True)
         chg = rank - rank.shift(5)
         return chg.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
@@ -21662,7 +21508,7 @@ class IntradayAmihudCrossZ20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -21714,7 +21560,7 @@ class IntradayAmihudSectorZ20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -21766,7 +21612,7 @@ class IntradayAmihudCrossRank20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -21818,7 +21664,7 @@ class IntradayAmihudSectorRelative20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -21872,7 +21718,7 @@ class IntradayAmihudVolPartial20d(Factor):
         if not {"close", "amount", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount, volume = panel["close"], panel["amount"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         ret_abs = ret_1m.abs()
         amihud = ret_abs / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
@@ -21955,7 +21801,7 @@ class IntradayAmihudResidSkew20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         ret_abs = ret_1m.abs()
         amihud = ret_abs / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
@@ -22029,7 +21875,7 @@ class IntradayAmihudVolConditional20d(Factor):
         if not {"close", "amount", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount, volume = panel["close"], panel["amount"], panel["volume"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -22098,7 +21944,7 @@ class IntradayAmihudResidVol20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         ret_abs = ret_1m.abs()
         amihud = ret_abs / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
@@ -22167,7 +22013,7 @@ class IntradayAmihudRank20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -22220,7 +22066,7 @@ class IntradayAmihudRankZ20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -22274,7 +22120,7 @@ class IntradayAmihudRankChange20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -22328,7 +22174,7 @@ class IntradayAmihudRankMa20d(Factor):
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
-        ret_1m = close.pct_change().abs()
+        ret_1m = close.pct_change(fill_method=None).abs()
         amihud = ret_1m / (amount + 1e-12)
         amihud = amihud.replace([np.inf, -np.inf], np.nan)
         day = amihud.index.normalize()
@@ -22500,7 +22346,7 @@ class IntradayVolumePriceCorrDiv20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         divs: dict = {}
         for dt in sorted(set(day)):
@@ -22561,7 +22407,7 @@ class IntradayVpCorrDivSlope20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         divs: dict = {}
         for dt in sorted(set(day)):
@@ -23084,7 +22930,7 @@ class IntradayOiVolumeCrowding20d(Factor):
                     continue
                 o_c = o.loc[common]
                 v_c = v.loc[common]
-                oi_growth = o_c.pct_change().dropna()
+                oi_growth = o_c.pct_change(fill_method=None).dropna()
                 if len(oi_growth) < 20:
                     continue
                 g_mean = oi_growth.mean()
@@ -23149,7 +22995,7 @@ class IntradayCrowdingExtremeReversal20d(Factor):
                     continue
                 o_c = o.loc[common]
                 v_c = v.loc[common]
-                oi_growth = o_c.pct_change().dropna()
+                oi_growth = o_c.pct_change(fill_method=None).dropna()
                 if len(oi_growth) < 20:
                     continue
                 g_mean = oi_growth.mean()
@@ -23334,7 +23180,7 @@ class IntradayRvFastSlowDivergence20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         divergences: dict = {}
         for dt in sorted(set(day)):
@@ -23392,7 +23238,7 @@ class IntradayRvDivergencePersistence20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         persist: dict = {}
         for dt in sorted(set(day)):
@@ -23458,7 +23304,7 @@ class IntradayRvCompression20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         rvs: dict = {}
         for dt in sorted(set(day)):
@@ -23510,7 +23356,7 @@ class IntradayRvCompressionBreakout20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         rvs: dict = {}
         for dt in sorted(set(day)):
@@ -23821,7 +23667,7 @@ class IntradayImpliedSectorBeta20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         betas: dict = {}
         for dt in sorted(set(day)):
@@ -23884,7 +23730,7 @@ class IntradayBetaChangeSignal20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         betas: dict = {}
         for dt in sorted(set(day)):
@@ -23948,7 +23794,7 @@ class IntradayMoneyFlowMargin20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         margins: dict = {}
         for dt in sorted(set(day)):
@@ -24011,7 +23857,7 @@ class IntradayMoneyPriceDivergence20d(Factor):
         if not {"close", "volume", "open"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume, open_px = panel["close"], panel["volume"], panel["open"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         divergences: dict = {}
         for dt in sorted(set(day)):
@@ -24120,12 +23966,12 @@ class IntradayAnnualizedBasisZ20d(Factor):
 
 @register_factor("intraday_basis_reversion_conviction_20d", category="intraday_advanced")
 class IntradayBasisReversionConviction20d(Factor):
-    """基差反转信念因子 (原创: B1 改进).
+    """基差反转信念因子（基于基差分位极值反转改进）。
 
-    在 B1 极值反转基础上, 用基差自身波动率加权信念:
+    在基差分位极值反转基础上，用基差自身波动率加权信念：
     基差极值 + 低波动 (基差稳定在极端) → 反转信念强; 高波动 → 基差本身在剧烈波动, 反转信号弱.
     信念 = 反转信号 / (1 + 基差20日波动).
-    相比 B1 的纯分位反转, 加入信号可靠性调节.
+    相比纯分位反转，加入信号可靠性调节。
     方向: 随结构.
     """
     name = "intraday_basis_reversion_conviction_20d"
@@ -24245,9 +24091,9 @@ class IntradayRollYieldDualscore20d(Factor):
 
 @register_factor("intraday_roll_dualscore_consistency_20d", category="intraday_advanced")
 class IntradayRollDualscoreConsistency20d(Factor):
-    """双打分一致性因子 (原创: B3 改进).
+    """双打分一致性因子（基于展期收益双打分改进）。
 
-    B3 平均两个打分, 本因子强调两分同向时的信念:
+    基础因子平均两个打分，本因子强调两分同向时的信念：
     截面 rank × 时序 rank — 两者都高(或都低)时才产生强信号, 冲突时衰减.
     高一致性 → 展期收益的截面优势与自身历史优势共振 → 更可靠 → 正向.
     方向: 正向.
@@ -24452,7 +24298,7 @@ class IntradaySectorRotationStrength20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         strengths: dict = {}
         prev_rank: dict = {}
@@ -24512,7 +24358,7 @@ class IntradaySectorRotationMomentum20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         momentum: dict = {}
         prev_ret: dict = {}
@@ -24718,7 +24564,7 @@ class IntradayFlowPriceDivergence20d(Factor):
         flow = (net / denom.replace(0, np.nan)).reindex(index=pd.DatetimeIndex(dates))
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = close.pct_change().reindex(index=pd.DatetimeIndex(dates))
+        ret = close.pct_change(fill_method=None).reindex(index=pd.DatetimeIndex(dates))
         f_mean = flow.rolling(20, min_periods=5).mean()
         f_std = flow.rolling(20, min_periods=5).std().replace(0, np.nan)
         r_mean = ret.rolling(20, min_periods=5).mean()
@@ -24760,7 +24606,7 @@ class IntradayFlowPriceCatchup20d(Factor):
         flow = (net / denom.replace(0, np.nan)).reindex(index=pd.DatetimeIndex(dates))
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = close.pct_change().reindex(index=pd.DatetimeIndex(dates))
+        ret = close.pct_change(fill_method=None).reindex(index=pd.DatetimeIndex(dates))
         f_mean = flow.rolling(20, min_periods=5).mean()
         f_std = flow.rolling(20, min_periods=5).std().replace(0, np.nan)
         r_mean = ret.rolling(20, min_periods=5).mean()
@@ -25001,7 +24847,7 @@ class IntradayDaysToRollover20d(Factor):
 
     def compute(self, data, dates, universe):
         idx = pd.DatetimeIndex(dates)
-        cal = _get_rollover_calendar(idx, universe)
+        cal = _get_rollover_calendar(data, idx, universe)
         out = pd.DataFrame(np.nan, index=idx, columns=universe)
         for root in universe:
             roll_days = sorted(cal.get(root, []))
@@ -25043,7 +24889,7 @@ class IntradayRolloverSettleGap20d(Factor):
     def compute(self, data, dates, universe):
         idx = pd.DatetimeIndex(dates)
         settle = _read_local_daily(data, idx, universe, "settle")
-        cal = _get_rollover_calendar(idx, universe)
+        cal = _get_rollover_calendar(data, idx, universe)
         win = _roll_window_flags(idx, universe, cal, half_window=1)
         # 换月日 settle 已置 NaN, diff 在窗口内会断; 用 3 日滚动最值差捕捉跨合约跳变
         # (rolling max-min 对含 NaN 窗口与 nanmax-nanmin 行为一致, 免逐元素 lambda)
@@ -25082,7 +24928,7 @@ class IntradayRolloverBasisGap20d(Factor):
         if "annualized_basis" not in panel:
             return pd.DataFrame(np.nan, index=idx, columns=universe)
         basis_d = _daily_mean_panel(panel["annualized_basis"], idx)
-        cal = _get_rollover_calendar(idx, universe)
+        cal = _get_rollover_calendar(data, idx, universe)
         win = _roll_window_flags(idx, universe, cal, half_window=1)
         # 换月稀疏, min_periods=1: 窗口内出现基差跳变即计入
         gap = basis_d.diff().abs().where(win > 0)
@@ -25119,7 +24965,7 @@ class IntradayDazzlingVol20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         dazzling: dict = {}
         h = 10
@@ -25140,7 +24986,7 @@ class IntradayDazzlingVol20d(Factor):
                 v_mean = v_c.mean()
                 if v_mean < 1e-12:
                     continue
-                r = c_c.pct_change().values
+                r = c_c.pct_change(fill_method=None).values
                 vol_arr = v_c.values
                 surge_pos = np.where(vol_arr > 2.0 * v_mean)[0]
                 if len(surge_pos) == 0:
@@ -25229,7 +25075,7 @@ class IntradayTccRel20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         tccs: dict = {}
         for dt in sorted(set(day)):
@@ -25355,7 +25201,7 @@ class IntradayCsadSigma12020d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
         sigma = csad.rolling(120, min_periods=30).std()
         return (-sigma).reindex(index=idx, columns=universe).shift(1)
@@ -25388,7 +25234,7 @@ class IntradayCsadSigma2020d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
         sigma = csad.rolling(20, min_periods=5).std()
         return (-sigma).reindex(index=idx, columns=universe).shift(1)
@@ -25421,7 +25267,7 @@ class IntradayCsadRatio20d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
         s20 = csad.rolling(20, min_periods=5).std()
         s120 = csad.rolling(120, min_periods=30).std().replace(0, np.nan)
@@ -25481,7 +25327,7 @@ class IntradayDazzlingVolDecay20d(Factor):
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         decays: dict = {}
         for dt in sorted(set(day)):
@@ -25501,7 +25347,7 @@ class IntradayDazzlingVolDecay20d(Factor):
                 v_mean = v_c.mean()
                 if v_mean < 1e-12:
                     continue
-                r = c_c.pct_change().values
+                r = c_c.pct_change(fill_method=None).values
                 vol_arr = v_c.values
                 surge_pos = np.where(vol_arr > 2.0 * v_mean)[0]
                 ratios = []
@@ -25592,7 +25438,7 @@ class IntradayTccBreakaway20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        ret_1m = close.pct_change()
+        ret_1m = close.pct_change(fill_method=None)
         day = ret_1m.index.normalize()
         breakaways: dict = {}
         for dt in sorted(set(day)):
@@ -25727,7 +25573,7 @@ class IntradayCsadTrend20d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
         trend = csad.rolling(20, min_periods=8).apply(
             lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
@@ -25762,7 +25608,7 @@ class IntradayCsadExtremeReversal20d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
         rank = csad.rolling(60, min_periods=15).apply(
             lambda x: float((x.iloc[:-1] <= x.iloc[-1]).sum() / max(1, len(x) - 1)), raw=False)
@@ -25798,7 +25644,7 @@ class IntradayCsadVolumeConfirm20d(Factor):
         if close is None or close.empty or volume is None or volume.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         vol = volume.reindex(index=idx)
         csad = _csad_sector(ret, universe)
         csad_rank = csad.rolling(60, min_periods=15).apply(
@@ -25808,30 +25654,6 @@ class IntradayCsadVolumeConfirm20d(Factor):
         v_z = (vol - v_mean) / v_std
         confirm = csad_rank * v_z.clip(lower=0)
         return (-confirm).reindex(index=idx, columns=universe).shift(1)
-
-
-def _fund_flow_minute(panel, day, dt, col, base_col=None):
-    """分钟符号成交额资金流: sign(ret) × amount (tick test 代理, ).
-
-    返回 (资金流Series, 振幅Series, 涨跌幅Series); 数据不足返回 None.
-    """
-    close = panel["close"]
-    if "amount" in panel:
-        amt = panel["amount"]
-    elif "volume" in panel:
-        amt = panel["volume"] * close
-    else:
-        return None
-    c = close[col].dropna()
-    a = amt[col].dropna()
-    common = c.index.intersection(a.index)
-    if len(common) < 5:
-        return None
-    c_c = c.loc[common]
-    a_c = a.loc[common]
-    ret = c_c.pct_change()
-    flow = np.sign(ret.fillna(0)) * a_c
-    return flow, a_c
 
 
 def _fund_flow_resid(flow, dates, universe, momentum=None):
@@ -25909,7 +25731,7 @@ class IntradayAmpCutFlowResid20d(Factor):
                 if hl < 1e-12:
                     continue
                 # 分钟振幅用 (high-low) 不可得, 用 |ret| + 自身波动代理
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 amp = ret.abs()
                 thr = amp.median()
                 high_mask = amp >= thr
@@ -25972,7 +25794,7 @@ class IntradayOpenFlowResid20d(Factor):
                     continue
                 c_c = c.loc[common].iloc[:n_open]
                 a_c = a.loc[common].iloc[:n_open]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 vals[col] = float((np.sign(ret) * a_c).sum())
             if vals:
                 flows[dt] = pd.Series(vals)
@@ -26028,7 +25850,7 @@ class IntradaySceneFlowResid20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 # 5min情景: 滚动5分钟累计收益 > 0
                 ret5 = ret.rolling(5, min_periods=1).sum()
                 up_scene = ret5 > 0
@@ -26088,7 +25910,7 @@ class IntradayLowampFlowResid20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 amp = ret.abs()
                 low_mask = amp < amp.median()
                 if low_mask.sum() < 5:
@@ -26148,7 +25970,7 @@ class IntradayCloseFlowResid20d(Factor):
                     continue
                 c_c = c.loc[common].iloc[-n_tail:]
                 a_c = a.loc[common].iloc[-n_tail:]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 vals[col] = float((np.sign(ret) * a_c).sum())
             if vals:
                 flows[dt] = pd.Series(vals)
@@ -26203,7 +26025,7 @@ class IntradaySceneAmpFlow20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 amp = ret.abs()
                 ret5 = ret.rolling(5, min_periods=1).sum()
                 sel = (ret5 > 0) & (amp >= amp.median())
@@ -26249,7 +26071,7 @@ class IntradaySameStateTraction20d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         sector_mean = _sector_mean(ret)
         traction = pd.DataFrame(index=idx, columns=universe, dtype=float)
         for col in ret.columns:
@@ -26310,7 +26132,7 @@ class IntradayFlowStateQuad20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret = c_c.pct_change().fillna(0)
+                ret = c_c.pct_change(fill_method=None).fillna(0)
                 signed = np.sign(ret) * a_c
                 net = signed.sum()
                 buy_amt = a_c[ret > 0].sum()
@@ -26415,7 +26237,7 @@ class IntradayPeakMomentCount20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26472,7 +26294,7 @@ class IntradayPriceRidgeRet20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26535,7 +26357,7 @@ class IntradayPriceValleyVwap20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                ret = c_c.pct_change()
+                ret = c_c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26594,7 +26416,7 @@ class IntradayPriceRidgeIntervalSkew20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26666,7 +26488,7 @@ class IntradayJumpAmountLagcorr20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret = c_c.pct_change()
+                ret = c_c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26730,7 +26552,7 @@ class IntradayPricePeakRet20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26787,7 +26609,7 @@ class IntradayPriceValleyRet20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26844,7 +26666,7 @@ class IntradayPricePeakIntervalStd20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26910,7 +26732,7 @@ class IntradayJumpRetFollowRatio20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -26980,7 +26802,7 @@ class IntradayPeakRidgeCoherence20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                ret = c.pct_change()
+                ret = c.pct_change(fill_method=None)
                 amp = ret.abs()
                 thr = amp.std(ddof=0)
                 if thr < 1e-12:
@@ -27041,8 +26863,8 @@ class IntradayRetExtremeMagnitude20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 60:
                     continue
-                r1 = c.pct_change()
-                r5 = c.pct_change(5)
+                r1 = c.pct_change(fill_method=None)
+                r5 = c.pct_change(5, fill_method=None)
                 var = np.percentile(r1.dropna(), 95)
                 if abs(var) < 1e-12:
                     vals[col] = 1.0
@@ -27100,7 +26922,7 @@ class IntradayRetExtremeFreq20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                r1 = c.pct_change().dropna()
+                r1 = c.pct_change(fill_method=None).dropna()
                 if len(r1) < 20 or r1.std(ddof=0) < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -27159,8 +26981,8 @@ class IntradayTorrentDown20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret5 = c_c.pct_change(5)
-                vol_chg = a_c.pct_change(5)
+                ret5 = c_c.pct_change(5, fill_method=None)
+                vol_chg = a_c.pct_change(5, fill_method=None)
                 down = (ret5 < 0) & (vol_chg > 0)
                 total = a_c.sum()
                 if total < 1e-12:
@@ -27219,8 +27041,8 @@ class IntradayTorrentUp20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                ret5 = c_c.pct_change(5)
-                vol_chg = a_c.pct_change(5)
+                ret5 = c_c.pct_change(5, fill_method=None)
+                vol_chg = a_c.pct_change(5, fill_method=None)
                 up = (ret5 > 0) & (vol_chg > 0)
                 total = a_c.sum()
                 if total < 1e-12:
@@ -27333,7 +27155,7 @@ class IntradayTrajectoryIlliq20d(Factor):
                 common = c.index.intersection(a.index)
                 if len(common) < 20:
                     continue
-                r = c.loc[common].pct_change().dropna()
+                r = c.loc[common].pct_change(fill_method=None).dropna()
                 amt_total = a.loc[common].sum()
                 if amt_total < 1e-12:
                     continue
@@ -27680,7 +27502,7 @@ class IntradayVpCorrHighFreq20d(Factor):
                 common = c.index.intersection(v.index)
                 if len(common) < 30:
                     continue
-                r = c.loc[common].pct_change()
+                r = c.loc[common].pct_change(fill_method=None)
                 lag_abs = np.log1p(r.shift(1).abs()).iloc[1:]
                 v_c = v.loc[common].iloc[1:]
                 if len(lag_abs) < 20 or lag_abs.std() < 1e-12 or v_c.std() < 1e-12:
@@ -27949,7 +27771,7 @@ class IntradayEmotionInstability20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change().dropna()
+                r = c_c.pct_change(fill_method=None).dropna()
                 if len(r) < 20:
                     continue
                 ret_vol = r.std(ddof=0)
@@ -28007,7 +27829,7 @@ class IntradayOrderFlowMemory20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 40:
                     continue
-                signs = np.sign(c.pct_change().fillna(0).values)
+                signs = np.sign(c.pct_change(fill_method=None).fillna(0).values)
                 n = len(signs)
                 mean_s = signs.mean()
                 var_s = signs.var(ddof=0)
@@ -28213,7 +28035,7 @@ class IntradaySmartMoneyRet20d(Factor):
                     continue
                 cum = v_c.cumsum() / total_v
                 smart = cum <= 0.20
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 sr = r[smart]
                 if len(sr) < 3:
                     vals[col] = 0.0
@@ -28346,7 +28168,7 @@ class IntradayEmotionDirection20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                signed = np.sign(c_c.pct_change().fillna(0)) * v_c
+                signed = np.sign(c_c.pct_change(fill_method=None).fillna(0)) * v_c
                 if signed.std(ddof=0) < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -28400,7 +28222,7 @@ class IntradayOrderFlowAutocorr20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                signs = np.sign(c.pct_change().fillna(0).values)
+                signs = np.sign(c.pct_change(fill_method=None).fillna(0).values)
                 if signs.var(ddof=0) < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -28521,7 +28343,7 @@ class IntradaySmartMoneyV420d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change().fillna(0)
+                r = c_c.pct_change(fill_method=None).fillna(0)
                 states = (r > 0).astype(int).values  # +态/−态
                 n = len(states)
                 if n < 20:
@@ -28673,7 +28495,7 @@ class IntradayVolFlowVol20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change().dropna()
+                r = c_c.pct_change(fill_method=None).dropna()
                 if len(r) < 20:
                     continue
                 # 按量峰值二分递归 6 次
@@ -28751,7 +28573,7 @@ class IntradayNegRetIlliq20d(Factor):
                 common = c.index.intersection(a.index)
                 if len(common) < 20:
                     continue
-                r = c.loc[common].pct_change()
+                r = c.loc[common].pct_change(fill_method=None)
                 amt = a.loc[common]
                 neg = r < 0
                 if neg.sum() < 5 or amt[neg].sum() < 1e-12:
@@ -28810,7 +28632,7 @@ class IntradayEnhancedIlliq20d(Factor):
                 common = c.index.intersection(v.index)
                 if len(common) < 30:
                     continue
-                r = c.loc[common].pct_change().dropna()
+                r = c.loc[common].pct_change(fill_method=None).dropna()
                 vol = v.loc[common].iloc[1:]
                 if len(r) < 25:
                     continue
@@ -28877,7 +28699,7 @@ class IntradayOverconfidenceTiming20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                r = c.pct_change().dropna()
+                r = c.pct_change(fill_method=None).dropna()
                 if len(r) < 20 or r.std(ddof=0) < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -28940,7 +28762,7 @@ class IntradaySmartMoneyV4Vol20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                r = c.pct_change().fillna(0)
+                r = c.pct_change(fill_method=None).fillna(0)
                 states = (r > 0).astype(int).values
                 n = len(states)
                 if n < 20:
@@ -29036,7 +28858,7 @@ class IntradayFollowingPriceConfirm20d(Factor):
                     continue
                 n_same = 0
                 n_valid = 0
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 for ch in chosen:
                     s = int(ch)
                     if s + 5 >= len(c_c) or s == 0:
@@ -29101,7 +28923,7 @@ class IntradayVolSegmentSkew20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change().dropna()
+                r = c_c.pct_change(fill_method=None).dropna()
                 if len(r) < 20:
                     continue
                 v_arr = v_c.values[:len(r)]
@@ -29163,7 +28985,7 @@ class IntradayNegIlliqAsym20d(Factor):
                 common = c.index.intersection(a.index)
                 if len(common) < 20:
                     continue
-                r = c.loc[common].pct_change()
+                r = c.loc[common].pct_change(fill_method=None)
                 amt = a.loc[common]
                 neg = r < 0
                 all_illiq = (r.abs() / amt).dropna()
@@ -29226,7 +29048,7 @@ class IntradayIlliqFlowInteraction20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                r = c_c.pct_change().fillna(0)
+                r = c_c.pct_change(fill_method=None).fillna(0)
                 amt_total = a_c.sum()
                 if amt_total < 1e-12:
                     continue
@@ -29286,7 +29108,7 @@ class IntradayOverconfidenceIntensity20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                r = c_c.pct_change().dropna()
+                r = c_c.pct_change(fill_method=None).dropna()
                 if len(r) < 20 or r.std(ddof=0) < 1e-12:
                     vals[col] = 1.0
                     continue
@@ -29484,7 +29306,7 @@ class IntradayVolRetDist20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 if r.std(ddof=0) < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -29601,7 +29423,7 @@ class IntradayLeadAmountSurge20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 if len(r) < 25:
                     continue
                 thr_high = np.percentile(r.dropna(), 90)
@@ -29727,7 +29549,7 @@ class IntradayHighfreqIlliq20d(Factor):
                 common = c.index.intersection(v.index)
                 if len(common) < 30:
                     continue
-                r = c.loc[common].pct_change().dropna()
+                r = c.loc[common].pct_change(fill_method=None).dropna()
                 vol = v.loc[common].iloc[1:]
                 if len(r) < 25:
                     continue
@@ -29780,7 +29602,7 @@ class IntradayRetSquare21d20d(Factor):
         if close is None or close.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         idx = pd.DatetimeIndex(dates)
-        ret = close.pct_change().reindex(index=idx)
+        ret = close.pct_change(fill_method=None).reindex(index=idx)
         vol21 = (ret ** 2).rolling(21, min_periods=5).sum()
         return (-vol21).reindex(index=idx, columns=universe).shift(1)
 
@@ -29824,7 +29646,7 @@ class IntradayUpsideVolRatio20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                r = c.pct_change().dropna()
+                r = c.pct_change(fill_method=None).dropna()
                 total_var = r.var(ddof=0)
                 if total_var < 1e-12:
                     vals[col] = 0.5
@@ -30193,7 +30015,7 @@ class IntradayVolRetCouplingDist20d(Factor):
                     continue
                 c_c = c.loc[common]
                 v_c = v.loc[common]
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 if r.std(ddof=0) < 1e-12 or v_c.mean() < 1e-12:
                     vals[col] = 0.0
                     continue
@@ -30328,7 +30150,7 @@ class IntradayLeadAmountPersistence20d(Factor):
                     continue
                 c_c = c.loc[common]
                 a_c = a.loc[common]
-                r = c_c.pct_change()
+                r = c_c.pct_change(fill_method=None)
                 if len(r) < 25 or a_c.mean() < 1e-12:
                     continue
                 thr_high = np.percentile(r.dropna(), 90)
@@ -30338,7 +30160,6 @@ class IntradayLeadAmountPersistence20d(Factor):
                     vals[col] = 0.0
                     continue
                 # 波动后5分钟量能
-                after = a_c.shift(-1)
                 persist_vals = []
                 for i, e in enumerate(extreme.values):
                     if e and i + 5 < len(a_c):
@@ -30462,7 +30283,7 @@ class IntradayIlliqTrend20d(Factor):
                 common = c.index.intersection(v.index)
                 if len(common) < 30:
                     continue
-                r = c.loc[common].pct_change().dropna()
+                r = c.loc[common].pct_change(fill_method=None).dropna()
                 vol = v.loc[common].iloc[1:]
                 if len(r) < 25:
                     continue
@@ -30528,7 +30349,7 @@ class IntradayVolSkewBalance20d(Factor):
                 c = grp[col].dropna()
                 if len(c) < 30:
                     continue
-                r = c.pct_change().dropna()
+                r = c.pct_change(fill_method=None).dropna()
                 total_var = r.var(ddof=0)
                 if total_var < 1e-12:
                     vals[col] = 0.5
@@ -31253,7 +31074,7 @@ class IntradaySectorBreadthZ20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
         factor = breadth - breadth.rolling(20, min_periods=5).std()
         return factor.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
@@ -31293,7 +31114,7 @@ class IntradaySectorBreadthTrend20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
         trend = breadth.rolling(20, min_periods=8).apply(
             lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
@@ -31405,7 +31226,7 @@ class IntradayLeaderRetPremium20d(Factor):
         p = _daily_panel(data, dates, universe)
         if not {"close", "amount"}.issubset(p.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         amount = p["amount"]
         out = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         sectors: dict = {}
@@ -31459,7 +31280,7 @@ class IntradayLeaderLaggardSpread20d(Factor):
         p = _daily_panel(data, dates, universe)
         if not {"close", "amount"}.issubset(p.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         amount = p["amount"]
         out = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         sectors: dict = {}
@@ -31587,7 +31408,7 @@ class IntradayVolRetCov20d(Factor):
         p = _daily_panel(data, dates, universe)
         if not {"close", "amount"}.issubset(p.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         amount = p["amount"]
         out = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         sectors: dict = {}
@@ -31641,7 +31462,7 @@ class IntradayVolRetCovTrend20d(Factor):
         p = _daily_panel(data, dates, universe)
         if not {"close", "amount"}.issubset(p.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         amount = p["amount"]
         cov = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         sectors: dict = {}
@@ -31946,7 +31767,7 @@ class IntradaySectorAdl20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
         adl = breadth.rolling(20, min_periods=5).sum()
         return adl.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
@@ -31983,7 +31804,7 @@ class IntradaySectorAdlSlope20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
         adl = breadth.rolling(20, min_periods=5).sum()
         slope = adl.rolling(20, min_periods=8).apply(
@@ -32023,7 +31844,7 @@ class IntradaySectorDisp20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         sector_mean = _sector_wide(ret, lambda x: float(x.mean()))
         abs_mean = sector_mean.abs()
         disp = abs_mean / abs_mean.rolling(20, min_periods=5).mean().where(abs_mean.rolling(20, min_periods=5).mean() > 1e-12)
@@ -32061,7 +31882,7 @@ class IntradaySectorDispVolatility20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         sector_mean = _sector_wide(ret, lambda x: float(x.mean()))
         abs_mean = sector_mean.abs()
         disp = abs_mean / abs_mean.rolling(20, min_periods=5).mean().where(abs_mean.rolling(20, min_periods=5).mean() > 1e-12)
@@ -32100,7 +31921,7 @@ class IntradayVolZscore20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         rv = ret.abs()
         mu = rv.rolling(20, min_periods=5).mean()
         sd = rv.rolling(20, min_periods=5).std()
@@ -32139,7 +31960,7 @@ class IntradayVolZExtremeFreq20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         rv = ret.abs()
         mu = rv.rolling(20, min_periods=5).mean()
         sd = rv.rolling(20, min_periods=5).std()
@@ -32181,7 +32002,7 @@ class IntradaySentimentBeta20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         market = ret.mean(axis=1)
         beta = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         for col in ret.columns:
@@ -32231,7 +32052,7 @@ class IntradaySentimentBetaVolatility20d(Factor):
         p = _daily_panel(data, dates, universe)
         if "close" not in p:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret = p["close"].pct_change()
+        ret = p["close"].pct_change(fill_method=None)
         market = ret.mean(axis=1)
         beta = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
         for col in ret.columns:

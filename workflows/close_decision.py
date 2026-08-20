@@ -1,9 +1,9 @@
-"""Fail-closed end-of-day decision gate.
+"""Fail-closed end-of-day target-weight publication gate.
 
 The close workflow is deliberately separate from research and backtesting.
 It never promotes a research candidate or an old report implicitly. Until a
-reviewed deployment package is explicitly enabled, the only valid decision is
-NO_TRADE.
+reviewed deployment package is explicitly enabled, it publishes no targets.
+Order creation, routing, fills, and position reconciliation are out of scope.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APPROVED_STATUSES = {"approved_for_paper_trade", "approved_for_live"}
+APPROVED_STATUSES = {"approved_for_target_publication"}
 
 
 def _resolve_project_path(value: str) -> Path:
@@ -34,12 +34,14 @@ def _load_gate(path: Path) -> dict[str, Any]:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        raise ValueError("trading gate config must contain a mapping")
+        raise ValueError("target publication config must contain a mapping")
     return raw
 
 
-def build_close_decision(config_path: str | Path, as_of: str) -> dict[str, Any]:
-    """Build an auditable close decision without assuming deployment approval."""
+def build_close_target_publication(
+    config_path: str | Path, as_of: str
+) -> dict[str, Any]:
+    """Build an auditable close publication without assuming approval."""
     decision_date = date.fromisoformat(as_of).isoformat()
     config_file = _resolve_project_path(str(config_path))
     gate = _load_gate(config_file)
@@ -50,56 +52,52 @@ def build_close_decision(config_path: str | Path, as_of: str) -> dict[str, Any]:
         _resolve_project_path(deployment_value) if deployment_value else None
     )
 
-    reason_code = "TRADING_DISABLED"
+    reason_code = "TARGET_PUBLICATION_DISABLED"
     if enabled and approval_status not in APPROVED_STATUSES:
-        reason_code = "DEPLOYMENT_NOT_APPROVED"
+        reason_code = "TARGET_PUBLICATION_NOT_APPROVED"
     elif enabled and deployment_path is None:
         reason_code = "DEPLOYMENT_PACKAGE_MISSING"
     elif enabled and not deployment_path.exists():
         reason_code = "DEPLOYMENT_PACKAGE_NOT_FOUND"
     elif enabled:
-        # The project has no approved deployment package yet. Refuse to infer
-        # live weights from historical candidates or backtest configuration.
-        reason_code = "DEPLOYMENT_EXECUTOR_NOT_RELEASED"
+        # Refuse to infer current targets from historical candidates or a
+        # backtest configuration until a reviewed generator is released.
+        reason_code = "TARGET_GENERATOR_NOT_RELEASED"
 
     return {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "as_of": decision_date,
-        "status": "NO_TRADE",
+        "status": "NO_TARGETS",
         "reason_code": reason_code,
         "approval_status": approval_status,
         "approved_study_id": gate.get("approved_study_id") or None,
         "protocol_sha256": gate.get("protocol_sha256") or None,
         "target_weights": {},
-        "orders": [],
         "config": str(config_file),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fail-closed end-of-day trading decision gate."
+        description="Fail-closed end-of-day target-weight publication gate."
     )
     parser.add_argument(
-        "--config", default="config/trading.yaml",
-        help="Trading approval gate (default: config/trading.yaml)",
+        "--config", default="config/target_publication.yaml",
+        help="Target publication gate (default: config/target_publication.yaml)",
     )
     parser.add_argument(
         "--as-of", default=date.today().isoformat(),
         help="Decision date in YYYY-MM-DD format",
     )
     parser.add_argument(
-        "--output", default=None,
-        help="Optional JSON path; defaults to signals_output/close_decision_DATE.json",
+        "--output", required=True,
+        help="Explicit JSON output path",
     )
     args = parser.parse_args()
 
-    decision = build_close_decision(args.config, args.as_of)
-    output = (
-        _resolve_project_path(args.output) if args.output
-        else PROJECT_ROOT / "signals_output" / f"close_decision_{args.as_of}.json"
-    )
+    decision = build_close_target_publication(args.config, args.as_of)
+    output = _resolve_project_path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(decision, ensure_ascii=False, indent=2) + "\n",

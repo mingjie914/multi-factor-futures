@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime
 import json
 from pathlib import Path
 import sys
@@ -16,47 +15,41 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = ROOT / "scripts"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
 
-from exp_core import PROD6  # noqa: E402
-from exp18_light_forward import DIRS, KEPT47  # noqa: E402
-from exp22_full_pool import (  # noqa: E402
-    NEW21,
-    NEW21_DIR,
-    Runner,
-    prepare_ic_history,
+from research.portfolio_experiment_support import (  # noqa: E402
+    BASELINE_6F as PROD6,
+    FACTORS_6F as F6,
+    FACTORS_10F as F10,
+    FACTORS_13F as F13,
+    FACTORS_14F as F14,
+    FACTOR_DIRECTIONS as DIRS,
+    FactorPanelRunner as Runner,
+    NEW_FACTOR_DIRECTIONS as NEW21_DIR,
+    NEW_VALIDATED_21 as NEW21,
+    VALIDATED_47 as KEPT47,
+    configured_futures_cost_model,
 )
+from backtest.metrics import TRADING_DAYS_PER_YEAR  # noqa: E402
+from backtest.research_ledger import build_close_marked_ledger  # noqa: E402
+from optimization.factor_weighting import factor_weights  # noqa: E402
+from research.historical_portfolio_search import (  # noqa: E402
+    PortfolioEvaluator,
+    PortfolioRecipe,
+    performance_metrics,
+)
+from external_strategies.guosen_trend_index.strategy import load_snapshot  # noqa: E402
+from strategies.combined import FACTORS as PRODUCTION_10F  # noqa: E402
 
 
-PERIODS_PER_YEAR = 242
-TRADE_COST_RATE = 0.0002
-ANNUAL_FEE = 0.001
-REFERENCE_NAV = Path(r"E:\程明杰公司内容\GSIXTREND.WI_nav.csv")
+PERIODS_PER_YEAR = TRADING_DAYS_PER_YEAR
+COST_MODEL = configured_futures_cost_model()
+TRADE_COST_RATE = COST_MODEL.turnover_cost_rate
+ANNUAL_FEE = COST_MODEL.annual_fee
+ANNUAL_ROLL_COST = COST_MODEL.annual_roll_cost
+SNAPSHOT_PATH = Path(__file__).with_name("config.yaml")
 
-F6 = list(PROD6)
-F14 = F6 + [
-    "intraday_ma_count_bullish_20d",
-    "intraday_torrent_down_20d",
-    "intraday_lowest_time_20d",
-    "intraday_term_slope_20d",
-    "intraday_open_close_volume_ratio_20d",
-    "intraday_seat_long_short_seat_ratio_20d",
-    "intraday_turnover_velocity_20d",
-    "intraday_price_delay_20d",
-]
-F13 = [name for name in F14 if name != "intraday_ma_count_bullish_20d"]
-F10 = [
-    name for name in F13
-    if name not in {
-        "intraday_turnover_velocity_20d",
-        "intraday_open_close_volume_ratio_20d",
-        "intraday_seat_long_short_seat_ratio_20d",
-    }
-]
 GUOSEN_BALANCED_6R = [
     "intraday_jump_intensity_20d",
     "intraday_dtws_20d",
@@ -67,52 +60,35 @@ GUOSEN_BALANCED_6R = [
 ]
 
 
-def _lw_cov(ic_matrix: pd.DataFrame) -> np.ndarray:
-    rows, columns = ic_matrix.shape
-    sample_cov = np.cov(ic_matrix, rowvar=False, ddof=1)
-    sample_corr = np.corrcoef(ic_matrix, rowvar=False)
-    average_corr = (
-        np.mean(sample_corr[np.triu_indices(columns, k=1)])
-        if columns > 1 else 0.0
-    )
-    target_corr = (
-        np.eye(columns) * (1.0 - average_corr)
-        + np.ones((columns, columns)) * average_corr
-    )
-    std = np.std(ic_matrix, axis=0, ddof=1)
-    target_cov = np.outer(std, std) * target_corr
-    centered = ic_matrix - ic_matrix.mean(axis=0)
-    pi = sum(
-        np.sum(
-            (
-                centered.iloc[index].to_numpy()[:, None]
-                @ centered.iloc[index].to_numpy()[None, :]
-                - sample_cov
-            ) ** 2
-        )
-        for index in range(rows)
-    ) / rows
-    gamma = np.sum((target_cov - sample_cov) ** 2)
-    shrinkage = max(0.0, min(1.0, pi / gamma)) if gamma > 0.0 else 0.5
-    return shrinkage * target_cov + (1.0 - shrinkage) * sample_cov
-
-
 def _factor_weights(history: pd.DataFrame) -> pd.Series:
-    if history.shape[1] < 2:
-        return pd.Series(dtype=float)
-    if len(history) < 30:
-        return pd.Series(1.0 / history.shape[1], index=history.columns)
-    mean_ic = history.mean()
-    covariance = _lw_cov(history)
-    try:
-        raw = np.linalg.solve(covariance, mean_ic.to_numpy())
-    except np.linalg.LinAlgError:
-        raw = mean_ic.abs().to_numpy()
-    raw = np.abs(raw)
-    total = float(raw.sum())
-    if not np.isfinite(total) or total <= 0.0:
-        return pd.Series(1.0 / history.shape[1], index=history.columns)
-    return pd.Series(raw / total, index=history.columns)
+    """Compatibility wrapper for historical callers and tests."""
+    return factor_weights(history, "lw_abs")
+
+
+def _factor_direction(name: str) -> int:
+    return int(DIRS.get(name, NEW21_DIR.get(name, PROD6.get(name, 1))))
+
+
+def _validate_fixed_factor_sets(snapshot_path: Path = SNAPSHOT_PATH) -> None:
+    """Fail if research labels drift from production or their frozen snapshot."""
+    _, configured_sets, _ = load_snapshot(snapshot_path)
+    expected_sets = {"6f": F6, "10f": F10, "13f": F13, "14f": F14}
+    for label, names in expected_sets.items():
+        configured = configured_sets.get(label)
+        if configured is None:
+            raise ValueError(f"snapshot is missing fixed factor set {label!r}")
+        flattened = {}
+        for group_name, variants in configured.items():
+            if len(variants) != 1 or variants[0][0] != group_name:
+                raise ValueError(f"snapshot factor set {label!r} is not flat")
+            flattened[group_name] = int(variants[0][1])
+        expected = {name: _factor_direction(name) for name in names}
+        if flattened != expected:
+            raise ValueError(f"snapshot factor set {label!r} drifted from code")
+    if dict(PRODUCTION_10F) != {
+        name: _factor_direction(name) for name in F10
+    }:
+        raise ValueError("10f research label drifted from production FACTORS")
 
 
 def _run_production_weights(
@@ -120,45 +96,17 @@ def _run_production_weights(
     factor_names: list[str],
     end: pd.Timestamp,
 ) -> pd.DataFrame:
-    missing = sorted(set(factor_names) - set(runner.ranks))
-    if missing:
-        raise KeyError(f"factor runner did not compute: {missing}")
     dates = runner.cal[runner.cal <= end]
-    weights = pd.DataFrame(0.0, index=dates, columns=runner.u)
-    ic = runner.ic[factor_names]
-    for index, date in enumerate(dates):
-        history = prepare_ic_history(ic.loc[:date].iloc[-60:-1])
-        factor_weights = _factor_weights(history)
-        if factor_weights.empty:
-            continue
-        score = pd.Series(0.0, index=runner.u)
-        for name, factor_weight in factor_weights.items():
-            score = score.add(
-                runner.ranks[name].loc[date].fillna(0.0) * factor_weight,
-                fill_value=0.0,
-            )
-        total = float(score.sum())
-        if total > 0.0:
-            score /= total
-        score = score.dropna()
-        if len(score) < 20:
-            continue
-        long_pool = runner.env.capped(score, ascending=False, date=date)
-        short_pool = runner.env.capped(score, ascending=True, date=date)
-        long_weights = runner.env.erc_w(long_pool, date) or {}
-        short_weights = runner.env.erc_w(short_pool, date) or {}
-        if not long_weights or not short_weights:
-            continue
-        for symbol, value in long_weights.items():
-            weights.loc[date, symbol] += value
-        for symbol, value in short_weights.items():
-            weights.loc[date, symbol] -= value
-        if (index + 1) % 500 == 0:
-            print(
-                f"  {','.join(factor_names[:2])}... weights {index + 1}/{len(dates)}",
-                flush=True,
-            )
-    return weights
+    evaluator = PortfolioEvaluator(
+        runner,
+        start=dates.min(),
+        end=dates.max(),
+        cost_model=COST_MODEL,
+    )
+    return evaluator.weights(
+        factor_names,
+        PortfolioRecipe("lw_abs", 10, 3, "erc"),
+    )
 
 
 def _ledger_from_weights(
@@ -166,58 +114,31 @@ def _ledger_from_weights(
     asset_returns: pd.DataFrame,
     start: pd.Timestamp,
     end: pd.Timestamp,
+    contract_schedule: pd.DataFrame | None = None,
+    decision_tradable: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    weights = weights.loc[:end].fillna(0.0)
-    gross_return = (
-        weights * asset_returns.reindex(index=weights.index, columns=weights.columns)
-    ).sum(axis=1, min_count=1).fillna(0.0)
-    turnover = weights.diff().abs().sum(axis=1)
-    if len(turnover):
-        turnover.iloc[0] = float(weights.iloc[0].abs().sum())
-    trade_cost = turnover * TRADE_COST_RATE
-    fee = pd.Series(ANNUAL_FEE / PERIODS_PER_YEAR, index=weights.index)
-    net_return = gross_return - trade_cost - fee
-    ledger = pd.DataFrame({
-        "gross_return": gross_return,
-        "turnover": turnover,
-        "trade_cost": trade_cost,
-        "management_fee": fee,
-        "net_return": net_return,
-        "gross_exposure": weights.abs().sum(axis=1),
-        "net_exposure": weights.sum(axis=1),
-    }).loc[start:end]
-    if len(ledger):
-        ledger.iloc[0, ledger.columns.get_loc("gross_return")] = 0.0
-        ledger.iloc[0, ledger.columns.get_loc("turnover")] = 0.0
-        ledger.iloc[0, ledger.columns.get_loc("trade_cost")] = 0.0
-        ledger.iloc[0, ledger.columns.get_loc("management_fee")] = 0.0
-        ledger.iloc[0, ledger.columns.get_loc("net_return")] = 0.0
-    ledger["nav"] = 1000.0 * (1.0 + ledger["net_return"]).cumprod()
+    evaluation_weights = weights.loc[start:end]
+    result = build_close_marked_ledger(
+        evaluation_weights,
+        asset_returns.reindex(
+            index=evaluation_weights.index, columns=evaluation_weights.columns
+        ),
+        **COST_MODEL.ledger_parameters(),
+        contract_schedule=contract_schedule,
+        decision_tradable=decision_tradable,
+        initial_nav=1000.0,
+    )
+    ledger = result.daily.copy()
+    ledger["nav"] = ledger["nav_after"]
     return ledger
 
 
 def _metrics(returns: pd.Series) -> dict[str, float | int]:
-    values = returns.replace([np.inf, -np.inf], np.nan).dropna()
-    if len(values) < 2:
-        return {"observations": int(len(values))}
-    growth = float((1.0 + values).prod())
-    annual_return = (
-        growth ** (PERIODS_PER_YEAR / len(values)) - 1.0
-        if growth > 0.0 else -1.0
+    return performance_metrics(
+        returns,
+        periods_per_year=PERIODS_PER_YEAR,
+        initial_anchor=True,
     )
-    annual_volatility = float(values.std(ddof=1) * np.sqrt(PERIODS_PER_YEAR))
-    nav = (1.0 + values).cumprod()
-    return {
-        "annual_return": annual_return,
-        "annual_volatility": annual_volatility,
-        "sharpe": (
-            float(values.mean() * PERIODS_PER_YEAR / annual_volatility)
-            if annual_volatility > 0.0 else 0.0
-        ),
-        "max_drawdown": float((nav / nav.cummax() - 1.0).min()),
-        "total_return": growth - 1.0,
-        "observations": int(len(values)),
-    }
 
 
 def _segment_ic_score(
@@ -322,9 +243,33 @@ def _forward_select(
     return current, history
 
 
+def _reference_nav_path(snapshot_path: Path = SNAPSHOT_PATH) -> Path:
+    _, _, raw = load_snapshot(snapshot_path)
+    value = raw.get("snapshot", {}).get("reference_nav")
+    if not value:
+        raise ValueError("snapshot.reference_nav is required")
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else snapshot_path.parent / path
+
+
 def _load_reference(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    frame = pd.read_csv(REFERENCE_NAV, parse_dates=["date"])
+    path = _reference_nav_path()
+    if not path.is_file():
+        raise FileNotFoundError(f"Guosen reference NAV not found: {path}")
+    frame = pd.read_csv(path, parse_dates=["date"])
+    if list(frame.columns) != ["date", "nav"]:
+        raise ValueError(f"unexpected Guosen columns: {frame.columns.tolist()}")
+    if frame["date"].duplicated().any() or not frame["date"].is_monotonic_increasing:
+        raise ValueError("Guosen dates must be unique and sorted ascending")
+    if frame["nav"].isna().any() or not np.isfinite(frame["nav"]).all():
+        raise ValueError("Guosen NAV must be finite")
+    if (frame["nav"] <= 0.0).any():
+        raise ValueError("Guosen NAV must be positive")
     nav = frame.set_index("date")["nav"].sort_index().loc[start:end]
+    if nav.empty:
+        raise ValueError(f"Guosen reference NAV has no data in {start.date()}..{end.date()}")
+    if pd.Timestamp(nav.index[0]) != start:
+        raise ValueError(f"Guosen reference NAV does not cover requested start {start.date()}")
     return nav / nav.iloc[0] * 1000.0
 
 
@@ -367,23 +312,21 @@ def _plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare production IC_IR/ERC long-short portfolios with GSIXTREND.WI"
+        description="Research factor-set search; use current_core_compare for fixed current comparisons"
     )
     parser.add_argument("--start", default="2016-03-31")
-    parser.add_argument("--end", default="2026-08-06")
-    parser.add_argument("--output")
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--output", required=True)
     args = parser.parse_args()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    output = Path(args.output) if args.output else (
-        ROOT / "runs" / "external_guosen_trend_index"
-        / f"{datetime.now():%Y%m%d_%H%M%S}_production_compare"
-    )
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
+    _validate_fixed_factor_sets()
 
     valid_factors = list(dict.fromkeys(F6 + KEPT47 + NEW21))
     directions = {
-        name: int(DIRS.get(name, NEW21_DIR.get(name, PROD6.get(name, 1))))
+        name: _factor_direction(name)
         for name in valid_factors
     }
     print(f"compute valid factor pool: {len(valid_factors)} factors", flush=True)
@@ -455,7 +398,7 @@ def main() -> None:
         "14f": F14,
         "guosen_balanced_6r": GUOSEN_BALANCED_6R,
         "search_robust_full": robust_full,
-        "search_robust_post2020": robust_post_2020,
+        "8f": robust_post_2020,
         "search_augmented_6f": augmented_6f,
         "search_consensus": consensus,
     }
@@ -476,7 +419,7 @@ def main() -> None:
         unique_sets[name] = factors
 
     snapshot = {
-        "as_of": "2026-08-09",
+        "as_of": str(end.date()),
         "valid_factor_count": len(valid_factors),
         "valid_factors": directions,
         "excluded_unvalidated_recent_factors": [
@@ -518,6 +461,7 @@ def main() -> None:
 
     reference_nav = _load_reference(start, end)
     asset_returns = runner.daily_ret.reindex(columns=runner.u)
+    contract_schedule = runner.get_contract_schedule()
     native_ledgers = {}
     equal_ledgers = {}
     metrics_rows = []
@@ -529,12 +473,22 @@ def main() -> None:
         print(f"exact production backtest: {name} ({len(factors)} factors)", flush=True)
         native_weights = _run_production_weights(runner, factors, end)
         native_ledger = _ledger_from_weights(
-            native_weights, asset_returns, start, end
+            native_weights,
+            asset_returns,
+            start,
+            end,
+            contract_schedule,
+            runner.close_tradable,
         )
         gross = native_weights.abs().sum(axis=1)
         equal_weights = native_weights.div(gross.where(gross > 0.0), axis=0).fillna(0.0)
         equal_ledger = _ledger_from_weights(
-            equal_weights, asset_returns, start, end
+            equal_weights,
+            asset_returns,
+            start,
+            end,
+            contract_schedule,
+            runner.close_tradable,
         )
         native_ledgers[name] = native_ledger
         equal_ledgers[name] = equal_ledger
@@ -542,9 +496,13 @@ def main() -> None:
         equal_dir = output / "equal_gross_1"
         native_dir.mkdir(exist_ok=True)
         equal_dir.mkdir(exist_ok=True)
-        native_weights.loc[start:end].to_csv(native_dir / f"{name}_weights.csv")
+        native_weights.loc[start:end].to_csv(
+            native_dir / f"{name}_target_weights.csv"
+        )
         native_ledger.to_csv(native_dir / f"{name}_ledger.csv")
-        equal_weights.loc[start:end].to_csv(equal_dir / f"{name}_weights.csv")
+        equal_weights.loc[start:end].to_csv(
+            equal_dir / f"{name}_target_weights.csv"
+        )
         equal_ledger.to_csv(equal_dir / f"{name}_ledger.csv")
 
     scenarios = {
@@ -578,7 +536,9 @@ def main() -> None:
                         ledger.loc[period_start:, "gross_exposure"].replace(0.0, np.nan).mean()
                     ),
                     "annual_turnover": float(
-                        ledger.loc[period_start:, "turnover"].mean() * PERIODS_PER_YEAR
+                        ledger.loc[
+                            period_start:, "executed_traded_notional"
+                        ].iloc[1:].mean() * PERIODS_PER_YEAR
                     ),
                 }
                 metrics_rows.append(row)
@@ -595,7 +555,7 @@ def main() -> None:
                     "trend",
                     "14f",
                     "search_robust_full",
-                    "search_robust_post2020",
+                    "8f",
                     "search_augmented_6f",
                     "search_consensus",
                 ],

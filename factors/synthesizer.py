@@ -33,7 +33,7 @@ class FactorSynthesizer:
     簇内若只有 1 个因子, 直接返回该因子 (标准化后).
     簇内若所有因子在某日全为 NaN, 合成结果为 NaN.
 
-    日内确认 (方案A): 合成后对指定因子应用日内代理特征增强.
+    日内确认: 合成后对指定因子应用日内代理特征增强.
     confirmed = z(factor) × (1 + weight × z(confirm_factor))
     - weight > 0: 同向确认 (动量+强势收盘 → 放大)
     - weight < 0: 反向确认 (动量+弱势收盘 → 衰减)
@@ -175,12 +175,10 @@ class FactorSynthesizer:
                     # 等权合成 (默认)
                     synth_mat = self._synthesize_equal_weight(mats)
                 result[synth_name] = synth_mat
-            except Exception:
-                logger.warning(
-                    f"合成因子 '{synth_name}' 失败, 使用首个因子",
-                    exc_info=True,
-                )
-                result[synth_name] = self._cross_section_zscore(mats[0])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"factor synthesis failed for {synth_name!r}"
+                ) from exc
 
         # 3. 日内确认: 对指定因子应用日内代理特征增强
         if self.confirm_map:
@@ -236,11 +234,10 @@ class FactorSynthesizer:
                 logger.debug(
                     f"日内确认: {target_name} × {confirm_name} (w={weight})"
                 )
-            except Exception:
-                logger.warning(
-                    f"日内确认失败: {target_name} ← {confirm_name}",
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"intraday confirmation failed: {target_name} <- {confirm_name}"
+                ) from exc
 
         return synthesized
 
@@ -347,12 +344,12 @@ class FactorSynthesizer:
         """
         mean = df.mean(axis=1)
         std = df.std(axis=1, ddof=0)
-        # 避免除零: std=0 时用 1 替代, 结果为 0
-        std_safe = std.where(std > 1e-10, 1.0)
+        # 避免除零: std=0 时仅把原本有效的位置设为0，缺失仍保持NaN。
+        variable = std > 1e-10
+        std_safe = std.where(variable, 1.0)
         z = df.sub(mean, axis=0).div(std_safe, axis=0)
-        # std=0 的行返回 0 (所有品种等价)
-        z = z.where(std > 1e-10, 0.0)
-        return z
+        z.loc[~variable, :] = 0.0
+        return z.where(df.notna())
 
 
 def build_cluster_map_from_json(
@@ -377,7 +374,6 @@ def build_cluster_map_from_json(
         - flip_signs: {因子名: +1 或 -1} 方向修正映射
     """
     import json
-    import os
 
     with open(corr_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)

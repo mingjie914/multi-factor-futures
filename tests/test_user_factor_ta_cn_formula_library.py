@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from core.registry import get
+from factors.user import ta_cn_formula_library as ta_library
 from factors.user.ta_cn_formula_library import FACTOR_SPECS
 
 
@@ -100,3 +102,15 @@ def test_stock_specific_unavailable_formula_fails_closed():
         provider, dates, universe
     )
     assert result.isna().all().all()
+
+
+def test_available_formula_failure_is_not_silently_converted_to_nan(monkeypatch):
+    dates, universe, provider = _sample()
+
+    def fail(_spec):
+        raise ValueError("broken formula")
+
+    monkeypatch.setattr(ta_library, "_module_and_function", fail)
+    factor = get("factor", "wq101_alpha101")()
+    with pytest.raises(RuntimeError, match="wq101_alpha101 formula computation failed"):
+        factor.compute(provider, dates, universe)

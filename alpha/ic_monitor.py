@@ -37,11 +37,19 @@ class ICMonitor:
         min_ic: float = 0.02,
         decay_tolerance: int = 20,
         reactivation_ic: float = 0.03,
+        min_cross_section: int = 3,
     ):
-        self._window = window
-        self._min_ic = min_ic
-        self._decay_tolerance = decay_tolerance
-        self._reactivation_ic = reactivation_ic
+        if int(window) <= 0 or int(decay_tolerance) <= 0:
+            raise ValueError("IC window and decay_tolerance must be positive")
+        if not np.isfinite([min_ic, reactivation_ic]).all():
+            raise ValueError("IC thresholds must be finite")
+        if int(min_cross_section) < 3:
+            raise ValueError("min_cross_section must be at least 3")
+        self._window = int(window)
+        self._min_ic = float(min_ic)
+        self._decay_tolerance = int(decay_tolerance)
+        self._reactivation_ic = float(reactivation_ic)
+        self._min_cross_section = int(min_cross_section)
 
         # 滚动 IC 历史: {factor_name: pd.Series(index=date, values=ic)}
         self._ic_history: Dict[str, pd.Series] = {}
@@ -99,6 +107,7 @@ class ICMonitor:
                 {name: frame.reindex(index=new_dates, columns=common_cols)
                  for name, frame, _ in entries},
                 forward_returns.reindex(index=new_dates, columns=common_cols),
+                min_cross_section=self._min_cross_section,
             )
             for name, _, existing in entries:
                 daily_ics = daily_by_factor.get(name, pd.Series(dtype=float))
@@ -121,107 +130,75 @@ class ICMonitor:
         self,
         factor_mat: pd.DataFrame,
         fwd_returns: pd.DataFrame,
-        *,
-        return_ranked: Optional[pd.DataFrame] = None,
     ) -> pd.Series:
-        """逐日计算截面 Spearman IC.
-
-        向量化实现: 对每行 (截面) 计算 rank 相关.
-        """
-        # 对齐列
+        """Compute pairwise-complete daily cross-sectional Spearman IC."""
         common_cols = factor_mat.columns.intersection(fwd_returns.columns)
-        if len(common_cols) < 3:
-            return pd.Series(dtype=float)
-
-        f = factor_mat[common_cols]
-
-        # Rank with pandas to preserve average-tie semantics, then perform all
-        # row reductions in NumPy. This avoids thousands of tiny DataFrame
-        # arithmetic and reduction objects during walk-forward refits.
-        f_ranked = f.rank(axis=1).to_numpy(dtype=float)
-        r_ranked = (
-            return_ranked.reindex(index=f.index, columns=common_cols).to_numpy(
-                dtype=float
-            )
-            if return_ranked is not None
-            else fwd_returns[common_cols].rank(axis=1).to_numpy(dtype=float)
-        )
-        f_count = np.sum(np.isfinite(f_ranked), axis=1, keepdims=True)
-        r_count = np.sum(np.isfinite(r_ranked), axis=1, keepdims=True)
-        f_mean = np.divide(
-            np.nansum(f_ranked, axis=1, keepdims=True),
-            f_count,
-            out=np.zeros((len(f_ranked), 1), dtype=float),
-            where=f_count > 0,
-        )
-        r_mean = np.divide(
-            np.nansum(r_ranked, axis=1, keepdims=True),
-            r_count,
-            out=np.zeros((len(r_ranked), 1), dtype=float),
-            where=r_count > 0,
-        )
-        f_c = f_ranked - f_mean
-        r_c = r_ranked - r_mean
-        numerator = np.nansum(f_c * r_c, axis=1)
-        denominator = np.sqrt(
-            np.nansum(f_c**2, axis=1) * np.nansum(r_c**2, axis=1)
-        )
-        ic = np.divide(
-            numerator,
-            denominator,
-            out=np.full_like(numerator, np.nan, dtype=float),
-            where=denominator != 0,
-        )
-        return pd.Series(ic, index=f.index)
+        dates = factor_mat.index.intersection(fwd_returns.index, sort=False)
+        if len(common_cols) < self._min_cross_section or len(dates) == 0:
+            return pd.Series(np.nan, index=dates, dtype=float)
+        return self._compute_daily_ic_batch(
+            {"factor": factor_mat.reindex(index=dates, columns=common_cols)},
+            fwd_returns.reindex(index=dates, columns=common_cols),
+            min_cross_section=self._min_cross_section,
+        )["factor"]
 
     @staticmethod
     def _compute_daily_ic_batch(
         factor_mats: Dict[str, pd.DataFrame],
         fwd_returns: pd.DataFrame,
+        *,
+        min_cross_section: int = 3,
     ) -> Dict[str, pd.Series]:
-        """Compute aligned factor ICs with one pandas rank operation."""
-        if not factor_mats or fwd_returns.shape[1] < 3:
-            return {name: pd.Series(dtype=float) for name in factor_mats}
+        """Compute pairwise-complete aligned ICs with two rank operations."""
+        if int(min_cross_section) < 3:
+            raise ValueError("min_cross_section must be at least 3")
+        if not factor_mats:
+            return {}
         names = list(factor_mats)
         dates = fwd_returns.index
+        columns = fwd_returns.columns
+        if len(columns) < min_cross_section:
+            return {
+                name: pd.Series(np.nan, index=dates, dtype=float)
+                for name in names
+            }
         n_dates, n_assets = fwd_returns.shape
         block = pd.concat(
-            [factor_mats[name] for name in names],
+            [factor_mats[name].reindex(index=dates, columns=columns) for name in names],
             keys=names,
             names=["factor", "date"],
         )
-        factor_ranked = block.rank(axis=1).to_numpy(dtype=float).reshape(
+        return_block = pd.concat(
+            [fwd_returns for _ in names], keys=names, names=["factor", "date"]
+        )
+        pairwise = block.notna() & return_block.notna()
+        factor_ranked = block.where(pairwise).rank(axis=1).to_numpy(dtype=float).reshape(
             len(names), n_dates, n_assets
         )
-        return_ranked = fwd_returns.rank(axis=1).to_numpy(dtype=float)
-        factor_count = np.sum(np.isfinite(factor_ranked), axis=2, keepdims=True)
-        return_count = np.sum(np.isfinite(return_ranked), axis=1, keepdims=True)
+        return_ranked = return_block.where(pairwise).rank(axis=1).to_numpy(
+            dtype=float
+        ).reshape(len(names), n_dates, n_assets)
+        count = np.sum(np.isfinite(factor_ranked), axis=2, keepdims=True)
         factor_mean = np.divide(
-            np.nansum(factor_ranked, axis=2, keepdims=True),
-            factor_count,
-            out=np.zeros(factor_count.shape, dtype=float),
-            where=factor_count > 0,
+            np.nansum(factor_ranked, axis=2, keepdims=True), count,
+            out=np.zeros(count.shape, dtype=float), where=count > 0,
         )
         return_mean = np.divide(
-            np.nansum(return_ranked, axis=1, keepdims=True),
-            return_count,
-            out=np.zeros(return_count.shape, dtype=float),
-            where=return_count > 0,
+            np.nansum(return_ranked, axis=2, keepdims=True), count,
+            out=np.zeros(count.shape, dtype=float), where=count > 0,
         )
         factor_centered = factor_ranked - factor_mean
         return_centered = return_ranked - return_mean
-        numerator = np.nansum(
-            factor_centered * return_centered[None, :, :], axis=2
-        )
+        numerator = np.nansum(factor_centered * return_centered, axis=2)
         denominator = np.sqrt(
             np.nansum(factor_centered**2, axis=2)
-            * np.nansum(return_centered**2, axis=1)[None, :]
+            * np.nansum(return_centered**2, axis=2)
         )
         ic = np.divide(
             numerator,
             denominator,
             out=np.full_like(numerator, np.nan, dtype=float),
-            where=denominator != 0,
+            where=(denominator > 0) & (count[:, :, 0] >= min_cross_section),
         )
         return {
             name: pd.Series(ic[index], index=dates)
@@ -234,13 +211,20 @@ class ICMonitor:
         if history is None or len(history) == 0:
             return
 
-        # 取最近 window 天的 IC
-        recent = history.tail(self._window)
-        if len(recent) == 0:
+        valid = history.dropna()
+        if valid.empty:
+            self._inactive_factors.add(factor_name)
+            self._decay_counter[factor_name] = self._decay_tolerance
             return
-
-        # 近期平均 IC
-        recent_ic = float(recent.mean())
+        rolling_ic = valid.rolling(self._window, min_periods=1).mean()
+        recent_ic = float(rolling_ic.iloc[-1])
+        below = rolling_ic.abs().lt(self._min_ic)
+        trailing_below = 0
+        for value in reversed(below.tolist()):
+            if not value:
+                break
+            trailing_below += 1
+        self._decay_counter[factor_name] = trailing_below
 
         if factor_name in self._inactive_factors:
             # 已剔除: 检查是否恢复
@@ -248,15 +232,8 @@ class ICMonitor:
                 self._inactive_factors.discard(factor_name)
                 self._decay_counter[factor_name] = 0
         else:
-            # 活跃: 检查是否需要剔除
-            if abs(recent_ic) < self._min_ic:
-                self._decay_counter[factor_name] = (
-                    self._decay_counter.get(factor_name, 0) + 1
-                )
-                if self._decay_counter[factor_name] >= self._decay_tolerance:
-                    self._inactive_factors.add(factor_name)
-            else:
-                self._decay_counter[factor_name] = 0
+            if trailing_below >= self._decay_tolerance:
+                self._inactive_factors.add(factor_name)
 
     def get_active_factors(self, all_factors: List[str]) -> List[str]:
         """返回当前活跃的因子列表 (剔除失效因子)."""
@@ -266,13 +243,13 @@ class ICMonitor:
         """返回因子健康报告."""
         report = {}
         for name, history in self._ic_history.items():
-            recent = history.tail(self._window)
-            recent_ic = float(recent.mean()) if len(recent) > 0 else 0.0
+            recent = history.dropna().tail(self._window)
+            recent_ic = float(recent.mean()) if not recent.empty else np.nan
             report[name] = {
                 "recent_ic": recent_ic,
                 "is_active": name not in self._inactive_factors,
                 "decay_count": self._decay_counter.get(name, 0),
-                "n_obs": len(history),
+                "n_obs": int(history.notna().sum()),
             }
         return report
 

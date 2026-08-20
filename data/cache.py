@@ -2,9 +2,8 @@
 
 import hashlib
 import json
-import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import pandas as pd
 
@@ -18,9 +17,12 @@ class Cache:
     """
 
     def __init__(self, cache_dir: str = "./cache", backend: str = "parquet") -> None:
+        backend = str(backend).strip().lower()
+        if backend != "parquet":
+            raise ValueError("cache backend must be 'parquet'")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.backend = backend  # 'parquet' | 'feather'
+        self.backend = backend
         self._parquet_metadata = {}
 
     def _inspect_parquet(self, path: Path):
@@ -147,12 +149,7 @@ class Cache:
 
         if covering_path is not None:
             covering = pd.read_parquet(covering_path)
-            sliced = covering.loc[start_ts:end_ts].reindex(columns=list(tickers))
-            try:
-                self.put(market, source, field, tickers, start, end, sliced)
-            except Exception:
-                pass
-            return sliced
+            return covering.loc[start_ts:end_ts].reindex(columns=list(tickers))
         return None
 
     def put(

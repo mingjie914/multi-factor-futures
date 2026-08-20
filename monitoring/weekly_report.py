@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """monitoring.weekly_report — 周报三件套(JSON + PNG + Markdown).
 
-输出到 weeklyreport/周报_YYYYMMDD/(子目录按时间, 内部文件不带日期):
+输出到 weeklyreport/周报_YYYYMMDD/（子目录按报告日期，内部文件不带日期）:
 - 周报.md            三口径表格 + 状态迁移摘要 + 结论
 - 因子IC热力图.png       因子 × 时间滚动 IC 热力图
 - 因子回撤路径.png       多空累计收益 + 回撤区间
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 
 import monitoring.config as C

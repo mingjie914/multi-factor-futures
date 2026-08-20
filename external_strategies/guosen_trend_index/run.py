@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 from pathlib import Path
 
@@ -12,14 +11,17 @@ import numpy as np
 import pandas as pd
 
 from core.config import load_config
+from backtest.metrics import TRADING_DAYS_PER_YEAR
 from factors.engine import FactorEngine
 from pipeline.runner import PipelineRunner
+from research.historical_portfolio_search import performance_metrics
 
 from .robustness import exhaustive_subset_search
 from .strategy import ExternalBacktestResult, GuosenTrendIndexBacktester, load_snapshot
 
 
 HERE = Path(__file__).resolve().parent
+METRIC_PERIODS_PER_YEAR = TRADING_DAYS_PER_YEAR
 
 
 def _metrics(
@@ -28,30 +30,14 @@ def _metrics(
     weights: pd.DataFrame | None = None,
     turnover: pd.Series | None = None,
 ) -> dict[str, float | int]:
-    values = returns.replace([np.inf, -np.inf], np.nan).dropna()
-    if values.empty:
-        return {"observations": 0}
-    total_growth = float((1.0 + values).prod())
-    annual_return = (
-        total_growth ** (periods_per_year / len(values)) - 1.0
-        if total_growth > 0.0 else -1.0
+    result = performance_metrics(
+        returns,
+        periods_per_year=periods_per_year,
+        initial_anchor=True,
     )
-    annual_volatility = float(values.std(ddof=1) * np.sqrt(periods_per_year))
-    nav = (1.0 + values).cumprod()
-    drawdown = nav / nav.cummax() - 1.0
-    result: dict[str, float | int] = {
-        "annual_return": float(annual_return),
-        "annual_volatility": annual_volatility,
-        "sharpe": (
-            float(values.mean() * periods_per_year / annual_volatility)
-            if annual_volatility > 0.0 else 0.0
-        ),
-        "max_drawdown": float(drawdown.min()),
-        "total_return": total_growth - 1.0,
-        "observations": int(len(values)),
-    }
+    interval_index = returns.index[1:]
     if weights is not None:
-        gross = weights.reindex(values.index).abs().sum(axis=1)
+        gross = weights.reindex(interval_index).abs().sum(axis=1)
         active_gross = gross[gross.gt(0.0)]
         result.update({
             "average_gross_exposure": float(active_gross.mean()) if len(active_gross) else 0.0,
@@ -59,8 +45,11 @@ def _metrics(
             "maximum_gross_exposure": float(active_gross.max()) if len(active_gross) else 0.0,
         })
     if turnover is not None:
+        traded = turnover.reindex(interval_index)
+        if traded.isna().any() or not np.isfinite(traded.to_numpy(dtype=float)).all():
+            raise ValueError("turnover must be finite and cover all return intervals")
         result["annual_turnover"] = float(
-            turnover.reindex(values.index).fillna(0.0).mean() * periods_per_year
+            traded.mean() * periods_per_year
         )
     return result
 
@@ -96,11 +85,17 @@ def _load_reference(path: str | Path, start: pd.Timestamp, end: pd.Timestamp) ->
     frame = pd.read_csv(path, parse_dates=["date"])
     if set(frame.columns) != {"date", "nav"}:
         raise ValueError("reference NAV must contain exactly date and nav columns")
-    if frame["date"].duplicated().any() or frame["nav"].isna().any():
-        raise ValueError("reference NAV contains duplicate dates or missing values")
+    if (
+        frame["date"].duplicated().any()
+        or frame["nav"].isna().any()
+        or not np.isfinite(frame["nav"]).all()
+    ):
+        raise ValueError("reference NAV contains duplicate dates or non-finite values")
     nav = frame.set_index("date")["nav"].sort_index().loc[start:end]
     if nav.empty or (nav <= 0.0).any():
         raise ValueError("reference NAV has no positive observations in the requested range")
+    if pd.Timestamp(nav.index[0]) != start:
+        raise ValueError(f"reference NAV does not cover requested start {start.date()}")
     return nav / nav.iloc[0] * 1000.0
 
 
@@ -152,7 +147,7 @@ def _plot_comparison(
 def _write_result(result: ExternalBacktestResult, output: Path, name: str) -> None:
     output.mkdir(parents=True, exist_ok=True)
     result.nav.to_csv(output / f"{name}_nav.csv")
-    result.weights.to_csv(output / f"{name}_weights.csv")
+    result.weights.to_csv(output / f"{name}_effective_weights.csv")
     pd.concat(
         [
             result.returns,
@@ -174,7 +169,7 @@ def main() -> None:
     parser.add_argument("--framework-config", default="config/intraday_backtest.yaml")
     parser.add_argument("--equal-gross", type=float, default=1.0)
     parser.add_argument("--search-subsets", action="store_true")
-    parser.add_argument("--output")
+    parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     spec, available_sets, raw_snapshot = load_snapshot(args.snapshot)
@@ -194,7 +189,8 @@ def main() -> None:
             if existing is not None and existing != variants:
                 raise ValueError(f"factor group {group_name!r} has conflicting definitions")
             all_groups[group_name] = variants
-    runner = PipelineRunner(config=load_config(args.framework_config))
+    framework_config = load_config(args.framework_config)
+    runner = PipelineRunner(config=framework_config)
     manager = runner.data_manager
     engine = FactorEngine(manager)
     warmup_start = start - pd.Timedelta(days=spec.warmup_calendar_days)
@@ -202,17 +198,26 @@ def main() -> None:
     close = manager.get("close", dates, list(spec.universe))
     if close is None or close.empty:
         raise RuntimeError("no close data for external strategy universe")
+    schedule_getter = getattr(manager.source, "fetch_contract_schedule", None)
+    contract_schedule = (
+        schedule_getter(list(spec.universe), dates.min(), dates.max())
+        if callable(schedule_getter)
+        else None
+    )
 
-    adapter = GuosenTrendIndexBacktester(manager, engine, spec)
+    adapter = GuosenTrendIndexBacktester(
+        manager,
+        engine,
+        spec,
+        framework_config.data.audited_nontrading_closes,
+    )
     factor_names = list(dict.fromkeys(
         factor for variants in all_groups.values() for factor, _ in variants
     ))
     factor_values = adapter.compute_factor_values(factor_names, dates)
     portfolios = adapter.build_factor_portfolios(factor_values, all_groups, close)
 
-    output = Path(args.output) if args.output else Path(
-        "runs/external_guosen_trend_index"
-    ) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     reference_path = raw_snapshot.get("snapshot", {}).get("reference_nav")
     if not reference_path:
@@ -227,13 +232,25 @@ def main() -> None:
         subset = {name: portfolios[name] for name in available_sets[set_name]}
         native_weights, diagnostics = adapter.combine_factor_portfolios(subset)
         native = _trim_to_base_date(
-            adapter.run_from_weights(native_weights, close, diagnostics), start
+            adapter.run_from_weights(
+                native_weights,
+                close,
+                diagnostics,
+                contract_schedule=contract_schedule,
+            ),
+            start,
         )
         equal_weights = adapter.project_weights_to_gross(
             native_weights, args.equal_gross
         )
         equal = _trim_to_base_date(
-            adapter.run_from_weights(equal_weights, close, diagnostics), start
+            adapter.run_from_weights(
+                equal_weights,
+                close,
+                diagnostics,
+                contract_schedule=contract_schedule,
+            ),
+            start,
         )
         scenario_results["native_target_vol_4pct"][set_name] = native
         scenario_results[f"equal_gross_{args.equal_gross:g}"][set_name] = equal
@@ -255,7 +272,9 @@ def main() -> None:
         for period_name, period_start in period_starts.items():
             summary[scenario][period_name] = {}
             reference_returns = _period_returns_from_nav(reference_nav, period_start)
-            reference_metrics = _metrics(reference_returns, spec.periods_per_year)
+            reference_metrics = _metrics(
+                reference_returns, METRIC_PERIODS_PER_YEAR
+            )
             reference_metrics["gross_exposure_note"] = "actual index; user-estimated near 1x"
             summary[scenario][period_name]["trend"] = reference_metrics
             metric_rows.append({
@@ -270,7 +289,7 @@ def main() -> None:
                     period_returns.iloc[0] = 0.0
                 metrics = _metrics(
                     period_returns,
-                    spec.periods_per_year,
+                    METRIC_PERIODS_PER_YEAR,
                     result.weights,
                     result.turnover,
                 )
@@ -284,7 +303,7 @@ def main() -> None:
             _plot_comparison(
                 navs,
                 period_start,
-                spec.periods_per_year,
+                METRIC_PERIODS_PER_YEAR,
                 (
                     f"国信趋势指数形式：{scenario}，{period_name} 起"
                 ),
@@ -298,21 +317,6 @@ def main() -> None:
     (output / "resolved_snapshot.json").write_text(
         json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    sc_audit = {
-        "raw_first_sc_date": "2018-03-26",
-        "framework_first_continuous_sc_date": (
-            close["SC"].first_valid_index().strftime("%Y-%m-%d")
-            if close["SC"].first_valid_index() is not None else None
-        ),
-        "interpretation": (
-            "The local raw dataset contains no SC observation before listing; "
-            "the adapter leaves SC unavailable rather than synthesizing history."
-        ),
-    }
-    (output / "sc_data_audit.json").write_text(
-        json.dumps(sc_audit, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
     if args.search_subsets:
         baseline_sets = {
             name: set(available_sets[name]) for name in selected_sets
@@ -326,6 +330,10 @@ def main() -> None:
             baseline_sets,
             output / "factor_subset_search",
             target_gross=args.equal_gross,
+            contract_schedule=contract_schedule,
+            audited_nontrading_closes=(
+                framework_config.data.audited_nontrading_closes
+            ),
         )
         summary["factor_subset_search"] = {
             "ranking_rule": "2016-2024 development segments only; 2025+ is holdout",

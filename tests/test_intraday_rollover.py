@@ -1,131 +1,139 @@
-"""B 阶段(换月事件工程)单测: _read_local_daily 修复与换月日历/新因子.
-
-覆盖审阅要求的 5 项:
-1. trade_date 对齐: 1d 的 _ts 为"前一自然日 16:00", 面板行标签应落在 trade_date;
-2. 合成合约排除: 8888/9999 持仓最大也不应出现在输出;
-3. 换月日 NaN: 主力切换日 settle 置 NaN, 前后日正常;
-4. _get_rollover_calendar 与 _read_local_daily 的换月日一致;
-5. #436-438 compute 无未来数据泄漏(shift(1) 后首行为 NaN).
-"""
+"""Regression tests for causal settlement data and effective roll dates."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import pytest
 
-import factors.library.intraday as ID
-
-
-def make_daily_raw(rows):
-    """rows: list of (trade_date, symbol, position, settle, close) → raw DataFrame."""
-    df = pd.DataFrame(rows, columns=["trade_date", "symbol", "position", "settle_price", "close"])
-    df["root"] = df["symbol"].str.extract(r"^([A-Za-z]+)")[0]
-    # 模拟真实 1d: _ts = 前一自然日 16:00
-    df["_ts"] = pd.to_datetime(df["trade_date"]) - pd.Timedelta(days=1)
-    df["_ts"] = df["_ts"] + pd.Timedelta(hours=16)
-    return df
-
-
-class EmptyData:
-    def get(self, *args, **kwargs):
-        return None
-
-
-@pytest.fixture(autouse=True)
-def _patch_raw(monkeypatch):
-    rows = [
-        # 交易日, 合约, 持仓, settle, close
-        ("2026-05-11", "RB2605", 100000, 3200.0, 3205.0),
-        ("2026-05-11", "RB2606", 60000, 3180.0, 3185.0),
-        ("2026-05-11", "RB8888", 999999, 9999.0, 9999.0),   # 合成合约, 持仓最大
-        ("2026-05-12", "RB2605", 80000, 3210.0, 3212.0),
-        ("2026-05-12", "RB2606", 90000, 3190.0, 3195.0),   # 换月: 2606 反超
-        ("2026-05-12", "RB8888", 999999, 9999.0, 9999.0),
-        ("2026-05-13", "RB2605", 40000, 3200.0, 3198.0),
-        ("2026-05-13", "RB2606", 110000, 3200.0, 3202.0),
-        ("2026-05-13", "RB8888", 999999, 9999.0, 9999.0),
-    ]
-    raw = make_daily_raw(rows)
-    monkeypatch.setattr(ID, "_read_local_raw", lambda dates, universe, freq="daily": raw)
-    yield
+import factors.library.intraday as intraday
 
 
 DATES = pd.date_range("2026-05-11", "2026-05-13", freq="D")
-UNIVERSE = ["RB"]
 
 
-def test_trade_date_alignment_and_synthetic_exclusion():
-    """面板行标签落在 trade_date 而非前一自然日; 合成合约值不出现."""
-    settle = ID._read_local_daily(EmptyData(), DATES, UNIVERSE, "settle")
-    assert settle.loc["2026-05-11", "RB"] == pytest.approx(3200.0)   # RB2605 主力(排除8888)
-    assert np.isnan(settle.loc["2026-05-12", "RB"])                  # 换月日
-    assert settle.loc["2026-05-13", "RB"] == pytest.approx(3200.0)   # RB2606 现为主力
-    # 无 9999.0(合成)混入
-    assert (settle["RB"].dropna() != 9999.0).all()
+class ScheduleData:
+    def __init__(self):
+        self.fields = {
+            "settle": pd.DataFrame(
+                {"RB": [3200.0, 3190.0, 3200.0]}, index=DATES
+            ),
+            "oi": pd.DataFrame(
+                {"RB": [100000.0, 90000.0, 110000.0]}, index=DATES
+            ),
+        }
+        self.schedule = pd.DataFrame(
+            {"RB": ["RB2605", "RB2606", "RB2606"]}, index=DATES
+        )
+
+    def get(self, field, dates, universe):
+        return self.fields[field].reindex(index=dates, columns=universe)
+
+    def get_contract_schedule(self, dates, universe):
+        return self.schedule.reindex(index=dates, columns=universe)
 
 
-def test_rollover_day_is_nan():
-    """05-12 主力 2605→2606 切换日 settle 为 NaN, 前后日正常."""
-    settle = ID._read_local_daily(EmptyData(), DATES, UNIVERSE, "settle")
-    assert np.isnan(settle.loc["2026-05-12", "RB"])
-    assert settle.loc["2026-05-11", "RB"] == pytest.approx(3200.0)
-    assert settle.loc["2026-05-13", "RB"] == pytest.approx(3200.0)   # 2606 现为主力
+def test_daily_settle_and_oi_follow_the_configured_causal_series():
+    data = ScheduleData()
+
+    settle = intraday._read_local_daily(data, DATES, ["RB"], "settle")
+    oi = intraday._read_local_daily(data, DATES, ["RB"], "oi")
+
+    assert settle.loc["2026-05-12", "RB"] == pytest.approx(3190.0)
+    assert oi.loc["2026-05-12", "RB"] == pytest.approx(90000.0)
 
 
-def test_rollover_calendar_matches_daily_nan():
-    """换月日历与 _read_local_daily 的换月日集合一致."""
-    cal = ID._get_rollover_calendar(DATES, UNIVERSE)
-    assert list(cal["RB"]) == [pd.Timestamp("2026-05-12")]
-    settle = ID._read_local_daily(EmptyData(), DATES, UNIVERSE, "settle")
-    for d in cal["RB"]:
-        assert np.isnan(settle.loc[d, "RB"])
+def test_rollover_calendar_uses_effective_contract_schedule():
+    data = ScheduleData()
+
+    calendar = intraday._get_rollover_calendar(data, DATES, ["RB"])
+
+    assert list(calendar["RB"]) == [pd.Timestamp("2026-05-12")]
 
 
-def test_oi_field_no_duplicate_column_bug():
-    """oi 字段(col=position)不应因重复列名导致面板全 NaN."""
-    oi = ID._read_local_daily(EmptyData(), DATES, UNIVERSE, "oi")
-    assert not oi["RB"].isna().all()
-    # 05-11 主力 2605(pos=100000), 05-13 主力 2606(pos=110000); 05-12 换月 NaN
-    assert oi.loc["2026-05-11", "RB"] == pytest.approx(100000.0)
-    assert np.isnan(oi.loc["2026-05-12", "RB"])
-    assert oi.loc["2026-05-13", "RB"] == pytest.approx(110000.0)
+def test_rollover_calendar_is_scoped_to_each_root():
+    data = ScheduleData()
+    data.fields["settle"]["M"] = [2800.0, 2810.0, 2820.0]
+    data.fields["oi"]["M"] = [50000.0, 51000.0, 52000.0]
+    data.schedule["M"] = ["M2607", "M2607", "M2607"]
+
+    calendar = intraday._get_rollover_calendar(data, DATES, ["RB", "M"])
+
+    assert list(calendar["RB"]) == [pd.Timestamp("2026-05-12")]
+    assert calendar["M"].empty
 
 
-def test_rollover_nan_scoped_to_own_root(monkeypatch):
-    """换月日置 NaN 必须按 (日期, 品种) 单元格, 不得误伤同日未换月的其他品种."""
-    rows = [
-        ("2026-05-11", "RB2605", 100000, 3200.0, 3205.0),
-        ("2026-05-11", "RB2606", 60000, 3180.0, 3185.0),
-        ("2026-05-12", "RB2605", 80000, 3210.0, 3212.0),
-        ("2026-05-12", "RB2606", 90000, 3190.0, 3195.0),   # RB 换月
-        ("2026-05-13", "RB2605", 40000, 3200.0, 3198.0),
-        ("2026-05-13", "RB2606", 110000, 3200.0, 3202.0),
-        # M: 全程 2607 主力, 不换月, 05-12 应保留值
-        ("2026-05-11", "M2607", 50000, 2800.0, 2802.0),
-        ("2026-05-12", "M2607", 51000, 2810.0, 2812.0),
-        ("2026-05-13", "M2607", 52000, 2820.0, 2822.0),
-    ]
-    monkeypatch.setattr(ID, "_read_local_raw",
-                        lambda dates, universe, freq="daily": make_daily_raw(rows))
-    dates2 = pd.date_range("2026-05-11", "2026-05-13", freq="D")
-    settle = ID._read_local_daily(EmptyData(), dates2, ["RB", "M"], "settle")
-    # RB 换月日 NaN
-    assert np.isnan(settle.loc["2026-05-12", "RB"])
-    # M 同日(05-12)不换月, 值必须保留
-    assert settle.loc["2026-05-12", "M"] == pytest.approx(2810.0)
-    assert settle.loc["2026-05-11", "M"] == pytest.approx(2800.0)
-    assert settle.loc["2026-05-13", "M"] == pytest.approx(2820.0)
+def test_rollover_schedule_failure_is_not_silently_replaced_by_no_rolls():
+    class FailingData(ScheduleData):
+        def get_contract_schedule(self, dates, universe):
+            raise OSError("schedule unavailable")
+
+    with pytest.raises(OSError, match="schedule unavailable"):
+        intraday._get_rollover_calendar(FailingData(), DATES, ["RB"])
 
 
-def test_new_factors_no_lookahead():
-    """#436-438 compute 输出 shift(1) 后首行应为 NaN(无未来数据泄漏)."""
+def test_term_curve_excludes_unheld_delivery_contracts_before_maturity_rank():
+    timestamp = pd.Timestamp("2026-08-14 15:00")
+
+    class Source:
+        def fetch_contract_curve_at_frequency(self, *args, **kwargs):
+            return pd.DataFrame([
+                {
+                    "trade_datetime": timestamp,
+                    "root": "M",
+                    "symbol": "M2608",
+                    "close": 3061.0,
+                    "position": 0.0,
+                    "volume": 0.0,
+                },
+                {
+                    "trade_datetime": timestamp,
+                    "root": "M",
+                    "symbol": "M2609",
+                    "close": 3120.0,
+                    "position": 722303.0,
+                    "volume": 10.0,
+                },
+                {
+                    "trade_datetime": timestamp,
+                    "root": "M",
+                    "symbol": "M2611",
+                    "close": 3180.0,
+                    "position": 100000.0,
+                    "volume": 5.0,
+                },
+            ])
+
+        @staticmethod
+        def trading_session_index(index):
+            return pd.DatetimeIndex(index)
+
+    data = type("Data", (), {"source": Source()})()
+    panel = intraday._read_local_term(
+        data, pd.DatetimeIndex(["2026-08-14"]), ["M"]
+    )
+
+    assert panel["near_close"].loc[timestamp, "M"] == pytest.approx(3120.0)
+    assert panel["far_close"].loc[timestamp, "M"] == pytest.approx(3180.0)
+    assert panel["near_expiry"].loc[timestamp, "M"] == 202609
+
+
+def test_rollover_factor_applies_decision_lag(monkeypatch):
     dates = pd.date_range("2026-03-01", "2026-08-01", freq="B")
-    universe = ["RB", "M", "IF", "AU", "JM", "CU", "IC"]
-    for cls_name in ["IntradayDaysToRollover20d", "IntradayRolloverSettleGap20d",
-                     "IntradayRolloverBasisGap20d"]:
-        cls = getattr(ID, cls_name)
-        out = cls().compute(EmptyData(), dates, universe)
-        assert isinstance(out, pd.DataFrame)
-        # compute 内部已 shift(1), 首行应无值(无泄漏)
-        assert out.iloc[0].isna().all()
-        assert out.index[0] == dates[0]
+    universe = ["RB"]
+
+    class Data:
+        def get_contract_schedule(self, requested_dates, requested_universe):
+            values = np.where(
+                np.arange(len(requested_dates)) < 20, "RB2605", "RB2606"
+            )
+            return pd.DataFrame(
+                {"RB": values}, index=pd.DatetimeIndex(requested_dates)
+            )
+
+    result = intraday.IntradayDaysToRollover20d().compute(
+        Data(), dates, universe
+    )
+
+    assert isinstance(result, pd.DataFrame)
+    assert pd.isna(result.iloc[0, 0])
+    assert result.index.equals(dates)

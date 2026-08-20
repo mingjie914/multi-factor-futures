@@ -10,6 +10,34 @@ class SolverValidationError(RuntimeError):
     """Raised when no solver produces a finite, constraint-valid optimum."""
 
 
+def validated_psd_covariance(
+    matrix: np.ndarray,
+    *,
+    relative_tolerance: float = 1e-8,
+    eigenvalue_floor: float = 0.0,
+) -> np.ndarray:
+    """Validate a covariance matrix and clip numerical negative eigenvalues."""
+    values = np.asarray(matrix, dtype=float)
+    if values.ndim != 2 or values.shape[0] != values.shape[1] or values.size == 0:
+        raise ValueError("covariance must be a non-empty square matrix")
+    if not np.isfinite(eigenvalue_floor) or eigenvalue_floor < 0.0:
+        raise ValueError("eigenvalue_floor must be finite and non-negative")
+    if not np.isfinite(values).all():
+        raise ValueError("covariance contains NaN/Inf")
+    scale = max(float(np.max(np.abs(values))), 1e-12)
+    if float(np.max(np.abs(values - values.T))) > relative_tolerance * scale:
+        raise ValueError("covariance is materially asymmetric")
+    symmetric = (values + values.T) / 2.0
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    if float(eigenvalues.min()) < -relative_tolerance * scale:
+        raise ValueError("covariance is not positive semidefinite")
+    if float(eigenvalues.min()) < eigenvalue_floor:
+        eigenvalues = np.maximum(eigenvalues, eigenvalue_floor)
+        symmetric = (eigenvectors * eigenvalues) @ eigenvectors.T
+        symmetric = (symmetric + symmetric.T) / 2.0
+    return symmetric
+
+
 @dataclass(frozen=True)
 class SolverOutcome:
     solver: str
@@ -94,4 +122,3 @@ def solve_validated(
 
     detail = "; ".join(attempts) if attempts else "no solver candidates"
     raise SolverValidationError(f"no validated optimal solution ({detail})")
-

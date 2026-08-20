@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,12 +11,9 @@ import numpy as np
 from core.types import (
     Date,
     DateIndex,
-    MarketState,
     NAVSeries,
-    SignalFrame,
     Universe,
     UniverseSchedule,
-    WeightVector,
 )
 from core.interfaces import (
     ReturnModel,
@@ -25,9 +21,6 @@ from core.interfaces import (
     Optimizer,
     CostModel,
     Constraint,
-    SignalGenerator,
-    PositionSizer,
-    SLTPRule,
 )
 from data.manager import DataManager
 from factors.engine import FactorEngine
@@ -37,12 +30,24 @@ from backtest.research_ledger import (
     ResearchReturnLedger,
     align_transition_weights,
     close_marked_step,
+    contract_transition_turnover,
+    contract_transition_weight_vectors,
     default_research_ledger_metadata,
 )
+from data.market_quality import prepare_close_data
 from core.logger import get_logger
 
 logger = get_logger("multi_factor")
-HOLDING_PERIOD = 5
+
+
+def _executed_turnover_intervals(result) -> pd.Series:
+    """Return exchange-timed turnover when an audited ledger is available."""
+    ledger = getattr(result, "research_ledger", None)
+    daily = getattr(ledger, "daily", None)
+    if daily is not None and "executed_traded_notional" in daily:
+        values = daily["executed_traded_notional"].dropna()
+        return values.iloc[1:] if len(values) else values
+    return getattr(result, "turnover", pd.Series(dtype=float)).dropna()
 
 
 class BacktestResult:
@@ -50,7 +55,6 @@ class BacktestResult:
         self,
         nav: NAVSeries,
         weights_history: pd.DataFrame,
-        signals_history: List[SignalFrame],
         metrics: Dict[str, float],
         turnover: pd.Series = None,
         positions_history: pd.DataFrame = None,
@@ -58,14 +62,19 @@ class BacktestResult:
         failure_ledger: List[dict] = None,
         costs: pd.Series = None,
         research_ledger: ResearchReturnLedger = None,
+        decision_turnover: pd.Series = None,
     ):
         self.nav = nav
         self.weights_history = weights_history
-        self.signals_history = signals_history
         self.metrics = metrics
         self.turnover = turnover if turnover is not None else pd.Series(dtype=float)
+        self.decision_turnover = (
+            decision_turnover
+            if decision_turnover is not None
+            else pd.Series(dtype=float)
+        )
         self.positions_history = positions_history if positions_history is not None else pd.DataFrame()
-        # 样本外验证: {"train": {...}, "test": {...}} 前60%/后40%分割指标
+        # 固定历史分段诊断: {"train": {...}, "test": {...}}，默认前75%/后25%。
         self.split_metrics = split_metrics if split_metrics is not None else {}
         self.failure_ledger = failure_ledger if failure_ledger is not None else []
         self.costs = costs if costs is not None else pd.Series(dtype=float)
@@ -86,7 +95,7 @@ class BacktestResult:
             tr = self.split_metrics["train"]
             te = self.split_metrics["test"]
             base += (
-                f"\n  样本分段诊断(前60%/后40%, 非独立OOS): "
+                f"\n  样本分段诊断(前75%/后25%, 非独立OOS): "
                 f"训练期[年化={tr.get('annual_return', 0):.2%} 夏普={tr.get('sharpe', 0):.2f}] "
                 f"测试期[年化={te.get('annual_return', 0):.2%} 夏普={te.get('sharpe', 0):.2f}]"
             )
@@ -212,14 +221,39 @@ class BacktestResult:
         plt.close(fig)
         print(f"  净值图已保存: {path}")
 
-    def export_signals(self, path: str):
-        """把所有信号合并导出."""
-        all_sigs = []
-        for sf in self.signals_history:
-            if not sf.empty:
-                all_sigs.append(sf)
-        if all_sigs:
-            pd.concat(all_sigs, ignore_index=True).to_csv(path, index=False)
+    def export_target_weights(self, path: str, as_of=None) -> str:
+        """Export one close-observed target-weight snapshot to an explicit path.
+
+        The exported weights are decisions observed at ``decision_date`` and are
+        intended for adjustment during the following trading session.  This
+        framework does not create or route orders.
+        """
+        if self.weights_history.empty:
+            raise ValueError("no target-weight history is available")
+        history = self.weights_history.copy()
+        if history.index.has_duplicates or history.columns.has_duplicates:
+            raise ValueError("target-weight history axes must be unique")
+        history.index = pd.DatetimeIndex(history.index)
+        history = history.sort_index()
+        if as_of is not None:
+            eligible = history.loc[history.index <= pd.Timestamp(as_of)]
+            if eligible.empty:
+                raise ValueError(f"no target weights are available by {as_of}")
+            history = eligible
+        decision_date = pd.Timestamp(history.index[-1])
+        weights = pd.to_numeric(history.iloc[-1], errors="raise").fillna(0.0)
+        if not np.isfinite(weights.to_numpy(dtype=float)).all():
+            raise ValueError("target weights contain NaN or infinity")
+        output = pd.DataFrame({
+            "decision_date": decision_date.date().isoformat(),
+            "ticker": weights.index.astype(str),
+            "target_weight": weights.to_numpy(dtype=float),
+            "execution_timing": "following_trading_session",
+        }).sort_values("ticker", kind="stable")
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output.to_csv(output_path, index=False)
+        return str(output_path)
 
 
 class MultiPortfolioResult:
@@ -255,6 +289,12 @@ class MultiPortfolioResult:
         """
         from backtest.metrics import compute_all_metrics
 
+        if not sub_results_raw:
+            raise ValueError("at least one sub-portfolio result is required")
+        total_capital = float(total_capital)
+        if not np.isfinite(total_capital) or total_capital <= 0.0:
+            raise ValueError("total_capital must be finite and positive")
+
         # 收集各子组合的归一化净值 (起始为1)
         sub_navs = {}
         sub_configs = []
@@ -270,11 +310,15 @@ class MultiPortfolioResult:
                 "metrics": result.metrics,
             })
             # 归一化净值
-            nav = result.nav.dropna()
-            if len(nav) > 0 and nav.iloc[0] != 0:
-                nav_norm = nav / nav.iloc[0]
-            else:
-                nav_norm = nav
+            nav = result.nav.dropna().sort_index()
+            if nav.empty:
+                raise ValueError(f"sub-portfolio {cfg.name!r} has no NAV")
+            if nav.index.has_duplicates:
+                raise ValueError(f"sub-portfolio {cfg.name!r} has duplicate NAV dates")
+            values = nav.to_numpy(dtype=float)
+            if not np.isfinite(values).all() or bool((values <= 0.0).any()):
+                raise ValueError(f"sub-portfolio {cfg.name!r} NAV must be finite and positive")
+            nav_norm = nav / nav.iloc[0]
             sub_navs[cfg.name] = nav_norm
 
         # 对齐到统一日期索引 (取并集)
@@ -284,15 +328,28 @@ class MultiPortfolioResult:
         # 向量化: 将所有子组合净值 stack 为 DataFrame, 一次性加权求和
         # 原始逐子组合循环 → 矩阵乘法
         sub_names = [s["name"] for s in sub_configs]
+        if len(set(sub_names)) != len(sub_names):
+            raise ValueError("sub-portfolio names must be unique")
         sub_nav_df = pd.DataFrame(sub_navs)
-        # 按 sub_configs 顺序对齐列, reindex 到并集日期并前向填充
-        sub_nav_aligned = (
-            sub_nav_df[sub_names]
-            .reindex(combined_idx)
-            .ffill()
-            .fillna(0.0)
-        )
-        weights = np.array([s["capital_weight"] for s in sub_configs])
+        # A sleeve may start later, but once started it must publish every
+        # combined date.  Forward filling here would hide an internal gap or
+        # an unexpectedly truncated run as a flat NAV segment.
+        sub_nav_aligned = sub_nav_df[sub_names].reindex(combined_idx)
+        for name in sub_names:
+            first = sub_nav_aligned[name].first_valid_index()
+            if first is None or sub_nav_aligned.loc[first:, name].isna().any():
+                raise ValueError(
+                    f"sub-portfolio {name!r} NAV has an internal or trailing gap"
+                )
+        # Capital allocated before a sleeve starts remains cash.
+        sub_nav_aligned = sub_nav_aligned.fillna(1.0)
+        weights = np.array([s["capital_weight"] for s in sub_configs], dtype=float)
+        if (
+            not np.isfinite(weights).all()
+            or bool((weights < 0.0).any())
+            or not np.isclose(weights.sum(), 1.0, rtol=0.0, atol=1e-10)
+        ):
+            raise ValueError("sub-portfolio capital weights must be non-negative and sum to 1")
         # 矩阵乘法: (n_dates, n_sub) @ (n_sub,) = (n_dates,)
         weighted_nav = pd.Series(
             sub_nav_aligned.values @ weights, index=combined_idx
@@ -317,8 +374,9 @@ class MultiPortfolioResult:
         for item in sub_results_raw:
             cfg = item["config"]
             result = item["result"]
-            if not result.turnover.dropna().empty:
-                total_turnover += cfg.capital_weight * result.turnover.mean()
+            executed = _executed_turnover_intervals(result)
+            if not executed.empty:
+                total_turnover += cfg.capital_weight * executed.mean()
         combined_metrics["avg_turnover"] = float(total_turnover)
 
         # 样本分段诊断 (固定权重叠加, 非独立OOS)
@@ -330,7 +388,6 @@ class MultiPortfolioResult:
         combined_result = BacktestResult(
             nav=combined_nav,
             weights_history=pd.DataFrame(),  # 子组合权重不合并
-            signals_history=[],
             metrics=combined_metrics,
             split_metrics=combined_split,
         )
@@ -383,15 +440,16 @@ class MultiPortfolioResult:
         combined_returns = combined_nav.pct_change(fill_method=None).dropna()
         combined_metrics = compute_all_metrics(combined_nav, returns=combined_returns)
 
-        # 子组合内部换手与叠加后真实底层换手分别报告。后者来自聚合目标
-        # 仓位变化，包含不同 sleeve 之间可相互抵消的交易。
+        # 子组合已审计交换手与元分配额外换手分别计量；没有订单/成交层，
+        # 因此不假定不同 sleeve 之间可以净额成交。
         weighted_sub_turnover = 0.0
         for item in sub_results_raw:
             cfg = item["config"]
             result = item["result"]
             avg_w = float(weight_history[cfg.name].mean()) if cfg.name in weight_history.columns else cfg.capital_weight
-            if not result.turnover.dropna().empty:
-                weighted_sub_turnover += avg_w * result.turnover.mean()
+            executed = _executed_turnover_intervals(result)
+            if not executed.empty:
+                weighted_sub_turnover += avg_w * executed.mean()
         combined_metrics["avg_subportfolio_turnover"] = float(weighted_sub_turnover)
 
         turnover_history = (
@@ -405,6 +463,15 @@ class MultiPortfolioResult:
         active_turnover = turnover_history[turnover_history > 0].dropna()
         combined_metrics["avg_turnover"] = (
             float(active_turnover.mean()) if not active_turnover.empty else 0.0
+        )
+        combined_metrics["avg_daily_turnover"] = float(
+            turnover_history.dropna().mean()
+        ) if not turnover_history.empty else 0.0
+        combined_metrics["annualized_turnover"] = (
+            combined_metrics["avg_daily_turnover"] * TRADING_DAYS_PER_YEAR
+        )
+        combined_metrics["total_turnover"] = float(
+            turnover_history.dropna().sum()
         )
         combined_metrics["total_transaction_cost"] = float(cost_history.fillna(0.0).sum())
         combined_metrics["avg_transaction_cost"] = (
@@ -424,7 +491,6 @@ class MultiPortfolioResult:
                 if underlying_weights_history is not None
                 else pd.DataFrame()
             ),
-            signals_history=[],
             metrics=combined_metrics,
             turnover=turnover_history,
             costs=cost_history,
@@ -443,7 +509,7 @@ class MultiPortfolioResult:
         return result
 
     def summary(self) -> str:
-        lines = ["=" * 70, "多频率子组合叠加回测结果", "=" * 70]
+        lines = ["=" * 70, "日频多子组合叠加回测结果", "=" * 70]
         for cfg in self.sub_configs:
             m = cfg["metrics"]
             lines.append(
@@ -467,7 +533,7 @@ class MultiPortfolioResult:
         if sm and sm.get("test"):
             tr, te = sm["train"], sm["test"]
             lines.append(
-                f"  样本分段诊断(前60%/后40%, 非独立OOS): "
+                f"  样本分段诊断(前75%/后25%, 非独立OOS): "
                 f"训练期[年化={tr.get('annual_return', 0):.2%} 夏普={tr.get('sharpe', 0):.2f}] "
                 f"测试期[年化={te.get('annual_return', 0):.2%} 夏普={te.get('sharpe', 0):.2f}]"
             )
@@ -563,7 +629,7 @@ class MultiPortfolioResult:
         ax.plot(combined_norm.index, combined_norm.values, label="叠加组合",
                 color="#202124", linewidth=2.0, linestyle="--")
 
-        title = "多频率子组合叠加净值曲线"
+        title = "日频多子组合叠加净值曲线"
         if version:
             title = f"{title} - {version}"
         ax.set_title(title, fontsize=14)
@@ -632,7 +698,7 @@ class Backtester:
     - _prepare_backtest_data(): 日历对齐、因子预计算、风险模型估计
     - _refit_alpha(): 增量 alpha 重训
     - _optimize_period(): 单期组合优化
-    - _compute_period_return(): 单期收益 + 成本
+    - close_marked_step(): 单日持仓收益、成本与权重漂移
     """
 
     def __init__(
@@ -648,13 +714,6 @@ class Backtester:
         self.training_window = 750
         self.retrain_freq = 10
         self.holding_period = 5
-        # 事件驱动调仓参数 (回撤触发额外调仓)
-        # - dd_threshold: 触发阈值 (回撤低于此值触发)
-        # - cooldown: 冷却期(交易日), 避免持续回撤时每天触发
-        # - hysteresis: 迟滞带, 触发后需回升到此阈值以上才能解除
-        self.event_rebalance_dd_threshold = -0.05
-        self.event_rebalance_cooldown = 10
-        self.event_rebalance_hysteresis = -0.03
         # 因子合成器 (可选): 聚类内等权合成, 降低多重共线性
         # None 表示不合成, 因子直接传入 alpha 模型
         self.factor_synthesizer = None
@@ -663,33 +722,12 @@ class Backtester:
         self.ic_monitor = None
         # 最近一次 refit 使用的因子名集合 (确保预测时维度一致)
         self._last_fit_factors: Optional[set] = None
-        self._failure_ledger: List[dict] = []
         self.asset_selector = None
         self.dynamic_risk_controller = None
         self.universe_selection_config = None
         self._eligibility_mask: Optional[pd.DataFrame] = None
         self.forecast_averaging_vintages = 1
         self._forecast_vintages: List[pd.Series] = []
-
-    def _record_failure(
-        self, stage: str, date: Date, error: object, action: str
-    ) -> None:
-        self._failure_ledger.append({
-            "date": str(pd.Timestamp(date)),
-            "stage": stage,
-            "error_type": type(error).__name__,
-            "error": str(error),
-            "action": action,
-        })
-
-    @staticmethod
-    def _fallback_weights(
-        current_weights: pd.Series, universe: Universe
-    ) -> pd.Series:
-        """Use the last valid position, or zero for a strategy not yet invested."""
-        if current_weights is not None and not current_weights.empty:
-            return current_weights.reindex(universe).fillna(0.0).astype(float)
-        return pd.Series(0.0, index=universe, dtype=float)
 
     @staticmethod
     def _factor_frame_asof(
@@ -790,7 +828,9 @@ class Backtester:
 
         calendar = data_manager.get_calendar(train_start, tail_end)
         if calendar.empty:
-            calendar = pd.date_range(train_start, tail_end, freq="B")
+            raise RuntimeError(
+                "交易日历为空，回测失败关闭；不得用普通工作日替代交易所日历"
+            )
         if hasattr(calendar, 'tz') and calendar.tz is not None:
             calendar = calendar.tz_localize(None)
         calendar = pd.DatetimeIndex(sorted(set(calendar)))
@@ -816,15 +856,16 @@ class Backtester:
             f"holding={holding_period}d, {len(rebalance_dates)} 个调仓日"
         )
 
-        # 因子计算
-        raw_factors = factor_engine.compute_factors(
-            factor_names, all_dates, universe_static, parallel=False
-        )
         ctx = build_processing_context(
             data_manager,
             all_dates,
             universe_static,
             self.universe_selection_config,
+        )
+        # The point-in-time eligibility mask must exist before snapshot factors
+        # evaluate cross-sectional operators.
+        raw_factors = factor_engine.compute_factors(
+            factor_names, all_dates, universe_static, parallel=False
         )
         self._eligibility_mask = ctx.eligibility
         processed_all = processor.process_batch(raw_factors, ctx)
@@ -847,18 +888,27 @@ class Backtester:
 
         # 预计算日度收益 (用于日度NAV累积, 解决样本点不足和收益重叠问题)
         close = data_manager.get("close", all_dates, universe_static)
-        if not close.empty:
-            daily_returns = close.pct_change(fill_method=None)
-        else:
-            daily_returns = pd.DataFrame(
-                0.0, index=all_dates, columns=universe_static
+        if close.empty or close.dropna(how="all").empty:
+            raise RuntimeError(
+                "close行情为空，回测失败关闭；不得生成平坦净值"
             )
+        prepare = getattr(data_manager, "prepare_close_data", None)
+        if callable(prepare):
+            daily_returns, self._close_tradable = prepare(close)
+        else:
+            daily_returns, self._close_tradable = prepare_close_data(close)
+
+        schedule_getter = getattr(data_manager, "get_contract_schedule", None)
+        self._contract_schedule = (
+            schedule_getter(all_dates, universe_static)
+            if callable(schedule_getter)
+            else None
+        )
 
         # 验证 fwd_returns 有效性
         if fwd_returns.empty or fwd_returns.dropna(how="all").empty:
-            log.warning(
-                "fwd_returns 全为空! 回测净值将保持不变. "
-                "请检查 close 数据是否覆盖全部日期范围 "
+            raise RuntimeError(
+                "fwd_returns全为空，回测失败关闭；请检查close覆盖与持有期 "
                 f"({all_dates[0].date()} ~ {all_dates[-1].date()})"
             )
         else:
@@ -957,35 +1007,35 @@ class Backtester:
         # 不会重新合成历史矩阵; 且训练因子名为合成名, 无法匹配 flip_signs 的原始因子名.
         # 方向统一由 Alpha 模型系数决定 (见 CR-010 修复).
 
+        if not train_factors:
+            raise RuntimeError(f"no active factors remain for alpha fit @ {date}")
         try:
             alpha_model.fit(train_factors, train_fwd, universe_static)
-            # 记录本次 fit 使用的因子名, 供 _predict_returns 复用
-            self._last_fit_factors = set(train_factors.keys())
+        except Exception as exc:
+            raise RuntimeError(f"alpha fit failed @ {date}: {exc}") from exc
 
-            # 风险模型使用截至 t-1 的日收益，不使用 H 日重叠前向收益。
-            if (
-                risk_model is not None
-                and data_manager is not None
-                and daily_returns is not None
-            ):
-                try:
-                    risk_start_idx = max(0, date_idx - self.training_window)
-                    risk_factors = {
-                        name: factor.iloc[risk_start_idx:date_idx]
-                        for name, factor in processed_all.items()
-                    }
-                    risk_daily = daily_returns.iloc[risk_start_idx:date_idx]
-                    risk_model.estimate(
-                        data_manager, risk_factors, risk_daily, universe_static
-                    )
-                except Exception as e:
-                    log.warning(f"风险模型重估计失败 @ {date.date()}: {type(e).__name__}: {e}")
-                    self._record_failure("risk_fit", date, e, "keep_previous_risk_model")
+        # 风险模型使用截至 t-1 的日收益，不使用 H 日重叠前向收益。
+        if (
+            risk_model is not None
+            and data_manager is not None
+            and daily_returns is not None
+        ):
+            risk_start_idx = max(0, date_idx - self.training_window)
+            risk_factors = {
+                name: factor.iloc[risk_start_idx:date_idx]
+                for name, factor in processed_all.items()
+            }
+            risk_daily = daily_returns.iloc[risk_start_idx:date_idx]
+            try:
+                risk_model.estimate(
+                    data_manager, risk_factors, risk_daily, universe_static
+                )
+            except Exception as exc:
+                raise RuntimeError(f"risk-model fit failed @ {date}: {exc}") from exc
 
-            return all_dates[train_cutoff_idx], train_cutoff_idx
-        except Exception as e:
-            logger.warning(f"alpha 拟合失败 @ {date.date()}: {e}")
-            return None, last_fit_idx
+        # Record only after both fitted components are valid.
+        self._last_fit_factors = set(train_factors)
+        return all_dates[train_cutoff_idx], train_cutoff_idx
 
     def _predict_returns(
         self,
@@ -993,54 +1043,56 @@ class Backtester:
         processed_all: Dict[str, FactorMatrix],
         date: Date,
         universe: Universe,
-    ) -> Optional[pd.Series]:
+    ) -> pd.Series:
         """预测截面预期收益."""
         # 使用最近一次 refit 的因子集, 确保 predict 和 fit 维度一致
         if self._last_fit_factors is not None:
             factor_names = self._last_fit_factors & set(processed_all.keys())
         else:
             factor_names = set(processed_all.keys())
+        if self._last_fit_factors is None:
+            raise RuntimeError(f"alpha model has not been fitted @ {date}")
+        current_factors = {}
+        missing = []
+        for name in sorted(factor_names):
+            row = self._factor_frame_asof(processed_all[name], date)
+            if row is None:
+                missing.append(name)
+            else:
+                current_factors[name] = row
+        if missing:
+            raise ValueError(
+                f"no point-in-time factor history for {len(missing)} factors: "
+                f"{', '.join(missing[:5])}"
+            )
+        if not hasattr(alpha_model, "predict"):
+            raise TypeError("alpha model has no predict method")
         try:
-            current_factors = {}
-            missing = []
-            for name in sorted(factor_names):
-                row = self._factor_frame_asof(processed_all[name], date)
-                if row is None:
-                    missing.append(name)
-                else:
-                    current_factors[name] = row
-            if missing:
-                raise ValueError(
-                    f"no point-in-time factor history for {len(missing)} factors: "
-                    f"{', '.join(missing[:5])}"
-                )
-            if not hasattr(alpha_model, "predict"):
-                raise TypeError("alpha model has no predict method")
             predicted = alpha_model.predict(current_factors, universe, date)
-            if not isinstance(predicted, pd.Series):
-                raise TypeError(
-                    f"alpha predict returned {type(predicted).__name__}, expected Series"
-                )
-            predicted = predicted.reindex(universe).replace([np.inf, -np.inf], np.nan)
-            if predicted.notna().sum() == 0:
-                raise ValueError("alpha prediction contains no finite values")
-            predicted = predicted.fillna(0.0).astype(float)
-            if self.asset_selector is not None:
-                predicted = self.asset_selector.apply(predicted, date=date)
-            vintages = max(int(self.forecast_averaging_vintages), 1)
-            if vintages > 1:
-                self._forecast_vintages.append(predicted.copy())
-                self._forecast_vintages = self._forecast_vintages[-vintages:]
-                predicted = pd.concat(self._forecast_vintages, axis=1).mean(axis=1)
-            return predicted
-        except Exception as e:
-            logger.warning(f"预测失败 @ {date.date()}: {type(e).__name__}: {e}", exc_info=True)
-            self._record_failure("prediction", date, e, "hold_previous_or_zero")
-            return None
+        except Exception as exc:
+            raise RuntimeError(f"alpha prediction failed @ {date}: {exc}") from exc
+        if not isinstance(predicted, pd.Series):
+            raise TypeError(
+                f"alpha predict returned {type(predicted).__name__}, expected Series"
+            )
+        if predicted.index.has_duplicates:
+            raise ValueError("alpha prediction index must be unique")
+        predicted = predicted.reindex(universe).replace([np.inf, -np.inf], np.nan)
+        if predicted.isna().any():
+            raise ValueError("alpha prediction contains missing or non-finite values")
+        predicted = predicted.astype(float)
+        if self.asset_selector is not None:
+            predicted = self.asset_selector.apply(predicted, date=date)
+        vintages = max(int(self.forecast_averaging_vintages), 1)
+        if vintages > 1:
+            self._forecast_vintages.append(predicted.copy())
+            self._forecast_vintages = self._forecast_vintages[-vintages:]
+            predicted = pd.concat(self._forecast_vintages, axis=1).mean(axis=1)
+        return predicted
 
     def _optimize_period(
         self,
-        predicted: Optional[pd.Series],
+        predicted: pd.Series,
         risk_model: RiskModel,
         current_weights: pd.Series,
         constraints: List[Constraint],
@@ -1054,13 +1106,13 @@ class Backtester:
         from core.logger import get_logger
         log = get_logger("multi_factor")
 
-        if predicted is None or predicted.empty:
-            return self._fallback_weights(current_weights, universe)
-        predicted = predicted.reindex(universe).fillna(0.0)
-        if float(predicted.abs().max()) < 1e-12:
-            error = ValueError("alpha prediction is all zero")
-            self._record_failure("optimization", date, error, "hold_previous_or_zero")
-            return self._fallback_weights(current_weights, universe)
+        if not isinstance(predicted, pd.Series) or predicted.empty:
+            raise ValueError("optimizer requires a non-empty prediction Series")
+        if predicted.index.has_duplicates:
+            raise ValueError("prediction index must be unique")
+        predicted = predicted.reindex(universe)
+        if predicted.isna().any() or not np.isfinite(predicted.values).all():
+            raise ValueError("prediction contains NaN/Inf")
 
         try:
             optimization_universe = pd.Index(universe)
@@ -1071,11 +1123,7 @@ class Backtester:
                     predicted.index[predicted.abs() > 1e-12]
                 )
                 if optimization_universe.empty:
-                    error = ValueError("asset selector produced an empty universe")
-                    self._record_failure(
-                        "optimization", date, error, "hold_previous_or_zero"
-                    )
-                    return self._fallback_weights(current_weights, universe)
+                    return pd.Series(0.0, index=universe, dtype=float)
                 optimization_predicted = predicted.reindex(optimization_universe)
                 optimization_current = current_weights.reindex(
                     optimization_universe
@@ -1095,6 +1143,10 @@ class Backtester:
                 raise TypeError(
                     f"optimizer returned {type(target_w).__name__}, expected Series"
                 )
+            if target_w.index.has_duplicates or not target_w.index.equals(
+                optimization_universe
+            ):
+                raise ValueError("optimizer returned misaligned weight index")
             target_w = target_w.reindex(universe).fillna(0.0)
             if target_w.isna().any() or not np.isfinite(target_w.values).all():
                 raise ValueError("optimizer returned NaN/Inf weights")
@@ -1111,6 +1163,11 @@ class Backtester:
                     universe,
                     annual_volatility=annual_volatility,
                 )
+                if not isinstance(target_w, pd.Series):
+                    raise TypeError("dynamic risk controller must return a Series")
+                target_w = target_w.reindex(universe)
+                if target_w.isna().any() or not np.isfinite(target_w.values).all():
+                    raise ValueError("dynamic risk controller returned invalid weights")
             log.info(
                 f"优化完成 @ {date.date()} | std={float(target_w.std()):.6f} "
                 f"max={float(target_w.max()):.4f} "
@@ -1118,80 +1175,27 @@ class Backtester:
                 f"gross={float(target_w.abs().sum()):.4f}"
             )
             return target_w
-        except Exception as e:
-            log.warning(
-                f"优化失败 @ {date.date()}: {type(e).__name__}: {e}, "
-                "保持上期权重或零仓"
-            )
-            self._record_failure("optimization", date, e, "hold_previous_or_zero")
-            return self._fallback_weights(current_weights, universe)
+        except Exception as exc:
+            raise RuntimeError(f"portfolio optimization failed @ {date}: {exc}") from exc
 
-    def _compute_period_return(
-        self,
-        target_w: pd.Series,
-        current_weights: pd.Series,
-        fwd_returns: pd.DataFrame,
-        date: Date,
-        universe: Universe,
-    ) -> Tuple[float, float]:
-        """计算单期收益和换手率.
-
-        Returns:
-            (portfolio_ret, turnover)
-        """
-        if date in fwd_returns.index:
-            period_fwd = fwd_returns.loc[date].reindex(universe).fillna(0.0)
-            w_aligned = target_w.reindex(universe).fillna(0.0)
-            portfolio_ret = float((w_aligned * period_fwd).sum())
-        else:
-            from core.logger import get_logger
-            log = get_logger("multi_factor")
-            log.warning(
-                f"调仓日 {date.date()} 不在 fwd_returns 索引中, "
-                f"期间收益设为 0. fwd_returns 日期范围: "
-                f"{fwd_returns.index[0].date() if len(fwd_returns) > 0 else 'EMPTY'} ~ "
-                f"{fwd_returns.index[-1].date() if len(fwd_returns) > 0 else 'EMPTY'}"
-            )
-            portfolio_ret = 0.0
-
-        # 交易成本
-        if self.cost_model is not None:
-            try:
-                prev = current_weights if not current_weights.empty else pd.Series(dtype=float)
-                cost = float(self.cost_model.estimate_cost(target_w, prev, date))
-                portfolio_ret -= cost
-            except Exception as e:
-                log.warning(f"成本模型估计失败 @ {date.date()}: {type(e).__name__}: {e}")
-
-        # 换手率
-        if not current_weights.empty:
-            turnover = float(
-                (target_w.reindex(current_weights.index).fillna(0.0)
-                 - current_weights).abs().sum()
-            )
-        else:
-            turnover = float(target_w.abs().sum())
-
-        return portfolio_ret, turnover
 
     def _compute_realized_vol(
-        self, returns_arr: np.ndarray, i: int
+        self, returns_arr: np.ndarray, end_exclusive: int
     ) -> float:
-        """计算近期已实现波动率 (用于 vol targeting).
+        """计算决策时已经完成的近期收益波动率 (用于 vol targeting).
 
         优化: 直接对 numpy 数组切片, 避免 pandas .iloc 开销.
 
         CR-006修复:
         - returns_arr 是日度组合收益, 年化应使用 sqrt(252), 而非 sqrt(252/5)
           (旧因子 sqrt(252/HOLDING_PERIOD) 错误地按 holding_period 频率年化)
-        - 波动率缩放只用 t-1 之前的数据 (returns_arr[s:i] 不含 i), 避免前视偏差;
-          同时过滤 NaN 防止传播.
+        ``end_exclusive`` 是已完成收益区间的右边界。收盘 T 决策调用时
+        传入 T 所在位置加一，因此包含已知的 R[T]，但不会读取 R[T+1]。
         """
-        # CR-006: 只用 t-1 之前的数据 (returns_arr[s:i] 不含 i)
-        if i < 5:
+        if end_exclusive < 5:
             return 0.0
-        s = max(0, i - 20)
-        recent = returns_arr[s:i]
+        start = max(0, end_exclusive - 20)
+        recent = returns_arr[start:end_exclusive]
         # CR-006: 过滤 NaN (避免 NaN 传播导致 std 为 NaN)
         recent = recent[~np.isnan(recent)]
         if recent.size > 3:
@@ -1201,50 +1205,6 @@ class Backtester:
                 # CR-006修复: 日度收益年化用 sqrt(252), 而非 sqrt(252/5)
                 return std_val * np.sqrt(TRADING_DAYS_PER_YEAR)
         return 0.0
-
-    def _generate_signals(
-        self,
-        signal_generator: SignalGenerator,
-        target_w: pd.Series,
-        current_positions: pd.DataFrame,
-        date: Date,
-        position_sizer: Optional[PositionSizer] = None,
-        sl_tp_rules: Optional[List[SLTPRule]] = None,
-    ) -> SignalFrame:
-        """生成交易信号.
-
-        CR-008修复: 信号执行状态机尚未完整实现前, 显式报 NotImplementedError,
-        避免静默输出空信号.
-
-        旧代码问题:
-        - 构造的 MarketState 行情全为空 (prices/high/low/... 均为空 Series),
-          生成器 (trend_following) 因 price=NaN 跳过全部品种 → 信号恒为空
-        - current_positions 始终为空 (run() 中从未更新)
-        - position_sizer / sl_tp_rules 未传入本方法, 仓位与止损止盈逻辑缺失
-        - trend_following 模式无开空仓逻辑
-        """
-        # CR-008: 信号层未完成前, 若启用信号但缺少仓位管理器或止损止盈规则,
-        # 显式报错避免静默输出空信号
-        if position_sizer is None or sl_tp_rules is None:
-            raise NotImplementedError(
-                "CR-008: 信号执行状态机尚未完整实现 "
-                "(position_sizer/sl_tp_rules 缺失, 且行情/持仓状态未接入, "
-                "无法生成有效信号)"
-            )
-
-        ms = MarketState(
-            date=date,
-            prices=pd.Series(dtype=float),
-            high=pd.Series(dtype=float),
-            low=pd.Series(dtype=float),
-            open=pd.Series(dtype=float),
-            volume=pd.Series(dtype=float),
-            atr=pd.Series(dtype=float),
-            pre_settle=pd.Series(dtype=float),
-        )
-        return signal_generator.generate(
-            target_w, current_positions, {}, ms, {}, date
-        )
 
     def run(
         self,
@@ -1258,23 +1218,24 @@ class Backtester:
         risk_model: RiskModel,
         optimizer: Optimizer,
         constraints: List[Constraint],
-        signal_generator: SignalGenerator = None,
-        position_sizer: PositionSizer = None,
-        sl_tp_rules: List[SLTPRule] = None,
     ) -> BacktestResult:
         """端到端回测主流程.
 
         Returns:
-            BacktestResult: 包含 NAV、权重历史、信号、绩效指标.
+            BacktestResult: 包含 NAV、目标权重历史和绩效指标.
         """
         from core.logger import get_logger
         log = get_logger("multi_factor")
-        self._failure_ledger = []
+        if not factor_names:
+            raise ValueError("backtest requires at least one configured factor")
+        self._last_fit_factors = None
         self._forecast_vintages = []
         if self.asset_selector is not None and hasattr(self.asset_selector, "reset"):
             self.asset_selector.reset()
 
         # === Step 1: 数据准备 ===
+        self._close_tradable = None
+        self._contract_schedule = None
         rebalance_dates, universe_static, all_dates, processed_all, fwd_returns, daily_returns = (
             self._prepare_backtest_data(
                 data_manager, factor_engine, processor, factor_names,
@@ -1283,14 +1244,8 @@ class Backtester:
         )
 
         if len(universe_static) == 0:
-            log.warning("universe 为空, 回测直接返回初值")
-            nav = pd.Series(index=rebalance_dates, dtype=float)
-            if len(nav) > 0:
-                nav.iloc[0] = self.initial_nav
-            nav = nav.ffill()
-            return BacktestResult(
-                nav=nav, weights_history=pd.DataFrame(),
-                signals_history=[], metrics=compute_all_metrics(nav),
+            raise RuntimeError(
+                "backtest universe is empty after data and eligibility gates"
             )
 
         # === Step 2: 日度NAV累积 ===
@@ -1308,16 +1263,14 @@ class Backtester:
 
         # 调仓日集合 (O(1) 查找)
         rebalance_set = set(rebalance_dates)
-        # 调仓日在 bt_dates 中的索引 → 用于触发 refit/optimize
-        rebalance_pos = {
-            d: i for i, d in enumerate(bt_dates) if d in rebalance_set
-        }
-
         # 预分配 numpy 数组 (日度频率)
         nav_arr = np.full(n_bt, np.nan, dtype=np.float64)
         returns_arr = np.full(n_bt, np.nan, dtype=np.float64)
         gross_returns_arr = np.full(n_bt, 0.0, dtype=np.float64)
         turnover_arr = np.full(n_bt, 0.0, dtype=np.float64)
+        roll_turnover_arr = np.full(n_bt, 0.0, dtype=np.float64)
+        executed_turnover_arr = np.full(n_bt, 0.0, dtype=np.float64)
+        executed_roll_turnover_arr = np.full(n_bt, 0.0, dtype=np.float64)
         cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         trade_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
         holding_cost_arr = np.full(n_bt, 0.0, dtype=np.float64)
@@ -1334,108 +1287,18 @@ class Backtester:
             nav_arr[0] = self.initial_nav
 
         current_weights = pd.Series(dtype=float)
-        current_positions = pd.DataFrame()
-        signal_list: List[SignalFrame] = []
+        held_contracts = pd.Series(dtype="object")
         weights_history: List[Tuple[pd.Timestamp, pd.Series]] = []
 
         last_fit_idx = -1
-        # 事件驱动调仓状态
-        last_event_rebalance_idx = -10000  # 上次事件调仓的 bt_dates 索引
-        event_active = False  # 是否处于事件触发状态 (迟滞带解除前持续)
-        # CR-007修复: pending_cost 暂存上一调仓日产生的交易成本, 在新权重生效的次日扣除.
-        # 这样无论调仓来源 (正式调仓 / 事件调仓), 只要权重变化非零, 次日都会扣成本.
+        # pending_cost 暂存本次收盘决策产生的成本，在新权重生效的次日扣除。
         pending_cost = 0.0
+        pending_turnover = 0.0
+        pending_roll_turnover = 0.0
 
         for i, date in enumerate(bt_dates):
             cost_today = 0.0  # 当日调仓产生的成本 (若调仓且权重有变化)
             pending_weights = None  # 调仓日决策的权重, 次日生效
-
-            # --- 计算当前回撤 (用于事件驱动调仓和回撤控制约束) ---
-            if i > 0 and not np.isnan(nav_arr[i - 1]):
-                peak_so_far = np.nanmax(nav_arr[:i])
-                current_drawdown = float((nav_arr[i - 1] - peak_so_far) / peak_so_far) if peak_so_far > 0 else 0.0
-            else:
-                current_drawdown = 0.0
-
-            # --- 事件驱动调仓: 回撤超阈值时触发额外调仓 ---
-            # 迟滞带机制: 触发后 event_active=True, 需回升到 hysteresis 阈值以上才解除
-            # 冷却期: 触发后 cooldown 个交易日内不重复触发 (避免每天调仓)
-            dd_thresh = self.event_rebalance_dd_threshold
-            hysteresis = self.event_rebalance_hysteresis
-            cooldown = self.event_rebalance_cooldown
-
-            if current_drawdown <= dd_thresh:
-                event_active = True
-            elif current_drawdown >= hysteresis:
-                event_active = False
-
-            event_rebalance = False
-            if (
-                event_active
-                and date not in rebalance_set
-                and (i - last_event_rebalance_idx) >= cooldown
-            ):
-                event_rebalance = True
-                last_event_rebalance_idx = i
-                logger.info(
-                    f"事件驱动调仓 @ {date.date()}: 回撤={current_drawdown:.2%} "
-                    f"(阈值={dd_thresh:.0%}, 冷却={cooldown}d)"
-                )
-
-            # --- 调仓日: 决策新权重 (但当日仍用旧权重计算收益) ---
-            if date in rebalance_set or event_rebalance:
-                # CR-004修复: 查询 universe 时使用"不晚于当前调仓日的最近 schedule key",
-                # 不静默回退到完整 universe_static (找不到时返回空 Index, 跳过本次调仓)
-                universe = self._lookup_universe_schedule(
-                    universe_schedule, date, universe_static
-                )
-                if self._eligibility_mask is not None:
-                    eligible_history = self._eligibility_mask.loc[
-                        self._eligibility_mask.index <= date
-                    ]
-                    if eligible_history.empty:
-                        universe = pd.Index([])
-                    else:
-                        eligible_row = eligible_history.iloc[-1].fillna(False)
-                        universe = universe.intersection(
-                            eligible_row.index[eligible_row.astype(bool)]
-                        )
-                if len(universe) > 0:
-                    # 增量 alpha 重训 (含D3: 风险模型walk-forward重估计)
-                    _, last_fit_idx = self._refit_alpha(
-                        alpha_model, processed_all, fwd_returns, date, all_dates,
-                        last_fit_idx, self.retrain_freq, universe_static,
-                        risk_model=risk_model, data_manager=data_manager,
-                        daily_returns=daily_returns,
-                    )
-
-                    # 预测
-                    predicted = self._predict_returns(
-                        alpha_model, processed_all, date, universe
-                    )
-
-                    # 优化
-                    realized_vol = self._compute_realized_vol(returns_arr, i)
-                    target_w = self._optimize_period(
-                        predicted, risk_model, current_weights, constraints,
-                        optimizer, date, universe, realized_vol,
-                        current_drawdown=current_drawdown,
-                    )
-
-                    # 暂存新权重, 当日收益仍用旧权重
-                    pending_weights = target_w
-
-                    # 信号生成
-                    # CR-008: signal_generator 为 None 时跳过 (信号模式未启用);
-                    # 否则调用 _generate_signals, 若 position_sizer/sl_tp_rules 缺失
-                    # 会显式 raise NotImplementedError, 避免静默输出空信号
-                    if signal_generator is not None:
-                        signals = self._generate_signals(
-                            signal_generator, target_w, current_positions, date,
-                            position_sizer=position_sizer,
-                            sl_tp_rules=sl_tp_rules,
-                        )
-                        signal_list.append(signals)
 
             # --- 每日: 计算组合日收益 (用当日生效的权重) ---
             if date in daily_returns.index:
@@ -1447,11 +1310,14 @@ class Backtester:
 
             effective_trade_cost = float(pending_cost)
             pending_cost = 0.0
+            executed_turnover_arr[i] = pending_turnover
+            executed_roll_turnover_arr[i] = pending_roll_turnover
+            pending_turnover = 0.0
+            pending_roll_turnover = 0.0
 
             holding_cost = 0.0
 
-            # CR-007修复: 扣除昨日暂存的交易成本 (pending_weights 生效的次日扣除)
-            # 这样无论昨日是正式调仓还是事件调仓, 只要权重变化非零, 今日就扣成本.
+            # 扣除昨日收盘决策暂存的交易成本（新权重生效的次日扣除）。
             # 顺序: 先用当日生效权重算 port_ret, 再扣 pending_cost (来自昨日调仓决策).
             if i > 0 and self.cost_model is not None:
                 holding_estimator = getattr(
@@ -1484,25 +1350,155 @@ class Backtester:
                 step.contributions.reindex(universe_static).fillna(0.0)
             )
 
-            # Rebalance from the post-mark drifted exposure. The new target is
-            # effective for the next bar. A target produced on the final bar is
-            # not treated as an executed trade because it has no holding period.
+            # 先完成 T 日收盘估值，再用真实漂移后的权重形成 T 日目标。
+            # 因而收益口径严格为 W[T-1] * R[T]，目标 W[T] 于下一根生效。
             current_weights = step.end_weights
-            if pending_weights is not None and i < n_bt - 1:
+            if i == 0:
+                nav_arr[i] = self.initial_nav * (1.0 + port_ret)
+            else:
+                nav_arr[i] = nav_arr[i - 1] * (1.0 + port_ret)
+            returns_arr[i] = port_ret
+
+            peak_so_far = np.nanmax(nav_arr[:i + 1])
+            current_drawdown = (
+                float((nav_arr[i] - peak_so_far) / peak_so_far)
+                if peak_so_far > 0.0 else 0.0
+            )
+
+            # --- 调仓日: 收盘后决策新权重，下一交易日生效 ---
+            if date in rebalance_set:
+                # CR-004修复: 查询 universe 时使用"不晚于当前调仓日的最近 schedule key",
+                # 不静默回退到完整 universe_static (找不到时返回空 Index, 跳过本次调仓)
+                universe = self._lookup_universe_schedule(
+                    universe_schedule, date, universe_static
+                )
+                if self._eligibility_mask is not None:
+                    eligible_history = self._eligibility_mask.loc[
+                        self._eligibility_mask.index <= date
+                    ]
+                    if eligible_history.empty:
+                        universe = pd.Index([])
+                    else:
+                        eligible_row = eligible_history.iloc[-1].fillna(False)
+                        universe = universe.intersection(
+                            eligible_row.index[eligible_row.astype(bool)]
+                        )
+                if len(universe) == 0:
+                    active = (
+                        not current_weights.empty
+                        and bool(current_weights.abs().gt(1e-12).any())
+                    )
+                    if active or self._last_fit_factors is not None:
+                        raise RuntimeError(
+                            f"eligible universe is empty at rebalance close {date.date()}"
+                        )
+                else:
+                    # 增量 alpha 重训 (含D3: 风险模型walk-forward重估计)
+                    _, last_fit_idx = self._refit_alpha(
+                        alpha_model, processed_all, fwd_returns, date, all_dates,
+                        last_fit_idx, self.retrain_freq, universe_static,
+                        risk_model=risk_model, data_manager=data_manager,
+                        daily_returns=daily_returns,
+                    )
+
+                    # Before the first complete training window, the strategy is
+                    # explicitly observation-only and holds cash.
+                    if self._last_fit_factors is not None:
+                        predicted = self._predict_returns(
+                            alpha_model, processed_all, date, universe
+                        )
+                        realized_vol = self._compute_realized_vol(returns_arr, i + 1)
+                        target_w = self._optimize_period(
+                            predicted, risk_model, current_weights, constraints,
+                            optimizer, date, universe, realized_vol,
+                            current_drawdown=current_drawdown,
+                        )
+                        pending_weights = target_w
+                        # Keep the observed close decision separate from the
+                        # effective exposure recorded by the daily ledger.
+                        weights_history.append((date, pending_weights.copy()))
+
+            # Rebalance from the post-mark drifted exposure. The new target is
+            # effective for the next bar. Contract rolls are checked every day,
+            # including days without a root-weight decision.
+            if i < n_bt - 1 and (
+                pending_weights is not None or self._contract_schedule is not None
+            ):
+                next_date = bt_dates[i + 1]
+                desired_target = (
+                    pending_weights if pending_weights is not None else step.end_weights
+                )
                 transition_target, transition_current = align_transition_weights(
-                    pending_weights, step.end_weights
+                    desired_target, step.end_weights
                 )
-                turnover_arr[i] = float(
-                    (transition_target - transition_current).abs().sum()
-                )
+                can_trade = pd.Series(True, index=transition_target.index)
+                if self._close_tradable is not None:
+                    missing_dates = [
+                        value for value in (date, next_date)
+                        if value not in self._close_tradable.index
+                    ]
+                    if missing_dates:
+                        raise RuntimeError(
+                            "close tradability mask is missing transition dates: "
+                            + ", ".join(str(pd.Timestamp(value).date()) for value in missing_dates)
+                        )
+                    can_trade = (
+                        self._close_tradable.loc[date]
+                        .reindex(transition_target.index)
+                        .eq(True)
+                        & self._close_tradable.loc[next_date]
+                        .reindex(transition_target.index)
+                        .eq(True)
+                    )
+                    transition_target = transition_target.where(
+                        can_trade, transition_current
+                    )
+
+                target_contracts = None
+                current_contracts = None
+                cost_target = transition_target
+                cost_current = transition_current
+                if self._contract_schedule is not None:
+                    target_contracts = (
+                        self._contract_schedule.loc[next_date]
+                        .reindex(transition_target.index)
+                        .copy()
+                    )
+                    current_contracts = held_contracts.reindex(
+                        transition_target.index
+                    )
+                    target_contracts = target_contracts.where(
+                        can_trade, current_contracts
+                    )
+                    turnover, roll_turnover = contract_transition_turnover(
+                        transition_target,
+                        transition_current,
+                        current_contracts=current_contracts,
+                        target_contracts=target_contracts,
+                    )
+                    cost_target, cost_current = contract_transition_weight_vectors(
+                        transition_target,
+                        transition_current,
+                        current_contracts=current_contracts,
+                        target_contracts=target_contracts,
+                    )
+                    held_contracts = target_contracts.where(
+                        transition_target.abs().gt(1e-12), pd.NA
+                    )
+                else:
+                    turnover, roll_turnover = contract_transition_turnover(
+                        transition_target, transition_current
+                    )
+                turnover_arr[i] = turnover
+                roll_turnover_arr[i] = roll_turnover
                 if self.cost_model is not None:
                     try:
-                        if not transition_current.equals(transition_target):
+                        if turnover > 1e-12:
                             cost_today = float(
                                 self.cost_model.estimate_cost(
-                                    transition_target,
-                                    transition_current,
-                                    date,
+                                    cost_target,
+                                    cost_current,
+                                    next_date,
                                 )
                             )
                         if not np.isfinite(cost_today) or cost_today < 0.0:
@@ -1510,30 +1506,29 @@ class Backtester:
                                 f"invalid transition cost at {date}: {cost_today}"
                             )
                     except Exception as e:
-                        self._record_failure(
-                            "research_cost", date, e, "abort_backtest"
-                        )
                         raise RuntimeError(
                             f"research transaction cost failed at {date}: {e}"
                         ) from e
                 current_weights = transition_target
-                weights_history.append((date, current_weights))
                 pending_cost = cost_today
-
-            # 更新 NAV (日度累积)
-            if i == 0:
-                nav_arr[i] = self.initial_nav * (1.0 + port_ret)
-            else:
-                nav_arr[i] = nav_arr[i - 1] * (1.0 + port_ret)
-
-            returns_arr[i] = port_ret
+                pending_turnover = turnover
+                pending_roll_turnover = roll_turnover
 
         # === Step 3: 绩效评估 ===
         # 日度 NAV → periods_per_year=252 天然正确, 无需手动调整
-        nav = pd.Series(nav_arr, index=bt_dates).ffill()
+        if not np.isfinite(nav_arr).all():
+            raise RuntimeError("backtest NAV contains an unaccounted NaN or infinity")
+        nav = pd.Series(nav_arr, index=bt_dates)
         returns_series = pd.Series(returns_arr, index=bt_dates)
         gross_returns_series = pd.Series(gross_returns_arr, index=bt_dates)
         turnover_series = pd.Series(turnover_arr, index=bt_dates)
+        roll_turnover_series = pd.Series(roll_turnover_arr, index=bt_dates)
+        executed_turnover_series = pd.Series(
+            executed_turnover_arr, index=bt_dates
+        )
+        executed_roll_turnover_series = pd.Series(
+            executed_roll_turnover_arr, index=bt_dates
+        )
         cost_series = pd.Series(cost_arr, index=bt_dates)
         asset_returns_frame = pd.DataFrame(
             asset_returns_arr, index=bt_dates, columns=universe_static
@@ -1552,6 +1547,11 @@ class Backtester:
         returns_series = returns_series.loc[eval_mask]
         gross_returns_series = gross_returns_series.loc[eval_mask]
         turnover_series = turnover_series.loc[eval_mask]
+        roll_turnover_series = roll_turnover_series.loc[eval_mask]
+        executed_turnover_series = executed_turnover_series.loc[eval_mask]
+        executed_roll_turnover_series = executed_roll_turnover_series.loc[
+            eval_mask
+        ]
         cost_series = cost_series.loc[eval_mask]
         asset_returns_frame = asset_returns_frame.loc[eval_mask]
         effective_weights_frame = effective_weights_frame.loc[eval_mask]
@@ -1569,6 +1569,11 @@ class Backtester:
                 "holding_cost": holding_cost_arr[eval_mask],
                 "net_return": returns_series,
                 "decision_turnover": turnover_series,
+                "turnover": executed_turnover_series,
+                "half_turnover": 0.5 * executed_turnover_series,
+                "roll_turnover": roll_turnover_series,
+                "executed_traded_notional": executed_turnover_series,
+                "executed_roll_turnover": executed_roll_turnover_series,
                 "gross_exposure": effective_weights_frame.abs().sum(axis=1),
                 "net_exposure": effective_weights_frame.sum(axis=1),
                 "active_instruments": effective_weights_frame.abs().gt(
@@ -1591,14 +1596,39 @@ class Backtester:
                 "periods_per_year": float(
                     getattr(self.cost_model, "periods_per_year", 252.0)
                 ),
-                "annual_transaction_cost": float(
-                    getattr(self.cost_model, "annual_transaction_cost", 0.0)
+                "turnover_cost_rate": float(
+                    getattr(self.cost_model, "turnover_cost_rate", 0.0)
                 ),
                 "annual_roll_cost": getattr(
                     self.cost_model, "annual_roll_cost", None
                 ),
+                "transaction_cost_timing": (
+                    "transition_cost_next_bar_plus_holding_cost_each_bar"
+                ),
+                "turnover_cost_policy": (
+                    "delegated_to_cost_model"
+                    if self.cost_model is not None
+                    else "not_charged"
+                ),
                 "transition_cost_policy": (
-                    "diagnostic_only_not_charged"
+                    "cost_model_on_concrete_contract_transition"
+                    if self._contract_schedule is not None
+                    else "cost_model_on_root_transition"
+                ),
+                "contract_schedule_policy": (
+                    "point_in_time_schedule"
+                    if self._contract_schedule is not None
+                    else "unavailable"
+                ),
+                "rollover_cost_policy": (
+                    "explicit_turnover_plus_declared_holding_cost_policy"
+                    if self._contract_schedule is not None
+                    else "declared_holding_cost_policy_only"
+                ),
+                "untradable_transition_policy": (
+                    "require_decision_and_next_close_then_freeze"
+                    if self._close_tradable is not None
+                    else "not_provided"
                 ),
             }
         )
@@ -1612,17 +1642,34 @@ class Backtester:
         research_ledger.validate()
 
         # 日度频率 periods_per_year=252 (默认值, 无需覆盖)
-        metrics = compute_all_metrics(nav, returns=returns_series)
-        # 换手率: 仅统计调仓日
-        reb_turnover = turnover_series[turnover_series > 0]
+        # The first row is the NAV anchor and has no preceding holding interval.
+        metrics = compute_all_metrics(nav, returns=returns_series.iloc[1:])
+        # avg_turnover保留“有成交日均值”兼容口径，其余字段显式报告
+        # 交换手的逐日、年化与全期口径。
+        executed_intervals = executed_turnover_series.iloc[1:]
+        reb_turnover = executed_intervals[executed_intervals > 0]
         if not reb_turnover.empty:
             metrics["avg_turnover"] = float(reb_turnover.mean())
+        else:
+            metrics["avg_turnover"] = 0.0
+        metrics["avg_daily_turnover"] = float(
+            executed_intervals.mean()
+        ) if len(executed_intervals) else 0.0
+        metrics["annualized_turnover"] = (
+            metrics["avg_daily_turnover"] * TRADING_DAYS_PER_YEAR
+        )
+        metrics["total_turnover"] = float(executed_intervals.sum())
         metrics["total_transaction_cost"] = float(cost_series.sum())
-        metrics["avg_transaction_cost"] = float(cost_series.mean()) if not cost_series.empty else 0.0
+        metrics["avg_transaction_cost"] = (
+            float(cost_series.iloc[1:].mean()) if len(cost_series) > 1 else 0.0
+        )
         metrics["total_trade_cost"] = float(trade_cost_arr[eval_mask].sum())
         metrics["total_holding_cost"] = float(holding_cost_arr[eval_mask].sum())
+        metrics["total_roll_turnover"] = float(
+            executed_roll_turnover_series.iloc[1:].sum()
+        )
 
-        # 样本分段诊断: 前60% / 后40%。不宣称独立样本外验证。
+        # 样本分段诊断: 前75% / 后25%。不宣称独立样本外验证。
         from backtest.metrics import compute_split_metrics
         split_metrics = compute_split_metrics(nav, returns_series, train_ratio=0.75)
 
@@ -1645,11 +1692,11 @@ class Backtester:
         return BacktestResult(
             nav=nav,
             weights_history=wh,
-            signals_history=signal_list,
             metrics=metrics,
-            turnover=turnover_series,
+            turnover=executed_turnover_series,
+            decision_turnover=turnover_series,
             costs=cost_series,
             research_ledger=research_ledger,
             split_metrics=split_metrics,
-            failure_ledger=list(self._failure_ledger),
+            failure_ledger=[],
         )

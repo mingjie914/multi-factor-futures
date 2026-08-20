@@ -1,4 +1,5 @@
 snapshot:
+  branch_id: B1
   name: guosen_china_assets_trend_allocation_proxy
   source_documents:
     - "E:/程明杰公司内容/指数编制方案/趋势配置指数编制方案.docx"
@@ -15,8 +16,8 @@ volatility_window: 20
 correlation_window: 20
 correlation_multiplier_cap: 2.0
 minimum_risk_observations: 10
-# 项目因子输出已内建 shift(1)：factor[T] 使用不晚于 T-1 的信息，故同日持有。
-# 若未来接入未预滞后的原始外部因子，应复制快照并改为 1。
+# 项目因子输出已内建 shift(1)：factor[T] 使用不晚于 T-1 的信息。
+# factor[T] 在 T 日形成目标，T+1 日才成为有效持仓；此参数只增加额外等待日。
 execution_lag_days: 0
 periods_per_year: 242
 transaction_cost_rate: 0.0002
@@ -48,15 +49,15 @@ factor_sets:
     intraday_drip_stone_20d: -1
     intraday_peak_ridge_ratio_20d: -1
   10f:
-    intraday_jump_intensity_20d: -1
     intraday_price_peak_count_20d: 1
     intraday_realised_skewness_20d: 1
-    intraday_dtws_20d: 1
     intraday_drip_stone_20d: -1
     intraday_peak_ridge_ratio_20d: -1
     intraday_torrent_down_20d: -1
     intraday_lowest_time_20d: 1
     intraday_term_slope_20d: 1
+    intraday_open_close_volume_ratio_20d: -1
+    intraday_turnover_velocity_20d: 1
     intraday_price_delay_20d: -1
   13f:
     intraday_jump_intensity_20d: -1

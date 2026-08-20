@@ -5,10 +5,10 @@
     表现应有差异. 本脚本对每个因子在 8 板块 × 多持有期上计算 IC/IR/t/稳定性,
     全量记录每个因子的最佳 (板块, 持有期) 组合, 并做样本外验证防止过拟合.
 
-输出:
-    runs/adaptivity_<timestamp>/factor_adaptivity.json — 全量适配性记录
-    runs/adaptivity_<timestamp>/factor_adaptivity_summary.csv — 精简摘要 (每因子一行)
-    runs/adaptivity_<timestamp>/factor_sector_selection.csv — 每个因子×板块的最优持有期
+输出（必须显式指定目录）:
+    <output-dir>/factor_adaptivity.json — 全量适配性记录
+    <output-dir>/factor_adaptivity_summary.csv — 精简摘要 (每因子一行)
+    <output-dir>/factor_sector_selection.csv — 每个因子×板块的最优持有期
 
 JSON 结构:
     {
@@ -36,9 +36,8 @@ JSON 结构:
     }
 
 Usage:
-    python main.py adaptivity
-    python main.py adaptivity --periods 1,5,10,20,40
-    python main.py adaptivity --factors ts_rank_close_5d_smooth,macd_diff_10d_z
+    python main.py adaptivity --output-dir runs/adaptivity/study_id
+    python main.py adaptivity --output-dir runs/adaptivity/study_id --periods 1,5,10,20,40
 """
 from __future__ import annotations
 
@@ -71,8 +70,7 @@ from core.sectors import (
     TAXONOMY_VERSION,
     taxonomy_sha256,
 )
-from data.manager import DataManager, FrequencyDataProvider
-from data.cache import Cache
+from data.manager import FrequencyDataProvider
 from factors.engine import FactorEngine
 from factors.processor import build_processing_context
 from testing.ic_test import _newey_west_ir
@@ -89,86 +87,6 @@ SECTOR_IC_THRESHOLD = 0.01       # 全市场统一经济量级底线
 SECTOR_T_THRESHOLD = 1.96        # 板块t值下限 (95%置信)
 SECTOR_HIT_RATE_THRESHOLD = 0.52 # IC命中率下限
 OOS_CONSISTENCY_THRESHOLD = 0.5  # 样本外IC方向一致比例下限
-
-
-def _load_data_from_cache(data_mgr, universe, factor_start, ic_end):
-    """若 MySQL 连接失败, 从缓存 parquet 加载数据.
-
-    复用 workflows.research 的缓存回退逻辑.
-    返回: (success: bool, calendar: pd.DatetimeIndex)
-
-    修复: 增加 get_contract_pair 的缓存回退, 使 roll_yield 等多合约因子
-    在缓存模式下也能正常计算 (而非返回空 DataFrame).
-    """
-    cache_dir = os.path.join(_PROJECT_ROOT, "cache")
-    if not os.path.exists(cache_dir):
-        return False, pd.DatetimeIndex([])
-
-    close_files = [f for f in os.listdir(cache_dir)
-                   if f.startswith("futures_MySQLSource_close_") and f.endswith(".parquet")]
-    if not close_files:
-        return False, pd.DatetimeIndex([])
-
-    # 选择列覆盖最好的缓存文件
-    best_dates = pd.DatetimeIndex([])
-    best_score = -1
-    for f in close_files:
-        try:
-            df = pd.read_parquet(os.path.join(cache_dir, f))
-            col_overlap = len(set(df.columns) & set(universe))
-            date_overlap = ((df.index >= pd.Timestamp(factor_start)) &
-                            (df.index <= pd.Timestamp(ic_end))).sum()
-            score = col_overlap * 1000 + date_overlap
-            if score > best_score:
-                best_score = score
-                best_dates = pd.DatetimeIndex(df.index)
-        except Exception:
-            continue
-
-    if len(best_dates) == 0:
-        return False, pd.DatetimeIndex([])
-
-    # 加载所有字段
-    ohlcv_cache = {}
-    for field in ["close", "open", "high", "low", "volume", "oi", "settle", "amount"]:
-        for f in os.listdir(cache_dir):
-            if f.startswith(f"futures_MySQLSource_{field}_") and f.endswith(".parquet"):
-                try:
-                    df = pd.read_parquet(os.path.join(cache_dir, f))
-                    df = df.reindex(index=best_dates, columns=universe)
-                    ohlcv_cache[field] = df
-                except Exception:
-                    pass
-                break
-
-    def _patched_get(field, dates, uni):
-        if field in ohlcv_cache:
-            return ohlcv_cache[field].reindex(index=dates, columns=uni)
-        return pd.DataFrame(index=dates, columns=uni)
-
-    data_mgr.get = _patched_get
-    # 同时 patch get_calendar 使其从缓存返回日历
-    def _patched_get_calendar(start, end):
-        mask = (best_dates >= pd.Timestamp(start)) & (best_dates <= pd.Timestamp(end))
-        return best_dates[mask]
-
-    data_mgr.get_calendar = _patched_get_calendar
-
-    # Do not fabricate a far contract when the cache only contains the main
-    # series. Missing term-structure data must fail the research gate.
-    def _patched_get_contract_pair(field, dates, uni):
-        empty = pd.DataFrame(np.nan, index=dates, columns=uni)
-        return {
-            "near": empty.copy(),
-            "far": empty.copy(),
-        }
-
-    data_mgr.get_contract_pair = _patched_get_contract_pair
-    print(
-        f"  (从缓存加载数据: {len(ohlcv_cache)} 个字段, {len(best_dates)} 天; "
-        "近远月合约对不可用，carry 类因子保持缺失)"
-    )
-    return True, best_dates
 
 
 def _cross_section_ic_and_slopes(
@@ -518,32 +436,6 @@ def _compute_single_instrument_ts_arrays(
         "p_value": float(conservative_p if sufficient_history else 1.0),
         "hit_rate": float((oriented_product > 0.0).mean()),
     }
-
-
-def _compute_pooled_ts_fixed_effects(
-    factor_mat: pd.DataFrame,
-    fwd_returns: pd.DataFrame,
-    *,
-    forward_period: int,
-) -> dict:
-    """Pooled predictive regression for sectors with only two instruments."""
-    common_dates = factor_mat.index.intersection(fwd_returns.index)
-    common_cols = factor_mat.columns.intersection(fwd_returns.columns)
-    if len(common_cols) < 2 or len(common_dates) < 20:
-        return {}
-
-    factor = factor_mat.loc[common_dates, common_cols].to_numpy(
-        dtype=float, copy=False
-    )
-    returns = fwd_returns.loc[common_dates, common_cols].to_numpy(
-        dtype=float, copy=False
-    )
-    return _compute_pooled_ts_fixed_effects_arrays(
-        factor,
-        returns,
-        common_dates,
-        forward_period=forward_period,
-    )
 
 
 def _compute_pooled_ts_fixed_effects_arrays(
@@ -1304,15 +1196,10 @@ def run_adaptivity_analysis(
         calendar = calendar.tz_localize(None)
     calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
-    if len(calendar) == 0 and period_ctx.is_daily:
-        cache_ok, cache_dates = _load_data_from_cache(
-            data_mgr, universe, factor_start, ic_end,
+    if len(calendar) == 0:
+        raise RuntimeError(
+            f"published Parquet returned an empty {frequency} research calendar"
         )
-        if cache_ok and len(cache_dates) > 0:
-            calendar = cache_dates
-            if hasattr(calendar, "tz") and calendar.tz is not None:
-                calendar = calendar.tz_localize(None)
-            calendar = pd.DatetimeIndex(sorted(set(calendar)))
 
     valid_universe = [t for t in universe if str(t) in SECTOR_MAP]
     if sectors_filter:
@@ -1386,7 +1273,9 @@ def run_adaptivity_analysis(
 
             _formula_inputs(data_mgr, calendar, valid_universe)
             ta_cn_inputs_ready = True
-        engine = FactorEngine(data_mgr)
+        # This is a library-wide discovery pass; selected-factor recomputation
+        # below remains strict.
+        engine = FactorEngine(data_mgr, tolerant=True)
         computed_batch = engine.compute_factors(
             batch_names,
             calendar,
@@ -1398,6 +1287,8 @@ def run_adaptivity_analysis(
         factor_batch = runner.processor.process_batch(
             computed_batch, processing_context
         )
+        if engine.failures:
+            print(f"  本批不可计算因子/依赖: {len(engine.failures)}（已记入日志）")
         for name in batch_names:
             if (
                 name in computed_batch
@@ -1481,9 +1372,8 @@ def run_adaptivity_analysis(
             print(f"    {sec}: {cnt} 个因子")
 
     # 保存JSON
-    output_dir = output_dir or os.path.join(
-        _PROJECT_ROOT, "runs", time.strftime("adaptivity_%Y%m%d_%H%M%S")
-    )
+    if not output_dir:
+        raise ValueError("output_dir is required; automatic run directories are disabled")
     output_dir = os.path.abspath(output_dir)
     out_path = os.path.join(output_dir, "factor_adaptivity.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -1763,8 +1653,8 @@ def main():
         "--ic-end", default="2025-06-30",
         help="IC检验结束日 (默认: 2025-06-30)")
     parser.add_argument(
-        "--output-dir", default=None,
-        help="输出目录 (默认: runs/adaptivity_<timestamp>)")
+        "--output-dir", required=True,
+        help="显式输出目录")
     parser.add_argument(
         "--workers", type=int, default=None,
         help="因子级分析线程数 (默认: min(4, CPU数); 设为1禁用并行)")
@@ -1792,9 +1682,6 @@ def main():
         help=("deployment 模式必填：P0 输出的 ic_by_window_period.json；"
               "自动加载冻结因子、预处理版本和观察期元数据"),
     )
-    parser.add_argument(
-        "--cache-only", action="store_true",
-        help="严格只使用本地缓存；缓存未命中时禁止访问数据库")
     args = parser.parse_args()
 
     config_path = args.config
@@ -1802,9 +1689,6 @@ def main():
         config_path = os.path.join(_PROJECT_ROOT, config_path)
     config_path = os.path.normpath(config_path)
     config = load_config(config_path)
-    if args.cache_only:
-        config.data.cache["only"] = True
-
     setup_logger("multi_factor")
 
     preprocessing_variants = None
