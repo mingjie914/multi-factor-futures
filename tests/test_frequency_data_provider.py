@@ -139,6 +139,26 @@ def test_prefetch_batches_frequency_dependencies():
     assert source.calls == [(('close', 'volume'), '5min')]
 
 
+def test_prefetch_dependency_override_skips_derived_fields():
+    dates = pd.date_range("2024-01-02 09:00", periods=3, freq="5min")
+    source = IntradaySource({})
+    manager = DataManager(source, config={"cache": {"enabled": False}})
+    provider = FrequencyDataProvider(
+        manager, "5min", dates.min(), dates.max(), pd.Index(["A"])
+    )
+
+    class Factor:
+        def dependencies(self):
+            return ["derived_feature"]
+
+        def prefetch_dependencies(self):
+            return []
+
+    provider.prefetch([Factor()], dates, pd.Index(["A"]))
+
+    assert source.calls == []
+
+
 def test_daily_prefetch_reuses_fields_across_factor_batches():
     dates = pd.date_range("2024-01-02", periods=3, freq="B")
     calls = []
@@ -167,6 +187,21 @@ def test_daily_prefetch_reuses_fields_across_factor_batches():
     manager.prefetch([Factor("close")], dates, universe)
 
     assert calls == [("close",), ("volume",)]
+
+
+def test_daily_prefetch_accepts_an_override_without_raw_dependencies():
+    class Source:
+        def fetch_price(self, *args, **kwargs):
+            raise AssertionError("derived-only factor must not prefetch raw fields")
+
+    class Factor:
+        def prefetch_dependencies(self):
+            return []
+
+    manager = DataManager(Source(), config={"cache": {"enabled": False}})
+    manager.prefetch(
+        [Factor()], pd.date_range("2024-01-02", periods=2), pd.Index(["A"])
+    )
 
 
 def test_calendar_failures_are_not_silently_replaced_with_weekdays():

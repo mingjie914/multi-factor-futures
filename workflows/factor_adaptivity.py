@@ -1645,7 +1645,7 @@ def main():
         help="仅分析指定板块, 逗号分隔 (如 ferrous,agri)")
     parser.add_argument(
         "--factor-start", default="2018-12-10",
-        help="因子计算起始日 (含1年预热, 默认: 2018-12-10)")
+        help="因子计算起始日（含预热，默认: 2018-12-10）")
     parser.add_argument(
         "--ic-start", default="2021-01-01",
         help="IC检验起始日 (默认: 2021-01-01)")

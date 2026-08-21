@@ -39,6 +39,12 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 - 修改 accelerator 后必须复用同一份固定 AST，比较 baseline、v1、factor chunk 和
   v2-lite，并核对 NaN mask、factor value、IC、direction、candidate 集合和排序。
 - 分钟数据按明确训练区间加载，超过特征内存预算时失败关闭，不用交换分区硬撑。
+- 并行因子共享同一请求的分钟面板；冷缓存只允许一次读取，避免多个 worker 重复扫描
+  同一批 Parquet。可复用的已测内层循环放在 `factors/numerics.py`，不得全局替换 Pandas
+  算子，也不得在没有逐值差分和端到端基准时引入原生构建依赖。
+- 全量`factors.library.intraday`日频研究按400个目标交易日＋128日预热分块，避免把
+  全历史分钟面板和因子中间量同时驻留内存；当前最长跨日依赖为120日，增加更长窗口时
+  必须先提高并验证重叠长度。后置检验和相关分析复用同一分块助手；64仅是因子批大小。
 - 本地 Parquet 的 selected-contract 和 curve cache 可以复用；源文件指纹变化时会失效。
 - 通用行情缓存命中更宽日期/品种覆盖时直接返回内存切片，不再为每个请求范围落一个
   派生 Parquet；不要恢复这种会持续制造重复缓存文件的写回行为。
@@ -63,6 +69,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 - 郑商所YMM/YYMM别名在发布层统一处理；规范键数值冲突时停止发布，不按文件顺序
   静默选择。全库重复检查留在数据发布和`data-health --strict`，不放入因子热路径。
 - 本框架只消费已发布的本地Parquet，不包含远程核对、回填或发布逻辑。
+- 严格健康门同时覆盖日线、1/5/15分钟行情和六张席位表；`delivery_seat`即使当前没有
+  因子直接消费，也必须与其他五张正式发布席位表一起通过自然键、规范根和分区检查。
 - 连续价格与合约日程必须来自同一份点时主力选择。组合账本逐日检查下一交易日具体合约，
   即使根权重不变、当天也不是常规调仓日，换月仍按旧约平仓＋新约开仓记录；停牌日延迟
   至首次可交易收盘执行。数据源不能提供合约日程时，账本元数据必须标记`unavailable`。
@@ -104,6 +112,11 @@ SQLite candidate catalog -> immutable JSON snapshot
 SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle 在完成必要外部归档后
 应从工作区删除。
 
+当前正式P0证据为`runs/factor_research/20260820_intraday599_rebuild/`。目录名记录最初
+599个历史注册类；11个不可估计死定义已清理，现行日内发现池为588。结果中的
+`research_contract`绑定运行时代码、配置、Parquet元数据和候选名；20个统计发现经
+`|corr|>=0.5`去重为13个观察候选，生产批准仍为0。
+
 ## 清理策略
 
 可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、`_work/`、空的
@@ -124,8 +137,8 @@ SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle
 
 ## Git 与远程仓库
 
-Git 是本地版本历史和可回滚边界；当前 `origin` 是 Gitee 仓库
-`mingjiec/multi-factor-futures`。推送前必须确认没有把行情、SQLite、普通 runs、
+Git 是本地版本历史和可回滚边界；当前`origin`是Gitee、`github`是GitHub镜像。
+推送前必须确认没有把行情、SQLite、普通runs、
 本机配置或凭据加入暂存区：
 
 1. 日常开发使用短分支和 pull request，不直接在 `main` 上累积大批改动。

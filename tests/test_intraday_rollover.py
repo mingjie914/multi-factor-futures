@@ -117,6 +117,49 @@ def test_term_curve_excludes_unheld_delivery_contracts_before_maturity_rank():
     assert panel["near_expiry"].loc[timestamp, "M"] == 202609
 
 
+def test_term_curve_chunking_preserves_cross_boundary_rollover(monkeypatch):
+    dates = pd.date_range("2026-08-10", periods=4, freq="D")
+
+    class Source:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_contract_curve_at_frequency(
+            self, tickers, start, end, fields, frequency
+        ):
+            self.calls.append((pd.Timestamp(start), pd.Timestamp(end)))
+            rows = []
+            for day in dates[(dates >= start) & (dates <= end)]:
+                symbols = (
+                    ("M2609", "M2611") if day < dates[2]
+                    else ("M2611", "M2701")
+                )
+                for rank, symbol in enumerate(symbols):
+                    rows.append({
+                        "trade_datetime": day + pd.Timedelta(hours=15),
+                        "root": "M",
+                        "symbol": symbol,
+                        "close": 3000.0 + rank,
+                        "position": 100.0 - rank,
+                        "volume": 10.0,
+                    })
+            return pd.DataFrame(rows)
+
+        @staticmethod
+        def trading_session_index(index):
+            return pd.DatetimeIndex(index)
+
+    source = Source()
+    data = type("Data", (), {"source": source})()
+    monkeypatch.setattr(intraday, "_TERM_FETCH_CHUNK_DAYS", 2)
+
+    panel = intraday._read_local_term(data, dates, ["M"])
+
+    assert len(source.calls) == 2
+    assert panel["near_expiry"]["M"].tolist() == [202609, 202609, 202611, 202611]
+    assert panel["rollover_flag"]["M"].tolist() == [0.0, 1.0, 1.0, 1.0]
+
+
 def test_rollover_factor_applies_decision_lag(monkeypatch):
     dates = pd.date_range("2026-03-01", "2026-08-01", freq="B")
     universe = ["RB"]

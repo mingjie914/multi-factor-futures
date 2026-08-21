@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from core.config import load_config
+from core.period import iter_overlapping_chunks
 from data.manager import DataManager
 from factors.engine import FactorComputationError, FactorEngine
 from optimization.costs import SimpleFuturesCost
@@ -224,7 +225,14 @@ class FactorPanelRunner:
     """Build the fixed 74-factor rank and IC panels used by research flows."""
 
     FACTOR_CHUNK_SIZE = 400
-    FACTOR_CHUNK_OVERLAP = 64
+    # 当前日内库最长跨日依赖为 120 个交易日；留 128 日预热保证边界一致。
+    FACTOR_CHUNK_OVERLAP = 128
+
+    @classmethod
+    def _iter_factor_chunks(cls, calendar):
+        return iter_overlapping_chunks(
+            calendar, cls.FACTOR_CHUNK_SIZE, cls.FACTOR_CHUNK_OVERLAP
+        )
 
     @staticmethod
     def _compute_part(engine, names, dates, universe, already_valid):
@@ -266,10 +274,7 @@ class FactorPanelRunner:
             )
         )
         comp: dict[str, pd.DataFrame] = {}
-        for start in range(0, len(self.cal), self.FACTOR_CHUNK_SIZE):
-            target_dates = self.cal[start:start + self.FACTOR_CHUNK_SIZE]
-            request_start = max(0, start - self.FACTOR_CHUNK_OVERLAP)
-            request_dates = self.cal[request_start:start + len(target_dates)]
+        for target_dates, request_dates in self._iter_factor_chunks(self.cal):
             for offset in range(0, len(all_factors), 10):
                 part = self._compute_part(
                     self.env.engine,

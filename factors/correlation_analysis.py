@@ -406,6 +406,7 @@ def analyze_and_save(
 
     output = {
         "n_significant": len(significant_factors),
+        "corrected_correlation": corrected_corr.to_dict(),
         "high_corr_threshold": high_corr_threshold,
         "high_corr_pairs": high_corr_pairs,
         "cluster_method": method,

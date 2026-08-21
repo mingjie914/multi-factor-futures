@@ -83,6 +83,16 @@ def _seat_rows() -> dict[str, list[dict]]:
             "deliver_seat_count": 1,
             "non_futures_net": 0.0,
         }],
+        "delivery_seat": [{
+            "delivery_date": pd.Timestamp("2026-08-03").date(),
+            "exchange": "SHFE",
+            "root": "RB",
+            "product_code": "RB",
+            "contract_code": "RB2610",
+            "symbol": "RB2610",
+            "seat_name": "seat",
+            **positions,
+        }],
     }
 
 
@@ -232,13 +242,14 @@ def test_all_parquet_schemas_scans_old_minute_partitions(tmp_path):
     assert result["datasets"]["1min"]["missing_required_examples"]
 
 
-def test_seat_parquet_gate_accepts_current_consumed_tables(tmp_path):
+def test_seat_parquet_gate_accepts_all_published_tables(tmp_path):
     _write_seat_tables(tmp_path)
 
     result = _check_all_seat_parquet_keys({"root_path": str(tmp_path)})
 
     assert result["status"] == "ok"
     assert result["datasets"]["derive_product_daily"]["rows"] == 1
+    assert result["datasets"]["delivery_seat"]["rows"] == 1
 
 
 def test_seat_parquet_gate_rejects_duplicate_business_key(tmp_path):

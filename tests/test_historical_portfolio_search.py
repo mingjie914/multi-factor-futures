@@ -125,6 +125,19 @@ def test_factor_panel_allows_only_leading_empty_chunks_for_late_start_factors():
         )
 
 
+def test_factor_panel_chunk_overlap_preserves_120_day_boundary_values():
+    calendar = pd.bdate_range("2020-01-02", periods=900)
+    raw = pd.Series(np.arange(len(calendar), dtype=float), index=calendar)
+    expected = raw.rolling(120, min_periods=120).mean()
+    actual = pd.Series(np.nan, index=calendar)
+
+    for target_dates, request_dates in FactorPanelRunner._iter_factor_chunks(calendar):
+        part = raw.loc[request_dates].rolling(120, min_periods=120).mean()
+        actual.loc[target_dates] = part.reindex(target_dates)
+
+    pd.testing.assert_series_equal(actual, expected)
+
+
 def test_factor_weight_methods_are_positive_normalized_and_causal_ready():
     history = pd.DataFrame({
         "a": np.linspace(0.01, 0.03, 40),

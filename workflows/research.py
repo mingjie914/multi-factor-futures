@@ -10,10 +10,10 @@ Usage:
     # 对指定因子执行完整多持有期筛选
     python main.py research --factors momentum_20d,skewness_20d --multi-period
 
-    # 筛选所有已注册因子, 按 t 值排序 (单持有期, 用配置的 holding_period)
-    python main.py research --all
+    # 筛选同输出频率的已注册因子；可用模块前缀限定假设族
+    python main.py research --all --module-prefix factors.library.intraday
 
-    # 多持有期窗口匹配筛选 (推荐): 5d因子测3/5/10周期, 10d因子测5/10/20周期, 20d因子测10/20/40周期
+    # 多持有期筛选；周期读取每个因子的冻结 validation_horizons
     python main.py research --all --multi-period
 
     # 显式周期仅用于契约完全相同的冻结因子批次（例如同一 GP horizon）
@@ -26,7 +26,7 @@ Usage:
     # 中的层级 FDR 与经济量级门槛。
     python main.py research --all --multi-period --t-threshold 1.74
 
-    # 自定义日期范围 (IC检验区间; 因子计算自动提前1年预热)
+    # 自定义日期范围；预热读取 validation_policy.warmup_days_by_frequency
     python main.py research --all --multi-period --start 2021-01-01 --end 2025-06-30
 
     # 因子相关性分析 + 聚类 (需先运行 --all --multi-period)
@@ -46,6 +46,7 @@ import sys
 import os
 import re
 import json
+import hashlib
 import math
 import time
 
@@ -56,9 +57,46 @@ if _PROJECT_ROOT not in sys.path:
 from factors.library import *  # noqa: F401,F403 注册所有因子
 from core.period import (
     PeriodContext,
+    iter_overlapping_chunks,
     parse_slug_window,
     parse_holding_periods,
 )
+from core.factor_contract import normalise_frequency
+
+
+_RESEARCH_CHECKPOINT_NAME = ".multi_period_checkpoint.json"
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _load_research_checkpoint(path: str, contract: dict) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"research checkpoint is unreadable: {path}") from exc
+    results = payload.get("results")
+    if payload.get("contract") != contract or not isinstance(results, list):
+        raise RuntimeError("research checkpoint contract does not match this run")
+    names = [item.get("name") for item in results if isinstance(item, dict)]
+    if len(names) != len(results) or len(names) != len(set(names)):
+        raise RuntimeError("research checkpoint contains invalid factor results")
+    if not set(names).issubset(contract["factors"]):
+        raise RuntimeError("research checkpoint contains factors outside this run")
+    return results
 
 
 def _infer_window(factor_name: str) -> str:
@@ -211,6 +249,73 @@ def _validate_requested_factors(
     if missing:
         raise ValueError(f"unregistered factors: {', '.join(missing)}")
     return requested
+
+
+def _select_registered_factors(
+    registry: dict[str, type],
+    frequency: str,
+    module_prefix: str | None = None,
+) -> list[str]:
+    """Select one frequency-compatible registered factor family."""
+    expected = normalise_frequency(frequency)
+    return sorted(
+        name for name, cls in registry.items()
+        if normalise_frequency(getattr(cls, "frequency", "daily")) == expected
+        and (module_prefix is None or cls.__module__.startswith(module_prefix))
+    )
+
+
+def _compute_factor_date_chunks(
+    data_mgr, factor_names, date_chunks, universe, chunk_size,
+    *, tolerate_failures: bool, clear_intraday_caches: bool,
+):
+    """Compute exact-date factor panels while bounding raw-data memory."""
+    import numpy as np
+    import pandas as pd
+    from factors.engine import FactorComputationError, FactorEngine
+
+    parts = {name: [] for name in factor_names}
+    hard_failures: set[str] = set()
+    for target_dates, request_dates in date_chunks:
+        engine = FactorEngine(data_mgr, tolerant=True, log_failures=False)
+        computed = engine.compute_factors(
+            factor_names, request_dates, universe, parallel=True,
+            chunk_size=chunk_size,
+        )
+        for failure in engine.failures:
+            if "factor output contains no finite values" in failure["error"]:
+                continue
+            failed = failure["factor"]
+            hard_failures.update(
+                factor_names if failed == "*batch*" else [failed]
+            )
+        for name in factor_names:
+            parts[name].append(computed[name].reindex(target_dates).copy())
+        engine.clear_cache()
+        if clear_intraday_caches:
+            from factors.library.intraday import clear_transient_data_caches
+
+            clear_transient_data_caches()
+
+    target_index = pd.Index([
+        date for target_dates, _ in date_chunks for date in target_dates
+    ])
+    matrices = {
+        name: pd.concat(frames).reindex(index=target_index, columns=universe)
+        for name, frames in parts.items()
+    }
+    invalid = {
+        name for name, matrix in matrices.items()
+        if not np.isfinite(matrix.to_numpy(dtype=float, copy=False)).any()
+    }
+    failures = hard_failures | invalid
+    if failures and not tolerate_failures:
+        raise FactorComputationError(
+            "date-chunk factor computation failed: " + ", ".join(sorted(failures))
+        )
+    for name in hard_failures:
+        matrices[name].loc[:, :] = np.nan
+    return matrices, sorted(invalid | hard_failures)
 
 
 def _apply_global_bonferroni(
@@ -721,25 +826,23 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                                  factor_start, ic_start, ic_end,
                                  periods_override=None, frequency="daily",
                                  output_dir=None, adaptivity_file=None):
-    """多持有期窗口匹配筛选 (推荐模式).
+    """按冻结契约执行多持有期筛选.
 
     持有期为"周期数"语义 (非天数); 当 frequency=daily 时, 1个周期=1个交易日.
 
     两种持有期选取模式:
-      1. 窗口匹配模式 (默认, periods_override=None):
-         - 5d 因子 → 测 3/5/10 周期持有期
-         - 10d 因子 → 测 5/10/20 周期持有期
-         - 20d 因子 → 测 10/20/40 周期持有期
-         - 其他因子 → 测 1/5/10/20 周期持有期
+      1. 冻结契约模式 (默认, periods_override=None):
+         - 每个因子使用注册时冻结的 validation_horizons；
+         - 仅当治理配置显式声明该因子家族时，使用冻结的 family_horizons。
       2. 显式持有期模式 (periods_override=[1,5,10,20,40]):
          - 仅允许因子注册契约与显式集合完全一致的同质批次
          - 不允许用该参数扩大或缩小冻结的因子内假设家族
 
-    因子计算从 factor_start 开始 (含1年预热), IC 检验从 ic_start 开始.
+    因子计算从 factor_start 开始（含配置预热）, IC 检验从 ic_start 开始.
     使用 Newey-West HAC 调整 t 统计量.
 
     Args:
-        periods_override: 显式持有期列表 (周期数). None 表示用窗口匹配模式.
+        periods_override: 显式持有期列表 (周期数). None 表示使用冻结注册契约.
         frequency: 周期单位 ("daily"/"1min"/"5min"/"15min"/"30min"/"hourly").
                    非日度研究通过 FrequencyDataProvider 使用真实 bar 索引。
     """
@@ -749,7 +852,6 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from data.manager import FrequencyDataProvider
     from core.factor_contract import validate_factor_contract
     from core.registry import get as registry_get
-    from factors.engine import FactorEngine
     from factors.processor import build_processing_context
     from research.governance import factor_family
     from research.validation import validate_policy, validation_policy_sha256
@@ -853,7 +955,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
 
     print("=" * 60)
-    print(f"因子多持有期窗口匹配筛选 ({len(all_factors)} 个)")
+    print(f"因子多持有期冻结契约筛选 ({len(all_factors)} 个)")
     print("=" * 60)
     print(f"  配置文件: {config_path}")
     print(f"  因子计算区间: {factor_start.date()} ~ {ic_end.date()} (含预热)")
@@ -872,7 +974,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "(必须与每个因子契约完全一致)"
         )
     else:
-        print(f"  持有期模式: 窗口匹配 (5d→[3,5,10], 10d→[5,10,20], 20d→[10,20,40])")
+        print("  持有期模式: 因子/家族冻结 validation_horizons")
 
     # 适配性输出只作为部署元数据，不能预先缩小发现阶段的假设家族。
     adaptivity_data = _load_adaptivity_data(adaptivity_file)
@@ -884,7 +986,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
         print()
     else:
-        print("  适配性研究: 未指定有效输入文件，使用纯窗口匹配")
+        print("  适配性研究: 未指定有效输入文件，使用冻结因子/家族契约")
         print()
 
     # 按窗口分组 (仍需要窗口信息用于结果展示, 即使持有期被覆盖)
@@ -953,7 +1055,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         runner.config.universe_selection,
     )
     fwd_returns_by_period: dict[int, pd.DataFrame] = {}
-    # 持有期集合: 显式模式 → periods_override; 窗口匹配模式 → 各窗口并集
+    # 持有期集合: 显式模式 → periods_override; 默认模式 → 各冻结契约并集
     all_periods = sorted({
         period
         for factor_name in all_factors
@@ -973,7 +1075,45 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     # Stream each factor batch through inference, then release its matrices.
     # This keeps census peak memory bounded by the batch size.
     print("\n=== 开始 IC 检验 (流式因子分块) ===")
-    results = []
+    from pathlib import Path
+    from research.artifacts import canonical_config_hash, source_tree_hash
+
+    source = base_data_mgr.source
+    source_root = getattr(source, "root_path", None)
+    fingerprint_builder = getattr(source, "_files_fingerprint", None)
+    if source_root is None or not callable(fingerprint_builder):
+        raise RuntimeError("formal research source does not expose a data fingerprint")
+    checkpoint_contract = {
+        "version": 1,
+        "config_sha256": canonical_config_hash(runner.config),
+        "code_sha256": source_tree_hash(Path(_PROJECT_ROOT)),
+        "data_sha256": fingerprint_builder(
+            source_root, Path(source_root).rglob("*.parquet")
+        ),
+        "factors": list(all_factors),
+        "factor_start": factor_start.isoformat(),
+        "ic_start": ic_start.isoformat(),
+        "ic_end": ic_end.isoformat(),
+        "frequency": period_ctx.unit.value,
+        "periods_override": list(periods_override or []),
+        "policy_sha256": policy_hash,
+    }
+    research_contract = {
+        key: value for key, value in checkpoint_contract.items()
+        if key != "factors"
+    }
+    research_contract.update({
+        "factor_count": len(all_factors),
+        "factor_names_sha256": hashlib.sha256(json.dumps(
+            list(all_factors), ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest(),
+    })
+    checkpoint_path = os.path.join(output_dir, _RESEARCH_CHECKPOINT_NAME)
+    results = _load_research_checkpoint(checkpoint_path, checkpoint_contract)
+    completed_names = {item["name"] for item in results}
+    pending_factors = [name for name in all_factors if name not in completed_names]
+    if completed_names:
+        print(f"  从检查点恢复: {len(completed_names)}/{len(all_factors)}")
     total = len(all_factors)
     t0 = time.time()
     default_chunk_size = 64 if period_ctx.is_daily else 16
@@ -990,25 +1130,32 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     print(f"  因子分块大小: {research_chunk_size}")
     print(f"  因子检验线程: {analysis_workers}")
 
-    for batch_start in range(0, total, research_chunk_size):
-        batch_names = all_factors[
+    intraday_daily_scan = period_ctx.is_daily and all(
+        registry_get("factor", name).__module__.startswith("factors.library.intraday")
+        for name in all_factors
+    )
+    if intraday_daily_scan:
+        date_chunks = list(iter_overlapping_chunks(calendar, 400, 128))
+        print("  日期分块: 400个目标交易日 + 128日预热")
+    else:
+        date_chunks = [(calendar, calendar)]
+
+    for batch_start in range(0, len(pending_factors), research_chunk_size):
+        batch_names = pending_factors[
             batch_start:batch_start + research_chunk_size
         ]
         # Discovery scans the entire registered library, including optional
         # factors.  Failures are recorded instead of aborting unrelated tests.
-        engine = FactorEngine(data_mgr, tolerant=True)
-        computed_batch = engine.compute_factors(
-            batch_names,
-            calendar,
-            universe,
-            parallel=True,
-            chunk_size=research_chunk_size,
+        computed_batch, invalid = _compute_factor_date_chunks(
+            data_mgr, batch_names, date_chunks, universe, research_chunk_size,
+            tolerate_failures=True,
+            clear_intraday_caches=intraday_daily_scan,
         )
         factor_batch = runner.processor.process_batch(
             computed_batch, processing_context
         )
-        if engine.failures:
-            print(f"  本批不可计算因子/依赖: {len(engine.failures)}（已记入日志）")
+        if invalid:
+            print(f"  本批不可计算因子/依赖: {len(invalid)}（已记入结果）")
         raw_variant_batch = {
             name: runner.processor.process_excluding(
                 computed_batch[name], processing_context, {"neutralize"}
@@ -1129,10 +1276,15 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             if pool is not None:
                 pool.shutdown(wait=True)
 
-        engine.clear_cache()
         del computed_batch, raw_variant_batch
         del factor_batch
-        done = min(batch_start + research_chunk_size, total)
+        _write_json_atomic(
+            checkpoint_path,
+            {"contract": checkpoint_contract, "results": results},
+        )
+        done = len(completed_names) + min(
+            batch_start + research_chunk_size, len(pending_factors)
+        )
         print(f"  [{done}/{total}] 耗时 {time.time() - t0:.1f}s")
 
     valid_hypotheses = _require_valid_hypothesis_observations(results)
@@ -1251,13 +1403,10 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
         print("\n=== 后置检验: 分层单调性 / 换手率 / 稳健性 ===")
         post_names = [row["name"] for row in significant]
-        post_engine = FactorEngine(data_mgr)
-        computed_post_matrices = post_engine.compute_factors(
-            post_names,
-            calendar,
-            universe,
-            parallel=True,
-            chunk_size=max(len(post_names), 1),
+        computed_post_matrices, _ = _compute_factor_date_chunks(
+            data_mgr, post_names, date_chunks, universe,
+            max(len(post_names), 1), tolerate_failures=False,
+            clear_intraday_caches=intraday_daily_scan,
         )
         factor_matrices = runner.processor.process_batch(
             computed_post_matrices, processing_context
@@ -1574,6 +1723,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     }
     threshold_sensitivity = _build_threshold_sensitivity(results, policy)
     out = {
+        "research_contract": research_contract,
         "config": {
             "factor_start": str(factor_start.date()),
             "ic_start": str(ic_start.date()),
@@ -1622,6 +1772,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "ic_threshold": policy.min_abs_ic,
             # 周期架构信息 (新增字段, 向后兼容)
             "frequency": period_ctx.unit.value,
+            # Keep the historical label for result-schema compatibility; the
+            # actual source is each factor/family's frozen registered contract.
             "periods_mode": "explicit" if periods_override is not None else "window_match",
             "periods_override": periods_override,
             "periods_semantics": "周期数 (非天数); daily频率下1周期=1交易日",
@@ -1658,21 +1810,16 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     }
     out_path = os.path.join(output_dir, "ic_by_window_period.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(out_path, out)
     funnel_path = os.path.join(output_dir, "validation_funnel.json")
-    with open(funnel_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "validation_policy_sha256": policy_hash,
-                "taxonomy_sha256": taxonomy_sha256(),
-                "funnel_audit": funnel_audit,
-                "threshold_sensitivity": threshold_sensitivity,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    _write_json_atomic(funnel_path, {
+        "research_contract": research_contract,
+        "validation_policy_sha256": policy_hash,
+        "taxonomy_sha256": taxonomy_sha256(),
+        "funnel_audit": funnel_audit,
+        "threshold_sensitivity": threshold_sensitivity,
+    })
+    os.unlink(checkpoint_path)
     print(f"\n结果已保存: {out_path}")
 
     # 输出 YAML 配置片段 (优先用 final_factors, 若后置检验未运行则回退 significant)
@@ -1727,8 +1874,8 @@ def _run_correlation_analysis(
         python main.py research --correlation --corr-auto-threshold
     """
     import pandas as pd
-    from factors.engine import FactorEngine
     from factors.correlation_analysis import analyze_and_save, _load_significant_factors
+    from core.registry import get as registry_get
 
     print("=" * 60)
     print("因子相关性分析 + 聚类")
@@ -1746,6 +1893,30 @@ def _run_correlation_analysis(
         print(f"\nIC 检验结果不存在: {ic_json_path}")
         print("请先运行: python main.py research --all --multi-period --t-threshold 1.96")
         return
+
+    from pathlib import Path
+    from research.artifacts import sha256_file, source_tree_hash
+
+    with open(ic_json_path, "r", encoding="utf-8") as handle:
+        screening_contract = json.load(handle).get("research_contract")
+    if not isinstance(screening_contract, dict):
+        raise RuntimeError("screening result has no research contract")
+    source = runner.data_manager.source
+    source_root = getattr(source, "root_path", None)
+    fingerprint_builder = getattr(source, "_files_fingerprint", None)
+    if source_root is None or not callable(fingerprint_builder):
+        raise RuntimeError("correlation source does not expose a data fingerprint")
+    current_data_hash = fingerprint_builder(
+        source_root, Path(source_root).rglob("*.parquet")
+    )
+    if current_data_hash != screening_contract.get("data_sha256"):
+        raise RuntimeError("screening and correlation data fingerprints differ")
+    analysis_contract = {
+        "screening_result_sha256": sha256_file(Path(ic_json_path)),
+        "screening_code_sha256": screening_contract.get("code_sha256"),
+        "analysis_code_sha256": source_tree_hash(Path(_PROJECT_ROOT)),
+        "data_sha256": current_data_hash,
+    }
 
     significant_factors = _load_significant_factors(ic_json_path)
     if not significant_factors:
@@ -1773,9 +1944,19 @@ def _run_correlation_analysis(
         universe,
         runner.config.universe_selection,
     )
-    engine = FactorEngine(data_mgr)
-    factor_matrices = engine.compute_factors(
-        factor_names, calendar, universe, parallel=True, chunk_size=100
+    intraday_daily_scan = normalise_frequency(
+        getattr(data_mgr, "frequency", "daily")
+    ) == "daily" and all(
+        registry_get("factor", name).__module__.startswith("factors.library.intraday")
+        for name in factor_names
+    )
+    date_chunks = (
+        list(iter_overlapping_chunks(calendar, 400, 128))
+        if intraday_daily_scan else [(calendar, calendar)]
+    )
+    factor_matrices, _ = _compute_factor_date_chunks(
+        data_mgr, factor_names, date_chunks, universe, 100,
+        tolerate_failures=False, clear_intraday_caches=intraday_daily_scan,
     )
     factor_matrices = runner.processor.process_batch(
         factor_matrices, processing_context
@@ -1787,7 +1968,7 @@ def _run_correlation_analysis(
         factor_matrices[name] = factor_matrices[name].loc[ic_start:ic_end]
 
     # 运行分析
-    analyze_and_save(
+    result = analyze_and_save(
         factor_matrices=factor_matrices,
         significant_factors=significant_factors,
         output_dir=output_dir,
@@ -1797,6 +1978,11 @@ def _run_correlation_analysis(
         auto_threshold=auto_threshold,
         high_corr_threshold=0.7,
     )
+    if result:
+        result["research_contract"] = analysis_contract
+        _write_json_atomic(
+            os.path.join(output_dir, "factor_correlation.json"), result
+        )
 
 
 def main():
@@ -1821,11 +2007,13 @@ def main():
         help="指定因子, 逗号分隔 (如: momentum_20d,skewness_20d)")
     parser.add_argument(
         "--all", action="store_true",
-        help="批量筛选所有已注册因子, 按 |t| 排序")
+        help="批量筛选与 --frequency 一致的已注册因子, 按 |t| 排序")
+    parser.add_argument(
+        "--module-prefix", default=None,
+        help="可选注册类模块前缀；例如 factors.library.intraday")
     parser.add_argument(
         "--multi-period", action="store_true",
-        help="多持有期窗口匹配筛选 (推荐): 5d因子测3/5/10周期, 10d因子测5/10/20周期, "
-             "20d因子测10/20/40周期 (持有期为周期数, 非天数)")
+        help="按每个因子的冻结validation_horizons执行多持有期筛选（周期数语义）")
     parser.add_argument(
         "--periods", default=None,
         help="显式指定持有期列表 (逗号分隔, 周期数语义), 如 '1,5,10,20,40'. "
@@ -1846,7 +2034,7 @@ def main():
         help="IC检验结束日期 (默认: 配置文件的 date_range.end)")
     parser.add_argument(
         "--factor-start", default=None,
-        help="因子计算起始日 (含预热期, 默认: IC检验起始日往前1年)")
+        help="因子计算起始日（默认按配置的频率预热天数向前推）")
     parser.add_argument(
         "--correlation", action="store_true",
         help="对显著因子做相关性分析 + 聚类, 生成 factor_correlation.json "
@@ -1895,7 +2083,9 @@ def main():
         output_dir = os.path.join(_PROJECT_ROOT, output_dir)
     output_dir = os.path.normpath(output_dir)
     if args.refuse_existing_output and os.path.exists(output_dir):
-        parser.error(f"输出目录已存在，拒绝覆盖: {output_dir}")
+        entries = set(os.listdir(output_dir)) if os.path.isdir(output_dir) else set()
+        if entries != {_RESEARCH_CHECKPOINT_NAME}:
+            parser.error(f"输出目录已存在，拒绝覆盖: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
 
     adaptivity_file = args.adaptivity_file
@@ -1957,11 +2147,14 @@ def main():
             screening_file=screening_file,
         )
     elif args.all or args.multi_period:
-        available_factors = set(
-            list_registered("factor").get("factor", {}).keys()
-        )
+        factor_registry = list_registered("factor").get("factor", {})
+        available_factors = set(factor_registry)
         if args.all:
-            selected_factors = sorted(available_factors)
+            selected_factors = _select_registered_factors(
+                factor_registry, args.frequency, args.module_prefix
+            )
+            if not selected_factors:
+                parser.error("没有符合 --frequency/--module-prefix 的已注册因子")
         else:
             try:
                 requested = _parse_requested_factors(args.factors)

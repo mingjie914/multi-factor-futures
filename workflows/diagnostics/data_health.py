@@ -433,6 +433,16 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
                 "non_futures_net",
             ),
         },
+        "delivery_seat": {
+            "date": "delivery_date",
+            "keys": (
+                "delivery_date", "exchange", "root", "contract_code", "seat_name",
+            ),
+            "required": (
+                "product_code", "symbol", "long_position", "long_change",
+                "short_position", "short_change", "net_position",
+            ),
+        },
     }
     checks = {}
     invalid = False

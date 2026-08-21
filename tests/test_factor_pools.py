@@ -24,10 +24,14 @@ def test_no_superseded_candidate_pool_is_promoted():
 
 def test_validated_factor_watchlist_loads_without_becoming_production_factors():
     config = load_config("config/validated_factors.yaml")
+    registered = set(list_registered("factor")["factor"])
 
     assert len(config.factors) == 10
-    assert len(config.validated_candidates) == 23
-    assert set(config.factors).isdisjoint(config.validated_candidates)
+    assert len(config.validated_candidates) == 13
+    assert set(config.validated_candidates) <= registered
+    assert set(config.factors) & set(config.validated_candidates) == {
+        "intraday_price_peak_count_20d"
+    }
 
 
 def test_retired_6f_snapshot_configs_match_their_frozen_definitions():

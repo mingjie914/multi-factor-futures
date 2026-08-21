@@ -649,9 +649,9 @@ def _write_review(
     adaptive = metrics.loc[metrics["strategy"] == "adaptive_search"].iloc[0]
     stress = metrics.loc[metrics["strategy"] == "adaptive_search_cost_2x"].iloc[0]
     lines = [
-        "# 当前有效因子库：扩展窗口历史方法与因子集搜索",
+        "# 冻结候选清单：扩展窗口历史方法与因子集搜索",
         "",
-        "> 本研究固定使用当前有效因子库，不重建历史因子研发时间。所有统计、聚类、",
+        "> 本研究固定使用本次预声明候选清单，不重建历史因子研发时间。所有统计、聚类、",
         "> 方法选择和因子选择只使用各折训练期；下一测试期完全冻结。结果属于严格时序的",
         "> 反事实历史研究，不等同于真实历史实盘。",
         "",

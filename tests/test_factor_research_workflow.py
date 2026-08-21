@@ -6,12 +6,18 @@ import pandas as pd
 import pytest
 
 from core.factor_contract import bind_factor_contract, validate_factor_contract
+from core.interfaces import Factor
+from core.period import iter_overlapping_chunks
 from core.registry import _REGISTRIES
 from workflows.research import (
+    _compute_factor_date_chunks,
     _load_adaptivity_data,
+    _load_research_checkpoint,
     _passes_post_bonferroni_quality,
     _parse_requested_factors,
+    _select_registered_factors,
     _validate_requested_factors,
+    _write_json_atomic,
 )
 
 
@@ -19,6 +25,65 @@ def test_requested_factor_parser_is_stable_and_deduplicated():
     assert _parse_requested_factors(" beta,alpha,beta ") == ["beta", "alpha"]
     with pytest.raises(ValueError, match="at least one"):
         _parse_requested_factors(" , ")
+
+
+def test_research_checkpoint_roundtrip_and_contract_guard(tmp_path):
+    path = tmp_path / ".multi_period_checkpoint.json"
+    contract = {"version": 1, "factors": ["alpha"]}
+    results = [{"name": "alpha", "best_ic": 0.01}]
+
+    _write_json_atomic(str(path), {"contract": contract, "results": results})
+
+    assert _load_research_checkpoint(str(path), contract) == results
+    with pytest.raises(RuntimeError, match="contract"):
+        _load_research_checkpoint(
+            str(path), {"version": 1, "factors": ["beta"]}
+        )
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_date_chunk_compute_preserves_sparse_early_history(monkeypatch):
+    import factors.engine as engine_module
+
+    dates = pd.date_range("2024-01-01", periods=6, freq="B")
+    universe = pd.Index(["RB"])
+
+    class Data:
+        frequency = "daily"
+
+        def prefetch(self, *args, **kwargs):
+            return None
+
+    class SparseFactor(Factor):
+        name = "sparse_factor"
+        frequency = "daily"
+        validation_horizons = (3, 5, 10)
+
+        def dependencies(self):
+            return []
+
+        def compute(self, data, requested_dates, requested_universe):
+            values = pd.DataFrame(
+                1.0, index=requested_dates, columns=requested_universe
+            )
+            values.loc[values.index < dates[3]] = float("nan")
+            return values
+
+    monkeypatch.setattr(
+        engine_module, "registry_get", lambda kind, name: SparseFactor
+    )
+    expected = engine_module.FactorEngine(Data()).compute_factors(
+        ["sparse_factor"], dates, universe
+    )["sparse_factor"]
+    actual, invalid = _compute_factor_date_chunks(
+        Data(), ["sparse_factor"], list(iter_overlapping_chunks(dates, 3, 0)),
+        universe, 1, tolerate_failures=False, clear_intraday_caches=False,
+    )
+
+    assert invalid == []
+    pd.testing.assert_frame_equal(
+        actual["sparse_factor"], expected, check_freq=False
+    )
 
 
 def test_explicit_adaptivity_file_fails_closed(tmp_path):
@@ -46,6 +111,24 @@ def test_requested_factor_validation_rejects_unknown_names():
     assert _validate_requested_factors(["known"], {"known"}) == ["known"]
     with pytest.raises(ValueError, match="missing"):
         _validate_requested_factors(["known", "missing"], {"known"})
+
+
+def test_all_factor_selection_respects_frequency_and_module_family():
+    daily_intraday = type(
+        "DailyIntraday", (), {"frequency": "daily", "__module__": "factors.library.intraday"}
+    )
+    minute_intraday = type(
+        "MinuteIntraday", (), {"frequency": "1min", "__module__": "factors.library.intraday"}
+    )
+    daily_other = type(
+        "DailyOther", (), {"frequency": "daily", "__module__": "factors.library.technical"}
+    )
+    registry = {"z": daily_other, "b": minute_intraday, "a": daily_intraday}
+
+    assert _select_registered_factors(
+        registry, "daily", "factors.library.intraday"
+    ) == ["a"]
+    assert _select_registered_factors(registry, "1min") == ["b"]
 
 
 def test_post_discovery_quality_uses_ic_and_t_not_stock_ir_cutoff():

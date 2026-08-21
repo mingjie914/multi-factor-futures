@@ -26,6 +26,17 @@ from typing import Iterable, List, Optional
 import numpy as np
 
 
+def iter_overlapping_chunks(index, chunk_size: int, overlap: int):
+    """Yield target slices with a preceding warm-up slice from one index."""
+    chunk_size, overlap = int(chunk_size), int(overlap)
+    if chunk_size < 1 or overlap < 0:
+        raise ValueError("chunk_size must be positive and overlap non-negative")
+    for start in range(0, len(index), chunk_size):
+        target = index[start:start + chunk_size]
+        request_start = max(0, start - overlap)
+        yield target, index[request_start:start + len(target)]
+
+
 class PeriodUnit(str, Enum):
     """周期单位枚举.
 

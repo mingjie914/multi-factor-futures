@@ -32,9 +32,13 @@ class FactorEngine:
     - parallel=False 默认串行, 100 因子以下串行最稳定
     """
 
-    def __init__(self, data_manager: DataManager, *, tolerant: bool = False):
+    def __init__(
+        self, data_manager: DataManager, *, tolerant: bool = False,
+        log_failures: bool = True,
+    ):
         self._data = data_manager
         self._tolerant = bool(tolerant)
+        self._log_failures = bool(log_failures)
         self._frequency = normalise_frequency(
             getattr(data_manager, "frequency", "daily")
         )
@@ -66,7 +70,8 @@ class FactorEngine:
             "stage": str(stage),
             "error": f"{type(exc).__name__}: {exc}",
         })
-        log.warning(message, exc_info=True)
+        if self._log_failures:
+            log.warning(message, exc_info=True)
         return self._nan_matrix(dates, universe)
 
     @staticmethod

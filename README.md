@@ -1,17 +1,18 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-08-20）仍为 `NO_TARGETS`：`config/default.yaml` 没有获批因子，
+（2026-08-21）仍为 `NO_TARGETS`：`config/default.yaml` 没有获批因子，
 `config/target_publication.yaml` 也保持关闭。挖掘结果只会进入候选池，不会自动进入组合
 或发布目标权重。
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
-> **2026-08-20基座复核已完成**：清洗后的本地Parquet严格门禁、完整字母根精确匹配、
+> **2026-08-21基座与全量研究复核已完成**：清洗后的本地Parquet严格门禁、完整字母根精确匹配、
 > 因果选约与复权、收盘决策、下一交易日收益、漂移换手、移仓、停牌及缓存隔离均已
-> 复核通过。2016-03-31至2026-08-19的88,143个选约点只有已审计的NI停牌日无报价，
-> 其余价格和88,105个可核收益逐值对账一致；固定集合历史结果仍只代表重建时的数据
-> 截止日，不自动延伸为新的策略结论，目标权重发布门继续关闭。
+> 复核通过；四种行情频率、日线全历史及六张席位表截至本地最新发布日均通过严格门禁。
+> 2016-03-31至2026-08-20的正式研究提交599个历史注册类，其中11个不可估计定义已确认
+> 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
+> `|corr|>=0.5`去重为13簇；全部仍等待新OOS，生产批准数为0，目标权重发布门继续关闭。
 
 ## 架构
 
@@ -30,7 +31,7 @@
   -> SHA-256 不可变 JSON 快照 -> 主框架 Factor registry
 ```
 
-审查时不加载 mined 快照的动态注册表共有 4,060 个因子（2026-08-17 实测）。这个数字是发现范围，
+审查时不加载 mined 快照的动态注册表共有 4,049 个因子（2026-08-21 实测）。这个数字是发现范围，
 不是已通过检验或可交易的数量。注册表由 `factors.library` 导入触发；主工作流会负责
 导入，单独使用 Python API 时应显式 `import factors.library`。
 
@@ -55,7 +56,7 @@ python -m pip install -r requirements-dev.txt      # 完整研究依赖 + 测试
 - **[docs/因子创造方法论与完整参考.md](docs/因子创造方法论与完整参考.md)** — 日内因子方法论与首批 170 个历史编号参考
 - **docs/策略基准记录.md** — 主分支 A 与多品种变种 B* 的基准登记
 - **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
-- **docs/扩展窗口历史方法与因子集搜索.md** — 当前有效因子库下的方法与因子集滚动搜索
+- **docs/扩展窗口历史方法与因子集搜索.md** — 冻结候选清单下的方法与因子集滚动搜索
 - **MAINTENANCE.md** — 维护、性能与版本控制
 
 ## 常用入口
@@ -67,6 +68,11 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -X utf8 -B main.py data-health --config config/parquet_research.yaml --strict
 & $PY -X utf8 -B main.py research --help
 & $PY -X utf8 -B main.py adaptivity --help
+
+# intraday.py 的588个日频输出发现因子
+& $PY -X utf8 -B main.py research --config config/intraday_backtest.yaml `
+  --all --multi-period --frequency daily `
+  --module-prefix factors.library.intraday --run-id <study_id>
 
 # 因子挖掘（合成冒烟不会写候选库）
 & $PY -X utf8 -B main.py mining dev-smoke `
@@ -89,8 +95,9 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -X utf8 -B -m workflows.experiments.historical_portfolio_search
 ```
 
-`data-health --strict`检查四个Parquet频率的最新发布分区和日线全历史；郑商所三位代码、
-同键重复或冲突别名会使检查失败，但不会把全量扫描加入回测热路径。
+`data-health --strict`检查四个Parquet频率的最新发布分区、日线全历史和六张席位表；
+郑商所三位代码、同键重复、冲突别名或席位自然键异常会使检查失败，但不会把全量扫描
+加入回测热路径。
 正式研究和回测不会在行情分区损坏或交易日历为空时静默跳过数据或改用普通工作日，
 而是在进入因子与组合计算前失败关闭。
 
@@ -129,7 +136,8 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 逐笔成本模型，但默认年化移仓费不会因此重复计费。
 
 本次政策升级前生成的本地结果和日期化报告已经清除；它们不得再作为当前结论引用。
-新的正式研究必须使用新目录重新生成完整 bundle。
+当前正式证据位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
+提交规模，结果内的研究契约、代码/配置/数据哈希和588个现行定义才是当前口径。
 
 ## 验证与保留
 

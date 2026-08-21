@@ -603,8 +603,11 @@ class DataManager(DataProvider):
         """Load each dependency once for one exact factor-batch request."""
         all_fields: set = set()
         for factor in factors:
-            if hasattr(factor, 'dependencies'):
-                deps = factor.dependencies()
+            dependency_loader = getattr(factor, "prefetch_dependencies", None)
+            if dependency_loader is None:
+                dependency_loader = getattr(factor, "dependencies", None)
+            if dependency_loader is not None:
+                deps = dependency_loader()
                 if deps:
                     all_fields.update(deps)
         if dates is None or universe is None:
@@ -738,7 +741,10 @@ class FrequencyDataProvider(DataProvider):
     ) -> None:
         fields = []
         for factor in factors:
-            dependencies = factor.dependencies() if hasattr(factor, "dependencies") else []
+            dependency_loader = getattr(
+                factor, "prefetch_dependencies", getattr(factor, "dependencies", None)
+            )
+            dependencies = dependency_loader() if dependency_loader else []
             fields.extend(dependencies or [])
         self._load(fields)
 

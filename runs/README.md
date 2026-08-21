@@ -8,11 +8,14 @@
 - `factor_research/holdout_ledger.jsonl`：只追加的已消费 holdout 记录，禁止删除、
   修改或把其中日期重新称为未见样本。
 
-## 当前结论相关证据
+## 历史审计证据
 
-- `external_guosen_trend_index/20260817_correctness_rebuild/`：本轮底层正确性门禁通过后
-  生成的当前固定集合证据，包含8f/10f/13f两种方法、国信参考、方法邻域、集中度、
-  10f账本与图表。它是固定集合重评估，不是修复后重新完成的因子搜索。
+- `factor_research/20260820_intraday599_rebuild/`：截至2026-08-20的全历史正式单因子
+  研究证据。运行提交599个历史类，588个可估计；形成20个统计发现、13个相关簇，
+  发布批准数为0。目录保留筛选结果、验证漏斗、相关矩阵JSON和相关图，不保存可再生
+  检查点。
+- `external_guosen_trend_index/20260817_correctness_rebuild/`：最终频率路由与因子实现
+  修复前的固定集合审计资料；其中绩效不得作为当前策略结论。
 
 下列旧运行已因分钟根前缀污染或组合口径不一致而删除，不得从外部副本恢复为当前证据：
 `20260810_full_prod_sort`、`20260813_contract_symbol_fix`、
