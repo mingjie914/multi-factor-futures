@@ -49,6 +49,11 @@ class DuckDBFuturesSource(ParquetFuturesSource):
     ) -> None:
         super().__init__(parquet_config=parquet_config, _validate_storage=False)
         config = dict(duckdb_config or {})
+        self.result_backend = str(config.get("result_backend", "pandas")).strip()
+        if self.result_backend not in {"pandas", "polars", "shadow"}:
+            raise ValueError(
+                "duckdb.result_backend must be pandas, polars, or shadow"
+            )
         path_text = str(config.get("path", "")).strip()
         if not path_text:
             raise ValueError("duckdb.path is required")
@@ -92,7 +97,24 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         with self._db_lock:
             if self._db is None:
                 raise RuntimeError("DuckDB source is closed")
-            return self._db.execute(sql, params or []).fetchdf()
+            parameters = params or []
+            if self.result_backend == "pandas":
+                return self._db.execute(sql, parameters).fetchdf()
+            candidate = self._db.execute(sql, parameters).pl().to_pandas(
+                use_pyarrow_extension_array=False
+            )
+            if self.result_backend == "polars":
+                return candidate
+            reference = self._db.execute(sql, parameters).fetchdf()
+            pd.testing.assert_frame_equal(
+                reference,
+                candidate,
+                check_dtype=False,
+                check_index_type=False,
+                check_column_type=False,
+                check_freq=False,
+            )
+            return reference
 
     def _partition_rows(self, native_frequency: str) -> list[tuple[str, str]]:
         dataset, _ = _MARKET_TABLES[native_frequency]

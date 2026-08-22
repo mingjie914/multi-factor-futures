@@ -9,6 +9,7 @@ import duckdb
 import pandas as pd
 import pytest
 
+from core.config import load_config
 from data.duckdb_source import DuckDBFuturesSource
 from data.parquet_source import ParquetFuturesSource
 
@@ -109,11 +110,16 @@ def _fixture(tmp_path: Path, *, build: bool = True):
     return updater, root, table_root, database
 
 
-def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(tmp_path):
+@pytest.mark.parametrize("result_backend", ["pandas", "polars", "shadow"])
+def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(
+    tmp_path, result_backend
+):
     updater, root, table_root, database = _fixture(tmp_path)
     config = {"root_path": str(table_root), "eager_fields": False}
     parquet = ParquetFuturesSource(config)
-    database_source = DuckDBFuturesSource({"path": str(database)}, config)
+    database_source = DuckDBFuturesSource(
+        {"path": str(database), "result_backend": result_backend}, config
+    )
     try:
         for frequency in ("daily", "1min", "5min", "15min", "30min", "hourly"):
             left = parquet.fetch_price_at_frequency(
@@ -151,6 +157,20 @@ def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(tmp
         updater.verify_database(con, root, exact=True)
     finally:
         con.close()
+
+
+def test_duckdb_result_backend_env_override(monkeypatch):
+    monkeypatch.setenv("MF_DUCKDB_RESULT_BACKEND", "polars")
+    assert load_config("config/default.yaml").data.duckdb.result_backend == "polars"
+
+
+def test_duckdb_rejects_unknown_result_backend(tmp_path):
+    _, _, table_root, database = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="result_backend"):
+        DuckDBFuturesSource(
+            {"path": str(database), "result_backend": "unknown"},
+            {"root_path": str(table_root), "eager_fields": False},
+        )
 
 
 def test_duckdb_month_update_is_exact_and_rolls_back_on_failure(tmp_path, monkeypatch):

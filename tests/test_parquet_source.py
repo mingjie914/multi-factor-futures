@@ -547,6 +547,7 @@ def test_parquet_research_config_extends_default_and_uses_env_root(
     tmp_path, monkeypatch
 ):
     root = _fixture_root(tmp_path / "market")
+    monkeypatch.setenv("MF_DATA_SOURCE", "parquet_futures")
     monkeypatch.setenv("MF_PARQUET_ROOT", str(root))
 
     config = load_config("config/parquet_research.yaml")
@@ -561,6 +562,7 @@ def test_framework_factory_builds_parquet_only_source(tmp_path, monkeypatch):
     from data.manager import DataManager
 
     root = _fixture_root(tmp_path / "market")
+    monkeypatch.setenv("MF_DATA_SOURCE", "parquet_futures")
     monkeypatch.setenv("MF_PARQUET_ROOT", str(root))
     config = load_config("config/default.yaml")
     config.data.parquet.datasets = dict(DATASETS)

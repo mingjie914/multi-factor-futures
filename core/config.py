@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel
@@ -97,6 +97,7 @@ class DuckDBConfig(StrictConfigModel):
 
     path: str = ""
     required_release_id: str = ""
+    result_backend: Literal["pandas", "polars", "shadow"] = "pandas"
 
 
 class DataSourceConfig(StrictConfigModel):
@@ -488,6 +489,7 @@ _ENV_MAP = {
     "MF_PARQUET_ROOT": (("data", "parquet", "root_path"), str),
     "MF_DUCKDB_PATH": (("data", "duckdb", "path"), str),
     "MF_DATA_RELEASE_ID": (("data", "duckdb", "required_release_id"), str),
+    "MF_DUCKDB_RESULT_BACKEND": (("data", "duckdb", "result_backend"), str),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
     "MF_DATE_END": (("date_range", "end"), str),

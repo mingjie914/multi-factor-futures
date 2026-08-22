@@ -41,6 +41,7 @@ data:
   duckdb:
     path: '${MF_DUCKDB_PATH:}'
     required_release_id: '${MF_DATA_RELEASE_ID:}'
+    result_backend: pandas
 
 # Reproducible baseline window, not an automatic latest-data sentinel.
 # 2017 is warm-up; formal historical studies evaluate from 2018.
