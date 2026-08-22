@@ -3,10 +3,10 @@ data:
   source: parquet_futures
   cache:
     enabled: false
-# Frozen comparison window; current-date signal workflows pass their own date.
+# Frozen final-OOS comparison window; simulated_live starts on 2026-05-15.
 date_range:
   start: '2025-01-01'
-  end: '2026-05-15'
+  end: '2026-05-14'
 universe:
 - A
 - AG

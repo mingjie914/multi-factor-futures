@@ -40,19 +40,19 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   v2-lite，并核对 NaN mask、factor value、IC、direction、candidate 集合和排序。
 - 分钟数据按明确训练区间加载，超过特征内存预算时失败关闭，不用交换分区硬撑。
 - 并行因子共享同一请求的分钟面板；冷缓存只允许一次读取，避免多个 worker 重复扫描
-  同一批 Parquet。可复用的已测内层循环放在 `factors/numerics.py`，不得全局替换 Pandas
+  同一批已发布行情。可复用的已测内层循环放在 `factors/numerics.py`，不得全局替换 Pandas
   算子，也不得在没有逐值差分和端到端基准时引入原生构建依赖。
 - 全量`factors.library.intraday`日频研究按400个目标交易日＋128日预热分块，避免把
   全历史分钟面板和因子中间量同时驻留内存；当前最长跨日依赖为120日，增加更长窗口时
   必须先提高并验证重叠长度。后置检验和相关分析复用同一分块助手；64仅是因子批大小。
-- 本地 Parquet 的 selected-contract 和 curve cache 可以复用；源文件指纹变化时会失效。
+- Parquet/DuckDB 数据源拥有的 selected-contract 和 curve cache 可以复用；发布指纹变化时会失效。
 - 通用行情缓存命中更宽日期/品种覆盖时直接返回内存切片，不再为每个请求范围落一个
   派生 Parquet；不要恢复这种会持续制造重复缓存文件的写回行为。
 - 因子批量计算依赖预取和 SPEC 按 base 分组，不要在单因子中重复读取相同字段。
 - 生产组合的风险历史按信号日只读取一次，再在多头池和空头池内分别执行完整性筛选与
   ERC；不要重新引入同一日期的重复行情读取。
 - 行情分区读取失败或正式流程取得空交易日历时必须失败关闭，不能把工作日历伪装成
-  交易所日历。本框架的数据源即本地 Parquet，不再保留失效的 `cache-only` 分支。
+  交易所日历。正式数据源只能是已发布Parquet或认证DuckDB，不再保留失效的`cache-only`分支。
 - 生产因子直接读取本地分钟/日线分片时，任一已发现分片损坏必须终止；不得跳过坏分片
   或在同一次计算中静默切换到另一个行情源。
 
@@ -68,7 +68,7 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   数据发布侧补齐到本地Parquet，不进入停牌白名单。
 - 郑商所YMM/YYMM别名在发布层统一处理；规范键数值冲突时停止发布，不按文件顺序
   静默选择。全库重复检查留在数据发布和`data-health --strict`，不放入因子热路径。
-- 本框架只消费已发布的本地Parquet，不包含远程核对、回填或发布逻辑。
+- 本框架只消费已发布的本地Parquet或其认证DuckDB镜像，不包含远程核对、回填或发布逻辑。
 - 严格健康门同时覆盖日线、1/5/15分钟行情和六张席位表；`delivery_seat`即使当前没有
   因子直接消费，也必须与其他五张正式发布席位表一起通过自然键、规范根和分区检查。
 - 连续价格与合约日程必须来自同一份点时主力选择。组合账本逐日检查下一交易日具体合约，
@@ -143,7 +143,7 @@ Git 是本地版本历史和可回滚边界；当前`origin`是Gitee、`github`�
 
 1. 日常开发使用短分支和 pull request，不直接在 `main` 上累积大批改动。
 2. `main` 启用保护：完整测试通过、至少一次审阅、禁止 force push。
-3. CI 使用 Python 3.10 和 3.12，安装 `requirements-dev.txt`，执行 compileall 和 pytest。
+3. CI 使用 Python 3.10 和 3.12，安装唯一依赖清单 `requirements.txt`，执行 compileall 和 pytest。
 4. 密钥、`config/local.yaml`、Parquet、SQLite 和普通 runs 继续由 `.gitignore` 排除。
 5. 大型研究证据放对象存储或只读 NAS，并在 Git 中保存 manifest、哈希和证据 URI。
 6. Git LFS 只适合少量必须版本化的大文件，不适合作为 1 分钟行情仓库。

@@ -35,6 +35,13 @@ from research.historical_portfolio_search import (  # noqa: E402
     PortfolioRecipe,
     performance_metrics,
 )
+from research.validation import (  # noqa: E402
+    HISTORICAL_START,
+    OOS_END,
+    OOS_START,
+    SIMULATED_LIVE_START,
+    period_protocol_snapshot,
+)
 from research.portfolio_experiment_support import (  # noqa: E402
     FACTORS_8F,
     FACTORS_10F as F10,
@@ -45,8 +52,8 @@ from research.portfolio_experiment_support import (  # noqa: E402
 )
 
 
-START = pd.Timestamp("2016-03-31")
-RECENT_START = pd.Timestamp("2025-01-01")
+START = pd.Timestamp(HISTORICAL_START)
+RECENT_START = pd.Timestamp(OOS_START)
 COST_MODEL = configured_futures_cost_model()
 PRODUCTION_RECIPE = PortfolioRecipe("lw_abs", 10, 3, "erc")
 ALTERNATIVE_RECIPE = PortfolioRecipe(
@@ -78,6 +85,15 @@ DISPLAY_NAMES = {
     "13f_equal_T12B12_no_cap_inverse_vol": "13f｜等权 + T12/B12 + 无cap + 逆波动",
     "guosen_trend": "国信趋势指数",
 }
+
+
+def _report_periods(end: pd.Timestamp) -> tuple[tuple[str, pd.Timestamp, pd.Timestamp], ...]:
+    return (
+        ("from_2016_03_31", START, end),
+        ("from_2025_01_01", RECENT_START, end),
+        ("oos_20250101_20260514", pd.Timestamp(OOS_START), min(end, pd.Timestamp(OOS_END))),
+        ("simulated_live_from_20260515", pd.Timestamp(SIMULATED_LIVE_START), end),
+    )
 
 
 def _plot(
@@ -122,6 +138,17 @@ def _plot(
                 f"{DISPLAY_NAMES[name]}{suffix}｜年化{metrics['annual_return']:.1%} "
                 f"夏普{metrics['sharpe']:.2f} 回撤{metrics['max_drawdown']:.1%}"
             ),
+        )
+
+    oos_left = max(start, pd.Timestamp(OOS_START))
+    oos_right = min(end, pd.Timestamp(OOS_END))
+    if oos_left <= oos_right:
+        ax.axvspan(oos_left, oos_right, color="#4C78A8", alpha=0.07, label="OOS")
+    live_left = max(start, pd.Timestamp(SIMULATED_LIVE_START))
+    if live_left <= end:
+        ax.axvspan(
+            live_left, end, color="#F2CF5B", alpha=0.10,
+            label=f"simulated_live（{SIMULATED_LIVE_START}起）",
         )
 
     ax.set_title(
@@ -171,11 +198,10 @@ def validate_alternative_method(runner, output: Path, end: pd.Timestamp) -> None
             ledger = evaluator.ledger_from_weights(weights)
             if risk_days == 90 and top_n == 12:
                 canonical_weights = weights
-            for period, start in (
-                ("from_2016_03_31", START),
-                ("from_2025_01_01", RECENT_START),
-            ):
-                returns = ledger.loc[start:end, "net_return"].copy()
+            for period, start, period_end in _report_periods(end):
+                returns = ledger.loc[start:period_end, "net_return"].copy()
+                if returns.empty:
+                    continue
                 if len(returns):
                     returns.iloc[0] = 0.0
                 rows.append({
@@ -185,7 +211,7 @@ def validate_alternative_method(runner, output: Path, end: pd.Timestamp) -> None
                     **performance_metrics(returns, initial_anchor=True),
                     "annual_turnover": float(
                         ledger.loc[
-                            start:end, "executed_traded_notional"
+                            start:period_end, "executed_traded_notional"
                         ].iloc[1:].mean()
                         * TRADING_DAYS_PER_YEAR
                     ),
@@ -297,11 +323,10 @@ def main() -> None:
             ledger.to_csv(output / "10f_ledger.csv")
         navs[name] = ledger["nav"]
         returns[name] = ledger["net_return"]
-        for period_name, period_start in (
-            ("from_2016_03_31", START),
-            ("from_2025_01_01", RECENT_START),
-        ):
-            period = ledger.loc[period_start:end]
+        for period_name, period_start, period_end in _report_periods(end):
+            period = ledger.loc[period_start:period_end]
+            if period.empty:
+                continue
             period_returns = period["net_return"].copy()
             if len(period_returns):
                 # Match interval-normalized charts and the established
@@ -326,11 +351,10 @@ def main() -> None:
         raise ValueError("Guosen reference has no observations in comparison interval")
     reference_end = pd.Timestamp(reference.index.max())
     navs["guosen_trend"] = reference
-    for period_name, period_start in (
-        ("from_2016_03_31", START),
-        ("from_2025_01_01", RECENT_START),
-    ):
-        reference_period = reference.loc[period_start:].dropna()
+    for period_name, period_start, period_end in _report_periods(end):
+        reference_period = reference.loc[period_start:period_end].dropna()
+        if reference_period.empty:
+            continue
         period_returns = reference_period.pct_change(
             fill_method=None
         ).fillna(0.0)
@@ -406,6 +430,7 @@ def main() -> None:
         },
         "production_configuration_modified": False,
         "method_validation_included": bool(args.validate_method),
+        "period_protocol": period_protocol_snapshot(),
     }
     (output / "resolved_config.json").write_text(
         json.dumps(resolved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -419,8 +444,7 @@ def main() -> None:
         "- 正确性口径：完整字母根精确匹配、决策日前60条IC、最终资产上限投影、收益日按W[T-1]×R[T]记账（等价于收盘目标W[T]从T+1生效）、漂移换手、显式移仓及停牌冻结。\n"
         "- 8f、10f及13f生产结构均为60日ICIR(LW)、Top10/Bottom10、单侧cap3、两侧ERC。\n"
         "- 三个因子集的替代结构均为因子等权、Top12/Bottom12、无cap、两侧逆波动率。\n"
-        "- 输出两张生产结构及两张双方法对比图，均同时包含国信趋势指数，并覆盖全期和2025年以来区间。\n"
-        "- 修复前标注的OOS/实盘日期不再视为独立前瞻证据，因此图中不作此类着色。\n"
+        f"- 输出两张生产结构及两张双方法对比图，均包含国信趋势指数；OOS固定为{OOS_START}至{OOS_END}，{SIMULATED_LIVE_START}起固定标为simulated_live。\n"
         "- 本运行是已知固定因子集重评估，不是修复后重新完成的因子搜索；不会自动修改配置、快照或交易批准门。\n",
         encoding="utf-8",
     )

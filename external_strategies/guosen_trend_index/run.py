@@ -15,6 +15,7 @@ from backtest.metrics import TRADING_DAYS_PER_YEAR
 from factors.engine import FactorEngine
 from pipeline.runner import PipelineRunner
 from research.historical_portfolio_search import performance_metrics
+from research.validation import OOS_END, OOS_START, SIMULATED_LIVE_START
 
 from .robustness import exhaustive_subset_search
 from .strategy import ExternalBacktestResult, GuosenTrendIndexBacktester, load_snapshot
@@ -336,7 +337,11 @@ def main() -> None:
             ),
         )
         summary["factor_subset_search"] = {
-            "ranking_rule": "2016-2024 development segments only; 2025+ is holdout",
+            "ranking_rule": (
+                "2016-2024 development segments only; fixed OOS is "
+                f"{OOS_START} through {OOS_END}; "
+                f"{SIMULATED_LIVE_START}+ is simulated_live"
+            ),
             "top10": search.head(10).to_dict(orient="records"),
             "baselines": search.loc[search["baseline_label"].ne("")].to_dict(orient="records"),
         }

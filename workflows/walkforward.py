@@ -29,6 +29,7 @@ if _PROJECT_ROOT not in sys.path:
 from core.logger import setup_logger
 from pipeline.runner import PipelineRunner
 from core.config import load_config
+from research.validation import OOS_END, SIMULATED_LIVE_START
 
 setup_logger("multi_factor")
 
@@ -587,7 +588,8 @@ def summarize_factor_fold_survival(
             ),
             "observation_transition_ready": False,
             "requires_positive_new_locked_oos": True,
-            "locked_oos_status": "pending_new_data_after_2026-07-25",
+            "locked_oos_status": f"frozen_oos_ends_{OOS_END}",
+            "simulated_live_status": f"active_since_{SIMULATED_LIVE_START}",
             "production_approved": False,
         }
     return summary

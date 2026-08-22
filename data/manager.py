@@ -138,10 +138,11 @@ class DataManager(DataProvider):
         dc = config.data
         cache_cfg = dc.cache if isinstance(dc.cache, dict) else {}
         source_name = dc.source
-        if source_name == "parquet_futures" and cache_cfg.get("enabled", True):
+        if source_name in {"parquet_futures", "duckdb_futures"} and cache_cfg.get("enabled", True):
             raise ValueError(
                 "the generic range cache is not source-fingerprinted and must be "
-                "disabled for parquet_futures; use the source-owned caches instead"
+                "disabled for parquet_futures/duckdb_futures; use the source-owned "
+                "caches instead"
             )
         cache = Cache(
             cache_dir=cache_cfg.get("path", "./cache"),
@@ -152,6 +153,8 @@ class DataManager(DataProvider):
         # plugins may register their own source before calling this factory.
         if source_name == "parquet_futures":
             from data import parquet_source  # noqa: F401
+        elif source_name == "duckdb_futures":
+            from data import duckdb_source  # noqa: F401
         elif source_name == "random":
             from data import random_source  # noqa: F401
 
@@ -170,6 +173,16 @@ class DataManager(DataProvider):
                     raise ValueError("data.parquet is required for parquet_futures")
                 source = create(
                     "data_source", source_name,
+                    parquet_config=_to_dict(dc.parquet),
+                )
+            elif source_name == "duckdb_futures":
+                if dc.duckdb is None or dc.parquet is None:
+                    raise ValueError(
+                        "data.duckdb and data.parquet are required for duckdb_futures"
+                    )
+                source = create(
+                    "data_source", source_name,
+                    duckdb_config=_to_dict(dc.duckdb),
                     parquet_config=_to_dict(dc.parquet),
                 )
             else:

@@ -3,7 +3,7 @@ data:
   source: parquet_futures
   cache:
     enabled: false
-# Frozen validation evidence window; not the current production end date.
+# Frozen evidence extraction window; it crosses the stage boundary and is not the OOS protocol.
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'
@@ -71,7 +71,7 @@ factors:
 - intraday_price_delay_20d
 validated_candidates:
 # 2026-08-20全历史层级FDR后、|corr|>=0.5簇内择优的观察候选。
-# 全部仍等待方向预声明后的新OOS，不能自动写入上方factors或发布目标权重。
+# 全部仍等待按冻结WF/OOS窗口重检及simulated_live观察，不能自动写入上方factors或发布目标权重。
 - intraday_basis_momentum_20d
 - intraday_price_peak_count_20d
 - intraday_torrent_up_20d

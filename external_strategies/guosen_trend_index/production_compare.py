@@ -39,6 +39,12 @@ from research.historical_portfolio_search import (  # noqa: E402
     PortfolioRecipe,
     performance_metrics,
 )
+from research.validation import (  # noqa: E402
+    OOS_END,
+    OOS_START,
+    SIMULATED_LIVE_START,
+    period_protocol_snapshot,
+)
 from external_strategies.guosen_trend_index.strategy import load_snapshot  # noqa: E402
 from strategies.combined import FACTORS as PRODUCTION_10F  # noqa: E402
 
@@ -428,7 +434,9 @@ def main() -> None:
             "intraday_amt_ratio_entropy_volatility_20d",
         ],
         "development_segments": ["2016-2019", "2020-2022", "2023-2024"],
-        "holdout_diagnostic": "2025-01-01 through comparison end",
+        "oos_diagnostic": f"{OOS_START} through {OOS_END}",
+        "simulated_live_diagnostic": f"{SIMULATED_LIVE_START} through comparison end",
+        "period_protocol": period_protocol_snapshot(),
         "full_eligible_count": len(full_eligible),
         "post_2020_eligible_count": len(post_2020_eligible),
         "factor_sets": unique_sets,

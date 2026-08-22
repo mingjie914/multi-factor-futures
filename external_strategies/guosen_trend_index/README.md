@@ -37,7 +37,7 @@
 
 ```powershell
 & 'E:\Python\Pythonvenv\Scripts\python.exe' -B -m external_strategies.guosen_trend_index.run `
-  --start 2016-03-31 --end 2026-08-06 `
+  --start 2016-03-31 --end 2026-05-14 `
   --factor-set 6f --factor-set 10f --factor-set 13f --factor-set 14f `
   --equal-gross 1.0 --search-subsets `
   --output runs/external_guosen_trend_index/<run_id>
@@ -76,15 +76,15 @@
 ```powershell
 & 'E:\Python\Pythonvenv\Scripts\python.exe' -X utf8 -B `
   -m external_strategies.guosen_trend_index.current_core_compare `
-  --end YYYY-MM-DD --output runs/external_guosen_trend_index/<run_id>
+  --output runs/external_guosen_trend_index/<run_id>
 ```
 
 它在一个共享因子面板中比较 8f、10f、13f 的生产结构（ICIR(LW)、
 Top10/Bottom10、单侧板块 cap=3、两侧 ERC），并分别用替代结构（因子等权、
 Top12/Bottom12、无 cap、两侧逆波动率）复算三套因子集。生产结构图和六方法图均含
-国信原始净值。输出包含2016-03-31起和2025-01-01起两组图。修复前标注的OOS/观察
-模拟分界已经消费过历史数据，不再作为独立前瞻或真实交易证据，因此当前图不作此类
-着色；外部指数晚于其最后日期不做填充。
+国信原始净值。输出包含2016-03-31起和2025-01-01起两组图，并统一标出固定OOS
+`2025-01-01~2026-05-14`及`2026-05-15`起的`simulated_live`；后者终点随本地数据库
+更新，不改变固定边界。外部指数晚于其最后日期不做填充。
 
 当前10f是13f剔除`jump_intensity`、`dtws`和`seat_long_short_seat_ratio`后的精简组合；
 旧10f定义已经退役。当前10f冻结于`snapshot/10f_icir/`并只作固定观察基线；

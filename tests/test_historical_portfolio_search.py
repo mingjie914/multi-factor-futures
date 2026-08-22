@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,6 +28,73 @@ from optimization.factor_weighting import (
 )
 from factors.engine import FactorComputationError
 from research.portfolio_experiment_support import FactorPanelRunner
+
+
+def test_historical_period_protocol_is_frozen_and_copy_safe():
+    from research.validation import (
+        LONG_HISTORY_REPLAY_END,
+        OOS_END,
+        SIMULATED_LIVE_START,
+        expanding_window_folds,
+        period_protocol_snapshot,
+    )
+
+    folds = expanding_window_folds()
+    assert workflow.OUTER_FOLDS == folds
+    assert folds[-1]["test_end"] == OOS_END == "2026-05-14"
+    assert SIMULATED_LIVE_START == "2026-05-15"
+    assert LONG_HISTORY_REPLAY_END == "2026-08-20"
+    assert period_protocol_snapshot()["long_history_replay"]["role"] == "frozen_control_only"
+    folds[-1]["test_end"] = "2099-12-31"
+    assert expanding_window_folds()[-1]["test_end"] == "2026-05-14"
+
+
+def test_factor_manifest_loads_only_estimable_factors(tmp_path):
+    path = tmp_path / "ic_by_window_period.json"
+    path.write_text(json.dumps({"all_results": [
+        {"name": "a", "all_periods": {"p1": {"estimable": True}}},
+        {"name": "b", "all_periods": {"p1": {"estimable": False}}},
+        {"name": "a", "all_periods": {"p2": {"estimable": True}}},
+    ]}), encoding="utf-8")
+
+    factors, digest = workflow._load_estimable_factor_manifest(path)
+
+    assert factors == ["a"]
+    assert len(digest) == 64
+
+
+def test_simulated_live_uses_frozen_fold_four_decision(monkeypatch, tmp_path):
+    dates = pd.bdate_range("2026-05-14", "2026-05-20")
+    runner = SimpleNamespace(
+        cal=dates,
+        daily_ret=pd.DataFrame({"A": 0.0}, index=dates),
+    )
+
+    class FakeEvaluator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def weights(self, factors, recipe):
+            assert factors == ["factor_a"]
+            assert recipe.name == "equal__top1_bottom1__capnone__equal"
+            return pd.DataFrame({"A": 1.0}, index=dates)
+
+        def ledger_from_weights(self, weights):
+            return pd.DataFrame({"net_return": [0.0, 0.01, -0.01, 0.02, 0.0]}, index=weights.index)
+
+        def clear_transient_caches(self):
+            pass
+
+    monkeypatch.setattr(workflow, "PortfolioEvaluator", FakeEvaluator)
+    metrics = workflow._evaluate_simulated_live(runner, {
+        "selected_candidate": "beam_1",
+        "selected_factors": ["factor_a"],
+        "selected_recipe": PortfolioRecipe("equal", 1, 0, "equal").to_dict(),
+    }, tmp_path)
+
+    assert metrics["start"] == "2026-05-15"
+    assert metrics["end"] == "2026-05-20"
+    assert (tmp_path / "simulated_live_ledger.csv").is_file()
 
 
 def test_factor_panel_schedule_is_frozen_before_data_environment_is_detached():

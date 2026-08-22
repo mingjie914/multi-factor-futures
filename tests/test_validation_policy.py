@@ -335,6 +335,8 @@ def test_fold_survival_cannot_claim_promotion_before_new_locked_oos():
     assert result["passes_two_consecutive_fold_gate"] is True
     assert result["observation_transition_ready"] is False
     assert result["requires_positive_new_locked_oos"] is True
+    assert result["locked_oos_status"] == "frozen_oos_ends_2026-05-14"
+    assert result["simulated_live_status"] == "active_since_2026-05-15"
     assert result["production_approved"] is False
 
 

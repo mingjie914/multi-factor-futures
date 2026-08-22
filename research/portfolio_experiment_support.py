@@ -222,7 +222,7 @@ class ExperimentEnvironment:
         }
 
 class FactorPanelRunner:
-    """Build the fixed 74-factor rank and IC panels used by research flows."""
+    """Build rank and IC panels for an explicitly supplied factor universe."""
 
     FACTOR_CHUNK_SIZE = 400
     # 当前日内库最长跨日依赖为 120 个交易日；留 128 日预热保证边界一致。

@@ -33,7 +33,7 @@ def main():
         from pipeline.runner import PipelineRunner
     except ImportError as e:
         print(f"框架模块导入失败: {e}")
-        print(f"   请安装依赖: python -m pip install -r requirements-minimal.txt")
+        print(f"   请安装依赖: python -m pip install -r requirements.txt")
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="多频率子组合叠加回测")

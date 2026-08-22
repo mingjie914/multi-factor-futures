@@ -5,7 +5,7 @@ data:
   cache:
     enabled: false
 
-# Frozen narrow smoke-test window.
+# Frozen narrow smoke-test window; it crosses the stage boundary and is not an OOS definition.
 date_range:
   start: '2025-01-01'
   end: '2026-05-31'

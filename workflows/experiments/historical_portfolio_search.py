@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import gc
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -54,44 +55,20 @@ from research.portfolio_experiment_support import (  # noqa: E402
     FACTORS_13F as F13,
     FACTORS_14F as F14,
     FactorPanelRunner as Runner,
-    NEW_VALIDATED_21 as NEW21,
-    VALIDATED_47 as KEPT47,
     configured_futures_cost_model,
+)
+from research.validation import (  # noqa: E402
+    HISTORICAL_START,
+    OOS_END,
+    SIMULATED_LIVE_START,
+    expanding_window_folds,
+    period_protocol_snapshot,
 )
 
 
 COST_MODEL = configured_futures_cost_model()
 
-OUTER_FOLDS = [
-    {
-        "fold": "fold_1",
-        "train_start": "2016-03-31",
-        "train_end": "2019-12-31",
-        "test_start": "2020-01-01",
-        "test_end": "2021-12-31",
-    },
-    {
-        "fold": "fold_2",
-        "train_start": "2016-03-31",
-        "train_end": "2021-12-31",
-        "test_start": "2022-01-01",
-        "test_end": "2023-12-31",
-    },
-    {
-        "fold": "fold_3",
-        "train_start": "2016-03-31",
-        "train_end": "2023-12-31",
-        "test_start": "2024-01-01",
-        "test_end": "2024-12-31",
-    },
-    {
-        "fold": "fold_4",
-        "train_start": "2016-03-31",
-        "train_end": "2024-12-31",
-        "test_start": "2025-01-01",
-        "test_end": "2026-08-06",
-    },
-]
+OUTER_FOLDS = expanding_window_folds()
 
 BASE_RECIPE = PortfolioRecipe("lw_abs", 10, 3, "erc")
 RECIPE_8F_ALT = PortfolioRecipe(
@@ -121,6 +98,29 @@ def _json_dump(path: Path, value) -> None:
         json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n",
         encoding="utf-8",
     )
+
+
+def _load_estimable_factor_manifest(path: Path) -> tuple[list[str], str]:
+    raw = path.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
+    rows = payload.get("all_results")
+    if not isinstance(rows, list):
+        raise ValueError("factor manifest must contain an all_results list")
+    factors = [
+        str(row["name"])
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("name")
+        and any(
+            bool(result.get("estimable"))
+            for result in dict(row.get("all_periods") or {}).values()
+            if isinstance(result, dict)
+        )
+    ]
+    factors = list(dict.fromkeys(factors))
+    if not factors:
+        raise ValueError("factor manifest contains no estimable factors")
+    return factors, hashlib.sha256(raw).hexdigest()
 
 
 def _deduplicate_recipes(recipes: Sequence[PortfolioRecipe]) -> list[PortfolioRecipe]:
@@ -321,13 +321,14 @@ def _factor_search(
     evaluator: PortfolioEvaluator,
     recipes_by_fold: Mapping[str, Sequence[PortfolioRecipe]],
     output: Path,
+    all_factors: Sequence[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[dict], pd.DataFrame]:
     diagnostic_rows = []
     cluster_rows = []
     candidate_rows = []
     decisions = []
     selected_weight_parts = []
-    all_factors = list(dict.fromkeys(F6 + list(KEPT47) + list(NEW21)))
+    all_factors = list(dict.fromkeys(all_factors))
 
     for fold in OUTER_FOLDS:
         train_start = pd.Timestamp(fold["train_start"])
@@ -431,6 +432,44 @@ def _factor_search(
     ledger.to_csv(output / "adaptive_oos_ledger.csv")
     _json_dump(output / "fold_decisions.json", decisions)
     return weights, ledger, decisions, candidates_frame
+
+
+def _evaluate_simulated_live(
+    runner: Runner,
+    final_decision: Mapping,
+    output: Path,
+) -> dict | None:
+    start = pd.Timestamp(SIMULATED_LIVE_START)
+    latest = min(pd.Timestamp(runner.cal.max()), pd.Timestamp(runner.daily_ret.index.max()))
+    if latest < start:
+        return None
+    evaluator = PortfolioEvaluator(
+        runner,
+        start=HISTORICAL_START,
+        end=latest,
+        cost_model=COST_MODEL,
+    )
+    recipe = _recipe_from_row(final_decision["selected_recipe"])
+    weights = evaluator.weights(final_decision["selected_factors"], recipe)
+    ledger = evaluator.ledger_from_weights(weights)
+    live_weights = weights.loc[start:latest]
+    live_ledger = ledger.loc[start:latest]
+    if live_ledger.empty:
+        return None
+    metrics = {
+        "evidence": "fold_4_training_winner_frozen_before_simulated_live",
+        "start": str(start.date()),
+        "end": str(latest.date()),
+        "selected_candidate": final_decision["selected_candidate"],
+        "selected_factors": final_decision["selected_factors"],
+        "selected_recipe": final_decision["selected_recipe"],
+        **performance_metrics(live_ledger["net_return"], initial_anchor=False),
+    }
+    live_weights.to_csv(output / "simulated_live_weights.csv")
+    live_ledger.to_csv(output / "simulated_live_ledger.csv")
+    _json_dump(output / "simulated_live_metrics.json", metrics)
+    evaluator.clear_transient_caches()
+    return metrics
 
 
 def _rank_fixed_recipes_for_fold(
@@ -725,6 +764,10 @@ def main() -> None:
         action="store_true",
         help="only run the two-recipe expanding-window freeze test for fixed 8f",
     )
+    parser.add_argument(
+        "--factor-manifest",
+        help="P0 ic_by_window_period.json; required for full factor search",
+    )
     args = parser.parse_args()
     output = Path(args.output)
     if args.resume:
@@ -733,17 +776,25 @@ def main() -> None:
     else:
         output.mkdir(parents=True, exist_ok=False)
 
-    valid_factors = (
-        list(FACTORS_8F) if args.recipe_only_8f
-        else list(dict.fromkeys(F6 + list(KEPT47) + list(NEW21)))
-    )
+    if args.recipe_only_8f:
+        valid_factors = list(FACTORS_8F)
+        manifest_sha256 = None
+    else:
+        if not args.factor_manifest:
+            parser.error("--factor-manifest is required unless --8f-recipe-only is used")
+        manifest_path = Path(args.factor_manifest)
+        if not manifest_path.is_file():
+            parser.error(f"factor manifest does not exist: {manifest_path}")
+        valid_factors, manifest_sha256 = _load_estimable_factor_manifest(manifest_path)
     resolved = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "8f_recipe_only" if args.recipe_only_8f else "full_search",
-        "factor_library_policy": "current_validated_library_fixed_for_all_historical_folds",
+        "factor_library_policy": "estimable_factors_from_frozen_p0_manifest",
+        "factor_manifest_sha256": manifest_sha256,
         "valid_factor_count": len(valid_factors),
         "valid_factors": valid_factors,
         "outer_folds": OUTER_FOLDS,
+        "period_protocol": period_protocol_snapshot(),
         "method_grid": (
             {
                 "predeclared_recipes": {
@@ -773,7 +824,12 @@ def main() -> None:
         "gross_exposure": 2.0,
     }
     resolved_path = output / "resolved_search_config.json"
-    if not args.resume or not resolved_path.exists():
+    if args.resume and resolved_path.exists():
+        previous = json.loads(resolved_path.read_text(encoding="utf-8"))
+        for key in ("factor_manifest_sha256", "period_protocol"):
+            if previous.get(key) != resolved.get(key):
+                raise ValueError(f"resume protocol mismatch: {key}")
+    else:
         _json_dump(resolved_path, resolved)
 
     print(f"compute current validated factor pool: {len(valid_factors)}", flush=True)
@@ -782,12 +838,13 @@ def main() -> None:
         print(f"reuse interrupted factor-panel cache: {panel_cache}", flush=True)
         payload = pd.read_pickle(panel_cache)
         if (
-            payload.get("schema_version") != 3
+            payload.get("schema_version") != 4
+            or payload.get("factor_names") != valid_factors
             or "close_tradable" not in payload
             or "contract_schedule" not in payload
         ):
             raise ValueError(
-                "stale factor-panel cache: rerun without --resume to rebuild schema 3"
+                "stale factor-panel cache: rerun without --resume to rebuild schema 4"
             )
         environment = CausalEligibilityEnvironment(
             payload["cal"], payload["daily_ret"], payload["sector_of"]
@@ -811,7 +868,8 @@ def main() -> None:
         )
         gc.collect()
         pd.to_pickle({
-            "schema_version": 3,
+            "schema_version": 4,
+            "factor_names": valid_factors,
             "cal": runner.cal,
             "u": runner.u,
             "daily_ret": runner.daily_ret,
@@ -823,8 +881,8 @@ def main() -> None:
         }, panel_cache)
     evaluator = PortfolioEvaluator(
         runner,
-        start="2016-03-31",
-        end="2026-08-06",
+        start=HISTORICAL_START,
+        end=OOS_END,
         cost_model=COST_MODEL,
     )
     if args.recipe_only_8f:
@@ -861,8 +919,9 @@ def main() -> None:
     evaluator.clear_transient_caches()
     print("stage 4: cluster-aware factor search", flush=True)
     adaptive_weights, adaptive_ledger, decisions, _ = _factor_search(
-        runner, evaluator, recipes_by_fold, output
+        runner, evaluator, recipes_by_fold, output, valid_factors
     )
+    live_metrics = _evaluate_simulated_live(runner, decisions[-1], output)
     print("final comparison and cost stress", flush=True)
     metrics = _comparison(evaluator, adaptive_weights, adaptive_ledger, output)
     _recipe_walk_forward_8f(evaluator, output)
@@ -874,6 +933,7 @@ def main() -> None:
         "adaptive_metrics": metrics.loc[
             metrics["strategy"] == "adaptive_search"
         ].iloc[0].to_dict(),
+        "simulated_live_metrics": live_metrics,
     }, ensure_ascii=False, indent=2), flush=True)
 
 

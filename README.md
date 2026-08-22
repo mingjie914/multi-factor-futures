@@ -1,23 +1,24 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-08-21）仍为 `NO_TARGETS`：`config/default.yaml` 没有获批因子，
+（2026-08-22）仍为 `NO_TARGETS`：`config/default.yaml` 没有获批因子，
 `config/target_publication.yaml` 也保持关闭。挖掘结果只会进入候选池，不会自动进入组合
 或发布目标权重。
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
-> **2026-08-21基座与全量研究复核已完成**：清洗后的本地Parquet严格门禁、完整字母根精确匹配、
-> 因果选约与复权、收盘决策、下一交易日收益、漂移换手、移仓、停牌及缓存隔离均已
-> 复核通过；四种行情频率、日线全历史及六张席位表截至本地最新发布日均通过严格门禁。
-> 2016-03-31至2026-08-20的正式研究提交599个历史注册类，其中11个不可估计定义已确认
+> **2026-08-22状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；DuckDB
+> 已具备运行时切换条件，但仓库默认仍为Parquet，正式部署需在维护窗口显式切换。
+> 2016-03-31至2026-08-20的冻结历史运行提交599个历史注册类，其中11个不可估计定义已确认
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
-> `|corr|>=0.5`去重为13簇；全部仍等待新OOS，生产批准数为0，目标权重发布门继续关闭。
+> `|corr|>=0.5`去重为13簇；该H20只作数据更新前的长期对照，尚未按冻结窗口完成WF/OOS
+> 重检，生产批准数为0，目标权重发布门继续关闭。
 
 ## 架构
 
 ```text
-已发布的本地 Parquet（日线/1分钟/5分钟/15分钟）
+已发布的本地 Parquet（权威、审计、恢复）
+  -> 认证 DuckDB 镜像（可选运行源）
   -> DataManager / FrequencyDataProvider
   -> 内置 Factor + SPEC + user Factor + mined snapshot bridge
   -> IC/HAC/分层/稳健性研究
@@ -37,12 +38,10 @@
 
 ## 环境
 
-要求 Python 3.10+。手动安装按用途选择：
+要求 Python 3.10+。项目只保留一份依赖清单：
 
 ```powershell
-python -m pip install -r requirements-minimal.txt  # 本地 Parquet、挖掘、研究、回测
-python -m pip install -r requirements.txt          # 完整本地研究依赖
-python -m pip install -r requirements-dev.txt      # 完整研究依赖 + 测试工具
+python -m pip install -r requirements.txt
 ```
 
 `python` 必须指向安装了项目依赖的解释器。Windows Store 的占位 `python.exe` 不能
@@ -53,11 +52,15 @@ python -m pip install -r requirements-dev.txt      # 完整研究依赖 + 测试
 - **[框架工作流程与使用方法.md](框架工作流程与使用方法.md)** — 标准工作流程（因子层可变/组合层固化）+ 快速上手（主入口）
 - **[docs/多因子框架研究手册.md](docs/多因子框架研究手册.md)** — 总体研究方法与四层架构
 - **docs/因子检验与准入流程.md** — 因子检验与准入流程（v2 策略）
+- **docs/有效因子库.md** — H20长期统计发现、13个去重观察候选与固定10f口径
 - **[docs/因子创造方法论与完整参考.md](docs/因子创造方法论与完整参考.md)** — 日内因子方法论与首批 170 个历史编号参考
 - **docs/策略基准记录.md** — 主分支 A 与多品种变种 B* 的基准登记
 - **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
 - **docs/扩展窗口历史方法与因子集搜索.md** — 冻结候选清单下的方法与因子集滚动搜索
 - **MAINTENANCE.md** — 维护、性能与版本控制
+- **docs/性能评估与优化报告.md**、**docs/因子监控与归因仪表盘_设计文档.md** — 性能基线与观察工具
+- **[docs/数据与计算加速迁移Handoff.md](docs/数据与计算加速迁移Handoff.md)** — DuckDB、Polars与选择性Rust分阶段实施边界
+- **docs/郑商所合约代码修复_20260813.md** — 历史数据事故及失败关闭边界，仅作审计
 
 ## 常用入口
 
@@ -92,10 +95,12 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -X utf8 -B main.py close --as-of YYYY-MM-DD --output runs/close_check.json
 
 # 隔离实验：扩展窗口搜索因子合成、Top/Bottom、品种权重和因子集
-& $PY -X utf8 -B -m workflows.experiments.historical_portfolio_search
+& $PY -X utf8 -B -m workflows.experiments.historical_portfolio_search `
+  --factor-manifest runs/factor_research/<p0_run>/ic_by_window_period.json `
+  --output runs/historical_portfolio_search/<run_id>
 ```
 
-`data-health --strict`检查四个Parquet频率的最新发布分区、日线全历史和六张席位表；
+`data-health --strict`检查所选运行源、四个Parquet权威频率、日线全历史和六张席位表；
 郑商所三位代码、同键重复、冲突别名或席位自然键异常会使检查失败，但不会把全量扫描
 加入回测热路径。
 正式研究和回测不会在行情分区损坏或交易日历为空时静默跳过数据或改用普通工作日，
@@ -106,15 +111,17 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 ## 配置边界
 
-- `config/default.yaml`：完整研究/回测基线，`factors: []`，默认只读本地Parquet，外层通用
-  行情缓存关闭；连续合约使用数据源自身带指纹的缓存。
+- `config/default.yaml`：完整研究/回测基线，`factors: []`，默认只读本地Parquet；
+  `duckdb_futures`是已认证的可选运行源。外层通用行情缓存关闭，连续合约使用数据源自身
+  带指纹的缓存。
 - `config/parquet_research.yaml`：继承默认值并冻结研究区间；同样只读本地Parquet。
-- `config/local.yaml`：仅保存本机Parquet路径，已被 Git 忽略。
+- `config/local.yaml`：保存本机数据路径与可选运行源，已被 Git 忽略。
 - `config/target_publication.yaml`：独立目标权重发布门，不能传给 `load_config()`当作研究配置。
 - 除成本模型的自定义参数外，未知配置键会直接报错，避免拼写错误被静默忽略。
 
-本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 或 `config/local.yaml` 提供。框架不包含远程
-行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
+本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；切换认证库时另设
+`MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`和当前`MF_DATA_RELEASE_ID`。
+框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 
 ## 研究治理
 
@@ -125,7 +132,7 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手仅作诊断，二者都不是正式
 入围证据。SQLite 只管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过筛选，也必须继续
-经过相关性、容量、成本、风险和新 OOS 审核。
+经过相关性、容量、成本、风险、冻结OOS和`simulated_live`审核。
 
 成本口径分两阶段：筛选期将年化半换手还原为完整成交名义，再乘每单位 0.02% 的成本率；
 因子通过后的研究回测按实际生效日的 `executed_traded_notional` 计提同一成本，并按总暴露
@@ -136,8 +143,12 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 逐笔成本模型，但默认年化移仓费不会因此重复计费。
 
 本次政策升级前生成的本地结果和日期化报告已经清除；它们不得再作为当前结论引用。
-当前正式证据位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
-提交规模，结果内的研究契约、代码/配置/数据哈希和588个现行定义才是当前口径。
+冻结历史对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
+提交规模。其研究契约、代码/配置/数据哈希用于更新后同区间重放比较，不代表当前数据
+更新后的正式结论。
+历史研究阶段由`research/validation.py::period_protocol_snapshot()`单一维护：最后一折OOS固定结束于
+`2026-05-14`，`2026-05-15`起至本地最新数据固定标为`simulated_live`。运行日期和数据库
+最新日期不得反向改写OOS边界；`holdout_ledger.jsonl`只记录历史样本消费事实，不是边界配置。
 
 ## 验证与保留
 

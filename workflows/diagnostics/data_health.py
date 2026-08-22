@@ -387,61 +387,64 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
     specs = {
         "derive_product_daily": {
             "date": "trade_date",
-            "keys": ("trade_date", "exchange", "root"),
+            "keys": ("trade_date", "product_code"),
             "required": (
                 "product_code", "total_long", "total_short", "net_position",
                 "long_change", "short_change", "seat_count",
             ),
+            "invariant": "net_position != total_long - total_short",
         },
         "derive_product_seat": {
             "date": "trade_date",
-            "keys": ("trade_date", "exchange", "root", "seat_name"),
+            "keys": ("trade_date", "product_code", "seat_name"),
             "required": (
                 "product_code", "long_position", "long_change",
                 "short_position", "short_change", "net_position",
                 "contract_count",
             ),
+            "invariant": "net_position != long_position - short_position",
         },
         "derive_main_contract_seat": {
             "date": "trade_date",
-            "keys": (
-                "trade_date", "exchange", "root", "contract_code", "seat_name",
-            ),
+            "keys": ("trade_date", "contract_code", "seat_name"),
             "required": (
                 "product_code", "symbol", "long_position", "long_change",
                 "short_position", "short_change", "net_position", "close",
                 "open_interest",
             ),
+            "symbol": True,
+            "invariant": "net_position != long_position - short_position",
         },
         "raw_seat_position": {
             "date": "trade_date",
-            "keys": (
-                "trade_date", "exchange", "root", "contract_code", "seat_name",
-                "is_aggregated", "record_grain",
-            ),
+            "keys": ("trade_date", "contract_code", "seat_name", "is_aggregated"),
             "required": (
                 "product_code", "symbol", "long_position", "long_change",
                 "short_position", "short_change", "net_position",
             ),
+            "symbol": True,
+            "invariant": "net_position != long_position - short_position",
         },
         "delivery_summary": {
             "date": "delivery_date",
-            "keys": ("delivery_date", "exchange", "root", "contract_code"),
+            "keys": ("delivery_date", "contract_code"),
             "required": (
                 "product_code", "product_name", "symbol", "receive_quantity",
                 "deliver_quantity", "receive_seat_count", "deliver_seat_count",
                 "non_futures_net",
             ),
+            "symbol": True,
+            "invariant": "non_futures_net != receive_quantity - deliver_quantity",
         },
         "delivery_seat": {
             "date": "delivery_date",
-            "keys": (
-                "delivery_date", "exchange", "root", "contract_code", "seat_name",
-            ),
+            "keys": ("delivery_date", "contract_code", "seat_name"),
             "required": (
                 "product_code", "symbol", "long_position", "long_change",
                 "short_position", "short_change", "net_position",
             ),
+            "symbol": True,
+            "invariant": "net_position != long_position - short_position",
         },
     }
     checks = {}
@@ -472,7 +475,9 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
                 period for period, path in zip(periods, partitions)
                 if not any(path.glob("*.parquet"))
             ]
-            required = set(spec["keys"]).union(spec["required"])
+            required = set(spec["keys"]).union(
+                spec["required"], {"exchange", "root"}
+            )
             variants: dict[tuple[str, ...], int] = {}
             missing_examples = []
             for path in files:
@@ -502,7 +507,19 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
             )
             date_column = spec["date"]
             source_sql = f"read_parquet('{glob_path}', hive_partitioning=true)"
-            rows, null_key_rows, bad_root_rows, first_date, last_date = connection.execute(
+            symbol_check = (
+                "SUM(CASE WHEN symbol IS NULL "
+                "OR CAST(symbol AS VARCHAR) != UPPER(TRIM(CAST(symbol AS VARCHAR))) "
+                "THEN 1 ELSE 0 END)"
+                if spec.get("symbol") else "0"
+            )
+            invariant_check = (
+                f"SUM(CASE WHEN {spec['invariant']} THEN 1 ELSE 0 END)"
+            )
+            (
+                rows, null_key_rows, bad_root_rows, bad_symbol_rows,
+                invariant_rows, first_date, last_date,
+            ) = connection.execute(
                 f"""
                 SELECT
                     COUNT(*),
@@ -511,6 +528,8 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
                                   OR CAST(root AS VARCHAR) != UPPER(TRIM(CAST(root AS VARCHAR)))
                                   OR NOT regexp_full_match(TRIM(CAST(root AS VARCHAR)), '[A-Z]+')
                              THEN 1 ELSE 0 END),
+                    {symbol_check},
+                    {invariant_check},
                     MIN("{date_column}"),
                     MAX("{date_column}")
                 FROM {source_sql}
@@ -532,6 +551,8 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
                 and not empty_partitions
                 and int(null_key_rows or 0) == 0
                 and int(bad_root_rows or 0) == 0
+                and int(bad_symbol_rows or 0) == 0
+                and int(invariant_rows or 0) == 0
                 and int(duplicate_groups) == 0
             ) else "invalid"
             invalid |= status != "ok"
@@ -548,6 +569,8 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
                 "empty_partitions": [str(item) for item in empty_partitions],
                 "null_key_rows": int(null_key_rows or 0),
                 "noncanonical_root_rows": int(bad_root_rows or 0),
+                "noncanonical_symbol_rows": int(bad_symbol_rows or 0),
+                "invariant_violation_rows": int(invariant_rows or 0),
                 "duplicate_key_groups": int(duplicate_groups),
             }
     except Exception as exc:
@@ -563,6 +586,100 @@ def _check_all_seat_parquet_keys(parquet_config: dict) -> dict:
     return {"status": "invalid" if invalid else "ok", "datasets": checks}
 
 
+def _check_duckdb_release(duckdb_config: dict) -> dict:
+    path_text = str(duckdb_config.get("path", "")).strip()
+    if not path_text:
+        return {"status": "not_configured"}
+    path = Path(path_text).expanduser().resolve()
+    if not path.is_file():
+        return {"status": "invalid", "message": f"DuckDB file not found: {path}"}
+    expected_tables = {
+        "market.bars_1m", "market.bars_5m", "market.bars_15m", "market.bars_1d",
+        "seat.raw_seat_position", "seat.derive_product_seat",
+        "seat.derive_main_contract_seat", "seat.derive_product_daily",
+        "seat.delivery_seat", "seat.delivery_summary",
+        "meta.releases", "meta.partitions",
+    }
+    connection = None
+    try:
+        import duckdb
+
+        connection = duckdb.connect(str(path), read_only=True)
+        current = connection.execute(
+            "SELECT release_id, market_component_id, seat_component_id, status, "
+            "schema_version "
+            "FROM meta.releases WHERE is_current"
+        ).fetchall()
+        if (
+            len(current) != 1
+            or current[0][3] != "certified"
+            or current[0][4] != "futures_data_v1_seat_contract_v2"
+        ):
+            raise RuntimeError(f"expected one certified current release, found {current}")
+        required = str(duckdb_config.get("required_release_id", "")).strip()
+        if required and str(current[0][0]) != required:
+            raise RuntimeError(
+                f"current release {current[0][0]} does not match required {required}"
+            )
+        tables = {
+            f"{schema}.{table}"
+            for schema, table in connection.execute(
+                "SELECT table_schema, table_name FROM information_schema.tables "
+                "WHERE table_schema IN ('market', 'seat', 'meta')"
+            ).fetchall()
+        }
+        if tables != expected_tables:
+            raise RuntimeError(
+                f"DuckDB table set differs: missing={sorted(expected_tables - tables)}, "
+                f"extra={sorted(tables - expected_tables)}"
+            )
+        duplicate_meta = int(connection.execute(
+            "SELECT COUNT(*) FROM (SELECT dataset, year_month, COUNT(*) AS n "
+            "FROM meta.partitions GROUP BY dataset, year_month HAVING COUNT(*) > 1)"
+        ).fetchone()[0])
+        if duplicate_meta:
+            raise RuntimeError(f"duplicate meta partition groups={duplicate_meta}")
+        business_tables = {
+            "1m": "market.bars_1m", "5m": "market.bars_5m",
+            "15m": "market.bars_15m", "1d": "market.bars_1d",
+            "raw_seat_position": "seat.raw_seat_position",
+            "derive_product_seat": "seat.derive_product_seat",
+            "derive_main_contract_seat": "seat.derive_main_contract_seat",
+            "derive_product_daily": "seat.derive_product_daily",
+            "delivery_seat": "seat.delivery_seat",
+            "delivery_summary": "seat.delivery_summary",
+        }
+        for dataset, table in business_tables.items():
+            expected = int(connection.execute(
+                "SELECT COALESCE(SUM(row_count), 0) FROM meta.partitions "
+                "WHERE dataset = ?", [dataset],
+            ).fetchone()[0])
+            actual = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if actual != expected:
+                raise RuntimeError(f"{table}: rows={actual}, meta rows={expected}")
+        latest_market = connection.execute(
+            "SELECT MAX(trade_date) FROM market.bars_1d"
+        ).fetchone()[0]
+        latest_seat = connection.execute(
+            "SELECT MAX(trade_date) FROM seat.raw_seat_position"
+        ).fetchone()[0]
+        return {
+            "status": "ok", "path": str(path), "release_id": str(current[0][0]),
+            "market_component_id": str(current[0][1]),
+            "seat_component_id": str(current[0][2]),
+            "latest_market_date": str(latest_market), "latest_seat_date": str(latest_seat),
+            "tables": len(tables),
+        }
+    except Exception as exc:
+        return {
+            "status": "invalid", "path": str(path),
+            "error_type": type(exc).__name__, "message": str(exc),
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def check_health(config_path: str, *, strict: bool = False) -> dict:
     config = load_config(config_path)
     selected_source = str(config.data.source)
@@ -571,6 +688,7 @@ def check_health(config_path: str, *, strict: bool = False) -> dict:
         "config": str(Path(config_path).resolve()),
         "selected_source": selected_source,
         "parquet": {"status": "not_selected"},
+        "duckdb": {"status": "not_selected"},
         "historical_parquet_schemas": {"status": "not_checked"},
         "historical_seat_tables": {"status": "not_checked"},
         "historical_daily_contract_keys": {"status": "not_checked"},
@@ -578,15 +696,20 @@ def check_health(config_path: str, *, strict: bool = False) -> dict:
         "cache": {},
     }
 
-    if selected_source != "parquet_futures":
+    if selected_source not in {"parquet_futures", "duckdb_futures"}:
         result["parquet"] = {
             "status": "invalid",
-            "message": "framework data source must be parquet_futures",
+            "message": "framework data source must be parquet_futures or duckdb_futures",
         }
     else:
         parquet_config = _model_dict(config.data.parquet)
-        result["parquet"] = _check_latest_parquet_contract_keys(parquet_config)
-        if strict and result["parquet"].get("status") == "ok":
+        if selected_source == "parquet_futures":
+            result["parquet"] = _check_latest_parquet_contract_keys(parquet_config)
+            selected_ok = result["parquet"].get("status") == "ok"
+        else:
+            result["duckdb"] = _check_duckdb_release(_model_dict(config.data.duckdb))
+            selected_ok = result["duckdb"].get("status") == "ok"
+        if strict and selected_ok:
             result["historical_parquet_schemas"] = _check_all_parquet_schemas(
                 parquet_config
             )
@@ -645,7 +768,10 @@ def main() -> None:
         output.write_text(rendered + "\n", encoding="utf-8")
 
     if args.strict:
-        selected_ok = result["parquet"].get("status") == "ok"
+        selected_key = (
+            "duckdb" if result["selected_source"] == "duckdb_futures" else "parquet"
+        )
+        selected_ok = result[selected_key].get("status") == "ok"
         schemas_ok = result["historical_parquet_schemas"].get("status") == "ok"
         seat_ok = result["historical_seat_tables"].get("status") == "ok"
         keys_ok = result["historical_daily_contract_keys"].get("status") == "ok"

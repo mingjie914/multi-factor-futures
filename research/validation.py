@@ -10,11 +10,70 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from datetime import date, timedelta
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import numpy as np
 
 from research.statistics import benjamini_hochberg, simes_p_value
+
+
+HISTORICAL_START = "2016-03-31"
+LONG_HISTORY_REPLAY_END = "2026-08-20"
+OOS_START = "2025-01-01"
+OOS_END = "2026-05-14"
+SIMULATED_LIVE_START = "2026-05-15"
+
+_OUTER_FOLDS = (
+    ("fold_1", HISTORICAL_START, "2019-12-31", "2020-01-01", "2021-12-31"),
+    ("fold_2", HISTORICAL_START, "2021-12-31", "2022-01-01", "2023-12-31"),
+    ("fold_3", HISTORICAL_START, "2023-12-31", "2024-01-01", "2024-12-31"),
+    ("fold_4", HISTORICAL_START, "2024-12-31", OOS_START, OOS_END),
+)
+
+
+def expanding_window_folds() -> list[dict[str, str]]:
+    """Return copies of the frozen historical research folds."""
+    return [
+        {
+            "fold": name,
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+        }
+        for name, train_start, train_end, test_start, test_end in _OUTER_FOLDS
+    ]
+
+
+def period_protocol_snapshot() -> dict:
+    """Return the shared, serializable OOS/simulated-live protocol."""
+    return {
+        "version": "historical_period_v1",
+        "long_history_replay": {
+            "start": HISTORICAL_START,
+            "end": LONG_HISTORY_REPLAY_END,
+            "role": "frozen_control_only",
+        },
+        "outer_folds": expanding_window_folds(),
+        "final_oos": {"start": OOS_START, "end": OOS_END},
+        "simulated_live_start": SIMULATED_LIVE_START,
+        "simulated_live_end": "latest_available_data",
+    }
+
+
+if date.fromisoformat(OOS_END) + timedelta(days=1) != date.fromisoformat(
+    SIMULATED_LIVE_START
+):
+    raise RuntimeError("OOS_END must be the day before SIMULATED_LIVE_START")
+for fold in expanding_window_folds():
+    if not (
+        date.fromisoformat(fold["train_start"])
+        <= date.fromisoformat(fold["train_end"])
+        < date.fromisoformat(fold["test_start"])
+        <= date.fromisoformat(fold["test_end"])
+    ):
+        raise RuntimeError(f"invalid expanding-window fold: {fold['fold']}")
 
 
 def policy_dict(policy: Any) -> dict:

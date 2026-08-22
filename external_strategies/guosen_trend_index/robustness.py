@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from data.market_quality import prepare_close_data
+from research.validation import OOS_END, OOS_START, SIMULATED_LIVE_START
 from .strategy import GuosenTrendIndexSpec
 
 
@@ -272,8 +273,8 @@ def exhaustive_subset_search(
     """Evaluate all subsets without recomputing factors or risk portfolios.
 
     Candidate ranking uses only three development segments ending in 2024.
-    The 2025+ segment is reported as a holdout diagnostic and is not part of
-    ``development_score``.
+    Fixed OOS and simulated-live segments are reported separately and neither
+    is part of ``development_score``.
     """
     if spec.execution_lag_days != 0:
         raise ValueError("subset cache currently requires execution_lag_days=0")
@@ -309,13 +310,14 @@ def exhaustive_subset_search(
         "dev_2016_2019": (pd.Timestamp("2016-03-31"), pd.Timestamp("2019-12-31")),
         "dev_2020_2022": (pd.Timestamp("2020-01-01"), pd.Timestamp("2022-12-31")),
         "dev_2023_2024": (pd.Timestamp("2023-01-01"), pd.Timestamp("2024-12-31")),
-        "holdout_2025_2026": (pd.Timestamp("2025-01-01"), end),
+        "oos_2025_20260514": (pd.Timestamp(OOS_START), pd.Timestamp(OOS_END)),
+        "simulated_live": (pd.Timestamp(SIMULATED_LIVE_START), end),
     }
     segment_masks = {
         label: (evaluation >= left) & (evaluation <= right)
         for label, (left, right) in segments.items()
     }
-    pre_holdout = evaluation < pd.Timestamp("2025-01-01")
+    pre_oos = evaluation < pd.Timestamp(OOS_START)
     records = []
     total = (1 << len(names)) - 1
     # The recursion is exact in time but candidates stay in a NumPy batch.
@@ -360,11 +362,11 @@ def exhaustive_subset_search(
             development = np.array(
                 [segment_sharpes[label] for label in list(segments)[:3]], dtype=float
             )
-            pre_returns = candidate_returns[pre_holdout]
+            pre_returns = candidate_returns[pre_oos]
             full_sharpe = _sharpe(candidate_returns, spec.periods_per_year)
-            pre_holdout_sharpe = _sharpe(pre_returns, spec.periods_per_year)
+            pre_oos_sharpe = _sharpe(pre_returns, spec.periods_per_year)
             development_score = (
-                0.30 * pre_holdout_sharpe
+                0.30 * pre_oos_sharpe
                 + 0.35 * float(np.median(development))
                 + 0.35 * float(np.min(development))
                 - 0.01 * len(indices)
@@ -376,7 +378,7 @@ def exhaustive_subset_search(
                 "factors": "|".join(selected_names),
                 "baseline_label": baseline_lookup.get(factor_key, ""),
                 "development_score": development_score,
-                "pre_2025_sharpe": pre_holdout_sharpe,
+                "pre_2025_sharpe": pre_oos_sharpe,
                 "full_sharpe": full_sharpe,
                 "full_max_drawdown": _max_drawdown(candidate_returns),
                 "annual_turnover": float(

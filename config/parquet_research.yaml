@@ -5,8 +5,8 @@ data:
   cache:
     enabled: false
 
-# Frozen historical research window. Windows and holding periods are bar counts
-# at the selected frequency.
+# Frozen final-OOS research window. Full-history replay must pass explicit dates;
+# simulated_live starts on 2026-05-15 and extends only through its dedicated path.
 date_range:
   start: '2017-01-01'
-  end: '2026-05-31'
+  end: '2026-05-14'

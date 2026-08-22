@@ -114,13 +114,15 @@ class ParquetFuturesSource(DataSource):
     def __init__(
         self,
         parquet_config: Optional[dict] = None,
+        *,
+        _validate_storage: bool = True,
     ) -> None:
         config = dict(parquet_config or {})
         root_text = str(config.get("root_path", "")).strip()
         if not root_text:
             raise ValueError("parquet.root_path is required")
         self.root_path = Path(root_text).expanduser().resolve()
-        if not self.root_path.is_dir():
+        if _validate_storage and not self.root_path.is_dir():
             raise FileNotFoundError(self.root_path)
 
         datasets = dict(config.get("datasets") or {})
@@ -141,10 +143,11 @@ class ParquetFuturesSource(DataSource):
             self._frequency_routes["5min"] = ("5min", None)
         # 日历缓存 (fetch_calendar 每次全量读 1d + 正则, 静态数据按 (start,end) 缓存)
         self._CALENDAR_CACHE: dict = {}
-        for name, relative in self.datasets.items():
-            path = self.root_path / str(relative)
-            if not path.is_dir():
-                raise FileNotFoundError(f"parquet dataset {name!r} not found: {path}")
+        if _validate_storage:
+            for name, relative in self.datasets.items():
+                path = self.root_path / str(relative)
+                if not path.is_dir():
+                    raise FileNotFoundError(f"parquet dataset {name!r} not found: {path}")
 
         self.dominant_lag_days = max(int(config.get("dominant_lag_days", 1)), 1)
         self.schedule_buffer_days = max(
@@ -539,16 +542,17 @@ class ParquetFuturesSource(DataSource):
         self._schema_cache[key] = columns
         return columns
 
-    def _read_partitions(
+    def _read_storage_partitions(
         self,
         native_frequency: str,
         start,
         end,
         columns: Iterable[str],
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, list[str], set[str]]:
         files = self._month_files(native_frequency, start, end)
         if not files:
-            return pd.DataFrame(columns=list(columns))
+            requested = list(dict.fromkeys(columns))
+            return pd.DataFrame(columns=requested), requested, set()
         schemas = [self._available_columns(path) for path in files]
         available = set.intersection(*schemas)
         present_anywhere = set.union(*schemas)
@@ -569,7 +573,7 @@ class ParquetFuturesSource(DataSource):
             )
         requested = [column for column in requested_columns if column in available]
         if not requested:
-            return pd.DataFrame()
+            return pd.DataFrame(), [], available
         selected = list(requested)
         if "symbol" in selected:
             for column in ("exchange", "trade_date", "trade_datetime"):
@@ -590,34 +594,39 @@ class ParquetFuturesSource(DataSource):
             except Exception as exc:
                 raise RuntimeError(f"failed to read market partition: {f}") from exc
         if not frames:
-            return pd.DataFrame(columns=requested)
+            return pd.DataFrame(columns=requested), requested, available
         combined = pd.concat(frames, ignore_index=True)
+        return combined, requested, available
+
+    def _read_partitions(
+        self,
+        native_frequency: str,
+        start,
+        end,
+        columns: Iterable[str],
+    ) -> pd.DataFrame:
+        combined, requested, available = self._read_storage_partitions(
+            native_frequency, start, end, columns
+        )
+        if not requested:
+            return combined
+        if combined.empty:
+            return combined.loc[:, requested]
         if "symbol" in combined:
             before = len(combined)
             canonical = canonicalize_contract_aliases(combined)
             missing_checks = [
                 field for field in MARKET_FIELDS
-                if field in available and field not in selected
+                if field in available and field not in combined.columns
             ]
             if len(canonical) < before and missing_checks:
-                validation_columns = selected + missing_checks
-                validation_frames = []
-                for path in files:
-                    try:
-                        frame = pd.read_parquet(
-                            path, columns=validation_columns, filters=filters
-                        )
-                        if not frame.empty:
-                            validation_frames.append(frame)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"failed to validate market partition: {path}"
-                        ) from exc
-                if not validation_frames:
-                    return pd.DataFrame(columns=requested)
-                canonical = canonicalize_contract_aliases(
-                    pd.concat(validation_frames, ignore_index=True)
+                validation_columns = list(combined.columns) + missing_checks
+                validation, _, _ = self._read_storage_partitions(
+                    native_frequency, start, end, validation_columns
                 )
+                if validation.empty:
+                    return pd.DataFrame(columns=requested)
+                canonical = canonicalize_contract_aliases(validation)
             combined = canonical
         return combined.loc[:, requested]
 

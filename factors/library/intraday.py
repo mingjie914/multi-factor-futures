@@ -833,21 +833,8 @@ def _read_local_seat(data, dates, universe):
     席位数据仅日度频率, 每交易日每条 (2020-03 起). 数据不可得时字段缺失.
     """
     dates = pd.DatetimeIndex(dates)
-    seat_base = _configured_seat_root(data)
-    if seat_base is None:
-        return {}
-    seat_root = os.path.join(seat_base, "derive_product_daily")
-    if not os.path.isdir(seat_root):
-        return {}
-    all_data = _read_seat_partitions(
-        seat_root, dates, "trade_date", "seat"
-    )
+    all_data = _read_local_seat_table(data, dates, universe, "product_daily")
     if all_data is None:
-        return {}
-    universe_set = {str(u).upper() for u in universe}
-    all_data["_root"] = all_data["root"].astype(str).str.upper()
-    all_data = all_data[all_data["_root"].isin(universe_set)]
-    if all_data.empty:
         return {}
     panel = {}
     for field in _SEAT_FIELDS:
@@ -910,17 +897,24 @@ def _read_local_seat_table(data, dates, universe, table):
     subdir = _SEAT_TABLE_DIRS.get(table)
     if subdir is None:
         return None
-    seat_base = _configured_seat_root(data)
-    if seat_base is None:
-        return None
-    base = os.path.join(seat_base, subdir)
-    if not os.path.isdir(base):
-        return None
     dates = pd.DatetimeIndex(dates)
     date_col = "delivery_date" if "delivery" in table else "trade_date"
-    all_data = _read_seat_partitions(
-        base, dates, date_col, f"seat table {table!r}"
-    )
+    source = getattr(data, "source", None)
+    fetcher = getattr(source, "fetch_seat_table", None)
+    if fetcher is not None:
+        all_data = fetcher(
+            subdir, dates.min(), dates.max(), universe
+        )
+    else:
+        seat_base = _configured_seat_root(data)
+        if seat_base is None:
+            return None
+        base = os.path.join(seat_base, subdir)
+        if not os.path.isdir(base):
+            return None
+        all_data = _read_seat_partitions(
+            base, dates, date_col, f"seat table {table!r}"
+        )
     if all_data is None:
         return None
     universe_set = {str(u).upper() for u in universe}

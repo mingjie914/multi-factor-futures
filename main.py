@@ -129,7 +129,7 @@ def main() -> None:
     missing = _check_dependencies()
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}", file=sys.stderr)
-        print("Install with: python -m pip install -r requirements-minimal.txt")
+        print("Install with: python -m pip install -r requirements.txt")
         raise SystemExit(1)
     try:
         configured_argv, candidate_count = _configure_mined_snapshot(sys.argv)

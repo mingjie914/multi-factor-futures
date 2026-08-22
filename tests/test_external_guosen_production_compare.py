@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from external_strategies.guosen_trend_index.current_core_compare import _report_periods
+
 from external_strategies.guosen_trend_index.production_compare import (
     ANNUAL_FEE,
     ANNUAL_ROLL_COST,
@@ -18,6 +20,21 @@ from external_strategies.guosen_trend_index.production_compare import (
     _ledger_from_weights,
     _validate_fixed_factor_sets,
 )
+
+
+def test_current_comparison_keeps_oos_fixed_and_extends_only_simulated_live():
+    periods = dict(
+        (name, (start, end))
+        for name, start, end in _report_periods(pd.Timestamp("2026-09-30"))
+    )
+    assert periods["oos_20250101_20260514"] == (
+        pd.Timestamp("2025-01-01"),
+        pd.Timestamp("2026-05-14"),
+    )
+    assert periods["simulated_live_from_20260515"] == (
+        pd.Timestamp("2026-05-15"),
+        pd.Timestamp("2026-09-30"),
+    )
 
 
 def test_validated_factor_pool_and_named_sets_are_stable():

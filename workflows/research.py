@@ -62,6 +62,7 @@ from core.period import (
     parse_holding_periods,
 )
 from core.factor_contract import normalise_frequency
+from research.validation import HISTORICAL_START, LONG_HISTORY_REPLAY_END
 
 
 _RESEARCH_CHECKPOINT_NAME = ".multi_period_checkpoint.json"
@@ -825,7 +826,8 @@ def _run_screening(runner, all_factors, config_path, t_threshold, output_dir):
 def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                                  factor_start, ic_start, ic_end,
                                  periods_override=None, frequency="daily",
-                                 output_dir=None, adaptivity_file=None):
+                                 output_dir=None, adaptivity_file=None,
+                                 research_role="unspecified"):
     """按冻结契约执行多持有期筛选.
 
     持有期为"周期数"语义 (非天数); 当 frequency=daily 时, 1个周期=1个交易日.
@@ -854,7 +856,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from core.registry import get as registry_get
     from factors.processor import build_processing_context
     from research.governance import factor_family
-    from research.validation import validate_policy, validation_policy_sha256
+    from research.validation import (
+        period_protocol_snapshot,
+        validate_policy,
+        validation_policy_sha256,
+    )
     from core.sectors import TAXONOMY_VERSION, taxonomy_sha256
     from scipy import stats as _scipy_stats
 
@@ -1097,6 +1103,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "frequency": period_ctx.unit.value,
         "periods_override": list(periods_override or []),
         "policy_sha256": policy_hash,
+        "period_protocol": period_protocol_snapshot(),
+        "research_role": research_role,
     }
     research_contract = {
         key: value for key, value in checkpoint_contract.items()
@@ -1916,6 +1924,8 @@ def _run_correlation_analysis(
         "screening_code_sha256": screening_contract.get("code_sha256"),
         "analysis_code_sha256": source_tree_hash(Path(_PROJECT_ROOT)),
         "data_sha256": current_data_hash,
+        "research_role": screening_contract.get("research_role"),
+        "period_protocol": screening_contract.get("period_protocol"),
     }
 
     significant_factors = _load_significant_factors(ic_json_path)
@@ -1995,7 +2005,7 @@ def main():
         from core.registry import list_registered
     except ImportError as e:
         print(f"框架模块导入失败: {e}")
-        print(f"   请安装依赖: python -m pip install -r requirements-minimal.txt")
+        print(f"   请安装依赖: python -m pip install -r requirements.txt")
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="多因子研究 — 因子 IC/分层/回归检验")
@@ -2058,6 +2068,11 @@ def main():
         "--output-dir", default=None,
         help="显式输出目录；指定后覆盖 runs/<run_id>")
     parser.add_argument(
+        "--research-role",
+        choices=["unspecified", "long_history_replay", "exploratory"],
+        default="unspecified",
+        help="写入研究契约的样本角色；正式重放必须显式指定")
+    parser.add_argument(
         "--refuse-existing-output", action="store_true",
         help="若输出目录已存在则拒绝运行；用于不可覆盖的规范化研究")
     parser.add_argument(
@@ -2072,6 +2087,8 @@ def main():
         parser.error("--all 与 --factors 不能同时使用")
     if args.periods and not args.multi_period:
         parser.error("--periods 必须配合 --multi-period 使用")
+    if args.refuse_existing_output and args.research_role == "unspecified":
+        parser.error("规范化研究使用 --refuse-existing-output 时必须显式指定 --research-role")
 
     if args.run_id and not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_id):
         parser.error("--run-id 仅允许字母、数字、点、下划线和连字符")
@@ -2132,6 +2149,14 @@ def main():
     )
     if ic_start > ic_end:
         parser.error("--start 必须早于或等于 --end")
+    if args.research_role == "long_history_replay" and (
+        ic_start != pd.Timestamp(HISTORICAL_START)
+        or ic_end != pd.Timestamp(LONG_HISTORY_REPLAY_END)
+    ):
+        parser.error(
+            "long_history_replay requires "
+            f"{HISTORICAL_START} through {LONG_HISTORY_REPLAY_END}"
+        )
     runner.config.date_range.start = str(ic_start.date())
     runner.config.date_range.end = str(ic_end.date())
 
@@ -2173,6 +2198,7 @@ def main():
                 frequency=args.frequency,
                 output_dir=output_dir,
                 adaptivity_file=adaptivity_file,
+                research_role=args.research_role,
             )
         else:
             # 单持有期模式: 同步配置日期

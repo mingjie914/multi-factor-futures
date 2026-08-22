@@ -92,12 +92,20 @@ class ParquetConfig(StrictConfigModel):
     selected_cache_path: str = "./cache/selected_contracts"
 
 
+class DuckDBConfig(StrictConfigModel):
+    """Certified local DuckDB runtime configuration."""
+
+    path: str = ""
+    required_release_id: str = ""
+
+
 class DataSourceConfig(StrictConfigModel):
     """Published local-Parquet selection, quality marks, and cache settings."""
     source: str = "parquet_futures"
     cache: Dict[str, Any] = {}
     audited_nontrading_closes: Dict[str, List[str]] = {}
     parquet: Optional[ParquetConfig] = None
+    duckdb: Optional[DuckDBConfig] = None
 
 
 class DateRangeConfig(StrictConfigModel):
@@ -478,6 +486,8 @@ _ENV_MAP = {
     "MF_MARKET": (("market",), str),
     "MF_DATA_SOURCE": (("data", "source"), str),
     "MF_PARQUET_ROOT": (("data", "parquet", "root_path"), str),
+    "MF_DUCKDB_PATH": (("data", "duckdb", "path"), str),
+    "MF_DATA_RELEASE_ID": (("data", "duckdb", "required_release_id"), str),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
     "MF_DATE_END": (("date_range", "end"), str),

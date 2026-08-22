@@ -3,7 +3,7 @@ market: futures
 seed: 42
 
 data:
-  # Current framework boundary: consume published local Parquet only.
+  # Portable default: Parquet remains authoritative and is also the rollback source.
   source: parquet_futures
   # Only exchange/source-verified market closures belong here. Unknown
   # post-listing close gaps fail closed and must be repaired at the data source.
@@ -36,6 +36,11 @@ data:
     curve_cache_path: './cache/curve_aggregates'
     selected_cache_enabled: true
     selected_cache_path: './cache/selected_contracts'
+  # Certified optional runtime store.  Production switches through MF_DATA_SOURCE
+  # in a maintenance window and binds the current certified release explicitly.
+  duckdb:
+    path: '${MF_DUCKDB_PATH:}'
+    required_release_id: '${MF_DATA_RELEASE_ID:}'
 
 # Reproducible baseline window, not an automatic latest-data sentinel.
 # 2017 is warm-up; formal historical studies evaluate from 2018.
