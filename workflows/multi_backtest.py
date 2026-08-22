@@ -120,13 +120,7 @@ def main():
 
     if not args.no_plot:
         try:
-            # 从配置推断版本号 (用于图表标题)
-            version_tag = ""
-            try:
-                version_tag = runner.config.version or "current"
-            except AttributeError:
-                version_tag = "current"
-            result.plot(save_dir=runner.config.backtest.report_dir, version=version_tag)
+            result.plot(save_dir=runner.config.backtest.report_dir, version="current")
             print(f"  子组合净值图 -> {runner.config.backtest.report_dir}/multi_portfolio_nav.png")
         except ImportError as exc:
             if "matplotlib" not in str(exc).lower():

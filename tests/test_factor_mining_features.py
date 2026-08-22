@@ -14,6 +14,11 @@ from factor_mining.features import FeatureEngine
 from factor_mining.validation import PreparedTarget, ValidationConfig, prepare_signal
 
 
+def test_feature_config_rejects_one_bar_rolling_window():
+    with pytest.raises(ValueError, match="at least two"):
+        FeatureConfig(rolling_windows=(1, 3))
+
+
 def test_one_minute_feature_vocabulary_includes_one_bar_information():
     panels = make_synthetic_panels(periods=80, symbols=5)
     features = FeatureEngine(FeatureConfig(

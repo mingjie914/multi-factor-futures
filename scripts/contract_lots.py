@@ -165,7 +165,7 @@ def main() -> None:
         help="手动权重的价格日期；省略时使用最新本地交易日",
     )
     parser.add_argument("--capital", type=float, default=1_000_000.0)
-    parser.add_argument("--config", default="config/intraday_backtest.yaml")
+    parser.add_argument("--config", default="config/default.yaml")
     args = parser.parse_args()
 
     if args.date:

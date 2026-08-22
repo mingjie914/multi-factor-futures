@@ -162,7 +162,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--periods", type=int, default=3000)
-    parser.add_argument("--symbols", type=int, default=47)
+    parser.add_argument("--symbols", type=int, default=38)
     parser.add_argument("--population", type=int, default=100)
     parser.add_argument("--block-rows", type=int, default=512)
     parser.add_argument("--workers", type=_csv_ints, default=(2, 4, 8))

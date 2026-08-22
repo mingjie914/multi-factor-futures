@@ -47,6 +47,10 @@
 
 ### 2.2 计算层
 
+- `config/default.yaml` 是研究、筛选、回测、监控和主策略的唯一框架配置；
+  `target_publication.yaml` 只是发布审批门，不是第二套策略配置。
+- `core.sectors.FRAMEWORK_UNIVERSE` 是唯一有序品种契约；当前为38品种。配置文件保留显式
+  列表便于审计，但加载时必须与代码契约完全一致。
 - 公共契约仍是 Pandas `DataFrame(dates × roots)`。
 - 当前注册表约 4,049 个因子，其中大量由共享 SPEC/公式路径动态生成；迁移共享算子，
   不逐个重写注册类。
@@ -113,7 +117,8 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 3. 设置 `MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`、`MF_PARQUET_ROOT` 和本次
    `MF_DATA_RELEASE_ID`，重启进程。
 4. 运行严格健康、代表日频/分钟/期限结构/席位任务。
-5. 连续观察至少两个夜间增量 release。失败时只回退 `MF_DATA_SOURCE=parquet_futures`。
+5. 连续观察至少两个夜间增量 release。该运行观察门独立记为D1b；失败时只回退
+   `MF_DATA_SOURCE=parquet_futures`。
 
 不修改仓库默认源为 DuckDB：空路径的公开 checkout 必须仍可按显式配置启动；正式运行源
 由部署环境冻结并记录。
@@ -286,17 +291,30 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 截至2026-08-22，本轮实施结论如下：
 
 - D0完成：唯一依赖清单、Polars 1.43.2、全量回归和双远端基线已冻结。
-- D1完成：本机运行源已绑定认证DuckDB release；仓库默认仍为Parquet。当前manifest与
+- D1a完成：本机运行源已绑定认证DuckDB release；仓库默认仍为Parquet。当前manifest与
   component ID一致、`changed_partitions={}`，因此没有执行无意义的重复sync。
+- D1b待完成：仍需连续观察至少两个新的夜间增量release；这不影响当前认证库随时可读或
+  通过环境变量回退Parquet，但完成观察前不得把增量运行稳定性写成已验收。
 - P1完成：`pandas|polars|shadow`桥接已进入唯一`_execute_df()`边界；本机启用Polars，
   公共DataFrame、行情频率、期限结构和六张席位表语义保持不变。代码提交为`ffcd1b1`。
 - P2停止扩张：席位长表和实际席位因子达到准入门；行情与期限结构仅有个位数改善，继续
   把标签矩阵或日期匹配改写为Polars不符合收益/风险边界。
-- C0完成：当前热点已重新画像；四个重复Python窗口因子改为共享日度聚合和小型NumPy核，
-  真实输出哈希完全一致且分别达到`47.1x`、`82.7x`，代码提交为`6ee134b`。
-- R1/R2当前No-Go：剩余主热点属于期限曲线I/O、ADF/AIC和复杂统计语义，不是低风险纯
-  ndarray滚动核；Rust无法解决当前首要瓶颈，因此不安装工具链、不新增crate或适配层。
+- C0完成：四个重复Python窗口因子已在`6ee134b`改为共享日度聚合和小型NumPy核，真实
+  输出哈希完全一致。随后完成38品种、164交易日、588因子全池画像：纯因子计算约
+  1,517秒；期限结构共享预热约214秒，主流intraday仍是主要计算热点。
+- C1完成：全池排名最前且公式重复的两个OHLC分段波动率因子复用一个NumPy向量化helper，
+  真实输出SHA-256及6,042个有限值完全一致；代表性热缓存墙钟分别由约29.02秒降至
+  14.14秒、25.36秒降至13.26秒。该结果只证明两个热点约减半，不外推为全框架倍数。
+- R1/R2当前延后而非永久排除：本轮低风险热点先用已有NumPy能力获得明确收益，因此不安装
+  Rust工具链。后续每次真实全池profile都重新开放Rust候选；只有边界清晰的纯ndarray
+  算子通过reference、shadow、端到端和RSS门禁后，才逐算子进入native白名单。
 
-本机`config/local.yaml`被Git忽略，当前固定`duckdb_futures + polars + required_release_id`。
+`config/default.yaml`现已收口为唯一38品种、10f观察基线和统一处理契约；旧的四个重复或
+继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段，当前固定
+`duckdb_futures + polars + required_release_id`，不能覆盖品种、因子、处理或回测语义。
+当前主框架处理链是MAD＋Z-score且未声明中性化；research现在按实际步骤记录`raw`，不再
+把未中性化结果误标为`neutralized`。正式mining/screen和主框架入口均校验同一有序品种
+契约；只有经完整38品种screen写出的绑定快照可挂载到主框架，普通池快照或旧未绑定快照
+继续可作审计读取，但不能注册为正式因子。
 夜间发布新DuckDB release后，必须先通过发布验证，再更新该ID并重启；回退只需切回
 `parquet_futures`。最终目标仍是真实research端到端收益，不以使用某项技术作为完成标准。

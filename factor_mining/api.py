@@ -7,6 +7,8 @@ import hashlib
 import json
 from typing import Any, Dict, Tuple
 
+from core.sectors import require_framework_universe
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -86,6 +88,8 @@ class FeatureConfig:
         ):
             if not values or any(int(value) < 1 for value in values):
                 raise ValueError(f"{name} must contain positive bar counts")
+        if any(int(value) < 2 for value in self.rolling_windows):
+            raise ValueError("rolling_windows must contain bar counts of at least two")
         if 1 not in self.feature_horizons:
             raise ValueError("feature_horizons must include the one-bar feature")
         if self.dtype not in {"float32", "float64"}:
@@ -191,8 +195,12 @@ class MiningRunSpec:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        mode = RunMode(self.mode)
+        object.__setattr__(self, "mode", mode)
         if not self.run_id or not self.universe:
             raise ValueError("run_id and universe are required")
+        if mode != RunMode.DEV:
+            require_framework_universe(self.universe)
         if self.target.decision_frequency != self.feature_config.decision_frequency:
             raise ValueError("run target and feature frequencies differ")
 

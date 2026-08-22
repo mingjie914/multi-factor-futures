@@ -60,7 +60,7 @@ FACTORS_8F = [
     "intraday_zero_ret_freq_20d",
 ]
 
-VALIDATED_47 = [
+VALIDATED_47_FACTORS = [
     "intraday_zero_ret_freq_20d", "intraday_open_close_drift_20d",
     "intraday_volatility_clustering_20d", "intraday_oi_vol_corr_daily_20d",
     "intraday_oi_time_centroid_20d", "intraday_wash_trade_20d",
@@ -168,7 +168,7 @@ NEW_FACTOR_DIRECTIONS = {
 
 def configured_futures_cost_model() -> SimpleFuturesCost:
     """Load the formal, stateless futures cost policy used by comparisons."""
-    config_path = Path(__file__).resolve().parents[1] / "config" / "intraday_backtest.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
     costs = load_config(str(config_path)).costs
     if str(costs.type) != "simple_futures":
         raise ValueError("production-style research requires simple_futures costs")
@@ -185,7 +185,7 @@ def latest_local_date(data_manager=None) -> pd.Timestamp:
     """Read the newest date through the configured formal Parquet source."""
     if data_manager is None:
         data_manager = DataManager.from_config(
-            load_config("config/intraday_backtest.yaml")
+            load_config("config/default.yaml")
         )
     fetcher = getattr(data_manager.source, "fetch_latest_trade_date", None)
     if not callable(fetcher):
@@ -199,7 +199,7 @@ class ExperimentEnvironment:
     """Shared data, factor, calendar and causal-risk caches for research."""
 
     def __init__(self, factors: dict[str, int] | None = None):
-        self.cfg = load_config("config/intraday_backtest.yaml")
+        self.cfg = load_config("config/default.yaml")
         self.data_manager = DataManager.from_config(self.cfg)
         self.cal = pd.DatetimeIndex(
             self.data_manager.get_calendar(
@@ -270,7 +270,7 @@ class FactorPanelRunner:
             dict.fromkeys(
                 factor_names
                 if factor_names is not None
-                else list(BASELINE_6F) + VALIDATED_47 + NEW_VALIDATED_21
+                else list(BASELINE_6F) + VALIDATED_47_FACTORS + NEW_VALIDATED_21
             )
         )
         comp: dict[str, pd.DataFrame] = {}

@@ -1077,7 +1077,6 @@ def _roll20_mean_std(frame):
     rm = _roll_mean(frame, 20, 5)
     rs = _roll_std(frame, 20, 5)
     return rm.add(rs, fill_value=0)
-    return {}
 
 
 # 1. vp_corr_intraday — 分钟收益×成交量日内相关
@@ -29062,6 +29061,32 @@ class IntradayUpsideVolRatio20d(Factor):
 # 516. intraday_vol_extreme_magnitude — 波动率极大值幅度
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _segmented_ohlc_relative_volatility(close, high, low, window, *, positive_only=False):
+    """Vectorized equivalent of the established non-overlapping OHLC loop."""
+    count = len(close) // int(window)
+    if count == 0:
+        return np.empty(0, dtype=float)
+    usable = count * int(window)
+    segments = np.concatenate(
+        [
+            np.asarray(close[:usable], dtype=float).reshape(count, window),
+            np.asarray(high[:usable], dtype=float).reshape(count, window),
+            np.asarray(low[:usable], dtype=float).reshape(count, window),
+        ],
+        axis=1,
+    )
+    means = segments.mean(axis=1)
+    valid = means > 0
+    values = np.divide(
+        segments.std(axis=1),
+        means,
+        out=np.full(count, np.nan, dtype=float),
+        where=valid,
+    )
+    if positive_only:
+        valid &= values > 0
+    return values[valid]
+
 @register_factor("intraday_vol_extreme_magnitude_20d", category="intraday_advanced")
 class IntradayVolExtremeMagnitude20d(Factor):
     """波动率极大值幅度因子.
@@ -29098,20 +29123,15 @@ class IntradayVolExtremeMagnitude20d(Factor):
                 common = c.index.intersection(h.index).intersection(l.index)
                 if len(common) < 40:
                     continue
-                c_c = c.loc[common]
-                h_c = h.loc[common]
-                l_c = l.loc[common]
                 # 更优波动率: 5分钟窗内 OHLC 波动率
-                vol5 = []
-                for i in range(0, len(c_c) - 4, 5):
-                    seg = np.concatenate([c_c.iloc[i:i + 5].values, h_c.iloc[i:i + 5].values, l_c.iloc[i:i + 5].values])
-                    if seg.std(ddof=0) / seg.mean() > 0 if seg.mean() > 0 else False:
-                        vol5.append(seg.std(ddof=0) / seg.mean())
-                vol30 = []
-                for i in range(0, len(c_c) - 29, 30):
-                    seg = np.concatenate([c_c.iloc[i:i + 30].values, h_c.iloc[i:i + 30].values, l_c.iloc[i:i + 30].values])
-                    if seg.mean() > 0:
-                        vol30.append(seg.std(ddof=0) / seg.mean())
+                vol5 = _segmented_ohlc_relative_volatility(
+                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
+                    l.loc[common].to_numpy(), 5, positive_only=True,
+                )
+                vol30 = _segmented_ohlc_relative_volatility(
+                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
+                    l.loc[common].to_numpy(), 30,
+                )
                 if len(vol5) < 5 or len(vol30) < 3:
                     vals[col] = 0.0
                     continue
@@ -29119,8 +29139,8 @@ class IntradayVolExtremeMagnitude20d(Factor):
                 if abs(var) < 1e-12:
                     vals[col] = 1.0
                     continue
-                extreme = [v for v in vol30 if v > var]
-                if not extreme:
+                extreme = vol30[vol30 > var]
+                if len(extreme) == 0:
                     vals[col] = 0.0
                     continue
                 vals[col] = float(np.mean(extreme) / var)
@@ -29803,24 +29823,19 @@ class IntradayVolRatioTrend20d(Factor):
                 common = c.index.intersection(h.index).intersection(l.index)
                 if len(common) < 40:
                     continue
-                c_c = c.loc[common]
-                h_c = h.loc[common]
-                l_c = l.loc[common]
-                vol5 = []
-                for i in range(0, len(c_c) - 4, 5):
-                    seg = np.concatenate([c_c.iloc[i:i + 5].values, h_c.iloc[i:i + 5].values, l_c.iloc[i:i + 5].values])
-                    if seg.mean() > 0:
-                        vol5.append(seg.std(ddof=0) / seg.mean())
-                vol30 = []
-                for i in range(0, len(c_c) - 29, 30):
-                    seg = np.concatenate([c_c.iloc[i:i + 30].values, h_c.iloc[i:i + 30].values, l_c.iloc[i:i + 30].values])
-                    if seg.mean() > 0:
-                        vol30.append(seg.std(ddof=0) / seg.mean())
+                vol5 = _segmented_ohlc_relative_volatility(
+                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
+                    l.loc[common].to_numpy(), 5,
+                )
+                vol30 = _segmented_ohlc_relative_volatility(
+                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
+                    l.loc[common].to_numpy(), 30,
+                )
                 if len(vol5) < 5 or len(vol30) < 3:
                     vals[col] = 0.0
                     continue
                 var = np.percentile(vol5, 95)
-                vals[col] = float(np.mean([1.0 if v > var else 0.0 for v in vol30]))
+                vals[col] = float(np.mean(vol30 > var))
             if vals:
                 freqs[dt] = pd.Series(vals)
         if not freqs:

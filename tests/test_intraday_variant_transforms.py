@@ -11,6 +11,7 @@ from factors.numerics import (
 
 from factors.library.intraday import (
     _daily_range_volume_ratio,
+    _segmented_ohlc_relative_volatility,
     IntradayDfTest20d,
     IntradayOiSurgeFollow20d,
     IntradayOiSurgeReversal20d,
@@ -20,6 +21,33 @@ from factors.library.intraday import (
     OpenCloseVolRank20d,
     PeakCountZscore20d,
 )
+
+
+@pytest.mark.parametrize("window,positive_only", [(5, False), (5, True), (30, False)])
+def test_segmented_ohlc_volatility_matches_established_loop(window, positive_only):
+    rng = np.random.default_rng(20260822)
+    close = rng.lognormal(mean=4.0, sigma=0.1, size=67)
+    high = close + rng.random(67)
+    low = close - rng.random(67)
+    close[:window] = 100.0
+    high[:window] = 100.0
+    low[:window] = 100.0
+    expected = []
+    for start in range(0, len(close) - window + 1, window):
+        segment = np.concatenate([
+            close[start:start + window],
+            high[start:start + window],
+            low[start:start + window],
+        ])
+        mean = segment.mean()
+        value = segment.std(ddof=0) / mean if mean > 0 else np.nan
+        if mean > 0 and (not positive_only or value > 0):
+            expected.append(value)
+
+    actual = _segmented_ohlc_relative_volatility(
+        close, high, low, window, positive_only=positive_only
+    )
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_daily_range_volume_ratio_uses_only_prior_twenty_days():

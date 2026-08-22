@@ -11,6 +11,8 @@ import monitoring.factor_health as FH
 import monitoring.attribution as AT
 import monitoring.weekly_report as WR
 from monitoring import io
+from core.config import load_config
+from core.sectors import FRAMEWORK_UNIVERSE
 from strategies.combined import FACTORS, SECTOR_MAP, UNIVERSE38
 
 
@@ -18,6 +20,14 @@ def test_monitoring_uses_current_strategy_definition():
     assert C.PRODUCTION_FACTORS == FACTORS
     assert C.SECTORS == SECTOR_MAP
     assert C.UNIVERSE38 == UNIVERSE38
+
+
+def test_default_config_is_the_framework_contract():
+    config = load_config("config/default.yaml")
+
+    assert tuple(config.universe) == FRAMEWORK_UNIVERSE
+    assert len(config.universe) == len(set(config.universe)) == 38
+    assert config.factors == list(FACTORS)
 
 
 # ---------- 工具 ----------

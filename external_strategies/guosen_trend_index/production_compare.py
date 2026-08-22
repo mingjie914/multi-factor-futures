@@ -28,7 +28,7 @@ from research.portfolio_experiment_support import (  # noqa: E402
     FactorPanelRunner as Runner,
     NEW_FACTOR_DIRECTIONS as NEW21_DIR,
     NEW_VALIDATED_21 as NEW21,
-    VALIDATED_47 as KEPT47,
+    VALIDATED_47_FACTORS as KEPT47_FACTORS,
     configured_futures_cost_model,
 )
 from backtest.metrics import TRADING_DAYS_PER_YEAR  # noqa: E402
@@ -330,7 +330,7 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=False)
     _validate_fixed_factor_sets()
 
-    valid_factors = list(dict.fromkeys(F6 + KEPT47 + NEW21))
+    valid_factors = list(dict.fromkeys(F6 + KEPT47_FACTORS + NEW21))
     directions = {
         name: _factor_direction(name)
         for name in valid_factors

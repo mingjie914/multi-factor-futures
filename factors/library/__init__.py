@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === Hand-authored factor library ===
 # 组织结构:
-#   intraday.py                   自创日内高频因子 (599个注册类，其中585个intraday_advanced)
+#   intraday.py                   自创日内高频因子（运行时注册表是唯一数量口径）
 #   technical_factors.py          日度技术面 (动量/反转/偏度/趋势/波动率)
 #   term_structure_factors.py     期限结构与基差
 #   volume_oi_factors.py          量价与持仓

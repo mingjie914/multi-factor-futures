@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel
 
+from core.sectors import require_framework_universe
+
 try:
     from pydantic import ConfigDict
 except ImportError:  # Pydantic 1.x compatibility
@@ -543,24 +545,6 @@ def load_config(path: str) -> FrameworkConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config file must contain a dict at top level, got {type(raw)}")
 
-    extends = raw.pop("extends", None)
-    if extends:
-        base_path = str(extends)
-        if not os.path.isabs(base_path):
-            base_path = os.path.join(os.path.dirname(path), base_path)
-        with open(base_path, "r", encoding="utf-8") as fh:
-            if base_path.endswith((".yaml", ".yml")):
-                base_raw = yaml.safe_load(fh)
-            else:
-                base_raw = json.load(fh)
-        if not isinstance(base_raw, dict):
-            raise ValueError(
-                f"Extended config must contain a dict, got {type(base_raw)}"
-            )
-        if "extends" in base_raw:
-            raise ValueError("Nested config extends is not supported")
-        raw = _deep_merge(base_raw, raw)
-
     # CR-012: 展开 ${VAR} 和 ${VAR:default} 环境变量引用
     raw = _expand_env_vars(raw)
 
@@ -569,14 +553,45 @@ def load_config(path: str) -> FrameworkConfig:
     if os.path.exists(local_path):
         with open(local_path, "r", encoding="utf-8") as fh:
             local_raw = yaml.safe_load(fh) or {}
-        if isinstance(local_raw, dict):
-            raw = _deep_merge(raw, local_raw)
-            raw = _expand_env_vars(raw)  # local.yaml 中也可能有 ${VAR}
+        if not isinstance(local_raw, dict):
+            raise ValueError("config/local.yaml must contain a dict")
+        _validate_local_overrides(local_raw)
+        raw = _deep_merge(raw, local_raw)
+        raw = _expand_env_vars(raw)  # local.yaml 中也可能有 ${VAR}
 
     # Apply env var overrides (production path)
     raw = _apply_env_overrides(raw)
 
-    return FrameworkConfig(**raw)
+    config = FrameworkConfig(**raw)
+    require_framework_universe(config.universe)
+    return config
+
+
+def _validate_local_overrides(local_raw: dict) -> None:
+    """Keep ignored machine-local config outside research semantics."""
+    allowed = {
+        "data.source",
+        "data.parquet.root_path",
+        "data.duckdb.path",
+        "data.duckdb.required_release_id",
+        "data.duckdb.result_backend",
+    }
+
+    def _leaf_paths(value: Any, prefix: str = "") -> List[str]:
+        if not isinstance(value, dict):
+            return [prefix]
+        paths: List[str] = []
+        for key, child in value.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_leaf_paths(child, name))
+        return paths
+
+    unexpected = sorted(set(_leaf_paths(local_raw)) - allowed)
+    if unexpected:
+        raise ValueError(
+            "config/local.yaml may only override machine-local data runtime settings: "
+            + ", ".join(unexpected)
+        )
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

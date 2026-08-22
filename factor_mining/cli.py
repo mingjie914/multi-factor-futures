@@ -37,7 +37,7 @@ from factor_mining.runtime.static_context import (
 )
 from factor_mining.screening import ScreeningConfig, screen_candidates
 from factor_mining.validation import PreparedTarget, ValidationConfig
-from core.sectors import sector_for
+from core.sectors import FRAMEWORK_UNIVERSE, require_framework_universe, sector_for
 
 
 DEFAULT_REPOSITORY = Path("runs/factor_mining/candidates.sqlite3")
@@ -548,7 +548,7 @@ def _screen(args) -> int:
         raise ValueError("candidate selection returned no candidates")
     candidates = tuple(repository.get_candidate(item) for item in candidate_ids)
     feature_config = candidates[0].feature_config
-    universe = args.universe
+    universe = require_framework_universe(args.universe)
     panels = _load_market_panels(
         args, universe, args.start, args.end, feature_config
     )
@@ -615,6 +615,7 @@ def _screen(args) -> int:
         snapshot_path = repository.write_snapshot(
             output_dir / "prescreen_candidates.snapshot.json",
             candidate_ids=outcome.passed_candidate_ids,
+            framework_universe=universe,
         )
     evidence = {
         "scope": "mining_prescreen_not_formal_evidence",
@@ -778,7 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     mine = commands.add_parser("mine", help="run GP against local Parquet bars")
     mine.add_argument("--data-root", type=Path, default=None)
-    mine.add_argument("--universe", type=_csv_strings, required=True)
+    mine.add_argument("--universe", type=_csv_strings, default=FRAMEWORK_UNIVERSE)
     mine.add_argument("--start", required=True)
     mine.add_argument("--end", required=True)
     mine.add_argument("--run-id", default=None)
@@ -798,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
         "screen", help="pre-screen mined candidates on local bars"
     )
     screen.add_argument("--data-root", type=Path, default=None)
-    screen.add_argument("--universe", type=_csv_strings, required=True)
+    screen.add_argument("--universe", type=_csv_strings, default=FRAMEWORK_UNIVERSE)
     screen.add_argument("--start", required=True)
     screen.add_argument("--end", required=True)
     screen.add_argument("--screen-id", required=True)

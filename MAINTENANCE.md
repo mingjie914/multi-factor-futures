@@ -24,7 +24,7 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-完整测试在当前开发机通常约 10～20 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
+完整测试在当前开发机约 25 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
 持续集成更适合检查明显回退，而不是维护容易过期的固定秒数或测试项数量。
 
 ## 性能原则

@@ -543,19 +543,33 @@ def test_panel_cache_adds_curve_fields_without_rebuilding_selected_panel(
     assert not curve["curve_total_oi"].empty
 
 
-def test_parquet_research_config_extends_default_and_uses_env_root(
+def test_default_config_uses_env_parquet_root(
     tmp_path, monkeypatch
 ):
     root = _fixture_root(tmp_path / "market")
     monkeypatch.setenv("MF_DATA_SOURCE", "parquet_futures")
     monkeypatch.setenv("MF_PARQUET_ROOT", str(root))
 
-    config = load_config("config/parquet_research.yaml")
+    config = load_config("config/default.yaml")
 
     assert config.data.source == "parquet_futures"
     assert config.data.parquet.root_path == str(root)
     assert config.processing
     assert config.universe
+
+
+def test_machine_local_config_cannot_override_research_semantics(tmp_path):
+    project = Path(__file__).resolve().parents[1]
+    (tmp_path / "default.yaml").write_text(
+        (project / "config" / "default.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (tmp_path / "local.yaml").write_text(
+        "universe: [RB]\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="machine-local data runtime settings"):
+        load_config(str(tmp_path / "default.yaml"))
 
 
 def test_framework_factory_builds_parquet_only_source(tmp_path, monkeypatch):

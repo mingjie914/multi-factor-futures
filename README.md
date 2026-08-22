@@ -1,9 +1,9 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-08-22）仍为 `NO_TARGETS`：`config/default.yaml` 没有获批因子，
-`config/target_publication.yaml` 也保持关闭。挖掘结果只会进入候选池，不会自动进入组合
-或发布目标权重。
+（2026-08-22）仍为 `NO_TARGETS`：`config/default.yaml` 的10f只是固定观察基线，
+`config/target_publication.yaml` 保持关闭且没有获批部署包。挖掘结果只会进入候选池，
+不会自动进入组合或发布目标权重。
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
@@ -69,12 +69,12 @@ python -m pip install -r requirements.txt
 $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 # 本地数据健康与研究
-& $PY -X utf8 -B main.py data-health --config config/parquet_research.yaml --strict
+& $PY -X utf8 -B main.py data-health --config config/default.yaml --strict
 & $PY -X utf8 -B main.py research --help
 & $PY -X utf8 -B main.py adaptivity --help
 
 # intraday.py 的588个日频输出发现因子
-& $PY -X utf8 -B main.py research --config config/intraday_backtest.yaml `
+& $PY -X utf8 -B main.py research --config config/default.yaml `
   --all --multi-period --frequency daily `
   --module-prefix factors.library.intraday --run-id <study_id>
 
@@ -112,11 +112,10 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 ## 配置边界
 
-- `config/default.yaml`：完整研究/回测基线，`factors: []`，默认只读本地Parquet；
-  `duckdb_futures`是已认证的可选运行源。外层通用行情缓存关闭，连续合约使用数据源自身
-  带指纹的缓存。
-- `config/parquet_research.yaml`：继承默认值并冻结研究区间；同样只读本地Parquet。
-- `config/local.yaml`：保存本机数据路径与可选运行源，已被 Git 忽略。
+- `config/default.yaml`：研究、筛选、回测、监控与主策略共用的唯一框架配置，包含固定
+  38品种、10f观察基线和统一处理语义；默认只读本地Parquet，`duckdb_futures`是认证镜像。
+- `config/local.yaml`：只保存本机数据路径、认证release与数据运行时选择，已被Git忽略；
+  加载器禁止它覆盖品种、因子、处理或回测语义。
 - `config/target_publication.yaml`：独立目标权重发布门，不能传给 `load_config()`当作研究配置。
 - 除成本模型的自定义参数外，未知配置键会直接报错，避免拼写错误被静默忽略。
 

@@ -118,8 +118,21 @@ class GPConfig:
             + self.mutation_probability
             + self.reproduction_probability
         )
+        probability_values = (
+            self.crossover_probability,
+            self.mutation_probability,
+            self.reproduction_probability,
+            self.terminal_probability,
+            self.constant_probability,
+        )
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in probability_values):
+            raise ValueError("GP probabilities must be finite and in [0, 1]")
         if not math.isclose(probabilities, 1.0, abs_tol=1e-9):
             raise ValueError("crossover/mutation/reproduction probabilities must sum to one")
+        if not math.isfinite(self.min_abs_ic) or not 0.0 <= self.min_abs_ic <= 1.0:
+            raise ValueError("min_abs_ic must be finite and in [0, 1]")
+        if not math.isfinite(self.correlation_limit) or not 0.0 < self.correlation_limit <= 1.0:
+            raise ValueError("correlation_limit must be finite and in (0, 1]")
         unknown = sorted(set(self.operators) - set(OPERATOR_SPECS))
         if unknown:
             raise ValueError(f"unknown GP operators: {unknown}")
@@ -488,12 +501,19 @@ class GPSearch:
                 child = parent
             if self._valid(child):
                 next_by_hash.setdefault(child.sha256, child)
-        while len(next_by_hash) < self.config.population_size:
+        fallback_attempts = 0
+        while (
+            len(next_by_hash) < self.config.population_size
+            and fallback_attempts < limit
+        ):
+            fallback_attempts += 1
             child = self._ensure_required_terminal(
                 self._random_expression(self.config.initialization_depth)
             )
             if self._valid(child):
                 next_by_hash.setdefault(child.sha256, child)
+        if len(next_by_hash) < self.config.population_size:
+            raise RuntimeError("unable to build a unique valid GP population")
         return list(next_by_hash.values())
 
     def _deduplicate_by_signal(

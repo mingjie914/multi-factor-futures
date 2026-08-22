@@ -49,10 +49,9 @@
 它们回答的是“预测作用在哪个分钟 horizon”与“排名能保持多久”。旧 `ICTest.ic_decay`
 计算的是 IC 时间序列本身的自相关，不等同于这两项诊断。
 
-默认 `screen` 预筛使用候选快照声明的静态品种全集，结果会明确写入
-`diagnostic_universe_policy=static_declared_universe`。正式 P0 仍使用主框架的滞后
-流动性动态品种池；静态预筛曲线只能定位 horizon，不能替代动态池下的正式 IC。
-动态池下的正式检验统一通过 `main.py research` 执行，不再保留一次性对齐脚本。
+默认 `screen` 预筛与正式P0都使用主框架唯一的`FRAMEWORK_UNIVERSE`，结果会明确写入
+`diagnostic_universe_policy=static_declared_universe`。预筛曲线只能定位horizon，不能
+替代`main.py research`的正式IC与点时可用性检验。
 
 ## 特征和算子
 
@@ -125,7 +124,7 @@ GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使�
 波动率中性化默认开启；缺少 15/30/60-bar 实现波动率控制时搜索会拒绝运行。板块
 中性化可通过 `GPSearch(..., group_labels=...)` 或 CLI 的 `--sector-neutralization`
 开启。CLI 使用主框架唯一的静态期货板块表，并把标签冻结进候选；正式研究仍会执行
-主框架配置声明的板块中性化。
+冻结研究协议声明的板块中性化变体。
 
 ## 预筛与正式检验
 
@@ -134,8 +133,7 @@ GP fitness 不再只奖励 IC/IR。默认 `economic_fitness_weight=0.50`，使�
 输出包括完整 CSV、相关性矩阵和不可变候选快照。
 
 正式研究必须按候选原始 `target.horizon_bars` 分组；H=1 挖掘因子只检验 1 bar，不能
-事后在 5/15/30 bar 中挑最优。若启用默认动态流动性品种池，`factor-start` 必须早于
-评价起点至少 `min_listing_days` 个交易日，并覆盖流动性 lookback。研究批次若得到
+事后在 5/15/30 bar 中挑最优。`factor-start` 必须覆盖因子自身的最长预热。研究批次若得到
 0 个有效因子×周期观测会直接失败，不再产生“零样本但完成”的结论。
 
 政策升级前的日期化复核报告和本地结果已经清除。当前正式准入只使用
@@ -211,7 +209,7 @@ benchmark 会保存固定 AST、raw factor memmap、worker/chunk 调优、各 ke
 计时和 RSS，并硬断言 NaN mask、factor 容差、IC、direction、candidate
 集合和排序。运行时必须显式传入 `--output-dir`，脚本不会自动创建时间戳目录。
 
-NumPy stable-argsort rank 曾通过 ties/NaN 等价探针，但在完整 12,000×47
+NumPy stable-argsort rank 曾通过 ties/NaN 等价探针，但在完整 12,000×47 合成矩阵
 benchmark 上慢于现有 SciPy `rankdata`，因此未进入生产路径；rank 仍使用 v1
 已验证的 SciPy/Pandas fallback。
 
@@ -221,7 +219,7 @@ v2-lite 使用算子能力白名单。`ts_ema`、`ts_corr`、`ts_cov`、横截�
 
 ### 2026-07-29 固定 100 AST 基准
 
-环境为 Windows、12,000×47、`block_T=2500`，每条正式路径重复三次并取中位数：
+环境为 Windows、12,000×47 合成矩阵（47列不是框架品种数）、`block_T=2500`，每条正式路径重复三次并取中位数：
 
 | 路径 | 中位耗时 | 相对 baseline | 峰值 RSS |
 | --- | ---: | ---: | ---: |

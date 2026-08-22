@@ -761,6 +761,14 @@ def test_pipeline_runner_rejects_intraday_frequency_before_initialization():
         PipelineRunner(config=load_config("config/default.yaml"), frequency="15min")
 
 
+def test_pipeline_runner_rejects_a_separate_universe_contract():
+    from core.config import FrameworkConfig
+    from pipeline.runner import PipelineRunner
+
+    with pytest.raises(ValueError, match="FRAMEWORK_UNIVERSE"):
+        PipelineRunner(config=FrameworkConfig(universe=["RB"]))
+
+
 def test_parquet_factory_rejects_stale_generic_range_cache():
     from core.config import load_config
     from data.manager import DataManager

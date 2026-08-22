@@ -9,6 +9,7 @@ import sqlite3
 from typing import Iterable, Iterator, Mapping, Sequence
 
 from factor_mining.api import CandidateSpec, MiningRunSpec, canonical_json, content_hash
+from core.sectors import require_framework_universe
 
 
 SCHEMA_VERSION = 1
@@ -298,6 +299,7 @@ class CandidateRepository:
         *,
         candidate_ids: Sequence[str] | None = None,
         statuses: Sequence[str] | None = None,
+        framework_universe: Sequence[str] | None = None,
         refuse_existing: bool = True,
     ) -> Path:
         if bool(candidate_ids) == bool(statuses):
@@ -317,6 +319,10 @@ class CandidateRepository:
             "candidate_count": len(candidates),
             "candidates": [candidate.to_dict() for candidate in candidates],
         }
+        if framework_universe is not None:
+            payload["framework_universe"] = list(
+                require_framework_universe(framework_universe)
+            )
         snapshot = dict(payload)
         snapshot["snapshot_sha256"] = content_hash(payload)
         path = Path(output).expanduser().resolve()
@@ -332,7 +338,9 @@ class CandidateRepository:
         return path
 
 
-def load_snapshot(path: str | Path) -> tuple[CandidateSpec, ...]:
+def load_snapshot(
+    path: str | Path, *, require_framework: bool = False
+) -> tuple[CandidateSpec, ...]:
     snapshot_path = Path(path).expanduser().resolve()
     value = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if int(value.get("schema_version", -1)) != SCHEMA_VERSION:
@@ -340,6 +348,8 @@ def load_snapshot(path: str | Path) -> tuple[CandidateSpec, ...]:
     declared = value.pop("snapshot_sha256", "")
     if not declared or declared != content_hash(value):
         raise ValueError("candidate snapshot hash mismatch")
+    if require_framework:
+        require_framework_universe(value.get("framework_universe", ()))
     candidates = tuple(
         CandidateSpec.from_dict(item) for item in value.get("candidates", ())
     )

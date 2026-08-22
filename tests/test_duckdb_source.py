@@ -164,6 +164,21 @@ def test_duckdb_result_backend_env_override(monkeypatch):
     assert load_config("config/default.yaml").data.duckdb.result_backend == "polars"
 
 
+def test_duckdb_research_fingerprint_covers_seat_release(tmp_path):
+    _, _, table_root, database = _fixture(tmp_path)
+    source = DuckDBFuturesSource(
+        {"path": str(database)},
+        {"root_path": str(table_root), "eager_fields": False},
+    )
+    try:
+        before = source._files_fingerprint(Path(), [Path("1min/month")])
+        source.seat_component_id = "seat-revision"
+        after = source._files_fingerprint(Path(), [Path("1min/month")])
+        assert before != after
+    finally:
+        source.close()
+
+
 def test_duckdb_rejects_unknown_result_backend(tmp_path):
     _, _, table_root, database = _fixture(tmp_path)
     with pytest.raises(ValueError, match="result_backend"):

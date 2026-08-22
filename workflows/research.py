@@ -922,6 +922,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         getattr(runner.config.factor_governance, "explicit_family_map", {}) or {}
     )
     dual_track_families = set(policy.dual_track_families)
+    has_neutralize = any(
+        str(step.type) == "neutralize" for step in runner.config.processing
+    )
 
     def _factor_family(name: str) -> str:
         return factor_family(name, explicit_family_map)
@@ -1164,14 +1167,17 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
         if invalid:
             print(f"  本批不可计算因子/依赖: {len(invalid)}（已记入结果）")
-        raw_variant_batch = {
-            name: runner.processor.process_excluding(
-                computed_batch[name], processing_context, {"neutralize"}
-            )
-            for name in batch_names
-            if name in computed_batch
-            and _factor_family(name) in dual_track_families
-        }
+        raw_variant_batch = (
+            {
+                name: runner.processor.process_excluding(
+                    computed_batch[name], processing_context, {"neutralize"}
+                )
+                for name in batch_names
+                if name in computed_batch
+                and _factor_family(name) in dual_track_families
+            }
+            if has_neutralize else {}
+        )
 
         def _evaluate_factor(fname):
             if fname not in factor_batch:
@@ -1179,7 +1185,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             window = _infer_window(fname)
             periods = list(factor_horizons[fname])
             all_period_results = {}
-            variants = {"neutralized": factor_batch[fname]}
+            variants = {
+                "neutralized" if has_neutralize else "raw": factor_batch[fname]
+            }
             if fname in raw_variant_batch:
                 variants["raw"] = raw_variant_batch[fname]
             for variant, matrix in variants.items():
@@ -1730,6 +1738,15 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "production_approved": 0,
     }
     threshold_sensitivity = _build_threshold_sensitivity(results, policy)
+    raw_preprocessing = ["mad_winsorize_by_date", "zscore_standardize_by_date"]
+    preprocessing_variants = {"raw": raw_preprocessing}
+    factor_preprocessing = raw_preprocessing
+    if has_neutralize:
+        preprocessing_variants["neutralized"] = [
+            "mad_winsorize_by_date", "sector_neutralize_by_date",
+            "zscore_standardize_by_date",
+        ]
+        factor_preprocessing = preprocessing_variants["neutralized"]
     out = {
         "research_contract": research_contract,
         "config": {
@@ -1745,22 +1762,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "taxonomy_version": TAXONOMY_VERSION,
             "taxonomy_sha256": taxonomy_sha256(),
             "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
-            "factor_preprocessing": [
-                "mad_winsorize_by_date",
-                "sector_neutralize_by_date_for_neutralized_variant",
-                "zscore_standardize_by_date",
-            ],
-            "factor_preprocessing_variants": {
-                "neutralized": [
-                    "mad_winsorize_by_date",
-                    "sector_neutralize_by_date",
-                    "zscore_standardize_by_date",
-                ],
-                "raw": [
-                    "mad_winsorize_by_date",
-                    "zscore_standardize_by_date",
-                ],
-            },
+            "factor_preprocessing": factor_preprocessing,
+            "factor_preprocessing_variants": preprocessing_variants,
             "selection_order": [
                 "predeclared_exposure_preprocessing",
                 "raw_ols_hac_p_values",

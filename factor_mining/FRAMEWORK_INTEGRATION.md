@@ -19,7 +19,6 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
 & $PY -B main.py mining `
   --repository 'runs\factor_mining\candidates.sqlite3' mine `
-  --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
   --start '2023-01-01' --end '2024-12-31' `
   --frequency 1min --horizon-bars 15 `
   --sector-neutralization `
@@ -35,7 +34,6 @@ $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
 & $PY -B main.py mining `
   --repository 'runs\factor_mining\candidates.sqlite3' screen `
   --data-root $env:MF_PARQUET_ROOT `
-  --universe 'RB,HC,I,J,JM,CU,AL,ZN' `
   --start '2023-01-01' --end '2024-12-31' `
   --screen-id 'screen_id' `
   --output-dir 'runs\factor_mining\screens\screen_id' `
@@ -61,7 +59,7 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 ```powershell
 & $PY -X utf8 -B main.py research `
   --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
-  --config config/parquet_research.yaml `
+  --config config/default.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
   --multi-period --periods '15' --frequency 1min
 ```
@@ -88,7 +86,7 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 ```powershell
 & $PY -X utf8 -B main.py research `
   --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
-  --config config/parquet_research.yaml `
+  --config config/default.yaml `
   --factors 'mined_gp_xxxxx,mined_gp_yyyyy' `
   --multi-period --periods '15' --frequency 1min `
   --factor-start '2022-10-01' --start '2023-01-01' --end '2024-12-31' `
@@ -96,9 +94,9 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
   --refuse-existing-output
 ```
 
-默认动态品种池需要足够的前置上市和流动性历史。`factor-start` 不只是技术指标预热，
-还必须覆盖 `universe_selection.min_listing_days` 与 `lookback`；否则研究会因 0 个有效
-假设失败关闭。
+正式 `mine`、`screen` 与主框架研究统一使用 `FRAMEWORK_UNIVERSE`；`--universe`
+仅用于显式复述同一有序全集，传入不同集合或顺序会失败关闭。`factor-start` 仍需覆盖
+因子自身的技术指标预热。
 
 正式执行时应先冻结候选快照、因子名、bar 周期、日期和检验边界，并为每次研究指定
 新的 `--output-dir` 与 `--refuse-existing-output`。`main.py research` 输出的
@@ -121,7 +119,7 @@ HAC t 值、收益或最优周期必须走该流程；合成数据调试、表�
 ```powershell
 & $PY -X utf8 -B main.py adaptivity `
   --mined-snapshot 'runs\factor_mining\screens\screen_id\prescreen_candidates.snapshot.json' `
-  --config config/parquet_research.yaml `
+  --config config/default.yaml `
   --fdr-method deployment `
   --discovery-file 'runs\factor_research\study_id\ic_by_window_period.json' `
   --frequency 1min --periods '1,5,15' `

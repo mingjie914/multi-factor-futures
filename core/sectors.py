@@ -38,6 +38,25 @@ SECTOR_MAP = {
     "EC": "other",
 }
 
+# The main framework universe is one ordered contract shared by research,
+# backtests, monitoring and the production-style strategy.  Broader taxonomy
+# entries above remain available for classification but are not separate
+# framework universes.
+FRAMEWORK_UNIVERSE = (
+    "A", "AG", "AL", "AU", "CU", "FU", "HC", "I", "IC", "IF", "IH", "J",
+    "JM", "M", "MA", "NI", "P", "RB", "RM", "RU", "SA", "SN", "SR", "T",
+    "TA", "TL", "TS", "Y", "ZN", "IM", "TF", "CF", "OI", "LH", "JD", "SC",
+    "V", "UR",
+)
+
+
+def require_framework_universe(instruments: Iterable[str]) -> tuple[str, ...]:
+    """Fail closed unless an entry point uses the ordered framework contract."""
+    normalized = tuple(map(str, instruments))
+    if normalized != FRAMEWORK_UNIVERSE:
+        raise ValueError("universe must exactly match FRAMEWORK_UNIVERSE")
+    return normalized
+
 TAXONOMY_VERSION = "futures_taxonomy_20260728"
 
 SECTOR_NAMES = tuple(sorted(set(SECTOR_MAP.values())))

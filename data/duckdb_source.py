@@ -156,7 +156,12 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         ]
 
     def _files_fingerprint(self, _root_path: Path, files: Iterable[Path]) -> str:
-        return _fingerprint((self.market_component_id, sorted(str(path) for path in files)))
+        return _fingerprint({
+            "release_id": self.release_id,
+            "market_component_id": self.market_component_id,
+            "seat_component_id": self.seat_component_id,
+            "partitions": sorted(str(path) for path in files),
+        })
 
     def _selected_cache_source_fingerprint(
         self, native_frequency: str, start: pd.Timestamp, end: pd.Timestamp

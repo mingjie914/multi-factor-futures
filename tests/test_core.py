@@ -1,6 +1,6 @@
 r"""核心组件单元测试: 因子计算、IC 检验、启发式优化器.
 
-用法: python tests/test_core.py
+用法: python -m pytest -q tests/test_core.py
 """
 from __future__ import annotations
 import sys
@@ -220,23 +220,4 @@ def test_scripts_import():
     except Exception as e:
         _check(False, f"scripts 导入失败: {e}")
 
-
-# ============================================================
-# Main
-# ============================================================
-if __name__ == "__main__":
-    test_cache_key_collision()
-    test_ic_pearson_perfect_positive()
-    test_ic_empty()
-    test_layered_empty()
-    test_stack_factors()
-    test_cache_key()
-    test_registry_constraint()
-    test_scripts_import()
-
-    total = _passed + _failed
-    print(f"\n{'='*50}")
-    print(f"  结果: {_passed}/{total} 通过, {_failed} 失败")
-    print(f"{'='*50}")
-    if _failed > 0:
-        sys.exit(1)
+# pytest is the sole runner; a partial hand-maintained __main__ list is forbidden.

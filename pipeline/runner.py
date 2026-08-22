@@ -12,6 +12,7 @@ from core.types import DateIndex, Universe
 from core.config import load_config, FrameworkConfig
 from core.period import PeriodContext
 from core.registry import create, list_registered
+from core.sectors import require_framework_universe
 from data.manager import DataManager
 from factors.engine import FactorEngine
 from factors.processor import (
@@ -60,6 +61,7 @@ class PipelineRunner:
             self.config: FrameworkConfig = load_config(config_path)
         else:
             raise ValueError("必须提供 config_path 或 config 参数")
+        require_framework_universe(self.config.universe)
         self.period_ctx = PeriodContext.from_string(frequency)
         if not self.period_ctx.is_daily:
             raise ValueError(

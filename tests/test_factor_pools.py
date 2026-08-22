@@ -23,7 +23,7 @@ def test_no_superseded_candidate_pool_is_promoted():
 
 
 def test_validated_factor_watchlist_loads_without_becoming_production_factors():
-    config = load_config("config/validated_factors.yaml")
+    config = load_config("config/default.yaml")
     registered = set(list_registered("factor")["factor"])
 
     assert len(config.factors) == 10

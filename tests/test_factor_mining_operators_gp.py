@@ -309,3 +309,17 @@ def test_gp_window_vocabulary_is_positive_and_duplicate_free():
         GPConfig(windows=(0, 5))
     with pytest.raises(ValueError, match="duplicates"):
         GPConfig(windows=(5, 5))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"mutation_probability": -0.1, "reproduction_probability": 0.45},
+        {"terminal_probability": 2.0},
+        {"min_abs_ic": float("nan")},
+        {"correlation_limit": 1.5},
+    ],
+)
+def test_gp_config_rejects_invalid_probability_and_score_bounds(kwargs):
+    with pytest.raises(ValueError):
+        GPConfig(**kwargs)

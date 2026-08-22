@@ -5,6 +5,7 @@ import os
 import pytest
 
 import main
+from core.sectors import FRAMEWORK_UNIVERSE
 from factor_mining.api import CandidateSpec, FeatureConfig, TargetSpec
 from factor_mining.bridge import SNAPSHOT_ENV
 from factor_mining.operators import Expr
@@ -42,7 +43,8 @@ def _snapshot(tmp_path):
     repository = CandidateRepository(tmp_path / "pool.sqlite3")
     repository.add_candidates((candidate,))
     return repository.write_snapshot(
-        tmp_path / "snapshot.json", candidate_ids=(candidate.candidate_id,)
+        tmp_path / "snapshot.json", candidate_ids=(candidate.candidate_id,),
+        framework_universe=FRAMEWORK_UNIVERSE,
     )
 
 

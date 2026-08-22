@@ -12,7 +12,7 @@ from external_strategies.guosen_trend_index.production_compare import (
     F10,
     F13,
     F14,
-    KEPT47,
+    KEPT47_FACTORS,
     NEW21,
     PERIODS_PER_YEAR,
     TRADE_COST_RATE,
@@ -49,7 +49,7 @@ def test_validated_factor_pool_and_named_sets_are_stable():
         "intraday_open_close_volume_ratio_20d",
         "intraday_turnover_velocity_20d",
     }.issubset(F10)
-    assert len(dict.fromkeys(F6 + KEPT47 + NEW21)) == 74
+    assert len(dict.fromkeys(F6 + KEPT47_FACTORS + NEW21)) == 74
 
 
 def test_factor_weights_are_long_only_and_normalized():

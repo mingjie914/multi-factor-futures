@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from core.registry import get
+from core.sectors import FRAMEWORK_UNIVERSE
 from factor_mining.api import (
     CandidateSpec,
     FeatureConfig,
@@ -78,6 +79,38 @@ def _repository_with_candidate(tmp_path):
     return repository, candidate
 
 
+def test_formal_mining_run_rejects_a_separate_universe():
+    candidate = _candidate()
+    with pytest.raises(ValueError, match="FRAMEWORK_UNIVERSE"):
+        MiningRunSpec(
+            run_id="formal_test",
+            mode=RunMode.MINE,
+            seed=1,
+            start="2024-01-01",
+            end="2024-02-01",
+            universe=("A", "B"),
+            target=candidate.target,
+            feature_config=candidate.feature_config,
+        )
+
+
+def test_dev_mining_run_normalizes_string_mode_without_framework_universe():
+    candidate = _candidate()
+    spec = MiningRunSpec(
+        run_id="dev_test",
+        mode="dev",
+        seed=1,
+        start="2024-01-01",
+        end="2024-02-01",
+        universe=("A", "B"),
+        target=candidate.target,
+        feature_config=candidate.feature_config,
+    )
+
+    assert spec.mode is RunMode.DEV
+    assert spec.to_dict()["mode"] == "dev"
+
+
 def test_sqlite_catalog_and_immutable_snapshot_can_coexist(tmp_path):
     repository, candidate = _repository_with_candidate(tmp_path)
     snapshot = repository.write_snapshot(
@@ -87,6 +120,8 @@ def test_sqlite_catalog_and_immutable_snapshot_can_coexist(tmp_path):
     loaded = load_snapshot(snapshot)
 
     assert loaded == (CandidateSpec.from_dict(candidate.to_dict()),)
+    with pytest.raises(ValueError, match="FRAMEWORK_UNIVERSE"):
+        load_snapshot(snapshot, require_framework=True)
     with pytest.raises(FileExistsError):
         repository.write_snapshot(
             snapshot, candidate_ids=(candidate.candidate_id,)
@@ -113,6 +148,7 @@ def test_snapshot_registration_freezes_train_oriented_direction(tmp_path):
     snapshot = repository.write_snapshot(
         tmp_path / "direction_selected.json",
         candidate_ids=(candidate.candidate_id,),
+        framework_universe=FRAMEWORK_UNIVERSE,
     )
 
     register_snapshot(snapshot)
@@ -143,7 +179,8 @@ def test_candidate_status_requires_evidence_and_cannot_move_backwards(tmp_path):
 def test_snapshot_tampering_is_rejected(tmp_path):
     repository, candidate = _repository_with_candidate(tmp_path)
     snapshot = repository.write_snapshot(
-        tmp_path / "selected.json", candidate_ids=(candidate.candidate_id,)
+        tmp_path / "selected.json", candidate_ids=(candidate.candidate_id,),
+        framework_universe=FRAMEWORK_UNIVERSE,
     )
     value = json.loads(snapshot.read_text(encoding="utf-8"))
     value["candidates"][0]["framework_name"] = "tampered"
@@ -156,7 +193,8 @@ def test_snapshot_tampering_is_rejected(tmp_path):
 def test_bridge_registers_normal_factor_and_preserves_point_in_time(tmp_path):
     repository, candidate = _repository_with_candidate(tmp_path)
     snapshot = repository.write_snapshot(
-        tmp_path / "selected.json", candidate_ids=(candidate.candidate_id,)
+        tmp_path / "selected.json", candidate_ids=(candidate.candidate_id,),
+        framework_universe=FRAMEWORK_UNIVERSE,
     )
     names = register_snapshot(snapshot)
     factor = get("factor", candidate.framework_name)()
@@ -227,7 +265,7 @@ def test_bridge_uses_framework_point_in_time_mask_inside_expression():
     assert revised.iloc[:, -2:].isna().all().all()
 
 
-def test_bridge_extends_frozen_group_labels_to_dynamic_universe():
+def test_bridge_rejects_incomplete_frozen_group_labels():
     candidate = _candidate("mined_bridge_group_label_extension_test")
     candidate = CandidateSpec.from_dict({
         **candidate.to_dict(),
@@ -245,13 +283,10 @@ def test_bridge_extends_frozen_group_labels_to_dynamic_universe():
     dates = panels["close"].index
     universe = pd.Index(["RB", "HC", "CU"])
 
-    with pytest.warns(RuntimeWarning, match="CU .*group_labels"):
-        result = compute_symbolic_candidate(
+    with pytest.raises(ValueError, match="group_labels.*CU"):
+        compute_symbolic_candidate(
             candidate, FrameProvider(panels), dates, universe
         )
-
-    assert result.columns.tolist() == ["RB", "HC", "CU"]
-    assert np.isfinite(result.iloc[5:].to_numpy()).any()
 
 
 def test_bridge_preserves_snapshot_group_labels_for_original_universe(monkeypatch):

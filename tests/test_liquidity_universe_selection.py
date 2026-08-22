@@ -176,12 +176,10 @@ def test_night_session_bars_share_the_following_trading_day():
     assert daily.loc[pd.Timestamp("2024-03-04"), "RB"] == 4.0
 
 
-def test_default_config_enables_distinct_research_universe_selection():
+def test_default_config_keeps_optional_universe_selection_disabled():
     config = load_config("config/default.yaml")
 
-    assert config.universe_selection.enabled is True
+    assert config.universe_selection.enabled is False
     assert config.universe_selection.target_count == 32
     assert config.asset_selection.enabled is False
-    assert [step.type for step in config.processing] == [
-        "winsorize", "neutralize", "standardize"
-    ]
+    assert [step.type for step in config.processing] == ["winsorize", "standardize"]

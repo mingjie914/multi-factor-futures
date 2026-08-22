@@ -27,7 +27,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.config import load_config
-from core.sectors import PORTFOLIO_SELECTION_GROUPS, portfolio_selection_group_for
+from core.sectors import (
+    FRAMEWORK_UNIVERSE,
+    PORTFOLIO_SELECTION_GROUPS,
+    portfolio_selection_group_for,
+)
 from data.manager import DataManager
 from factors.engine import FactorEngine
 from factors import library as _factor_library  # noqa: F401
@@ -63,14 +67,8 @@ FACTORS = {
     "intraday_price_delay_20d": -1,
 }
 
-# 品种池 38 (2026-08-03 升级: manual29 + 金融 IM/TF, 农产品 CF/OI/LH/JD, 能化 SC/V/UR)
-UNIVERSE38 = [
-    "A", "AG", "AL", "AU", "CU", "FU", "HC", "I", "IC", "IF", "IH", "J", "JM",
-    "M", "MA", "NI", "P", "RB", "RM", "RU", "SA", "SN", "SR", "T", "TA", "TL",
-    "TS", "Y", "ZN",
-    # 2026-08-03 新增 9 个
-    "IM", "TF", "CF", "OI", "LH", "JD", "SC", "V", "UR",
-]
+# Compatibility alias; the framework contract itself lives in core.sectors.
+UNIVERSE38 = list(FRAMEWORK_UNIVERSE)
 _DEFAULT_TOP_N = 10
 
 # 生产选池使用五个宽组；因子研究仍使用 core.sectors 的细分类。
@@ -86,7 +84,7 @@ SECTOR_MAP = {
 class CombinedStrategy:
     """10f IC_IR打分选池 + 池内ERC风险平价（38品种、cap3、日度）。"""
 
-    def __init__(self, config_path: str = "config/intraday_backtest.yaml",
+    def __init__(self, config_path: str = "config/default.yaml",
                  top_n: int = _DEFAULT_TOP_N):
         self.config_path = config_path
         if int(top_n) <= 0:
@@ -308,7 +306,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="combined 融合策略信号")
     parser.add_argument("--date", default="2026-05-29", help="信号日期")
-    parser.add_argument("--config", default="config/intraday_backtest.yaml")
+    parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--topn", type=int, default=_DEFAULT_TOP_N)
     args = parser.parse_args()
 

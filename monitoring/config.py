@@ -44,6 +44,6 @@ UNIVERSE38: list[str] = list(STRATEGY_UNIVERSE)
 SIGNAL_TOP_N = 10            # 多空组合: 因子值前/后 N 名品种(信号组合收益与归因用)
 
 # ---- 回测配置(信号构建时引用) ----
-BACKTEST_CONFIG = "config/intraday_backtest.yaml"
+BACKTEST_CONFIG = "config/default.yaml"
 DATA_START = "2025-01-01"
 # 信号构建窗口上限: 运行时自动截断到数据源可用最后交易日(见 run_monitoring.cmd_build_signals)

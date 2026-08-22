@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--end", required=True)
     parser.add_argument("--factor-set", action="append", dest="factor_sets")
     parser.add_argument("--snapshot", default=str(HERE / "config.yaml"))
-    parser.add_argument("--framework-config", default="config/intraday_backtest.yaml")
+    parser.add_argument("--framework-config", default="config/default.yaml")
     parser.add_argument("--equal-gross", type=float, default=1.0)
     parser.add_argument("--search-subsets", action="store_true")
     parser.add_argument("--output", required=True)

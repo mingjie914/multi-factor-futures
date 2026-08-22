@@ -1,4 +1,4 @@
-# Research/backtest defaults. This file intentionally contains no approved factors.
+# Single framework contract for research, screening, backtests and the main strategy.
 market: futures
 seed: 42
 
@@ -43,72 +43,84 @@ data:
     required_release_id: '${MF_DATA_RELEASE_ID:}'
     result_backend: pandas
 
-# Reproducible baseline window, not an automatic latest-data sentinel.
-# 2017 is warm-up; formal historical studies evaluate from 2018.
+# Current frozen full-history boundary. Commands may narrow dates explicitly;
+# they do not replace the framework contract.
 date_range:
   start: '2017-01-01'
-  end: '2026-07-24'
+  end: '2026-08-20'
 
 universe:
-  - RB
+  - A
+  - AG
+  - AL
+  - AU
+  - CU
+  - FU
   - HC
   - I
+  - IC
+  - IF
+  - IH
   - J
   - JM
-  - FG
-  - SM
-  - SF
-  - CU
-  - AL
-  - SN
-  - NI
-  - ZN
-  - AU
-  - AG
-  - SC
-  - SA
-  - FU
-  - V
-  - TA
-  - RU
-  - MA
-  - EG
-  - EB
-  - PK
-  - A
   - M
-  - Y
+  - MA
+  - NI
   - P
-  - C
-  - CF
-  - SR
-  - OI
+  - RB
   - RM
-  - JD
-  - AP
-  - LH
-  - EC
-  - IF
-  - IC
-  - IM
-  - IH
+  - RU
+  - SA
+  - SN
+  - SR
   - T
+  - TA
   - TL
+  - TS
+  - Y
+  - ZN
+  - IM
+  - TF
+  - CF
+  - OI
+  - LH
+  - JD
+  - SC
+  - V
   - UR
-  - LC
-  - PS
 
-# Empty by design: only an audited study may propose factors.
-factors: []
+# Fixed 10-factor observation baseline. It is not deployment approval.
+factors:
+  - intraday_price_peak_count_20d
+  - intraday_realised_skewness_20d
+  - intraday_drip_stone_20d
+  - intraday_peak_ridge_ratio_20d
+  - intraday_torrent_down_20d
+  - intraday_lowest_time_20d
+  - intraday_term_slope_20d
+  - intraday_open_close_volume_ratio_20d
+  - intraday_turnover_velocity_20d
+  - intraday_price_delay_20d
+
+# Audited watchlist only. These names never enter factors automatically.
+validated_candidates:
+  - intraday_basis_momentum_20d
+  - intraday_price_peak_count_20d
+  - intraday_torrent_up_20d
+  - intraday_support_test_20d
+  - intraday_upper_wick_ratio_20d
+  - intraday_path_bandwidth_20d
+  - intraday_term_spread_vol_20d
+  - intraday_overconfidence_intensity_20d
+  - intraday_wick_symmetry_20d
+  - intraday_volume_vol_20d
+  - intraday_sector_sync_20d
+  - intraday_residual_skew_20d
+  - intraday_tail_ratio_20d
 
 processing:
   - type: winsorize
     params: {method: mad, n_sigma: 3}
-  - type: neutralize
-    params:
-      by: [industry]
-      min_group_size: 2
-      missing_policy: error
   - type: standardize
     params: {method: zscore, by_date: true}
 
@@ -177,11 +189,10 @@ costs:
   periods_per_year: 252
   cost_stage: post_screen_backtest
 
-# Research universe: monthly point-in-time selection from lagged 60-day
-# liquidity. Sector floors protect small but economically distinct sleeves;
-# caps prevent the large agriculture/energy groups from dominating the IC.
+# The main framework uses the complete ordered universe above. The selector is
+# retained as an explicit research capability but is not a second default pool.
 universe_selection:
-  enabled: true
+  enabled: false
   mode: lagged_liquidity_sector_balanced
   lookback: 60
   rebalance_freq: monthly

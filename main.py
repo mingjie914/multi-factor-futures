@@ -110,7 +110,7 @@ def _configure_mined_snapshot(argv: list[str]) -> tuple[list[str], int]:
     from factor_mining.bridge import SNAPSHOT_ENV
     from factor_mining.repository import load_snapshot
 
-    candidates = load_snapshot(path)
+    candidates = load_snapshot(path, require_framework=True)
     os.environ[SNAPSHOT_ENV] = str(path)
     return cleaned, len(candidates)
 
