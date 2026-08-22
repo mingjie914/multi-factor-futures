@@ -1616,6 +1616,34 @@ class ParquetFuturesSource(DataSource):
         roots = sorted(frame.loc[frame["is_concrete"], "root"].unique())
         return pd.Index(roots)
 
+    def fetch_listing_dates(self, tickers) -> pd.Series:
+        """Return each root's first published concrete-contract trade date."""
+        roots = self._normalise_tickers(tickers)
+        if not roots:
+            return pd.Series(dtype="datetime64[ns]")
+        files = sorted(self._dataset_path("daily").glob("year_month=*/*.parquet"))
+        if not files:
+            return pd.Series(index=roots, dtype="datetime64[ns]")
+        missing = [
+            str(path) for path in files
+            if not {"symbol", "trade_date"}.issubset(self._available_columns(path))
+        ]
+        if missing:
+            raise RuntimeError(
+                "daily parquet shards lack listing-date columns: "
+                + ", ".join(missing[:5])
+            )
+        frame = self._annotate_symbols(pd.concat([
+            pd.read_parquet(path, columns=["symbol", "trade_date"])
+            .groupby("symbol", as_index=False)["trade_date"].min()
+            for path in files
+        ], ignore_index=True))
+        listing = (
+            frame.loc[frame["is_concrete"] & frame["root"].isin(roots)]
+            .groupby("root")["trade_date"].min()
+        )
+        return pd.to_datetime(listing.reindex(roots)).astype("datetime64[ns]")
+
     def fetch_latest_trade_date(self) -> pd.Timestamp:
         """Return the newest published daily trade date from physical shards."""
         dataset = self._dataset_path("daily")

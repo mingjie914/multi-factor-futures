@@ -91,3 +91,60 @@ def rolling_split_sum_difference(
                 np.sum(observed_returns[high]) - np.sum(observed_returns[~high])
             )
     return result
+
+
+def rolling_linear_slope(
+    values, window: int = 20, min_periods: int = 8
+) -> np.ndarray:
+    """OLS slope for fixed-width rolling columns without Python callbacks."""
+
+    array = np.asarray(values, dtype=float)
+    if array.ndim != 2:
+        raise ValueError("values must be a two-dimensional array")
+    window, min_periods = int(window), int(min_periods)
+    if window < 2 or min_periods < 2 or min_periods > window:
+        raise ValueError("require 2 <= min_periods <= window")
+
+    rows = array.shape[0]
+    result = np.full(array.shape, np.nan, dtype=float)
+    for end in range(min_periods - 1, rows):
+        start = max(0, end - window + 1)
+        segment = array[start:end + 1]
+        complete = np.isfinite(segment).all(axis=0)
+        x = np.arange(len(segment), dtype=float)
+        x -= x.mean()
+        observed = segment[:, complete]
+        observed = observed - observed.mean(axis=0)
+        result[end, complete] = x @ observed / np.dot(x, x)
+    return result
+
+
+def variance_ratio(values, q: int) -> float:
+    """Match the established autocorrelation-form variance-ratio statistic."""
+
+    array = np.asarray(values, dtype=float)
+    horizon = int(q)
+    if array.ndim != 1 or horizon < 2:
+        raise ValueError("variance ratio requires a one-dimensional array and horizon >= 2")
+    if len(array) < 5 * horizon:
+        return 0.0
+    mean = array.mean()
+    variance = np.sum((array[1:] - mean) ** 2) / (len(array) - 1)
+    if variance < 1e-12:
+        return 0.0
+    result = 1.0
+    for lag in range(1, horizon):
+        current, previous = array[lag:], array[:-lag]
+        current = current - current.mean()
+        previous = previous - previous.mean()
+        current_ss = np.dot(current, current)
+        previous_ss = np.dot(previous, previous)
+        if (
+            np.sqrt(current_ss / len(current)) > 1e-12
+            and np.sqrt(previous_ss / len(previous)) > 1e-12
+        ):
+            correlation = np.dot(current, previous) / np.sqrt(
+                current_ss * previous_ss
+            )
+            result += 2.0 * (1.0 - lag / horizon) * correlation
+    return float(result - 1.0)

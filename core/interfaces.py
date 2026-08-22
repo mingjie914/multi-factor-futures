@@ -260,7 +260,7 @@ class DataSource(abc.ABC):
             return self.fetch_price(tickers, start, end, fields)
         raise NotImplementedError(
             f"{self.__class__.__name__} 不支持 frequency={frequency!r}, "
-            f"仅支持 daily. 请使用支持该周期的 Parquet 数据源."
+            f"仅支持 daily. 请使用支持该周期的已配置数据源."
         )
 
     def fetch_contract_schedule(

@@ -1,6 +1,6 @@
 """日内分钟级因子 SPEC 定义 (15分钟频率).
 
-本模块定义 frequency="15min" 的 SPEC 因子, 使用本地分钟 Parquet 计算.
+本模块定义 frequency="15min" 的 SPEC 因子, 使用主框架已配置本地分钟数据源计算.
 与日度 SPEC (factors/specs/*.py) 的区别:
 - frequency 字段为 "15min"
 - slug 后缀用 "p" (period) 而非 "d" (day), 避免与日度因子混淆

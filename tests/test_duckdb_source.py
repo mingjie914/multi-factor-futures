@@ -131,6 +131,10 @@ def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(
             assert left.keys() == right.keys()
             for field in left:
                 pd.testing.assert_frame_equal(left[field], right[field])
+        pd.testing.assert_series_equal(
+            parquet.fetch_listing_dates(["A"]),
+            database_source.fetch_listing_dates(["A"]),
+        )
         pd.testing.assert_frame_equal(
             parquet.fetch_contract_pair_prices(["A"], "2024-01-02", "2024-01-04")["near"],
             database_source.fetch_contract_pair_prices(

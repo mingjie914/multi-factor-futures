@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 import main
 from core.sectors import FRAMEWORK_UNIVERSE
 from factor_mining.api import CandidateSpec, FeatureConfig, TargetSpec
 from factor_mining.bridge import SNAPSHOT_ENV
+from factor_mining.cli import _load_market_panels
 from factor_mining.operators import Expr
 from factor_mining.repository import CandidateRepository
 
@@ -50,6 +53,39 @@ def _snapshot(tmp_path):
 
 def test_main_exposes_factor_mining_as_first_class_command():
     assert main.WORKFLOW_COMMANDS["mining"][0] == "factor_mining.cli"
+
+
+def test_formal_mining_uses_the_unified_framework_data_source(monkeypatch):
+    index = pd.date_range("2025-01-02 09:00", periods=3, freq="min")
+    source = SimpleNamespace(closed=False)
+    source.fetch_price_at_frequency = lambda *args, **kwargs: {
+        "close": pd.DataFrame(100.0, index=index, columns=FRAMEWORK_UNIVERSE)
+    }
+    source.close = lambda: setattr(source, "closed", True)
+    config = SimpleNamespace(universe=FRAMEWORK_UNIVERSE)
+    monkeypatch.setattr("core.config.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "data.manager.DataManager.from_config",
+        lambda framework_config: SimpleNamespace(source=source),
+    )
+
+    panels = _load_market_panels(
+        SimpleNamespace(data_root=None, config="config/default.yaml"),
+        FRAMEWORK_UNIVERSE,
+        index[0],
+        index[-1],
+        FeatureConfig(raw_fields=("close",)),
+    )
+
+    assert panels["close"].shape == (3, len(FRAMEWORK_UNIVERSE))
+    assert source.closed
+
+    with pytest.raises(ValueError, match="FRAMEWORK_UNIVERSE"):
+        _load_market_panels(
+            SimpleNamespace(data_root="unused", config="config/default.yaml"),
+            FRAMEWORK_UNIVERSE[:-1], index[0], index[-1],
+            FeatureConfig(raw_fields=("close",)),
+        )
 
 
 def test_main_validates_and_strips_mined_snapshot_before_workflow_import(

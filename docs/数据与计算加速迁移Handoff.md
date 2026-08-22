@@ -42,8 +42,8 @@
 - 表：4 张行情、6 张席位、2 张元数据。
 - 当前主框架已支持 `parquet_futures` 与 `duckdb_futures`；仓库默认仍为 Parquet，
   通过环境配置切换 DuckDB。
-- `factor_mining` 的独立 `LocalParquetData` 目前仍直读 Parquet，不能把主框架支持
-  DuckDB 误写成挖掘插件已经完成迁移。
+- 正式`factor_mining mine/screen`默认复用`config/default.yaml`与DataManager；显式
+  `--data-root`仅保留为Parquet审计/回退入口，不维护第二份框架配置。
 
 ### 2.2 计算层
 
@@ -157,8 +157,8 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 3. 第一处与第二处共同需要 Polars helper 时，才允许新增一个 `data/frame_ops.py`；
    在此之前保持逻辑位于现有数据源文件。
 4. DataProvider 边界仍返回 `DataFrame(dates × roots)`，因子代码不感知 Polars。
-5. `factor_mining` 只有在主框架 P2 稳定后，才评估把 `LocalParquetData` 改为共用
-   DataManager/DuckDB；不能在同一提交同时迁移两条读取链。
+5. 主框架P2稳定后，`factor_mining`正式入口已复用DataManager；独立`LocalParquetData`
+   仅保留为显式Parquet审计/回退API，不再是正式CLI默认路径。
 
 ### C0：重新剖析因子计算
 
@@ -206,10 +206,10 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 
 候选优先级：
 
-1. `ts_percentile_last`；
-2. `ts_linear_slope`；
-3. profile确认的逐窗口Python循环；
-4. GP rolling backend中语义已冻结的纯数组算子。
+1. 新profile确认且现有NumPy/Bottleneck仍不能满足门槛的逐窗口Python循环；
+2. GP rolling backend中实际存在、语义已冻结并占端到端时间的纯数组算子；
+3. 只有多个正式因子共同复用时才考虑通用percentile/slope native核，不能为不存在的
+   算子名称预建工程。
 
 暂不迁移 shift、diff、pct_change、EMA/Wilder、截面/group rank、复杂期限结构、选约、
 复权、夜盘、回测、风险和组合逻辑。mean/std/sum 已有向量化或Bottleneck时，必须先证明
@@ -305,7 +305,15 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 - C1完成：全池排名最前且公式重复的两个OHLC分段波动率因子复用一个NumPy向量化helper，
   真实输出SHA-256及6,042个有限值完全一致；代表性热缓存墙钟分别由约29.02秒降至
   14.14秒、25.36秒降至13.26秒。该结果只证明两个热点约减半，不外推为全框架倍数。
-- R1/R2当前延后而非永久排除：本轮低风险热点先用已有NumPy能力获得明确收益，因此不安装
+- C2完成：成交额持续性、季节性、滚动斜率、方差比、K线路径和VPIN均通过真实完整因子
+  A/B；第二次38品种、164交易日、588因子画像为588/588无错误，纯因子墙钟由约1517秒
+  降至约1111秒（`-26.8%`）。成交量稳定性两因子随后复用现有分钟面板内的同一日度矩阵，
+  未新增缓存文件或全局缓存层。
+- 适配性研究现在按唯一处理链记录`raw|neutralized`，冻结发现文件缺少合法variant会失败
+  关闭；正式mining/screen也已收口到统一配置和DataManager。
+- Parquet与DuckDB现在都从日线具体合约的首个已发布交易日提供品种上市/可用日期；真实
+  U38为38/38无缺失，正式研究与周度回测入口均已完成真实烟测。最终全量回归为689项通过。
+- R1/R2本轮No-Go而非永久排除：低风险热点用已有NumPy能力已获得明确端到端收益，因此不安装
   Rust工具链。后续每次真实全池profile都重新开放Rust候选；只有边界清晰的纯ndarray
   算子通过reference、shadow、端到端和RSS门禁后，才逐算子进入native白名单。
 
@@ -317,4 +325,6 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 契约；只有经完整38品种screen写出的绑定快照可挂载到主框架，普通池快照或旧未绑定快照
 继续可作审计读取，但不能注册为正式因子。
 夜间发布新DuckDB release后，必须先通过发布验证，再更新该ID并重启；回退只需切回
-`parquet_futures`。最终目标仍是真实research端到端收益，不以使用某项技术作为完成标准。
+`parquet_futures`。D1b不阻塞当前研究；现有认证release、统一配置、DuckDB/Polars读取和
+计算热点均已通过门禁，可直接开始正式research、screen、selection与backtest。最终目标
+仍是真实research端到端收益，不以使用某项技术作为完成标准。

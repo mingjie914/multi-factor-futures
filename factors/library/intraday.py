@@ -1,6 +1,6 @@
 """日内因子 (分钟数据聚合为日度值).
 
-依赖本地分钟 Parquet，由框架按精确合约根和因果主力日程聚合为日度字段:
+依赖主框架已配置的本地分钟数据源，由框架按精确合约根和因果主力日程聚合为日度字段:
 - vwap: 成交量加权均价
 - intraday_return: 日内收益 (close-open)/open
 - overnight_gap: 隔夜跳空 (open-prev_close)/prev_close
@@ -43,7 +43,9 @@ from core.sectors import SECTOR_MAP as _SECTOR_MAP
 from factors.numerics import (
     count_isolated_peaks,
     histogram_window_l1_stability,
+    rolling_linear_slope,
     rolling_split_sum_difference,
+    variance_ratio,
 )
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -83,6 +85,16 @@ def _roll_sum(df: pd.DataFrame, window: int = 20, min_periods: int = 3) -> pd.Da
     return pd.DataFrame(
         _bn.move_sum(df.values, window=window, min_count=min_periods, axis=0),
         index=df.index, columns=df.columns,
+    )
+
+
+def _roll_slope(
+    df: pd.DataFrame, window: int = 20, min_periods: int = 8
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        rolling_linear_slope(df.to_numpy(dtype=float), window, min_periods),
+        index=df.index,
+        columns=df.columns,
     )
 
 
@@ -418,12 +430,12 @@ def _get_minute_panel(data, dates, universe, freq="1min", force_1min=False):
     """获取分钟级 OHLCV 面板.
 
     优先级: 已配置的频率数据源 > 自定义 Provider.
-    带模块级缓存: 同一 (日期区间, 品种池, 频率) 组合只读一次 Parquet,
+    带模块级缓存: 同一 (日期区间, 品种池, 频率) 组合只读一次已配置数据源,
     多个因子共享面板, 避免 N 因子重复读取 N 次.
 
     频率严格按因子请求传递，不允许用全局开关静默替换。force_1min
     仅保留为旧因子调用兼容入口，并明确强制真实 1min 数据。
-    - 30min 由正式 Parquet 数据源从 15min bar 显式重采样，不存在目录冒充.
+    - 30min 由正式数据源从 15min bar 显式重采样，不存在目录冒充.
     """
     dates = pd.DatetimeIndex(dates)
     if force_1min:
@@ -513,7 +525,7 @@ def _daily_intraday_features(data, dates, universe):
 def _load_minute_panel(data, dates, universe, freq, source, cache_key):
     """Load and cache one normalized minute panel while the caller holds the lock."""
 
-    # 1) 已配置数据源。ParquetFuturesSource 在这里完成精确根解析、滞后选约和复权；
+    # 1) 已配置数据源在这里完成精确根解析、滞后选约和复权；
     # 标准日内因子不得再把同根全部合约聚合成一个伪合约。
     if source is not None and hasattr(source, "fetch_price_at_frequency"):
         try:
@@ -636,7 +648,7 @@ def _term_base_panel(curve, mapper):
 
 
 def _read_local_term(data, dates, universe, freq="1min"):
-    """从正式 Parquet 数据源读取近月/次近月合约面板 (期限结构).
+    """从正式配置数据源读取近月/次近月合约面板 (期限结构).
 
     对每个 (datetime, root):
       - 排除合成合约 (8888/9998/9999, 其持仓/价格语义与真实合约不同);
@@ -3688,23 +3700,29 @@ class IntradaySeasonalityResidual20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         volume = panel["volume"]
         day = volume.index.normalize()
-        sorted_days = sorted(set(day))
+        daily_volume = {
+            dt: group for dt, group in volume.groupby(day, sort=True)
+        }
+        sorted_days = list(daily_volume)
         residuals: dict = {}
         lookback_days = 10
         for idx, dt in enumerate(sorted_days):
-            grp = volume.loc[day == dt]
+            grp = daily_volume[dt]
             n_bars = len(grp)
             if n_bars < 20 or idx < lookback_days:
                 continue
-            recent_days = sorted_days[idx - lookback_days:idx]
+            recent_groups = [
+                daily_volume[recent]
+                for recent in sorted_days[idx - lookback_days:idx]
+            ]
             vals = {}
             for col in grp.columns:
                 v_today = grp[col].dropna()
                 if len(v_today) < 20:
                     continue
                 profiles = []
-                for rd in recent_days:
-                    rg = volume.loc[day == rd, col].dropna()
+                for recent in recent_groups:
+                    rg = recent[col].dropna()
                     if len(rg) >= 20:
                         profiles.append(rg.values)
                 if len(profiles) < 3:
@@ -4151,23 +4169,7 @@ class IntradayVarianceRatio5m20d(Factor):
     def dependencies(self) -> list:
         return []
 
-    @staticmethod
-    def _vr(series, q):
-        n = len(series)
-        if n < 5 * q:
-            return 0.0
-        mu = series.mean()
-        var1 = np.sum((series[1:] - mu) ** 2) / (n - 1)
-        if var1 < 1e-12:
-            return 0.0
-        # autocorrelation form
-        vr = 1.0
-        for k in range(1, q):
-            r_t = series[k:]
-            r_tm = series[:-k]
-            rho_k = float(np.corrcoef(r_t, r_tm)[0, 1]) if r_t.std() > 1e-12 and r_tm.std() > 1e-12 else 0.0
-            vr += 2.0 * (1.0 - k / q) * rho_k
-        return float(vr - 1.0)
+    _vr = staticmethod(variance_ratio)
 
     def compute(self, data, dates, universe):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
@@ -4216,22 +4218,7 @@ class IntradayVarianceRatio30m20d(Factor):
     def dependencies(self) -> list:
         return []
 
-    @staticmethod
-    def _vr(series, q):
-        n = len(series)
-        if n < 5 * q:
-            return 0.0
-        mu = series.mean()
-        var1 = np.sum((series[1:] - mu) ** 2) / (n - 1)
-        if var1 < 1e-12:
-            return 0.0
-        vr = 1.0
-        for k in range(1, q):
-            r_t = series[k:]
-            r_tm = series[:-k]
-            rho_k = float(np.corrcoef(r_t, r_tm)[0, 1]) if r_t.std() > 1e-12 and r_tm.std() > 1e-12 else 0.0
-            vr += 2.0 * (1.0 - k / q) * rho_k
-        return float(vr - 1.0)
+    _vr = staticmethod(variance_ratio)
 
     def compute(self, data, dates, universe):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
@@ -4360,21 +4347,23 @@ class IntradayVPIN20d(Factor):
                 n_b = len(c_c) // bucket
                 if n_b < 3:
                     continue
-                ois = []
-                for b in range(n_b):
-                    seg_c = c_c[b * bucket:(b + 1) * bucket]
-                    seg_v = v_c[b * bucket:(b + 1) * bucket]
-                    d_price = seg_c[-1] - seg_c[0]
-                    sigma = seg_c.std(ddof=0)
-                    if sigma < 1e-12:
-                        buy_frac = 0.5 if d_price >= 0 else 0.5
-                    else:
-                        buy_frac = float(_norm.cdf(d_price / sigma))
-                    buy = seg_v.sum() * buy_frac
-                    sell = seg_v.sum() * (1.0 - buy_frac)
-                    total = buy + sell
-                    ois.append(abs(buy - sell) / total if total > 1e-12 else 0.0)
-                vals[col] = float(np.mean(ois))
+                prices = c_c[:n_b * bucket].reshape(n_b, bucket)
+                volumes = v_c[:n_b * bucket].reshape(n_b, bucket)
+                price_change = prices[:, -1] - prices[:, 0]
+                sigma = prices.std(axis=1, ddof=0)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    buy_fraction = np.where(
+                        sigma < 1e-12, 0.5, _norm.cdf(price_change / sigma)
+                    )
+                bucket_volume = volumes.sum(axis=1)
+                buy = bucket_volume * buy_fraction
+                sell = bucket_volume * (1.0 - buy_fraction)
+                total = buy + sell
+                imbalance = np.divide(
+                    np.abs(buy - sell), total,
+                    out=np.zeros_like(total), where=total > 1e-12,
+                )
+                vals[col] = float(imbalance.mean())
             if vals:
                 vpins[dt] = pd.Series(vals)
         if not vpins:
@@ -25024,9 +25013,7 @@ class IntradayCsadTrend20d(Factor):
         idx = pd.DatetimeIndex(dates)
         ret = close.pct_change(fill_method=None).reindex(index=idx)
         csad = _csad_sector(ret, universe)
-        trend = csad.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(csad, 20, 8)
         return (-trend).reindex(index=idx, columns=universe).shift(1)
 
 
@@ -26537,25 +26524,19 @@ class IntradayKlineShortestPathIlliq20d(Factor):
         day = close.index.normalize()
         illiqs: dict = {}
         for dt in sorted(set(day)):
-            vals = {}
-            for col in close.columns:
-                h = high.loc[day == dt, col].dropna()
-                l = low.loc[day == dt, col].dropna()
-                o = open_px.loc[day == dt, col].dropna()
-                c = close.loc[day == dt, col].dropna()
-                a = amount.loc[day == dt, col].dropna()
-                common = h.index.intersection(l.index).intersection(o.index).intersection(c.index).intersection(a.index)
-                if len(common) < 20:
-                    continue
-                path = 2.0 * (h.loc[common] - l.loc[common]) - (c.loc[common] - o.loc[common]).abs()
-                amt = a.loc[common]
-                illiq = (path / amt.replace(0, np.nan)).dropna()
-                illiq = illiq[illiq >= 0]
-                if len(illiq) < 10:
-                    continue
-                vals[col] = float(illiq.mean())
-            if vals:
-                illiqs[dt] = pd.Series(vals)
+            current = day == dt
+            h, l, o, c, a = (
+                field.loc[current]
+                for field in (high, low, open_px, close, amount)
+            )
+            common = h.notna() & l.notna() & o.notna() & c.notna() & a.notna()
+            path = 2.0 * (h - l) - (c - o).abs()
+            illiq = (path / a.replace(0, np.nan)).where(common)
+            illiq = illiq.where(illiq.ge(0))
+            eligible = common.sum().ge(20) & illiq.count().ge(10)
+            daily_values = illiq.mean()[eligible]
+            if not daily_values.empty:
+                illiqs[dt] = daily_values
         if not illiqs:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(illiqs).T
@@ -28543,6 +28524,33 @@ class IntradayOverconfidenceIntensity20d(Factor):
 # 507. intraday_vol_dist_stability — 成交量分布稳定性
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _daily_volume_distribution_stability(panel) -> pd.DataFrame:
+    cache_key = "_daily_volume_distribution_stability"
+    cached = panel.get(cache_key)
+    if cached is not None:
+        return cached
+    volume = panel["volume"]
+    day = volume.index.normalize()
+    stabilities: dict = {}
+    for dt in sorted(set(day)):
+        grp = volume.loc[day == dt]
+        if len(grp) < 30:
+            continue
+        vals = {}
+        for col in grp.columns:
+            values = grp[col].dropna()
+            if len(values) < 30 or values.std(ddof=0) < 1e-12:
+                vals[col] = 0.0
+                continue
+            normalized = (values - values.mean()) / values.std(ddof=0)
+            vals[col] = histogram_window_l1_stability(normalized.values)
+        if vals:
+            stabilities[dt] = pd.Series(vals)
+    daily = pd.DataFrame(stabilities).T
+    daily.index = pd.DatetimeIndex(daily.index)
+    panel[cache_key] = daily
+    return daily
+
 @register_factor("intraday_vol_dist_stability_20d", category="intraday_advanced")
 class IntradayVolDistStability20d(Factor):
     """成交量分布稳定性因子.
@@ -28566,27 +28574,9 @@ class IntradayVolDistStability20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        volume = panel["volume"]
-        day = volume.index.normalize()
-        stabilities: dict = {}
-        for dt in sorted(set(day)):
-            grp = volume.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                v = grp[col].dropna()
-                if len(v) < 30 or v.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                v_norm = (v - v.mean()) / v.std(ddof=0)
-                vals[col] = histogram_window_l1_stability(v_norm.values)
-            if vals:
-                stabilities[dt] = pd.Series(vals)
-        if not stabilities:
+        daily = _daily_volume_distribution_stability(panel)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(stabilities).T
-        daily.index = pd.DatetimeIndex(daily.index)
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -29523,6 +29513,45 @@ class IntradayDiffAutocorrLong20d(Factor):
 # 523. intraday_lead_amount_persistence — 领先成交额持续性 (原创改进)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _post_extreme_amount_persistence(close, amount) -> np.ndarray:
+    """Mean next-five-bar amount after extreme returns, divided by day mean."""
+
+    close_array = np.asarray(close, dtype=float)
+    amount_array = np.asarray(amount, dtype=float)
+    if close_array.ndim != 2 or close_array.shape != amount_array.shape:
+        raise ValueError("close and amount must be same-shaped two-dimensional arrays")
+    result = np.full(close_array.shape[1], np.nan, dtype=float)
+    for column in range(close_array.shape[1]):
+        observed = ~(
+            np.isnan(close_array[:, column])
+            | np.isnan(amount_array[:, column])
+        )
+        prices = close_array[observed, column]
+        amounts = amount_array[observed, column]
+        if len(prices) < 30:
+            continue
+        mean_amount = amounts.mean()
+        if mean_amount < 1e-12:
+            continue
+        returns = np.empty(len(prices), dtype=float)
+        returns[0] = np.nan
+        returns[1:] = prices[1:] / prices[:-1] - 1.0
+        valid_returns = returns[~np.isnan(returns)]
+        low, high = np.percentile(valid_returns, (10, 90))
+        extreme = (returns > high) | (returns < low)
+        if np.count_nonzero(extreme) < 3:
+            result[column] = 0.0
+            continue
+        starts = np.flatnonzero(extreme[:-5]) + 1
+        if starts.size == 0:
+            result[column] = 0.0
+            continue
+        future_means = np.lib.stride_tricks.sliding_window_view(
+            amounts, 5
+        ).mean(axis=1)
+        result[column] = float(future_means[starts].mean() / mean_amount)
+    return result
+
 @register_factor("intraday_lead_amount_persistence_20d", category="intraday_advanced")
 class IntradayLeadAmountPersistence20d(Factor):
     """领先成交额持续性因子 (原创: #511 改进).
@@ -29554,35 +29583,10 @@ class IntradayLeadAmountPersistence20d(Factor):
             grp_a = amount.loc[day == dt]
             if len(grp_c) < 30:
                 continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                a = grp_a[col].dropna()
-                common = c.index.intersection(a.index)
-                if len(common) < 30:
-                    continue
-                c_c = c.loc[common]
-                a_c = a.loc[common]
-                r = c_c.pct_change(fill_method=None)
-                if len(r) < 25 or a_c.mean() < 1e-12:
-                    continue
-                thr_high = np.percentile(r.dropna(), 90)
-                thr_low = np.percentile(r.dropna(), 10)
-                extreme = (r > thr_high) | (r < thr_low)
-                if extreme.sum() < 3:
-                    vals[col] = 0.0
-                    continue
-                # 波动后5分钟量能
-                persist_vals = []
-                for i, e in enumerate(extreme.values):
-                    if e and i + 5 < len(a_c):
-                        persist_vals.append(float(a_c.iloc[i + 1:i + 6].mean()))
-                if not persist_vals:
-                    vals[col] = 0.0
-                    continue
-                vals[col] = float(np.mean(persist_vals) / a_c.mean())
-            if vals:
-                persists[dt] = pd.Series(vals)
+            values = _post_extreme_amount_persistence(grp_c, grp_a)
+            daily_values = pd.Series(values, index=grp_c.columns).dropna()
+            if not daily_values.empty:
+                persists[dt] = daily_values
         if not persists:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(persists).T
@@ -29649,9 +29653,7 @@ class IntradayVwapDivergenceTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(divergences).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29718,9 +29720,7 @@ class IntradayIlliqTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(lambdas).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29778,9 +29778,7 @@ class IntradayVolSkewBalance20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29900,9 +29898,7 @@ class IntradayReversalConsistency20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(ratios).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29961,9 +29957,7 @@ class IntradayTailCrowding20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(centroids).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29993,30 +29987,10 @@ class IntradayVolStabilityTrend20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        volume = panel["volume"]
-        day = volume.index.normalize()
-        stabilities: dict = {}
-        for dt in sorted(set(day)):
-            grp = volume.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                v = grp[col].dropna()
-                if len(v) < 30 or v.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                v_norm = (v - v.mean()) / v.std(ddof=0)
-                vals[col] = histogram_window_l1_stability(v_norm.values)
-            if vals:
-                stabilities[dt] = pd.Series(vals)
-        if not stabilities:
+        daily = _daily_volume_distribution_stability(panel)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(stabilities).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -30349,9 +30323,7 @@ class IntradayAmtRatioEntropyTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         daily = pd.DataFrame(entropies).T
         daily.index = pd.DatetimeIndex(daily.index)
-        trend = daily.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(daily, 20, 8)
         return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -30509,9 +30481,7 @@ class IntradaySectorBreadthTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
-        trend = breadth.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(breadth, 20, 8)
         return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -30872,9 +30842,7 @@ class IntradayVolRetCovTrend20d(Factor):
                 if len(common) < 3:
                     continue
                 cov.loc[t, cols] = np.cov(a.loc[common].values, r.loc[common].values)[0, 1]
-        trend = cov.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(cov, 20, 8)
         return trend.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -30948,9 +30916,7 @@ class IntradaySectorVolDivTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         amount = p["amount"]
         div = _sector_wide(amount, lambda x: float(x.std(ddof=0) / x.mean()) if x.mean() > 1e-12 else np.nan)
-        trend = div.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(div, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -31200,9 +31166,7 @@ class IntradaySectorAdlSlope20d(Factor):
         ret = p["close"].pct_change(fill_method=None)
         breadth = _sector_wide(ret, lambda x: float((x > 0).sum() - (x < 0).sum()))
         adl = breadth.rolling(20, min_periods=5).sum()
-        slope = adl.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        slope = _roll_slope(adl, 20, 8)
         return slope.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -31610,9 +31574,7 @@ class IntradayRelTurnoverTrend20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         turnover = p["volume"] / p["position"].where(p["position"].abs() > 1e-12)
         rel = turnover / turnover.rolling(20, min_periods=5).mean().where(turnover.rolling(20, min_periods=5).mean() > 1e-12)
-        trend = rel.rolling(20, min_periods=8).apply(
-            lambda x: float(np.polyfit(np.arange(len(x)), x.values, 1)[0]) if len(x) >= 8 else np.nan,
-            raw=False)
+        trend = _roll_slope(rel, 20, 8)
         return (-trend).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 

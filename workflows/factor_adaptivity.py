@@ -1059,9 +1059,17 @@ def load_discovery_contract(
     if missing:
         raise ValueError(f"discovery contract missing final-factor metadata: {missing}")
     variants = {
-        name: str(rows[name].get("best_variant", "neutralized"))
+        name: str(rows[name].get("best_variant", "")).strip()
         for name in names
     }
+    invalid_variants = {
+        name: value for name, value in variants.items()
+        if value not in {"raw", "neutralized"}
+    }
+    if invalid_variants:
+        raise ValueError(
+            f"discovery contract has invalid preprocessing variants: {invalid_variants}"
+        )
     metadata = {
         name: {
             "observation_channel": bool(
@@ -1154,6 +1162,18 @@ def run_adaptivity_analysis(
         else PipelineRunner(config_path)
     )
     config = runner.config
+    processing_types = [str(step.type) for step in config.processing]
+    has_neutralize = "neutralize" in processing_types
+    default_variant = "neutralized" if has_neutralize else "raw"
+    if (
+        preprocessing_variants
+        and "neutralized" in preprocessing_variants.values()
+        and not has_neutralize
+    ):
+        raise ValueError(
+            "frozen discovery requires neutralized preprocessing, "
+            "but the active framework processing has no neutralize step"
+        )
     policy = config.validation_policy
     from research.validation import validate_policy, validation_policy_sha256
 
@@ -1312,7 +1332,7 @@ def run_adaptivity_analysis(
                 frequency=period_ctx.unit.value,
             )
             factor_result["preprocessing_variant"] = (
-                (preprocessing_variants or {}).get(name, "neutralized")
+                (preprocessing_variants or {}).get(name, default_variant)
             )
             factor_result["candidate_metadata"] = dict(
                 (candidate_metadata or {}).get(name, {})
@@ -1404,13 +1424,16 @@ def run_adaptivity_analysis(
             ),
             "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
             "factor_preprocessing": [
-                "mad_winsorize_by_date",
-                "candidate_selected_sector_neutralization",
-                "zscore_standardize_by_date",
+                {
+                    "winsorize": "mad_winsorize_by_date",
+                    "neutralize": "candidate_selected_sector_neutralization",
+                    "standardize": "zscore_standardize_by_date",
+                }.get(step, step)
+                for step in processing_types
             ],
             "preprocessing_variant_source": (
                 "frozen_discovery_contract"
-                if preprocessing_variants else "neutralized_default"
+                if preprocessing_variants else f"{default_variant}_default"
             ),
             "selection_order": [
                 "predeclared_exposure_preprocessing",
@@ -1481,7 +1504,7 @@ def run_adaptivity_analysis(
         summary_rows.append({
             "factor": fname,
             "preprocessing_variant": res.get(
-                "preprocessing_variant", "neutralized"
+                "preprocessing_variant", default_variant
             ),
             "observation_channel": observation_channel,
             "sample_sufficient": bool(res.get("sample_sufficient", False)),

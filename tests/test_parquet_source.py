@@ -142,6 +142,17 @@ def test_latest_trade_date_comes_from_all_latest_daily_shards(tmp_path):
     assert source.fetch_latest_trade_date() == pd.Timestamp("2024-01-05")
 
 
+def test_listing_dates_come_from_first_concrete_contract_observation(tmp_path):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
+    })
+
+    result = source.fetch_listing_dates(["A", "MISSING"])
+
+    assert result.loc["A"] == pd.Timestamp("2024-01-02")
+    assert pd.isna(result.loc["MISSING"])
+
+
 def test_intraday_route_keeps_real_bar_index_and_resamples(tmp_path):
     root = _fixture_root(tmp_path)
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})

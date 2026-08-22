@@ -6,7 +6,6 @@ import csv
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import re
 import sys
@@ -79,12 +78,33 @@ def _repository(args) -> CandidateRepository:
 
 
 def _load_market_panels(args, universe, start, end, feature_config):
-    data_root = args.data_root or os.environ.get("MF_PARQUET_ROOT")
-    if not data_root:
-        raise ValueError("set --data-root or MF_PARQUET_ROOT")
-    return LocalParquetData(LocalParquetSpec(Path(data_root))).load_panels(
-        universe, start, end, feature_config
-    )
+    require_framework_universe(universe)
+    if args.data_root is not None:
+        return LocalParquetData(LocalParquetSpec(Path(args.data_root))).load_panels(
+            universe, start, end, feature_config
+        )
+
+    from core.config import load_config
+    from data.manager import DataManager
+
+    config = load_config(args.config)
+    require_framework_universe(config.universe)
+    manager = DataManager.from_config(config)
+    fields = list(dict.fromkeys(feature_config.raw_fields))
+    try:
+        panels = manager.source.fetch_price_at_frequency(
+            list(universe), pd.Timestamp(start), pd.Timestamp(end), fields,
+            frequency=feature_config.decision_frequency,
+        )
+    finally:
+        close = getattr(manager.source, "close", None)
+        if callable(close):
+            close()
+    if not isinstance(panels, dict) or not isinstance(panels.get("close"), pd.DataFrame):
+        raise TypeError("framework data source must return a close DataFrame")
+    if panels["close"].empty:
+        raise ValueError("framework data query returned no close data")
+    return panels
 
 
 def _feature_config(args) -> FeatureConfig:
@@ -777,7 +797,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository", type=Path, default=DEFAULT_REPOSITORY)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    mine = commands.add_parser("mine", help="run GP against local Parquet bars")
+    mine = commands.add_parser("mine", help="run GP against the framework data source")
+    mine.add_argument("--config", default="config/default.yaml")
     mine.add_argument("--data-root", type=Path, default=None)
     mine.add_argument("--universe", type=_csv_strings, default=FRAMEWORK_UNIVERSE)
     mine.add_argument("--start", required=True)
@@ -798,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     screen = commands.add_parser(
         "screen", help="pre-screen mined candidates on local bars"
     )
+    screen.add_argument("--config", default="config/default.yaml")
     screen.add_argument("--data-root", type=Path, default=None)
     screen.add_argument("--universe", type=_csv_strings, default=FRAMEWORK_UNIVERSE)
     screen.add_argument("--start", required=True)

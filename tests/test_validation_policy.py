@@ -442,3 +442,30 @@ def test_deployment_adaptivity_loads_only_frozen_discovery_contract(tmp_path):
             expected_policy_sha256=validation_policy_sha256(policy),
             expected_taxonomy_sha256="0" * 64,
         )
+
+    del payload["significant_factors"][0]["best_variant"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid preprocessing variants"):
+        load_discovery_contract(
+            str(path),
+            expected_policy_sha256=validation_policy_sha256(policy),
+            expected_taxonomy_sha256=taxonomy_sha256(),
+        )
+
+
+def test_adaptivity_rejects_neutralized_contract_without_neutralize_step():
+    from types import SimpleNamespace
+
+    from core.config import load_config
+    from workflows.factor_adaptivity import run_adaptivity_analysis
+
+    config = load_config("config/default.yaml")
+    assert "neutralize" not in {str(step.type) for step in config.processing}
+
+    with pytest.raises(ValueError, match="requires neutralized preprocessing"):
+        run_adaptivity_analysis(
+            [], "config/default.yaml", "2026-01-01", "2026-01-01", "2026-01-02",
+            config=config,
+            runner=SimpleNamespace(config=config),
+            preprocessing_variants={"signal": "neutralized"},
+        )

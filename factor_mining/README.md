@@ -8,7 +8,7 @@
 
 ## 边界
 
-- 数据：只读已发布的本地1分钟Parquet，不包含远程数据旁路。
+- 数据：正式入口只读主框架已配置的本地数据源（Parquet或认证DuckDB）；显式`--data-root`仅作Parquet审计/回退，不包含远程旁路。
 - 搜索：首版使用内置轻量 GP，无 `gplearn`/`DEAP` 新依赖，不使用 Python `eval`。
 - 验证：挖掘期提供 rank IC/IR、分层、换手、成本和时间分段诊断；它们不是正式
   HAC 检验或 OOS 证据。
@@ -66,7 +66,8 @@
 结算价、现货基差、会员持仓、库存/仓单、宏观和另类数据目前没有被本地 Parquet
 适配器可靠暴露为 point-in-time 面板，因此首版不伪造代理值。未来将真实本地面板传给
 `FeatureEngine` 并把字段加入 `FeatureConfig.raw_fields` 后，字段会自动成为 GP
-terminal；若走 CLI，还需在 `LocalParquetData` 中显式映射对应数据集。
+terminal；正式 CLI 通过统一DataManager暴露字段，显式`LocalParquetData`仅用于Parquet
+审计/回退，新增字段不能在两条入口间使用不同语义。
 
 算子包括保护四则运算、平方/立方/有符号开方和对数、max/min/avg、delay/delta、
 滚动统计、相关/协方差、时序和横截面 rank/zscore/demean，以及可选条件逻辑。
@@ -151,13 +152,15 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 此命令只使用合成数据，不写 SQLite，也不触发正式研究流程。
 
 也可继续使用独立入口 `python -m factor_mining`；`main.py mining` 是并入主框架后的
-首选入口，两者调用同一实现。
+首选入口，两者调用同一实现。正式`mine/screen`默认读取`config/default.yaml`和当前
+DataManager运行源；`--data-root`仅是显式Parquet审计/回退参数。
 
 ## 程序接口
 
 稳定的模块边界如下：
 
 ```python
+# 仅在显式Parquet审计/回退时使用：
 from factor_mining.data import LocalParquetData, LocalParquetSpec
 from factor_mining.features import FeatureEngine
 from factor_mining.gp import GPConfig, GPSearch

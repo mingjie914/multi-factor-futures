@@ -15,8 +15,8 @@
     8. daily_mom_x_amihud:           日度动量 × Amihud非流动性 (趋势+流动性确认)
 
 数据依赖:
-    - 日度 OHLCV: 通过 DataManager 从本地日线 Parquet 获取
-    - 日内特征: 通过 DataManager 从本地分钟 Parquet 聚合获取
+    - 日度 OHLCV: 通过 DataManager 从主框架已配置本地数据源获取
+    - 日内特征: 通过 DataManager 从已配置分钟数据聚合获取
     - 发现扫描允许缺失因子保持 NaN；正式选中因子必须通过严格完整性检查
 
 计算逻辑:

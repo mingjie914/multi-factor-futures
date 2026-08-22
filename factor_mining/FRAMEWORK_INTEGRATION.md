@@ -16,7 +16,6 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 建立不同 run，避免搜索后再挑选周期而低估多重检验。
 
 ```powershell
-$env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
 & $PY -B main.py mining `
   --repository 'runs\factor_mining\candidates.sqlite3' mine `
   --start '2023-01-01' --end '2024-12-31' `
@@ -33,13 +32,16 @@ $env:MF_PARQUET_ROOT = 'D:\path\to\local_parquet'
 ```powershell
 & $PY -B main.py mining `
   --repository 'runs\factor_mining\candidates.sqlite3' screen `
-  --data-root $env:MF_PARQUET_ROOT `
   --start '2023-01-01' --end '2024-12-31' `
   --screen-id 'screen_id' `
   --output-dir 'runs\factor_mining\screens\screen_id' `
   --candidate-ids 'gp_xxxxx,gp_yyyyy' `
   --min-coverage 0.50
 ```
+
+`mine`和`screen`默认读取统一的`config/default.yaml`，本机DuckDB/Polars选择只来自受限的
+`config/local.yaml`或`MF_DATA_*`运行时覆盖。`--data-root`只用于明确的Parquet审计或回退，
+不会另建品种、因子、处理或回测配置。
 
 若要一次预筛某次挖掘 run 的全部候选，可把 `--candidate-ids` 换成
 `--candidate-run-ids 'mine_run_id'`；候选 ID、候选文件和 run ID 三种选择方式互斥，

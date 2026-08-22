@@ -6,13 +6,18 @@ import pytest
 
 from factors.numerics import (
     histogram_window_l1_stability,
+    rolling_linear_slope,
     rolling_split_sum_difference,
+    variance_ratio,
 )
 
 from factors.library.intraday import (
     _daily_range_volume_ratio,
+    _daily_volume_distribution_stability,
+    _post_extreme_amount_persistence,
     _segmented_ohlc_relative_volatility,
     IntradayDfTest20d,
+    IntradayKlineShortestPathIlliq20d,
     IntradayOiSurgeFollow20d,
     IntradayOiSurgeReversal20d,
     IntradayPricePeakCount20d,
@@ -50,6 +55,31 @@ def test_segmented_ohlc_volatility_matches_established_loop(window, positive_onl
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
 
 
+def test_post_extreme_amount_persistence_matches_established_loop():
+    rng = np.random.default_rng(731)
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, size=(67, 3)), axis=0))
+    amount = rng.lognormal(8.0, 0.6, size=(67, 3))
+    close[5:8, 1] = np.nan
+    amount[30:32, 2] = np.nan
+    expected = []
+    for column in range(close.shape[1]):
+        observed = ~(np.isnan(close[:, column]) | np.isnan(amount[:, column]))
+        prices, amounts = close[observed, column], amount[observed, column]
+        returns = pd.Series(prices).pct_change(fill_method=None)
+        high, low = np.percentile(returns.dropna(), (90, 10))
+        extreme = (returns > high) | (returns < low)
+        future = [
+            amounts[row + 1:row + 6].mean()
+            for row, is_extreme in enumerate(extreme)
+            if is_extreme and row + 5 < len(amounts)
+        ]
+        expected.append(np.mean(future) / amounts.mean())
+
+    actual = _post_extreme_amount_persistence(close, amount)
+
+    np.testing.assert_allclose(actual, expected, atol=1e-15, rtol=0.0)
+
+
 def test_daily_range_volume_ratio_uses_only_prior_twenty_days():
     days = pd.bdate_range("2024-01-02", periods=24)
     index = pd.DatetimeIndex([
@@ -81,6 +111,30 @@ def test_daily_range_volume_ratio_uses_only_prior_twenty_days():
             close.loc[current, "A"] > midpoint, 0.0
         ).sum() / panel["volume"].loc[current, "A"].sum()
         assert result.iloc[row, 0] == expected
+
+
+def test_kline_shortest_path_excludes_negative_illiq_ratio(monkeypatch):
+    dates = pd.bdate_range("2025-01-02", periods=7)
+    index = pd.DatetimeIndex([
+        day + pd.Timedelta(minutes=minute)
+        for day in dates for minute in range(30)
+    ])
+    frame = pd.DataFrame({"A": 100.0}, index=index)
+    amount = frame.copy()
+    amount.iloc[::30, 0] = -100.0
+    panel = {
+        "high": frame + 2.0,
+        "low": frame - 1.0,
+        "open": frame,
+        "close": frame + 1.0,
+        "amount": amount,
+    }
+    import factors.library.intraday as intraday
+    monkeypatch.setattr(intraday, "_get_minute_panel", lambda *args, **kwargs: panel)
+
+    result = IntradayKlineShortestPathIlliq20d().compute(None, dates, ["A"])
+
+    assert result.iloc[-1, 0] == pytest.approx(0.05)
 
 
 def test_rank_variants_apply_cross_sectional_percentiles():
@@ -210,6 +264,16 @@ def test_histogram_stability_kernel_matches_window_rest_reference():
     )
 
 
+def test_volume_distribution_stability_reuses_the_minute_panel_lifetime():
+    index = pd.date_range("2025-01-02 09:00", periods=70, freq="min")
+    panel = {"volume": pd.DataFrame({"A": np.arange(70.0) + 1.0}, index=index)}
+
+    first = _daily_volume_distribution_stability(panel)
+    second = _daily_volume_distribution_stability(panel)
+
+    assert second is first
+
+
 def test_rolling_split_sum_difference_matches_window_reference():
     rng = np.random.default_rng(17)
     returns = rng.normal(size=(47, 3))
@@ -234,3 +298,42 @@ def test_rolling_split_sum_difference_matches_window_reference():
     np.testing.assert_allclose(
         rolling_split_sum_difference(returns, scores), expected, equal_nan=True
     )
+
+
+def test_rolling_linear_slope_matches_established_polyfit():
+    values = np.random.default_rng(20260822).normal(size=(47, 3))
+    values[:4, 1] = np.nan
+    values[35, 1] = np.inf
+    values[25, 2] = np.nan
+    frame = pd.DataFrame(values)
+    expected = frame.rolling(20, min_periods=8).apply(
+        lambda x: np.polyfit(np.arange(len(x)), x.values, 1)[0],
+        raw=False,
+    )
+
+    actual = rolling_linear_slope(values, window=20, min_periods=8)
+
+    np.testing.assert_allclose(actual, expected.to_numpy(), atol=3e-15, rtol=0.0)
+
+    large_offset = 1e12 + np.arange(47, dtype=float)[:, None] * 0.25
+    stable = rolling_linear_slope(large_offset, window=20, min_periods=8)
+    assert stable[-1, 0] == pytest.approx(0.25, abs=1e-12)
+
+
+@pytest.mark.parametrize("horizon", [5, 30])
+def test_variance_ratio_matches_established_correlation_loop(horizon):
+    values = np.random.default_rng(731).normal(size=240)
+    mean = values.mean()
+    variance = np.sum((values[1:] - mean) ** 2) / (len(values) - 1)
+    expected = 1.0
+    for lag in range(1, horizon):
+        current, previous = values[lag:], values[:-lag]
+        correlation = (
+            np.corrcoef(current, previous)[0, 1]
+            if current.std() > 1e-12 and previous.std() > 1e-12
+            else 0.0
+        )
+        expected += 2.0 * (1.0 - lag / horizon) * correlation
+
+    assert variance > 1e-12
+    assert variance_ratio(values, horizon) == pytest.approx(expected - 1.0, abs=1e-15)

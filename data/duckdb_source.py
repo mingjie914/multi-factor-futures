@@ -289,6 +289,20 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             raise RuntimeError("DuckDB daily table has no trade_date")
         return pd.Timestamp(latest).normalize()
 
+    def fetch_listing_dates(self, tickers) -> pd.Series:
+        roots = self._normalise_tickers(tickers)
+        if not roots:
+            return pd.Series(dtype="datetime64[ns]")
+        frame = self._annotate_symbols(self._execute_df(
+            "SELECT symbol, MIN(trade_date) AS trade_date "
+            "FROM market.bars_1d GROUP BY symbol ORDER BY symbol"
+        ))
+        listing = (
+            frame.loc[frame["is_concrete"] & frame["root"].isin(roots)]
+            .groupby("root")["trade_date"].min()
+        )
+        return pd.to_datetime(listing.reindex(roots)).astype("datetime64[ns]")
+
     def fetch_seat_table(
         self,
         table: str,
