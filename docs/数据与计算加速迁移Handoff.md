@@ -283,6 +283,20 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 
 ## 9. 当前阶段结论
 
-本次版本收口只完成 D0。D1、P1、P2、C0、R1、R2均是后续独立实施阶段。
-当前不修改策略语义、不启用Polars路径、不安装Rust，也不承诺迁移全部因子。最终目标是
-真实research端到端加速，而不是把“使用DuckDB/Polars/Rust”本身当作完成标准。
+截至2026-08-22，本轮实施结论如下：
+
+- D0完成：唯一依赖清单、Polars 1.43.2、全量回归和双远端基线已冻结。
+- D1完成：本机运行源已绑定认证DuckDB release；仓库默认仍为Parquet。当前manifest与
+  component ID一致、`changed_partitions={}`，因此没有执行无意义的重复sync。
+- P1完成：`pandas|polars|shadow`桥接已进入唯一`_execute_df()`边界；本机启用Polars，
+  公共DataFrame、行情频率、期限结构和六张席位表语义保持不变。代码提交为`ffcd1b1`。
+- P2停止扩张：席位长表和实际席位因子达到准入门；行情与期限结构仅有个位数改善，继续
+  把标签矩阵或日期匹配改写为Polars不符合收益/风险边界。
+- C0完成：当前热点已重新画像；四个重复Python窗口因子改为共享日度聚合和小型NumPy核，
+  真实输出哈希完全一致且分别达到`47.1x`、`82.7x`，代码提交为`6ee134b`。
+- R1/R2当前No-Go：剩余主热点属于期限曲线I/O、ADF/AIC和复杂统计语义，不是低风险纯
+  ndarray滚动核；Rust无法解决当前首要瓶颈，因此不安装工具链、不新增crate或适配层。
+
+本机`config/local.yaml`被Git忽略，当前固定`duckdb_futures + polars + required_release_id`。
+夜间发布新DuckDB release后，必须先通过发布验证，再更新该ID并重启；回退只需切回
+`parquet_futures`。最终目标仍是真实research端到端收益，不以使用某项技术作为完成标准。

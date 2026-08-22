@@ -7,8 +7,8 @@
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
-> **2026-08-22状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；DuckDB
-> 已具备运行时切换条件，但仓库默认仍为Parquet，正式部署需在维护窗口显式切换。
+> **2026-08-22状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；本机运行
+> 已切换为DuckDB＋Polars 1.43.2结果桥接，仓库默认仍为Parquet＋Pandas以保留可移植回退。
 > 2016-03-31至2026-08-20的冻结历史运行提交599个历史注册类，其中11个不可估计定义已确认
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
 > `|corr|>=0.5`去重为13簇；该H20只作数据更新前的长期对照，尚未按冻结窗口完成WF/OOS
@@ -18,7 +18,8 @@
 
 ```text
 已发布的本地 Parquet（权威、审计、恢复）
-  -> 认证 DuckDB 镜像（可选运行源）
+  -> 认证 DuckDB 镜像（本机运行源；仓库默认可回退）
+  -> Polars 结果传输（公共边界仍为 Pandas DataFrame）
   -> DataManager / FrequencyDataProvider
   -> 内置 Factor + SPEC + user Factor + mined snapshot bridge
   -> IC/HAC/分层/稳健性研究
@@ -120,7 +121,10 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 - 除成本模型的自定义参数外，未知配置键会直接报错，避免拼写错误被静默忽略。
 
 本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；切换认证库时另设
-`MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`和当前`MF_DATA_RELEASE_ID`。
+`MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`、当前`MF_DATA_RELEASE_ID`和可选的
+`MF_DUCKDB_RESULT_BACKEND=pandas|polars|shadow`。仓库默认后端为`pandas`；只有通过
+真实A/B的本机部署才设为`polars`。夜间DuckDB发布新release后，必须先验证成功，再更新
+绑定的release ID并重启；旧ID会失败关闭，不能自动漂移到未经确认的数据。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 
 ## 研究治理

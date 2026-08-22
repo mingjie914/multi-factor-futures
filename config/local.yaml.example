@@ -1,7 +1,11 @@
-# 本地路径模板 — 复制为 local.yaml 后填写本机 Parquet 根目录。
-# local.yaml 已在 .gitignore 中，也可改用 MF_PARQUET_ROOT。
+# 本地路径模板 — 复制为 local.yaml 后填写本机路径。
+# local.yaml 已在 .gitignore 中；认证前保持 Parquet 默认源。
 
 data:
   source: parquet_futures
   parquet:
     root_path: 'E:\\path\\to\\local\\futures-parquet'
+  duckdb:
+    path: 'E:\\path\\to\\local\\futures_data.duckdb'
+    required_release_id: ''
+    result_backend: pandas

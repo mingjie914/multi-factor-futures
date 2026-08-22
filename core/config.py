@@ -6,7 +6,7 @@ Supports:
 - ${VAR} and ${VAR:default} inline env var expansion
 - Nested validation via pydantic
 
-Current research mode: published local Parquet configured in local.yaml or env vars.
+Runtime data is selected explicitly between published Parquet and certified DuckDB.
 """
 from __future__ import annotations
 
