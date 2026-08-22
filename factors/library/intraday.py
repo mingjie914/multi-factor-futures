@@ -40,7 +40,11 @@ import re
 from core.interfaces import Factor
 from core.registry import register_factor
 from core.sectors import SECTOR_MAP as _SECTOR_MAP
-from factors.numerics import count_isolated_peaks, histogram_window_l1_stability
+from factors.numerics import (
+    count_isolated_peaks,
+    histogram_window_l1_stability,
+    rolling_split_sum_difference,
+)
 
 # ────────────────────────────────────────────────────────────────────────────
 # Bottleneck 加速的 rolling 薄封装 (可选加速, 数值等价已验证).
@@ -22007,6 +22011,36 @@ class IntradayVpCorrDivSlope20d(Factor):
         return slope.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
+def _daily_range_volume_ratio(panel, lookback=20):
+    """Return the shared daily upper-range volume ratio for factors 397/398."""
+
+    close, volume = panel["close"], panel["volume"]
+    day = close.index.normalize()
+    daily_high = panel["high"].groupby(day).max()
+    daily_low = panel["low"].groupby(day).min()
+    high_bound = daily_high.shift(1).rolling(lookback, min_periods=5).max()
+    low_bound = daily_low.shift(1).rolling(lookback, min_periods=5).min()
+    price_range = high_bound - low_bound
+    midpoint = (high_bound + low_bound) / 2.0
+    midpoint.iloc[:lookback] = np.nan
+    midpoint_by_bar = midpoint.reindex(day)
+    midpoint_by_bar.index = close.index
+
+    valid = close.notna() & volume.notna()
+    common_count = valid.groupby(day).sum()
+    total = volume.where(valid).groupby(day).sum()
+    upper = volume.where(valid & close.gt(midpoint_by_bar)).groupby(day).sum()
+    ratio = upper.div(total).where(
+        common_count.ge(10)
+        & total.ge(1e-12)
+        & price_range.ge(1e-12)
+        & midpoint.notna()
+    )
+    ratio.index = pd.DatetimeIndex(ratio.index)
+    ratio.columns.name = None
+    return ratio
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 397. intraday_price_range_volume_ratio — 价格区间量能偏斜 (A3 变体)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -22033,53 +22067,7 @@ class IntradayPriceRangeVolumeRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="5min")
         if not {"close", "volume", "high", "low"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume, high, low = panel["close"], panel["volume"], panel["high"], panel["low"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        sorted_days = sorted(set(day))
-        lookback = 20
-        for idx, dt in enumerate(sorted_days):
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 10:
-                continue
-            if idx < lookback:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                if len(c) < 10:
-                    continue
-                h_c = high.loc[day == dt, col].dropna()
-                l_c = low.loc[day == dt, col].dropna()
-                # N日区间中位: 用近20日的日high/low
-                past_h = [high.loc[day == rd, col].dropna().max() for rd in sorted_days[idx - lookback:idx]]
-                past_l = [low.loc[day == rd, col].dropna().min() for rd in sorted_days[idx - lookback:idx]]
-                past_h = [x for x in past_h if not np.isnan(x)]
-                past_l = [x for x in past_l if not np.isnan(x)]
-                if len(past_h) < 5 or len(past_l) < 5:
-                    continue
-                hi = max(past_h); lo = min(past_l)
-                if hi - lo < 1e-12:
-                    continue
-                mid = (hi + lo) / 2.0
-                vol = volume.loc[day == dt, col].dropna()
-                common = c.index.intersection(vol.index)
-                if len(common) < 10:
-                    continue
-                c_c = c.loc[common]
-                v_c = vol.loc[common]
-                upper = v_c[c_c > mid].sum()
-                lower = v_c[c_c <= mid].sum()
-                total = upper + lower
-                if total < 1e-12:
-                    continue
-                vals[col] = float(upper / total)
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_range_volume_ratio(panel)
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -22109,50 +22097,7 @@ class IntradayRangeVolSkewDelta20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="5min")
         if not {"close", "volume", "high", "low"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume, high, low = panel["close"], panel["volume"], panel["high"], panel["low"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        sorted_days = sorted(set(day))
-        lookback = 20
-        for idx, dt in enumerate(sorted_days):
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 10:
-                continue
-            if idx < lookback:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                if len(c) < 10:
-                    continue
-                past_h = [high.loc[day == rd, col].dropna().max() for rd in sorted_days[idx - lookback:idx]]
-                past_l = [low.loc[day == rd, col].dropna().min() for rd in sorted_days[idx - lookback:idx]]
-                past_h = [x for x in past_h if not np.isnan(x)]
-                past_l = [x for x in past_l if not np.isnan(x)]
-                if len(past_h) < 5 or len(past_l) < 5:
-                    continue
-                hi = max(past_h); lo = min(past_l)
-                if hi - lo < 1e-12:
-                    continue
-                mid = (hi + lo) / 2.0
-                vol = volume.loc[day == dt, col].dropna()
-                common = c.index.intersection(vol.index)
-                if len(common) < 10:
-                    continue
-                c_c = c.loc[common]
-                v_c = vol.loc[common]
-                upper = v_c[c_c > mid].sum()
-                lower = v_c[c_c <= mid].sum()
-                total = upper + lower
-                if total < 1e-12:
-                    continue
-                vals[col] = float(upper / total)
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_range_volume_ratio(panel)
         delta = daily.diff()
         return delta.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
@@ -27053,41 +26998,20 @@ class IntradayWcutReversal20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, amount = panel["close"], panel["amount"]
         day = close.index.normalize()
-        sorted_days = sorted(set(day))
-        reversals: dict = {}
-        for dt in sorted_days:
-            idx_pos = sorted_days.index(dt)
-            if idx_pos < 20:
-                continue
-            window_days = sorted_days[idx_pos - 20:idx_pos]
-            vals = {}
-            for col in close.columns:
-                day_rets = []
-                day_amts = []
-                for rd in window_days:
-                    c = close.loc[day == rd, col].dropna()
-                    a = amount.loc[day == rd, col].dropna()
-                    common = c.index.intersection(a.index)
-                    if len(common) < 5:
-                        continue
-                    ret = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0) if c.loc[common].iloc[0] > 0 else 0.0
-                    day_rets.append(ret)
-                    day_amts.append(float(a.loc[common].mean()))
-                if len(day_rets) < 15:
-                    continue
-                amt_arr = np.array(day_amts)
-                thr = np.median(amt_arr)
-                high_mask = amt_arr > thr
-                low_mask = amt_arr <= thr
-                m_high = float(np.sum(np.array(day_rets)[high_mask]))
-                m_low = float(np.sum(np.array(day_rets)[low_mask]))
-                vals[col] = m_high - m_low
-            if vals:
-                reversals[dt] = pd.Series(vals)
-        if not reversals:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(reversals).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        common = close.notna() & amount.notna()
+        daily_close = close.where(common).groupby(day)
+        daily_amount = amount.where(common).groupby(day)
+        count = daily_close.count()
+        first = daily_close.first()
+        returns = daily_close.last().div(first).sub(1.0).where(first.gt(0), 0.0)
+        returns = returns.where(count.ge(5))
+        scores = daily_amount.mean().where(count.ge(5))
+        daily = pd.DataFrame(
+            rolling_split_sum_difference(returns, scores),
+            index=returns.index,
+            columns=returns.columns,
+        )
+        daily.columns.name = None
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -27453,41 +27377,20 @@ class IntradayWcutAmpMomentum20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close, high, low = panel["close"], panel["high"], panel["low"]
         day = close.index.normalize()
-        sorted_days = sorted(set(day))
-        momentums: dict = {}
-        for dt in sorted_days:
-            idx_pos = sorted_days.index(dt)
-            if idx_pos < 20:
-                continue
-            window_days = sorted_days[idx_pos - 20:idx_pos]
-            vals = {}
-            for col in close.columns:
-                day_rets = []
-                day_amps = []
-                for rd in window_days:
-                    c = close.loc[day == rd, col].dropna()
-                    h = high.loc[day == rd, col].dropna()
-                    l = low.loc[day == rd, col].dropna()
-                    if len(c) < 5:
-                        continue
-                    ret = float(c.iloc[-1] / c.iloc[0] - 1.0) if c.iloc[0] > 0 else 0.0
-                    amp = float((h.max() - l.min()) / c.mean()) if c.mean() > 0 else 0.0
-                    day_rets.append(ret)
-                    day_amps.append(amp)
-                if len(day_rets) < 15:
-                    continue
-                amp_arr = np.array(day_amps)
-                thr = np.median(amp_arr)
-                high_mask = amp_arr > thr
-                m_high = float(np.sum(np.array(day_rets)[high_mask]))
-                m_low = float(np.sum(np.array(day_rets)[~high_mask]))
-                vals[col] = m_high - m_low
-            if vals:
-                momentums[dt] = pd.Series(vals)
-        if not momentums:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(momentums).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily_close = close.groupby(day)
+        count = daily_close.count()
+        first = daily_close.first()
+        mean = daily_close.mean()
+        returns = daily_close.last().div(first).sub(1.0).where(first.gt(0), 0.0)
+        returns = returns.where(count.ge(5))
+        scores = high.groupby(day).max().sub(low.groupby(day).min()).div(mean)
+        scores = scores.where(mean.gt(0), 0.0).where(count.ge(5))
+        daily = pd.DataFrame(
+            rolling_split_sum_difference(returns, scores),
+            index=returns.index,
+            columns=returns.columns,
+        )
+        daily.columns.name = None
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 

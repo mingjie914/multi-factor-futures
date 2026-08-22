@@ -3,9 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-from factors.numerics import histogram_window_l1_stability
+
+from factors.numerics import (
+    histogram_window_l1_stability,
+    rolling_split_sum_difference,
+)
 
 from factors.library.intraday import (
+    _daily_range_volume_ratio,
     IntradayDfTest20d,
     IntradayOiSurgeFollow20d,
     IntradayOiSurgeReversal20d,
@@ -15,6 +20,39 @@ from factors.library.intraday import (
     OpenCloseVolRank20d,
     PeakCountZscore20d,
 )
+
+
+def test_daily_range_volume_ratio_uses_only_prior_twenty_days():
+    days = pd.bdate_range("2024-01-02", periods=24)
+    index = pd.DatetimeIndex([
+        day + pd.Timedelta(minutes=minute)
+        for day in days for minute in range(10)
+    ])
+    day_number = np.repeat(np.arange(len(days), dtype=float), 10)
+    intraday_step = np.tile(np.arange(10, dtype=float), len(days))
+    close = pd.DataFrame({"A": 100.0 + day_number + intraday_step}, index=index)
+    panel = {
+        "close": close,
+        "high": close + 1.0,
+        "low": close - 1.0,
+        "volume": pd.DataFrame({"A": intraday_step + 1.0}, index=index),
+    }
+
+    result = _daily_range_volume_ratio(panel)
+
+    assert result.iloc[:20].isna().all().all()
+    normalized = index.normalize()
+    for row in range(20, len(days)):
+        history = normalized.isin(days[row - 20:row])
+        midpoint = (
+            panel["high"].loc[history].max().iloc[0]
+            + panel["low"].loc[history].min().iloc[0]
+        ) / 2.0
+        current = normalized == days[row]
+        expected = panel["volume"].loc[current, "A"].where(
+            close.loc[current, "A"] > midpoint, 0.0
+        ).sum() / panel["volume"].loc[current, "A"].sum()
+        assert result.iloc[row, 0] == expected
 
 
 def test_rank_variants_apply_cross_sectional_percentiles():
@@ -141,4 +179,30 @@ def test_histogram_stability_kernel_matches_window_rest_reference():
 
     assert histogram_window_l1_stability(values) == pytest.approx(
         np.std(expected, ddof=0), abs=1e-15
+    )
+
+
+def test_rolling_split_sum_difference_matches_window_reference():
+    rng = np.random.default_rng(17)
+    returns = rng.normal(size=(47, 3))
+    scores = rng.normal(size=(47, 3))
+    returns[4:10, 1] = np.nan
+    scores[25, 2] = np.nan
+    expected = np.full_like(returns, np.nan)
+    for row in range(20, len(returns)):
+        for column in range(returns.shape[1]):
+            observed_returns = returns[row - 20:row, column]
+            observed_scores = scores[row - 20:row, column]
+            valid = ~np.isnan(observed_returns)
+            if valid.sum() < 15:
+                continue
+            observed_returns = observed_returns[valid]
+            observed_scores = observed_scores[valid]
+            high = observed_scores > np.median(observed_scores)
+            expected[row, column] = (
+                observed_returns[high].sum() - observed_returns[~high].sum()
+            )
+
+    np.testing.assert_allclose(
+        rolling_split_sum_difference(returns, scores), expected, equal_nan=True
     )

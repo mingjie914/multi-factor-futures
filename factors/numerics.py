@@ -61,3 +61,33 @@ def histogram_window_l1_stability(values, block_size: int = 5) -> float:
                 inside / inside_total - outside / outside_total
             ).sum()))
     return float(np.std(distances, ddof=0)) if distances else 0.0
+
+
+def rolling_split_sum_difference(
+    returns, scores, window: int = 20, min_periods: int = 15
+) -> np.ndarray:
+    """Split prior-window returns at the score median and subtract group sums."""
+
+    return_array = np.asarray(returns, dtype=float)
+    score_array = np.asarray(scores, dtype=float)
+    if return_array.ndim != 2 or return_array.shape != score_array.shape:
+        raise ValueError("returns and scores must be same-shaped two-dimensional arrays")
+    window = int(window)
+    min_periods = int(min_periods)
+    if window < 1 or min_periods < 1 or min_periods > window:
+        raise ValueError("require 1 <= min_periods <= window")
+    result = np.full(return_array.shape, np.nan, dtype=float)
+    for row in range(window, len(return_array)):
+        row_returns = return_array[row - window:row]
+        row_scores = score_array[row - window:row]
+        for column in range(return_array.shape[1]):
+            valid = ~np.isnan(row_returns[:, column])
+            if np.count_nonzero(valid) < min_periods:
+                continue
+            observed_returns = row_returns[valid, column]
+            observed_scores = row_scores[valid, column]
+            high = observed_scores > np.median(observed_scores)
+            result[row, column] = (
+                np.sum(observed_returns[high]) - np.sum(observed_returns[~high])
+            )
+    return result
