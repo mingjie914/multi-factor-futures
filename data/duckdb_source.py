@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 import threading
 from typing import Iterable, Optional
 
@@ -241,6 +242,7 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         start,
         end,
         columns: Iterable[str],
+        roots: Iterable[str] | None = None,
     ) -> tuple[pd.DataFrame, list[str], set[str]]:
         self._month_files(native_frequency, start, end)
         _, table = _MARKET_TABLES[native_frequency]
@@ -267,11 +269,20 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             "SELECT " + ", ".join(f'"{column}"' for column in selected)
             + f" FROM {table} WHERE trade_date >= ? AND trade_date <= ?"
         )
+        params = [pd.Timestamp(start).date(), pd.Timestamp(end).date()]
+        normalised_roots = tuple(dict.fromkeys(
+            str(root).strip().upper() for root in (roots or ()) if str(root).strip()
+        ))
+        if normalised_roots:
+            clauses = [
+                'regexp_matches(upper(trim("symbol")), ?)'
+                for _ in normalised_roots
+            ]
+            sql += " AND (" + " OR ".join(clauses) + ")"
+            params.extend(f"^{re.escape(root)}[0-9]+$" for root in normalised_roots)
         if order:
             sql += " ORDER BY " + ", ".join(f'"{column}"' for column in order)
-        frame = self._execute_df(
-            sql, [pd.Timestamp(start).date(), pd.Timestamp(end).date()]
-        )
+        frame = self._execute_df(sql, params)
         timestamp_unit = self._timestamp_unit(
             native_frequency, start, end, described
         )
@@ -281,6 +292,72 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             elif types[column].startswith("TIMESTAMP") and column in frame:
                 frame[column] = frame[column].astype(f"datetime64[{timestamp_unit}]")
         return frame, requested, available
+
+    def fetch_term_contracts_at_frequency(
+        self, tickers, start, end, frequency: str = "1min"
+    ) -> Optional[pd.DataFrame]:
+        """Push the exact near/far candidate reduction into DuckDB."""
+
+        frequency = str(frequency).strip().lower()
+        if frequency in {"1min", "1m"}:
+            native_frequency, table = "1min", "market.bars_1m"
+        elif frequency in {"5min", "5m"}:
+            native_frequency, table = "5min", "market.bars_5m"
+        else:
+            return None
+        roots = self._normalise_tickers(tickers)
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+        if not roots or start_ts > end_ts:
+            return pd.DataFrame()
+        read_start = start_ts.normalize() - pd.Timedelta(days=7)
+        self._month_files(native_frequency, read_start, end_ts)
+        placeholders = ", ".join("?" for _ in roots)
+        sql = f"""
+            WITH candidates AS (
+                SELECT
+                    trade_datetime,
+                    trade_date,
+                    upper(trim(symbol)) AS symbol,
+                    close,
+                    position,
+                    volume,
+                    regexp_extract(upper(trim(symbol)), '^([A-Z]+)[0-9]{{4}}$', 1) AS root,
+                    try_cast(regexp_extract(upper(trim(symbol)), '([0-9]{{4}})$', 1) AS INTEGER) AS expiry
+                FROM {table}
+                WHERE trade_date >= ? AND trade_date <= ?
+                  AND regexp_matches(upper(trim(symbol)), '^[A-Z]+[0-9]{{4}}$')
+                  AND regexp_extract(upper(trim(symbol)), '^([A-Z]+)', 1)
+                      IN ({placeholders})
+            ), ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY trade_datetime, root ORDER BY expiry, symbol
+                ) AS maturity_rank
+                FROM candidates
+                WHERE close > 0 AND isfinite(close)
+                  AND position > 0 AND isfinite(position)
+            )
+            SELECT trade_datetime, trade_date, root, symbol, close, position, volume,
+                   maturity_rank AS _maturity_rank, expiry AS _expiry_code
+            FROM ranked
+            WHERE maturity_rank <= 2
+            ORDER BY trade_datetime, root, expiry, symbol
+        """
+        frame = self._execute_df(
+            sql,
+            [read_start.date(), end_ts.normalize().date(), *roots],
+        )
+        if frame.empty:
+            return frame
+        frame = self._annotate_symbols(frame)
+        frame = self._assign_intraday_trade_dates(frame)
+        return frame.loc[
+            frame["root"].isin(roots)
+            & frame["is_concrete"]
+            & frame["trade_date"].between(
+                start_ts.normalize(), end_ts.normalize()
+            )
+        ].sort_values(["trade_datetime", "root", "symbol"]).reset_index(drop=True)
 
     def fetch_latest_trade_date(self) -> pd.Timestamp:
         frame = self._execute_df("SELECT MAX(trade_date) AS latest FROM market.bars_1d")

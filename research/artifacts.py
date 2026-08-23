@@ -69,12 +69,15 @@ def canonical_config_hash(config: Any) -> str:
     for sub_portfolio in raw.get("sub_portfolios", []):
         if isinstance(sub_portfolio, dict):
             sub_portfolio.pop("factors", None)
+    backtest = raw.get("backtest")
+    if isinstance(backtest, dict):
+        backtest.pop("report_dir", None)
     payload = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def source_tree_hash(root: Path) -> str:
-    """Hash active project Python/config sources in stable relative-path order."""
+    """Hash active Python, config and Rust sources in stable path order."""
     root = root.resolve()
     ignored_parts = {
         ".git",
@@ -92,7 +95,9 @@ def source_tree_hash(root: Path) -> str:
     for path in root.rglob("*"):
         if not path.is_file() or any(part in ignored_parts for part in path.parts):
             continue
-        if path.suffix.lower() not in {".py", ".yaml", ".yml", ".json"}:
+        if path.suffix.lower() not in {
+            ".py", ".yaml", ".yml", ".json", ".rs", ".toml", ".lock",
+        }:
             continue
         candidates.append(path)
     digest = hashlib.sha256()

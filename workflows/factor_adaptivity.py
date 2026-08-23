@@ -1043,9 +1043,9 @@ def load_discovery_contract(
         payload = json.load(handle)
     config = dict(payload.get("config", {}) or {})
     if config.get("validation_policy_sha256") != expected_policy_sha256:
-        raise ValueError("discovery validation-policy hash mismatch; rerun P0")
+        raise ValueError("discovery validation-policy hash mismatch; rerun discovery")
     if config.get("taxonomy_sha256") != expected_taxonomy_sha256:
-        raise ValueError("discovery taxonomy hash mismatch; rerun P0")
+        raise ValueError("discovery taxonomy hash mismatch; rerun discovery")
     names = [str(name) for name in payload.get("final_factors", [])]
     if not names or len(names) != len(set(names)):
         raise ValueError("discovery contract has no unique final_factors")
@@ -1702,7 +1702,7 @@ def main():
     )
     parser.add_argument(
         "--discovery-file", default=None,
-        help=("deployment 模式必填：P0 输出的 ic_by_window_period.json；"
+        help=("deployment 模式必填：对应训练折发现输出的 ic_by_window_period.json；"
               "自动加载冻结因子、预处理版本和观察期元数据"),
     )
     args = parser.parse_args()

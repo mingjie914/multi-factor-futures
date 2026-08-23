@@ -17,7 +17,7 @@ WORKFLOW_COMMANDS = {
     "adaptivity": ("workflows.factor_adaptivity", "sector/horizon diagnostics"),
     "backtest": ("workflows.backtest", "single-portfolio backtest"),
     "multi": ("workflows.multi_backtest", "multi-sleeve portfolio backtest"),
-    "walkforward": ("workflows.walkforward", "frozen walk-forward validation"),
+    "walkforward": ("workflows.walkforward", "rolling walk-forward validation"),
     "summarize": (
         "workflows.summarize_results", "summarize frozen walk-forward outputs"
     ),

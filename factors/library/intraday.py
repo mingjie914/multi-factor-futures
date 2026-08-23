@@ -41,8 +41,24 @@ from core.interfaces import Factor
 from core.registry import register_factor
 from core.sectors import SECTOR_MAP as _SECTOR_MAP
 from factors.numerics import (
+    assert_native_equal,
     count_isolated_peaks,
+    daily_candle_path_statistics,
+    daily_breakout_statistics,
+    daily_lagged_pair_statistics,
+    daily_oi_statistics,
+    daily_pair_statistics,
+    daily_price_volume_statistics,
+    daily_price_path_statistics,
+    daily_return_statistics,
+    daily_return_path_statistics,
+    daily_smart_money_statistics,
+    daily_tail_statistics,
+    daily_unary_statistics,
+    daily_volume_shock_statistics,
+    factor_kernel_mode,
     histogram_window_l1_stability,
+    native_array_kernel,
     rolling_linear_slope,
     rolling_split_sum_difference,
     variance_ratio,
@@ -358,6 +374,10 @@ _MINUTE_FIELDS = ["open", "high", "low", "close", "volume", "amount", "oi"]
 
 _PANEL_CACHE: dict = {}
 _PANEL_CACHE_LOCK = threading.Lock()
+_PEAK_RIDGE_CACHE: dict = {}
+_PEAK_RIDGE_CACHE_LOCK = threading.Lock()
+_BREAKOUT_CACHE: dict = {}
+_BREAKOUT_CACHE_LOCK = threading.Lock()
 # One full-library request needs the exact 1-minute and 5-minute panels plus
 # the small legacy daily-feature aggregate.  A fourth entry would only retain
 # an obsolete request range and inflate the research working set.
@@ -522,6 +542,465 @@ def _daily_intraday_features(data, dates, universe):
         return _remember_panel(cache_key, result)
 
 
+def _daily_feature_frames(values, index, columns) -> dict[str, pd.DataFrame]:
+    """Match established daily loops by omitting dates with no valid symbol."""
+    return {
+        name: pd.DataFrame(value, index=index, columns=columns).dropna(how="all")
+        for name, value in values.items()
+    }
+
+
+def _minute_return_statistics(panel: dict) -> dict:
+    """Build shared daily minute-return primitives once per cached panel."""
+
+    cache_key = "_daily_return_statistics"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        index, offsets = _day_offsets(close.index)
+        values = daily_return_statistics(close.to_numpy(dtype=float), offsets)
+        result = _daily_feature_frames(values, index, close.columns)
+        result["rows"] = pd.Series(np.diff(offsets), index=index)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_return_path_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_return_path_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        index, offsets = _day_offsets(close.index)
+        values = daily_return_path_statistics(close.to_numpy(dtype=float), offsets)
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_volume_shock_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_volume_shock_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        volume = panel.get("volume", close)
+        amount = panel.get("amount", volume)
+        index, offsets = _day_offsets(close.index)
+        values = daily_volume_shock_statistics(
+            close.to_numpy(dtype=float),
+            volume.to_numpy(dtype=float),
+            amount.to_numpy(dtype=float),
+            offsets,
+        )
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _day_offsets(index) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    day = pd.DatetimeIndex(index).normalize()
+    starts = np.r_[0, np.flatnonzero(day[1:] != day[:-1]) + 1]
+    return pd.DatetimeIndex(day[starts]), np.r_[starts, len(day)].astype(np.int64)
+
+
+def _daily_candle_features(panel: dict) -> dict[str, pd.DataFrame]:
+    """Aggregate the shared body/wick family once from the 1-minute panel."""
+
+    cache_key = "_daily_candle_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        open_px, high, low, close = (
+            panel[field] for field in ("open", "high", "low", "close")
+        )
+        index, offsets = _day_offsets(close.index)
+        candle_range = (high - low).replace(0, np.nan)
+        upper = (high - np.maximum(open_px, close)) / candle_range
+        lower = (np.minimum(open_px, close) - low) / candle_range
+        ratios = {
+            "body": (close - open_px).abs() / candle_range,
+            "upper": upper,
+            "lower": lower,
+            "symmetry": upper - lower,
+        }
+        common = open_px.notna() & high.notna() & low.notna() & close.notna()
+        common_count = daily_unary_statistics(
+            common.to_numpy(dtype=float), offsets
+        )["sum"]
+        rows = np.diff(offsets)[:, None]
+        result = {}
+        for name, ratio in ratios.items():
+            stats = daily_unary_statistics(ratio.to_numpy(dtype=float), offsets)
+            valid = (rows >= 20) & (common_count >= 20) & (stats["count"] >= 10)
+            result[name] = pd.DataFrame(
+                np.where(valid, stats["mean"], np.nan),
+                index=index,
+                columns=close.columns,
+            ).dropna(how="all")
+        body = (close - open_px).abs()
+        valid_range = candle_range > 1e-12
+        meaningful_body = body.div(candle_range) > 0.1
+        patterns = {
+            "hammer": (
+                (np.minimum(open_px, close) - low >= 2.0 * body)
+                & (high - np.maximum(open_px, close) <= 0.3 * body + 1e-12)
+                & meaningful_body
+            ),
+            "shooting_star": (
+                (high - np.maximum(open_px, close) >= 2.0 * body)
+                & (np.minimum(open_px, close) - low <= 0.3 * body + 1e-12)
+                & meaningful_body
+            ),
+        }
+        valid_count = daily_unary_statistics(
+            valid_range.astype(float).where(common).to_numpy(dtype=float), offsets
+        )["sum"]
+        for name, pattern in patterns.items():
+            pattern_count = daily_unary_statistics(
+                pattern.astype(float).where(common).to_numpy(dtype=float), offsets
+            )["sum"]
+            valid = (rows >= 20) & (common_count >= 20) & (valid_count >= 10)
+            result[name] = pd.DataFrame(
+                np.where(valid, pattern_count / valid_count, np.nan),
+                index=index,
+                columns=close.columns,
+            ).dropna(how="all")
+        panel[cache_key] = result
+        return result
+
+
+def _daily_candle_path_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_candle_path_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel.get("close", panel["high"])
+        index, offsets = _day_offsets(close.index)
+        values = daily_candle_path_statistics(
+            panel.get("open", close).to_numpy(dtype=float),
+            panel["high"].to_numpy(dtype=float),
+            panel["low"].to_numpy(dtype=float),
+            close.to_numpy(dtype=float),
+            offsets,
+        )
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_price_volume_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_price_volume_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        frame = panel.get("close", panel.get("amount", panel["volume"]))
+        close = panel.get("close", frame)
+        volume = panel.get("volume", frame * np.nan)
+        amount = panel.get("amount", volume * close)
+        index, offsets = _day_offsets(frame.index)
+        values = daily_price_volume_statistics(
+            panel.get("high", close).to_numpy(dtype=float),
+            panel.get("low", close).to_numpy(dtype=float),
+            close.to_numpy(dtype=float),
+            volume.to_numpy(dtype=float),
+            amount.to_numpy(dtype=float),
+            offsets,
+        )
+        result = _daily_feature_frames(values, index, frame.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_price_path_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_price_path_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        index, offsets = _day_offsets(close.index)
+        values = daily_price_path_statistics(
+            panel.get("open", close).to_numpy(dtype=float),
+            panel.get("high", close).to_numpy(dtype=float),
+            panel.get("low", close).to_numpy(dtype=float),
+            close.to_numpy(dtype=float),
+            panel.get("volume", close * np.nan).to_numpy(dtype=float),
+            offsets,
+        )
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _rolling_candle_feature(data, dates, universe, field):
+    panel = _get_minute_panel(data, dates, universe, freq="1min")
+    if not {"open", "high", "low", "close"}.issubset(panel):
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    daily = _daily_candle_features(panel)[field]
+    return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+def _daily_hlc_features(panel: dict) -> dict[str, pd.DataFrame]:
+    """Aggregate the shared high/low/close shape family once per minute panel."""
+
+    cache_key = "_daily_hlc_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        high, low, close = (panel[field] for field in ("high", "low", "close"))
+        index, offsets = _day_offsets(close.index)
+        rows = np.diff(offsets)[:, None]
+        common = high.notna() & low.notna() & close.notna()
+        high_values = high.where(common).to_numpy(dtype=float)
+        low_values = low.where(common).to_numpy(dtype=float)
+        close_values = close.where(common).to_numpy(dtype=float)
+        high_stats = daily_unary_statistics(high_values, offsets)
+        low_stats = daily_unary_statistics(low_values, offsets)
+        close_stats = daily_unary_statistics(close_values, offsets)
+        common_count = close_stats["count"]
+        daily_range = high_stats["max"] - low_stats["min"]
+
+        asymmetry = -(high - close).div((close - low).replace(0, np.nan))
+        asymmetry_stats = daily_unary_statistics(
+            asymmetry.where(common).to_numpy(dtype=float), offsets
+        )
+        asymmetry_valid = (
+            (rows >= 20)
+            & (common_count >= 20)
+            & (asymmetry_stats["count"] >= 10)
+        )
+
+        safe_range = np.where(daily_range < 1e-12, np.nan, daily_range)
+        day_number = np.repeat(np.arange(len(index)), np.diff(offsets))
+        position_mean = daily_unary_statistics(
+            (close_values - low_stats["min"][day_number]) / safe_range[day_number],
+            offsets,
+        )["mean"]
+        distance = np.minimum(
+            (high_stats["max"][day_number] - close_values) / safe_range[day_number],
+            (close_values - low_stats["min"][day_number]) / safe_range[day_number],
+        )
+        distance_mean = daily_unary_statistics(distance, offsets)["mean"]
+        shape_valid = (rows >= 30) & (common_count >= 30)
+
+        result = {
+            "range_asymmetry": np.where(
+                asymmetry_valid, asymmetry_stats["mean"], np.nan
+            ),
+            "range_position": np.where(
+                shape_valid,
+                np.where(
+                    daily_range < 1e-12,
+                    0.5,
+                    position_mean,
+                ),
+                np.nan,
+            ),
+            "anchor_distance": np.where(
+                shape_valid,
+                np.where(daily_range < 1e-12, 0.0, -distance_mean),
+                np.nan,
+            ),
+        }
+        result = _daily_feature_frames(result, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _rolling_hlc_feature(data, dates, universe, field):
+    panel = _get_minute_panel(data, dates, universe, freq="1min")
+    if not {"high", "low", "close"}.issubset(panel):
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    daily = _daily_hlc_features(panel)[field]
+    return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+
+
+def _daily_smart_money_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_smart_money_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        volume = panel.get("volume")
+        if volume is None:
+            volume = pd.DataFrame(1.0, index=close.index, columns=close.columns)
+        index, offsets = _day_offsets(close.index)
+        values = daily_smart_money_statistics(
+            close.to_numpy(dtype=float), volume.to_numpy(dtype=float), offsets
+        )
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_oi_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_oi_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        template = panel["position"]
+        close = panel.get("close", template)
+        fields = (
+            panel.get("high", close),
+            panel.get("low", close),
+            close,
+            panel.get("volume", template),
+            template,
+        )
+        index, offsets = _day_offsets(template.index)
+        values = daily_oi_statistics(
+            *(field.to_numpy(dtype=float) for field in fields), offsets
+        )
+        result = _daily_feature_frames(values, index, template.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_pair_feature(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    metric: str = "correlation",
+    min_rows: int = 30,
+    min_valid: int = 30,
+) -> pd.DataFrame:
+    """Compute one exact paired daily reduction without Python group loops."""
+
+    if not left.index.equals(right.index) or not left.columns.equals(right.columns):
+        right = right.reindex(index=left.index, columns=left.columns)
+    index, offsets = _day_offsets(left.index)
+    stats = daily_pair_statistics(
+        left.to_numpy(dtype=float), right.to_numpy(dtype=float), offsets
+    )
+    valid = (np.diff(offsets)[:, None] >= min_rows) & (
+        stats["count"] >= min_valid
+    )
+    values = stats[metric]
+    if metric == "correlation":
+        constant = (stats["left_std"] < 1e-12) | (stats["right_std"] < 1e-12)
+        values = np.where(constant | np.isnan(values), 0.0, values)
+    return pd.DataFrame(
+        np.where(valid, values, np.nan), index=index, columns=left.columns
+    ).dropna(how="all")
+
+
+def _daily_lagged_pair_feature(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    min_rows: int,
+    min_valid: int,
+    lag: int = 1,
+) -> pd.DataFrame:
+    """Compute paired daily lead/lag correlation after established NaN filtering."""
+
+    if not left.index.equals(right.index) or not left.columns.equals(right.columns):
+        right = right.reindex(index=left.index, columns=left.columns)
+    index, offsets = _day_offsets(left.index)
+    stats = daily_lagged_pair_statistics(
+        left.to_numpy(dtype=float), right.to_numpy(dtype=float), offsets, lag
+    )
+    valid = (np.diff(offsets)[:, None] >= min_rows) & (
+        stats["count"] >= min_valid
+    )
+    constant = (stats["left_std"] < 1e-12) | (stats["right_std"] < 1e-12)
+    values = np.where(constant | np.isnan(stats["correlation"]), 0.0, stats["correlation"])
+    return pd.DataFrame(
+        np.where(valid, values, np.nan), index=index, columns=left.columns
+    ).dropna(how="all")
+
+
+def _daily_term_features(panel: dict) -> dict[str, pd.DataFrame]:
+    """Aggregate shared near/far term-structure primitives once per panel."""
+
+    cache_key = "_daily_term_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        near, far = panel["near_close"], panel["far_close"]
+        index, offsets = _day_offsets(near.index)
+        rows = np.diff(offsets)[:, None]
+        pair = daily_pair_statistics(
+            near.to_numpy(dtype=float), far.to_numpy(dtype=float), offsets
+        )
+        slope_stats = daily_unary_statistics(
+            ((near - far) / far.replace(0, np.nan)).to_numpy(dtype=float), offsets
+        )
+        basis_stats = daily_unary_statistics(
+            ((far - near) / near.replace(0, np.nan)).to_numpy(dtype=float), offsets
+        )
+        spread = far - near
+        spread_stats = daily_unary_statistics(spread.to_numpy(dtype=float), offsets)
+        abs_spread_stats = daily_unary_statistics(
+            spread.abs().to_numpy(dtype=float), offsets
+        )
+        return_pair = daily_pair_statistics(
+            near.pct_change(fill_method=None).to_numpy(dtype=float),
+            far.pct_change(fill_method=None).to_numpy(dtype=float),
+            offsets,
+        )
+        slope_valid = (
+            (rows >= 20) & (pair["count"] >= 20) & (slope_stats["count"] >= 10)
+        )
+        spread_valid = (rows >= 20) & (pair["count"] >= 20)
+        return_valid = (rows >= 30) & (return_pair["count"] >= 30)
+        values = {
+            "slope": np.where(slope_valid, slope_stats["mean"], np.nan),
+            "basis": np.where(
+                (rows >= 20) & (pair["count"] >= 20) & (basis_stats["count"] >= 10),
+                basis_stats["mean"],
+                np.nan,
+            ),
+            "spread_mean": np.where(spread_valid, spread_stats["mean"], np.nan),
+            "spread_abs_mean": np.where(
+                spread_valid, abs_spread_stats["mean"], np.nan
+            ),
+            "spread_vol": np.where(spread_valid, -spread_stats["std"], np.nan),
+            "vol_spread": np.where(
+                return_valid,
+                -(return_pair["left_std"] - return_pair["right_std"]),
+                np.nan,
+            ),
+        }
+        if {"near_position", "far_position"}.issubset(panel):
+            near_position = panel["near_position"]
+            far_position = panel["far_position"]
+            position_pair = daily_pair_statistics(
+                near_position.to_numpy(dtype=float),
+                far_position.to_numpy(dtype=float),
+                offsets,
+            )
+            ratio_stats = daily_unary_statistics(
+                near_position.div(
+                    (near_position + far_position).replace(0, np.nan)
+                ).to_numpy(dtype=float),
+                offsets,
+            )
+            ratio_valid = (
+                (rows >= 20)
+                & (position_pair["count"] >= 20)
+                & (ratio_stats["count"] >= 10)
+            )
+            values["oi_ratio"] = np.where(
+                ratio_valid, ratio_stats["mean"], np.nan
+            )
+        result = _daily_feature_frames(values, index, near.columns)
+        panel[cache_key] = result
+        return result
+
+
 def _load_minute_panel(data, dates, universe, freq, source, cache_key):
     """Load and cache one normalized minute panel while the caller holds the lock."""
 
@@ -599,13 +1078,60 @@ def _term_base_panel(curve, mapper):
         return {}
     curve = curve.copy()
     curve["_ts"] = mapper(curve["trade_datetime"])
-    concrete = curve[curve["symbol"].map(_expiry_ym).notna()].copy()
+    if {"_maturity_rank", "_expiry_code"}.issubset(curve):
+        close = pd.to_numeric(curve["close"], errors="coerce")
+        position = pd.to_numeric(curve["position"], errors="coerce")
+        curve = curve.loc[
+            curve["_maturity_rank"].isin([1, 2])
+            & close.gt(0.0)
+            & np.isfinite(close)
+            & position.gt(0.0)
+        ].sort_values(["_ts", "root", "_maturity_rank"])
+        panel = {}
+        selected = {}
+        for label, rank in (("near", 1), ("far", 2)):
+            source = curve.loc[curve["_maturity_rank"].eq(rank)].set_index(
+                ["_ts", "root"]
+            )
+            if source.index.has_duplicates:
+                raise RuntimeError("pre-ranked term rows contain duplicate keys")
+            selected[label] = source
+            for field in ("close", "position", "volume"):
+                frame = source[field].unstack(level="root")
+                frame.index = pd.DatetimeIndex(frame.index)
+                panel[f"{label}_{field}"] = frame
+            expiry = pd.to_numeric(source["_expiry_code"], errors="coerce")
+            frame = (200000 + expiry).unstack(level="root")
+            frame.index = pd.DatetimeIndex(frame.index)
+            panel[f"{label}_expiry"] = frame
+        near = selected["near"]
+        expiry = pd.to_numeric(near["_expiry_code"], errors="coerce")
+        expiry_dates = pd.Series(
+            pd.to_datetime({
+                "year": 2000 + expiry.floordiv(100).to_numpy(),
+                "month": expiry.mod(100).to_numpy(),
+                "day": np.ones(len(expiry), dtype=int),
+            }).to_numpy(),
+            index=near.index,
+        ) + pd.offsets.MonthEnd(0)
+        timestamps = pd.Series(
+            pd.DatetimeIndex(near.index.get_level_values("_ts")), index=near.index
+        )
+        panel["remaining_days"] = (
+            (expiry_dates - timestamps) / pd.Timedelta(days=1)
+        ).clip(lower=1, upper=365).unstack(level="root")
+        return panel
+    curve["_expiry"] = curve["symbol"].map(_expiry_ym)
+    concrete = curve[curve["_expiry"].notna()].copy()
     if concrete.empty:
         return {}
     per_symbol = (
         concrete.sort_values("_ts")
         .groupby(["_ts", "root", "symbol"], as_index=False)
-        .agg({"close": "last", "position": "last", "volume": "sum"})
+        .agg({
+            "close": "last", "position": "last", "volume": "sum",
+            "_expiry": "last",
+        })
     )
     close = pd.to_numeric(per_symbol["close"], errors="coerce")
     position = pd.to_numeric(per_symbol["position"], errors="coerce")
@@ -614,7 +1140,6 @@ def _term_base_panel(curve, mapper):
     ].copy()
     if per_symbol.empty:
         return {}
-    per_symbol["_expiry"] = per_symbol["symbol"].map(_expiry_ym)
     per_symbol = per_symbol.dropna(subset=["_expiry"]).sort_values(
         ["_ts", "root", "_expiry"]
     )
@@ -674,6 +1199,7 @@ def _read_local_term(data, dates, universe, freq="1min"):
         )
     if not callable(fetcher):
         return {}
+    term_fetcher = getattr(source, "fetch_term_contracts_at_frequency", None)
     mapper = getattr(source, "trading_session_index", None)
     if not callable(mapper):
         raise RuntimeError("contract-curve source does not expose session mapping")
@@ -681,10 +1207,18 @@ def _read_local_term(data, dates, universe, freq="1min"):
     parts: dict[str, list[pd.DataFrame]] = {}
     for start in range(0, len(date_index), _TERM_FETCH_CHUNK_DAYS):
         chunk = date_index[start:start + _TERM_FETCH_CHUNK_DAYS]
-        curve = fetcher(
-            list(universe), chunk.min(), chunk.max(),
-            ["close", "position", "volume"], frequency=freq,
+        curve = (
+            term_fetcher(
+                list(universe), chunk.min(), chunk.max(), frequency=freq
+            )
+            if callable(term_fetcher)
+            else None
         )
+        if curve is None:
+            curve = fetcher(
+                list(universe), chunk.min(), chunk.max(),
+                ["close", "position", "volume"], frequency=freq,
+            )
         for field, frame in _term_base_panel(curve, mapper).items():
             parts.setdefault(field, []).append(frame)
     if not parts:
@@ -901,6 +1435,10 @@ def clear_transient_data_caches() -> None:
         _PANEL_CACHE.clear()
     with _TERM_CACHE_LOCK:
         _TERM_CACHE.clear()
+    with _PEAK_RIDGE_CACHE_LOCK:
+        _PEAK_RIDGE_CACHE.clear()
+    with _BREAKOUT_CACHE_LOCK:
+        _BREAKOUT_CACHE.clear()
     _SEAT_CACHE.clear()
     _SEAT_DETAIL_CACHE.clear()
 
@@ -1273,16 +1811,10 @@ class IntradayRealisedSkewness20d(Factor):
                 .shift(1)
                 .reindex(columns=universe)
             )
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        results: dict = {}
-        for dt, grp in ret_1m.groupby(day):
-            if len(grp) >= 10:
-                results[dt] = grp.skew()
-        if not results:
+        stats = _minute_return_statistics(panel)
+        daily = stats["skew"].where(stats["rows"].ge(10), axis=0)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(results).T
-        daily.index = pd.DatetimeIndex(daily.index)
         return _roll20_mean_std(_mean_distance(daily)).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -1911,33 +2443,9 @@ class IntradayVolumeTimeCentroid20d(Factor):
 
     def compute(self, data, dates, universe):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "amount" in panel:
-            amt = panel["amount"]
-        elif "volume" in panel and "close" in panel:
-            amt = panel["volume"] * panel["close"]
-        else:
+        if "amount" not in panel and not {"volume", "close"}.issubset(panel):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        day = amt.index.normalize()
-        centroids: dict = {}
-        for dt in sorted(set(day)):
-            grp = amt.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                a = grp[col].dropna().values
-                if len(a) < 20:
-                    continue
-                tw = np.arange(1, len(a) + 1) / len(a)
-                numerator = np.sum(tw * a)
-                denominator = np.sum(a)
-                vals[col] = float(numerator / denominator) if denominator > 0 else 0.5
-            if vals:
-                centroids[dt] = pd.Series(vals)
-        if not centroids:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(centroids).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["volume_time_centroid"]
         # 重心小=早盘放量=正向, 取负号使高值=正向
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
@@ -1967,32 +2475,7 @@ class IntradayClosePosition20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        positions: dict = {}
-        for dt in sorted(set(day)):
-            grp_high = high.loc[day == dt]
-            grp_low = low.loc[day == dt]
-            grp_close = close.loc[day == dt]
-            if len(grp_close) < 20:
-                continue
-            vals = {}
-            for col in grp_close.columns:
-                h = grp_high[col].dropna()
-                l = grp_low[col].dropna()
-                c = grp_close[col].dropna()
-                if len(c) < 20:
-                    continue
-                h_day, l_day = h.max(), l.min()
-                c_end = c.iloc[-1]
-                denom = h_day - l_day
-                vals[col] = float((c_end - l_day) / denom) if denom > 1e-12 else 0.5
-            if vals:
-                positions[dt] = pd.Series(vals)
-        if not positions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(positions).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["close_position"]
         return _roll20_mean_std(_mean_distance(daily)).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2021,27 +2504,7 @@ class IntradayReversalIntensity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        intensities: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna().values
-                if len(r) < 20:
-                    continue
-                signs = np.sign(r)
-                switches = int(np.sum(np.diff(signs) != 0))
-                vals[col] = float(switches / (len(r) - 1)) if len(r) > 1 else 0.0
-            if vals:
-                intensities[dt] = pd.Series(vals)
-        if not intensities:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(intensities).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["reversal_intensity"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2070,40 +2533,9 @@ class IntradayUpperLowerVolumeRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        if "amount" in panel:
-            amt = panel["amount"]
-        elif "volume" in panel:
-            amt = panel["volume"] * panel["close"]
-        else:
+        if "amount" not in panel and "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp_close = close.loc[day == dt]
-            grp_amt = amt.loc[day == dt]
-            if len(grp_close) < 20:
-                continue
-            vals = {}
-            for col in grp_close.columns:
-                c = grp_close[col].dropna()
-                a = grp_amt[col].dropna()
-                common_idx = c.index.intersection(a.index)
-                if len(common_idx) < 20:
-                    continue
-                c, a = c.loc[common_idx], a.loc[common_idx]
-                mid = (c.max() + c.min()) / 2.0
-                upper_mask = c > mid
-                lower_mask = c < mid
-                upper_vol = a[upper_mask].sum()
-                lower_vol = a[lower_mask].sum()
-                vals[col] = float(upper_vol / lower_vol) if lower_vol > 1e-12 else 1.0
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["upper_lower_amount_ratio"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2416,40 +2848,7 @@ class IntradayRetVolCoupling20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        couplings: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                v_mean = v_c.mean()
-                if v_mean < 1e-12:
-                    continue
-                high_vol_mask = v_c > v_mean
-                if high_vol_mask.sum() < 3:
-                    continue
-                r_high = r_c[high_vol_mask]
-                up_ratio = (r_high > 0).sum() / len(r_high)
-                down_ratio = (r_high < 0).sum() / len(r_high)
-                vals[col] = float(max(up_ratio, down_ratio))
-            if vals:
-                couplings[dt] = pd.Series(vals)
-        if not couplings:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(couplings).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["ret_vol_coupling"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2479,36 +2878,7 @@ class IntradayPriceVolumeElasticity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None).abs()
-        day = ret_1m.index.normalize()
-        elasticities: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_abs = r.loc[common]
-                v_c = v.loc[common]
-                v_mean = v_c.mean()
-                if v_mean < 1e-12:
-                    continue
-                v_norm = v_c / v_mean
-                elasticity = r_abs / (v_norm + 1e-12)
-                vals[col] = float(elasticity.mean())
-            if vals:
-                elasticities[dt] = pd.Series(vals)
-        if not elasticities:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(elasticities).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["price_volume_elasticity"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2670,35 +3040,7 @@ class IntradayUpDownVolumeAsymmetry20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        asymmetries: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                up_mask = r_c > 0
-                down_mask = r_c < 0
-                up_vol = v_c[up_mask].mean() if up_mask.any() else 0.0
-                down_vol = v_c[down_mask].mean() if down_mask.any() else 0.0
-                vals[col] = float(up_vol / down_vol) if down_vol > 1e-12 else (2.0 if up_vol > 1e-12 else 1.0)
-            if vals:
-                asymmetries[dt] = pd.Series(vals)
-        if not asymmetries:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(asymmetries).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["up_down_volume_asymmetry"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -2729,35 +3071,7 @@ class IntradayVwapDeviation20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        day = close.index.normalize()
-        deviations: dict = {}
-        for dt in sorted(set(day)):
-            grp_close = close.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_close) < 20:
-                continue
-            vals = {}
-            for col in grp_close.columns:
-                c = grp_close[col].dropna()
-                v = grp_vol[col].dropna()
-                common = c.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                c_c = c.loc[common]
-                v_c = v.loc[common]
-                v_sum = v_c.sum()
-                if v_sum < 1e-12:
-                    continue
-                vwap = float((c_c * v_c).sum() / v_sum)
-                deviations_from_vwap = c_c - vwap
-                vals[col] = float(deviations_from_vwap.std(ddof=0))
-            if vals:
-                deviations[dt] = pd.Series(vals)
-        if not deviations:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(deviations).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["vwap_deviation"]
         return _roll20_mean_std(_mean_distance(daily)).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -3057,48 +3371,7 @@ class IntradayLargeOrderImpact20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        impacts: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 30:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                mu_v = v_c.mean()
-                sigma_v = v_c.std(ddof=0)
-                if sigma_v < 1e-12:
-                    continue
-                spike_mask = v_c > (mu_v + 2.0 * sigma_v)
-                n_spikes = spike_mask.sum()
-                if n_spikes < 1:
-                    vals[col] = 0.0
-                    continue
-                spike_indices = np.where(spike_mask.values)[0]
-                impacts_list = []
-                for idx in spike_indices:
-                    look_forward = min(5, len(r_c) - idx - 1)
-                    if look_forward < 1:
-                        continue
-                    cum_ret = r_c.iloc[idx + 1:idx + 1 + look_forward].sum()
-                    impacts_list.append(np.sign(cum_ret))
-                vals[col] = float(np.mean(impacts_list)) if impacts_list else 0.0
-            if vals:
-                impacts[dt] = pd.Series(vals)
-        if not impacts:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(impacts).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_volume_shock_features(panel)["large_order_impact"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -3196,36 +3469,7 @@ class IntradaySignedVolumeRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                up_mask = r_c > 0
-                dn_mask = r_c < 0
-                buy_vol = v_c[up_mask].sum()
-                sell_vol = v_c[dn_mask].sum()
-                total = buy_vol + sell_vol
-                vals[col] = float((buy_vol - sell_vol) / total) if total > 1e-12 else 0.0
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["signed_volume_ratio"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -3305,36 +3549,13 @@ class IntradayMicroLeverage20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        ret_1m = close.pct_change(fill_method=None)
-        amplitude = (high - low) / close.replace(0, np.nan)
-        day = ret_1m.index.normalize()
-        leverages: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_amp = amplitude.loc[day == dt]
-            if len(grp_ret) < 30:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                a = grp_amp[col].dropna()
-                common = r.index.intersection(a.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                a_c = a.loc[common]
-                if r_c.std() < 1e-12 or a_c.std() < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = r_c.iloc[:-1].corr(a_c.iloc[1:], method="pearson")
-                    vals[col] = float(-corr_val) if not np.isnan(corr_val) else 0.0
-            if vals:
-                leverages[dt] = pd.Series(vals)
-        if not leverages:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(leverages).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        close = panel["close"]
+        daily = -_daily_lagged_pair_feature(
+            close.pct_change(fill_method=None),
+            (panel["high"] - panel["low"]) / close.replace(0, np.nan),
+            min_rows=30,
+            min_valid=29,
+        )
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -3423,40 +3644,7 @@ class IntradayParkinsonVolRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp_high = high.loc[day == dt]
-            grp_low = low.loc[day == dt]
-            grp_close = close.loc[day == dt]
-            if len(grp_close) < 20:
-                continue
-            vals = {}
-            for col in grp_close.columns:
-                h = grp_high[col].dropna()
-                l = grp_low[col].dropna()
-                c = grp_close[col].dropna()
-                common_hl = h.index.intersection(l.index)
-                if len(common_hl) < 20:
-                    continue
-                h_c = h.loc[common_hl]
-                l_c = l.loc[common_hl]
-                log_hl = np.log(h_c / l_c.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
-                if len(log_hl) < 10:
-                    continue
-                parkinson = float(np.sqrt((log_hl ** 2).sum() / (4.0 * len(log_hl) * np.log(2.0))))
-                cc_vol = c.pct_change(fill_method=None).dropna().std(ddof=0)
-                if cc_vol < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    vals[col] = float(-parkinson / cc_vol)
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["parkinson_vol_ratio"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -3642,34 +3830,13 @@ class IntradayRealizedCovariance20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        covariances: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common].values
-                v_c = v.loc[common].values
-                log_v = np.log(v_c + 1.0)
-                r_dev = r_c - r_c.mean()
-                v_dev = log_v - log_v.mean()
-                vals[col] = float(np.mean(r_dev * v_dev))
-            if vals:
-                covariances[dt] = pd.Series(vals)
-        if not covariances:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(covariances).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_pair_feature(
+            panel["close"].pct_change(fill_method=None),
+            np.log(panel["volume"] + 1.0),
+            metric="covariance",
+            min_rows=20,
+            min_valid=20,
+        )
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -4398,34 +4565,7 @@ class IntradayOrderFlowImbalance20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        imbalances: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                buy = v_c[r_c > 0].sum()
-                sell = v_c[r_c < 0].sum()
-                total = buy + sell
-                vals[col] = float((buy - sell) / total) if total > 1e-12 else 0.0
-            if vals:
-                imbalances[dt] = pd.Series(vals)
-        if not imbalances:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(imbalances).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["signed_volume_ratio"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -4454,34 +4594,12 @@ class IntradayInformedTrading20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        informed: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 30:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 30:
-                    continue
-                imbalance = np.sign(r.loc[common].values) * v.loc[common].values
-                imb_t, imb_tm1 = imbalance[1:], imbalance[:-1]
-                if imb_t.std(ddof=0) < 1e-12 or imb_tm1.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    vals[col] = float(np.corrcoef(imb_t, imb_tm1)[0, 1])
-            if vals:
-                informed[dt] = pd.Series(vals)
-        if not informed:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(informed).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        imbalance = (
+            np.sign(panel["close"].pct_change(fill_method=None)) * panel["volume"]
+        )
+        daily = _daily_lagged_pair_feature(
+            imbalance, imbalance, min_rows=30, min_valid=29
+        )
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -4949,26 +5067,39 @@ class IntradayMfdfaWidth20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         close = panel["close"]
-        day = close.index.normalize()
-        widths: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 60:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna().values
-                if len(c) < 60:
+        index, offsets = _day_offsets(close.index)
+        mode = factor_kernel_mode()
+        candidate = None
+        if mode != "reference":
+            candidate = native_array_kernel(
+                "daily_mfdfa_width", close.to_numpy(dtype=float), offsets
+            )
+        if mode == "native":
+            daily = pd.DataFrame(candidate, index=index, columns=close.columns)
+        else:
+            day = close.index.normalize()
+            widths: dict = {}
+            for dt in sorted(set(day)):
+                grp = close.loc[day == dt]
+                if len(grp) < 60:
                     continue
-                r = np.diff(np.log(c[c > 0]))
-                if len(r) < 40:
-                    continue
-                vals[col] = self._mfdfa_width(r)
-            if vals:
-                widths[dt] = pd.Series(vals)
-        if not widths:
+                vals = {}
+                for col in grp.columns:
+                    c = grp[col].dropna().values
+                    if len(c) < 60:
+                        continue
+                    r = np.diff(np.log(c[c > 0]))
+                    if len(r) < 40:
+                        continue
+                    vals[col] = self._mfdfa_width(r)
+                if vals:
+                    widths[dt] = pd.Series(vals)
+            daily = pd.DataFrame(widths).T.reindex(index=index, columns=close.columns)
+            if mode == "shadow":
+                assert_native_equal(daily.to_numpy(), candidate, "daily_mfdfa_width")
+        daily = daily.dropna(how="all")
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(widths).T
         daily.index = pd.DatetimeIndex(daily.index)
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
@@ -5132,47 +5263,11 @@ class IntradayPermutationEntropy20d(Factor):
     def dependencies(self) -> list:
         return []
 
-    @staticmethod
-    def _perm_entropy(series, order=3):
-        n = len(series)
-        if n < 20:
-            return 0.5
-        patterns = {}
-        for i in range(n - order + 1):
-            window = series[i:i + order]
-            perm = tuple(np.argsort(window))
-            patterns[perm] = patterns.get(perm, 0) + 1
-        total = float(sum(patterns.values()))
-        if total <= 0:
-            return 0.5
-        entropy = -sum((c / total) * np.log(c / total) for c in patterns.values())
-        import math as _math
-        max_entropy = np.log(_math.factorial(order))
-        return float(entropy / max_entropy) if max_entropy > 0 else 0.5
-
     def compute(self, data, dates, universe):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        entropies: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna().values
-                if len(r) < 30:
-                    continue
-                vals[col] = -self._perm_entropy(r)
-            if vals:
-                entropies[dt] = pd.Series(vals)
-        if not entropies:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(entropies).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_return_path_features(panel)["permutation_entropy"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -5199,44 +5294,7 @@ class IntradayBodyRatio20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        bodies: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c = o.loc[common]
-                h_c = h.loc[common]
-                l_c = l.loc[common]
-                c_c = c.loc[common]
-                rng = (h_c - l_c).replace(0, np.nan)
-                ratio = ((c_c - o_c).abs() / rng).dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(ratio.mean())
-            if vals:
-                bodies[dt] = pd.Series(vals)
-        if not bodies:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(bodies).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "body")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5261,42 +5319,7 @@ class IntradayUpperWickRatio20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        wicks: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                rng = (h_c - l_c).replace(0, np.nan)
-                upper = (h_c - np.maximum(o_c, c_c)) / rng
-                ratio = upper.dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(ratio.mean())
-            if vals:
-                wicks[dt] = pd.Series(vals)
-        if not wicks:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(wicks).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "upper")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5321,42 +5344,7 @@ class IntradayLowerWickRatio20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        wicks: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                rng = (h_c - l_c).replace(0, np.nan)
-                lower = (np.minimum(o_c, c_c) - l_c) / rng
-                ratio = lower.dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(ratio.mean())
-            if vals:
-                wicks[dt] = pd.Series(vals)
-        if not wicks:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(wicks).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "lower")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5382,43 +5370,7 @@ class IntradayWickSymmetry20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        sym: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                rng = (h_c - l_c).replace(0, np.nan)
-                upper = (h_c - np.maximum(o_c, c_c)) / rng
-                lower = (np.minimum(o_c, c_c) - l_c) / rng
-                ratio = (upper - lower).dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(ratio.mean())
-            if vals:
-                sym[dt] = pd.Series(vals)
-        if not sym:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(sym).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "symmetry")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5443,49 +5395,7 @@ class IntradayHammerFreq20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        hammers: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                rng = (h_c - l_c).values
-                body = np.abs(c_c.values - o_c.values)
-                lower = np.minimum(o_c.values, c_c.values) - l_c.values
-                upper = h_c.values - np.maximum(o_c.values, c_c.values)
-                valid = rng > 1e-12
-                if valid.sum() < 10:
-                    continue
-                body_ratio = np.divide(
-                    body, rng, out=np.zeros_like(body), where=valid
-                )
-                body_n = body_ratio > 0.1  # 实体需有意义
-                hammer = (lower >= 2.0 * body) & (upper <= 0.3 * body + 1e-12) & (body_n == 1)
-                vals[col] = float(hammer.sum() / valid.sum())
-            if vals:
-                hammers[dt] = pd.Series(vals)
-        if not hammers:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(hammers).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "hammer")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5510,49 +5420,7 @@ class IntradayShootingStarFreq20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"open", "high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        stars: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                rng = (h_c - l_c).values
-                body = np.abs(c_c.values - o_c.values)
-                lower = np.minimum(o_c.values, c_c.values) - l_c.values
-                upper = h_c.values - np.maximum(o_c.values, c_c.values)
-                valid = rng > 1e-12
-                if valid.sum() < 10:
-                    continue
-                body_ratio = np.divide(
-                    body, rng, out=np.zeros_like(body), where=valid
-                )
-                body_n = body_ratio > 0.1
-                star = (upper >= 2.0 * body) & (lower <= 0.3 * body + 1e-12) & (body_n == 1)
-                vals[col] = float(star.sum() / valid.sum())
-            if vals:
-                stars[dt] = pd.Series(vals)
-        if not stars:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(stars).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_candle_feature(data, dates, universe, "shooting_star")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5580,40 +5448,7 @@ class IntradayVolRatio53020d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            n = len(grp)
-            if n < 60:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna().values
-                if len(r) < 60:
-                    continue
-                # 5-min segments
-                vol5 = []
-                for i in range(0, len(r) - 4, 5):
-                    seg = r[i:i + 5]
-                    vol5.append(seg.std(ddof=0))
-                vol5 = np.array([v for v in vol5 if not np.isnan(v)])
-                # 30-min segments
-                vol30 = []
-                for i in range(0, len(r) - 29, 30):
-                    seg = r[i:i + 30]
-                    vol30.append(seg.std(ddof=0))
-                vol30 = np.array([v for v in vol30 if not np.isnan(v)])
-                m5 = vol5.mean() if len(vol5) else 0.0
-                m30 = vol30.mean() if len(vol30) else 0.0
-                vals[col] = float(m5 / m30) if m30 > 1e-12 else 1.0
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_return_path_features(panel)["vol_ratio_5_30"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -5702,40 +5537,7 @@ class IntradayRangeAsymmetry20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        asym: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                upper = (h_c - c_c)
-                lower = (c_c - l_c).replace(0, np.nan)
-                ratio = (upper / lower).dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(-ratio.mean())
-            if vals:
-                asym[dt] = pd.Series(vals)
-        if not asym:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(asym).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_hlc_feature(data, dates, universe, "range_asymmetry")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5970,45 +5772,11 @@ class IntradayDepthProxy20d(Factor):
 
     def compute(self, data, dates, universe):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "amount" in panel:
-            amt = panel["amount"]
-        elif "volume" in panel and "close" in panel:
-            amt = panel["volume"] * panel["close"]
-        else:
+        if "amount" not in panel and not {"volume", "close"}.issubset(panel):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         if not {"high", "low"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low = panel["high"], panel["low"]
-        day = amt.index.normalize()
-        depths: dict = {}
-        for dt in sorted(set(day)):
-            grp_amt = amt.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            if len(grp_amt) < 20:
-                continue
-            vals = {}
-            for col in grp_amt.columns:
-                a = grp_amt[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                common = a.index.intersection(h.index).intersection(l.index)
-                if len(common) < 20:
-                    continue
-                a_c, h_c, l_c = (x.loc[common] for x in (a, h, l))
-                rng = (h_c - l_c).replace(0, np.nan)
-                rng_clean = rng.dropna()
-                if len(rng_clean) < 10:
-                    continue
-                mean_amt = a_c.mean()
-                mean_rng = rng_clean.mean()
-                vals[col] = float(mean_amt / mean_rng) if mean_rng > 1e-12 else 0.0
-            if vals:
-                depths[dt] = pd.Series(vals)
-        if not depths:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(depths).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["depth_proxy"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -6374,25 +6142,11 @@ class IntradayLotteryMax20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        maxs: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                vals[col] = float(-r.max())  # 大MAX=低值=负向
-            if vals:
-                maxs[dt] = pd.Series(vals)
-        if not maxs:
+        stats = _minute_return_statistics(panel)
+        valid = stats["count"].ge(20)
+        daily = (-stats["max"]).where(valid).where(stats["rows"].ge(20), axis=0)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(maxs).T
-        daily.index = pd.DatetimeIndex(daily.index)
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -7562,25 +7316,11 @@ class IntradayVolatilityBreakout20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        daily_vol: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 30:
-                    continue
-                vals[col] = float(r.std(ddof=0))
-            if vals:
-                daily_vol[dt] = pd.Series(vals)
-        if not daily_vol:
+        stats = _minute_return_statistics(panel)
+        valid = stats["count"].ge(30)
+        vol_df = stats["std"].where(valid).where(stats["rows"].ge(30), axis=0)
+        if vol_df.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        vol_df = pd.DataFrame(daily_vol).T
-        vol_df.index = pd.DatetimeIndex(vol_df.index)
         vol_df = vol_df.reindex(dates)
         vol_ma = vol_df.rolling(10, min_periods=3).mean()
         ratios = vol_df / vol_ma.replace(0, np.nan)
@@ -7966,38 +7706,7 @@ class IntradayNewHighVolume20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, volume = panel["high"], panel["volume"]
-        day = high.index.normalize()
-        confirms: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            if len(grp_h) < 20:
-                continue
-            vals = {}
-            for col in grp_h.columns:
-                h = grp_h[col].dropna()
-                v = grp_v[col].dropna()
-                common = h.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                h_c = h.loc[common]
-                v_c = v.loc[common]
-                cum_max = h_c.cummax()
-                new_high_mask = (h_c == cum_max) & (cum_max > cum_max.shift(1).fillna(cum_max.iloc[0] - 1.0))
-                base_vol = v_c.mean()
-                if base_vol < 1e-12:
-                    continue
-                if new_high_mask.sum() >= 2:
-                    vals[col] = float(v_c[new_high_mask].mean() / base_vol)
-                else:
-                    vals[col] = 1.0
-            if vals:
-                confirms[dt] = pd.Series(vals)
-        if not confirms:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(confirms).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["new_high_volume"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -8026,35 +7735,7 @@ class IntradayObvSlope20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        slopes: dict = {}
-        for dt in sorted(set(day)):
-            grp_ret = ret_1m.loc[day == dt]
-            grp_vol = volume.loc[day == dt]
-            if len(grp_ret) < 30:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                r = grp_ret[col].dropna()
-                v = grp_vol[col].dropna()
-                common = r.index.intersection(v.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common].values
-                v_c = v.loc[common].values
-                obv = np.cumsum(np.sign(r_c) * v_c)
-                t = np.arange(len(obv)) / max(1, len(obv) - 1)
-                slope = np.polyfit(t, obv, 1)[0]
-                base = (v_c.mean() * len(v_c))
-                vals[col] = float(slope / base) if base > 1e-12 else 0.0
-            if vals:
-                slopes[dt] = pd.Series(vals)
-        if not slopes:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(slopes).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_volume_features(panel)["obv_slope"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -8220,39 +7901,7 @@ class IntradayChoppiness20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        chops: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_ret = ret_1m.loc[day == dt]
-            if len(grp_ret) < 20:
-                continue
-            vals = {}
-            for col in grp_ret.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                r = grp_ret[col].dropna()
-                common = h.index.intersection(l.index).intersection(r.index)
-                if len(common) < 20:
-                    continue
-                h_c, l_c, r_c = (x.loc[common] for x in (h, l, r))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                sum_ret = r_c.abs().sum()
-                n = len(r_c)
-                chop = np.log10(sum_ret / rng) / np.log10(n) if n > 1 and sum_ret > 1e-12 else 0.0
-                vals[col] = -float(chop)
-            if vals:
-                chops[dt] = pd.Series(vals)
-        if not chops:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(chops).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["choppiness"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -8281,38 +7930,7 @@ class IntradayADX20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low = panel["high"], panel["low"]
-        day = high.index.normalize()
-        adxs: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            if len(grp_h) < 30:
-                continue
-            vals = {}
-            for col in grp_h.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                common = h.index.intersection(l.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c = (x.loc[common] for x in (h, l))
-                dh = h_c.diff()
-                dl = -l_c.diff()
-                up_move = dh.clip(lower=0)
-                dn_move = dl.clip(lower=0)
-                dm_plus = ((up_move > dn_move) & (up_move > 0)) * up_move
-                dm_minus = ((dn_move > up_move) & (dn_move > 0)) * dn_move
-                sum_plus = dm_plus.sum()
-                sum_minus = dm_minus.sum()
-                denom = sum_plus + sum_minus
-                vals[col] = float(100.0 * abs(sum_plus - sum_minus) / denom) if denom > 1e-12 else 0.0
-            if vals:
-                adxs[dt] = pd.Series(vals)
-        if not adxs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(adxs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_candle_path_features(panel)["adx"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -8913,34 +8531,7 @@ class IntradayRangeCrossing20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        crossings: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                mid = (h_c.max() + l_c.min()) / 2.0
-                above = (c_c > mid).astype(int).values
-                crossings_n = int(np.sum(np.diff(above) != 0))
-                vals[col] = -float(crossings_n)
-            if vals:
-                crossings[dt] = pd.Series(vals)
-        if not crossings:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(crossings).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["range_crossing"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -9085,37 +8676,7 @@ class IntradayRiskAdjMomentum20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"open", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, close = panel["open"], panel["close"]
-        ret_1m = close.pct_change(fill_method=None)
-        day = close.index.normalize()
-        rarms: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            grp_r = ret_1m.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                c = grp_c[col].dropna()
-                r = grp_r[col].dropna()
-                common = o.index.intersection(c.index).intersection(r.index)
-                if len(common) < 20:
-                    continue
-                o_c, c_c, r_c = (x.loc[common] for x in (o, c, r))
-                o_first = o_c.iloc[0]
-                if o_first < 1e-12:
-                    continue
-                intraday_ret = c_c.iloc[-1] / o_first - 1.0
-                vol = r_c.std(ddof=0)
-                vals[col] = float(intraday_ret / vol) if vol > 1e-12 else 0.0
-            if vals:
-                rarms[dt] = pd.Series(vals)
-        if not rarms:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(rarms).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["risk_adj_momentum"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -9366,28 +8927,13 @@ class IntradayUpMinuteRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                up = (r > 0).sum()
-                dn = (r < 0).sum()
-                total = up + dn
-                vals[col] = float(up / total) if total > 0 else 0.5
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
+        stats = _minute_return_statistics(panel)
+        total = stats["positive_count"] + stats["negative_count"]
+        daily = stats["positive_count"].div(total.where(total > 0)).fillna(0.5)
+        valid = stats["count"].ge(20)
+        daily = daily.where(valid).where(stats["rows"].ge(20), axis=0)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -9786,32 +9332,7 @@ class IntradayMidLineTime20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        times: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                mid = (h_c.max() + l_c.min()) / 2.0
-                vals[col] = float((c_c > mid).sum() / len(c_c))
-            if vals:
-                times[dt] = pd.Series(vals)
-        if not times:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(times).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["mid_line_time"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -10432,31 +9953,16 @@ class IntradayTrendFollowScore20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        scores: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                day_dir = np.sign(r.sum())
-                total_abs = r.abs().sum()
-                if abs(day_dir) < 1e-12 or total_abs < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                aligned = (r * day_dir).clip(lower=0).sum()
-                vals[col] = float(aligned / total_abs)
-            if vals:
-                scores[dt] = pd.Series(vals)
-        if not scores:
+        stats = _minute_return_statistics(panel)
+        total_abs = stats["abs_mean"] * stats["count"]
+        daily = 0.5 * (1.0 + stats["sum"].abs().div(total_abs))
+        daily = daily.where(
+            stats["sum"].abs().ge(1e-12) & total_abs.ge(1e-12), 0.0
+        )
+        valid = stats["count"].ge(20)
+        daily = daily.where(valid).where(stats["rows"].ge(20), axis=0)
+        if daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(scores).T
-        daily.index = pd.DatetimeIndex(daily.index)
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -11193,40 +10699,7 @@ class IntradayMorningStarFreq20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"open", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, close = panel["open"], panel["close"]
-        day = close.index.normalize()
-        freqs: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(c.index)
-                if len(common) < 30:
-                    continue
-                o_c, c_c = (x.loc[common].values for x in (o, c))
-                n = len(o_c)
-                cnt = 0
-                for i in range(1, n - 1):
-                    rng1 = max(abs(c_c[i - 1] - o_c[i - 1]), 1e-12)
-                    body1 = (c_c[i - 1] - o_c[i - 1]) / rng1  # <0 阴线
-                    body2 = abs(c_c[i] - o_c[i]) / max(abs(c_c[i] - o_c[i]) + abs(c_c[i - 1] - o_c[i - 1]) + 1e-12, 1e-12)
-                    rng3 = max(abs(c_c[i + 1] - o_c[i + 1]), 1e-12)
-                    body3 = (c_c[i + 1] - o_c[i + 1]) / rng3  # >0 阳线
-                    # 阴线 + 小实体 + 阳线
-                    if body1 < -0.5 and body2 < 0.3 and body3 > 0.5:
-                        cnt += 1
-                vals[col] = float(cnt / n)
-            if vals:
-                freqs[dt] = pd.Series(vals)
-        if not freqs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(freqs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_candle_path_features(panel)["morning_star"]
         return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -11917,43 +11390,8 @@ class LiquidityElasticity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        vol = panel["volume"]
-        ret = close.pct_change(fill_method=None)
-        day = close.index.normalize()
-        daily = {}
-        for dt in sorted(set(day)):
-            c = close.loc[day == dt]
-            v = vol.loc[vol.index.normalize() == dt]
-            common = c.columns.intersection(v.columns)
-            vals = {}
-            for col in common:
-                cc, vv = c[col], v[col]
-                idx = cc.dropna().index.intersection(vv.dropna().index)
-                if len(idx) < 30:
-                    continue
-                cc, vv = cc.loc[idx], vv.loc[idx]
-                rr = cc.pct_change(fill_method=None)
-                vol_spike = vv > (vv.mean() + 2 * vv.std(ddof=0))
-                if not vol_spike.any():
-                    continue
-                spike_idx = vol_spike[vol_spike].index
-                # 冲击时收益绝对值
-                shock_abs = rr.loc[spike_idx].abs()
-                if shock_abs.empty:
-                    continue
-                # 冲击后5分钟累计收益
-                recover = []
-                for si in spike_idx:
-                    pos = rr.index.get_loc(si)
-                    if pos + 5 < len(rr):
-                        recover.append(abs(rr.iloc[pos + 1:pos + 6].sum()))
-                if not recover:
-                    continue
-                vals[col] = float(np.mean(recover) / max(shock_abs.mean(), 1e-9))
-            if vals:
-                daily[dt] = pd.Series(vals)
-        return _finalize(pd.DataFrame(daily).T, dates, universe)
+        daily = _daily_volume_shock_features(panel)["liquidity_elasticity"]
+        return _finalize(daily, dates, universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -12485,36 +11923,7 @@ class IntradayVwapBandRetention20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        day = close.index.normalize()
-        retentions: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                v = grp_v[col].dropna()
-                common = c.index.intersection(v.index)
-                if len(common) < 30:
-                    continue
-                c_c = c.loc[common]
-                v_c = v.loc[common]
-                vwap = float((c_c * v_c).sum() / v_c.sum()) if v_c.sum() > 1e-12 else c_c.mean()
-                sigma = c_c.std(ddof=0)
-                if sigma < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                in_band = ((c_c - vwap).abs() <= sigma).sum()
-                vals[col] = float(in_band / len(c_c))
-            if vals:
-                retentions[dt] = pd.Series(vals)
-        if not retentions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(retentions).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["vwap_band_retention"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -12540,40 +11949,7 @@ class IntradayRangePositionAvg20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        positions: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.5
-                    continue
-                pos = (c_c - l_c.min()) / rng
-                vals[col] = float(pos.mean())
-            if vals:
-                positions[dt] = pd.Series(vals)
-        if not positions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(positions).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_hlc_feature(data, dates, universe, "range_position")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -12601,36 +11977,7 @@ class IntradayPathBandwidth20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        bandwidths: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                p10, p90 = np.percentile(c_c.values, [10, 90])
-                vals[col] = float((p90 - p10) / rng)
-            if vals:
-                bandwidths[dt] = pd.Series(vals)
-        if not bandwidths:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(bandwidths).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["path_bandwidth"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -12659,37 +12006,7 @@ class IntradayEdgeTouchRatio20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        touches: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                pos = (c_c - l_c.min()) / rng
-                touch = ((pos <= 0.1) | (pos >= 0.9)).sum()
-                vals[col] = -float(touch / len(c_c))
-            if vals:
-                touches[dt] = pd.Series(vals)
-        if not touches:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(touches).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["edge_touch_ratio"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -12830,37 +12147,7 @@ class IntradayMidlineDirection20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        balances: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                mid = (h_c.max() + l_c.min()) / 2.0
-                above = (c_c > mid).astype(int).values
-                diff = np.diff(above)
-                up_cross = int(np.sum(diff == 1))
-                dn_cross = int(np.sum(diff == -1))
-                total = up_cross + dn_cross
-                vals[col] = float(up_cross / total) if total > 0 else 0.5
-            if vals:
-                balances[dt] = pd.Series(vals)
-        if not balances:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(balances).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["midline_direction"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -12886,42 +12173,7 @@ class IntradayAnchorDistance20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        distances: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                dist_to_high = (h_c.max() - c_c) / rng
-                dist_to_low = (c_c - l_c.min()) / rng
-                min_dist = np.minimum(dist_to_high, dist_to_low)
-                vals[col] = -float(min_dist.mean())
-            if vals:
-                distances[dt] = pd.Series(vals)
-        if not distances:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(distances).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_hlc_feature(data, dates, universe, "anchor_distance")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -13053,36 +12305,9 @@ class IntradayOiPriceSensitivity20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change(fill_method=None)
-        oi_change = position.diff()
-        day = ret_1m.index.normalize()
-        sensitivities: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_1m.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_r) < 30:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                o = grp_o[col].dropna()
-                common = r.index.intersection(o.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                o_c = o.loc[common]
-                if r_c.std(ddof=0) < 1e-12 or o_c.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(r_c, o_c)[0, 1])
-                    vals[col] = corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                sensitivities[dt] = pd.Series(vals)
-        if not sensitivities:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(sensitivities).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_pair_feature(
+            panel["close"].pct_change(fill_method=None), panel["position"].diff()
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -13166,39 +12391,7 @@ class IntradayOpenDrive20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"open", "high", "low", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        open_px, high, low, close = panel["open"], panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        drives: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = open_px.loc[day == dt]
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            n_open = max(10, min(30, len(grp_c) // 4))
-            vals = {}
-            for col in grp_c.columns:
-                o = grp_o[col].dropna()
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(h.index).intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                o_c, h_c, l_c, c_c = (x.loc[common] for x in (o, h, l, c))
-                o_first = o_c.iloc[0]
-                rng = h_c.max() - l_c.min()
-                if o_first < 1e-12 or rng < 1e-12:
-                    continue
-                open_ret = c_c.iloc[n_open - 1] / o_first - 1.0
-                vals[col] = float(open_ret / rng)
-            if vals:
-                drives[dt] = pd.Series(vals)
-        if not drives:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(drives).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["open_drive"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -13437,35 +12630,7 @@ class IntradayOiVolCorr20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "volume" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        volume, position = panel["volume"], panel["position"]
-        oi_change = position.diff()
-        day = volume.index.normalize()
-        corrs: dict = {}
-        for dt in sorted(set(day)):
-            grp_v = volume.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_v) < 30:
-                continue
-            vals = {}
-            for col in grp_v.columns:
-                v = grp_v[col].dropna()
-                o = grp_o[col].dropna()
-                common = v.index.intersection(o.index)
-                if len(common) < 30:
-                    continue
-                v_c = v.loc[common]
-                o_c = o.loc[common]
-                if v_c.std(ddof=0) < 1e-12 or o_c.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(v_c, o_c)[0, 1])
-                    vals[col] = corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                corrs[dt] = pd.Series(vals)
-        if not corrs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(corrs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_pair_feature(panel["position"].diff(), panel["volume"])
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14110,33 +13275,7 @@ class IntradayTermSlope20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        slopes: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                n_c = n.loc[common]
-                f_c = f.loc[common].replace(0, np.nan)
-                slope = ((n_c - f_c) / f_c).dropna()
-                if len(slope) < 10:
-                    continue
-                vals[col] = float(slope.mean())
-            if vals:
-                slopes[dt] = pd.Series(vals)
-        if not slopes:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(slopes).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_term_features(panel)["slope"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14165,34 +13304,7 @@ class IntradayTermSlopeChange20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        daily_slope: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                n_c = n.loc[common]
-                f_c = f.loc[common]
-                slope = (n_c - f_c) / f_c.replace(0, np.nan)
-                slope = slope.dropna()
-                if len(slope) < 10:
-                    continue
-                vals[col] = float(slope.mean())
-            if vals:
-                daily_slope[dt] = pd.Series(vals)
-        if not daily_slope:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_slope).T
-        df.index = pd.DatetimeIndex(df.index)
+        df = _daily_term_features(panel)["slope"]
         chg = df.diff()
         return chg.reindex(index=dates, columns=universe).shift(1)
 
@@ -14222,29 +13334,7 @@ class IntradayTermSpreadVol20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        vols: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                spread = f.loc[common] - n.loc[common]
-                vals[col] = -float(spread.std(ddof=0))
-            if vals:
-                vols[dt] = pd.Series(vals)
-        if not vols:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(vols).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_term_features(panel)["spread_vol"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14273,34 +13363,7 @@ class IntradayTermOiRatio20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_position" not in panel or "far_position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near_pos, far_pos = panel["near_position"], panel["far_position"]
-        day = near_pos.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near_pos.loc[day == dt]
-            grp_f = far_pos.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                n_c = n.loc[common]
-                f_c = f.loc[common]
-                total = n_c + f_c
-                ratio = (n_c / total.replace(0, np.nan)).dropna()
-                if len(ratio) < 10:
-                    continue
-                vals[col] = float(ratio.mean())
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_term_features(panel)["oi_ratio"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14329,32 +13392,7 @@ class IntradayTermSlopeMaCross20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        daily_slope: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                slope = (n.loc[common] - f.loc[common]) / f.loc[common].replace(0, np.nan)
-                slope = slope.dropna()
-                if len(slope) < 10:
-                    continue
-                vals[col] = float(slope.mean())
-            if vals:
-                daily_slope[dt] = pd.Series(vals)
-        if not daily_slope:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_slope).T
-        df.index = pd.DatetimeIndex(df.index)
+        df = _daily_term_features(panel)["slope"]
         ma5 = df.rolling(5, min_periods=3).mean()
         ma20 = df.rolling(20, min_periods=5).mean()
         cross = (ma5 - ma20) / ma20.replace(0, np.nan)
@@ -14386,31 +13424,7 @@ class IntradayTermVolSpread20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        ret_n, ret_f = near.pct_change(fill_method=None), far.pct_change(fill_method=None)
-        day = ret_n.index.normalize()
-        spreads: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = ret_n.loc[day == dt]
-            grp_f = ret_f.loc[day == dt]
-            if len(grp_n) < 30:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                rn = grp_n[col].dropna()
-                rf = grp_f[col].dropna()
-                common = rn.index.intersection(rf.index)
-                if len(common) < 30:
-                    continue
-                vol_n = rn.loc[common].std(ddof=0)
-                vol_f = rf.loc[common].std(ddof=0)
-                vals[col] = -float(vol_n - vol_f)
-            if vals:
-                spreads[dt] = pd.Series(vals)
-        if not spreads:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(spreads).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_term_features(panel)["vol_spread"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14439,29 +13453,7 @@ class IntradayTermBreakout20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        daily_spread: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                spread = (f.loc[common] - n.loc[common]).abs()
-                vals[col] = float(spread.mean())
-            if vals:
-                daily_spread[dt] = pd.Series(vals)
-        if not daily_spread:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_spread).T
-        df.index = pd.DatetimeIndex(df.index)
+        df = _daily_term_features(panel)["spread_abs_mean"]
         df = df.reindex(dates)
         ma = df.rolling(10, min_periods=3).mean()
         ratio = df / ma.replace(0, np.nan)
@@ -14493,29 +13485,7 @@ class IntradayTermReversion20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="1min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        daily_spread: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                spread = f.loc[common] - n.loc[common]
-                vals[col] = float(spread.mean())
-            if vals:
-                daily_spread[dt] = pd.Series(vals)
-        if not daily_spread:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_spread).T
-        df.index = pd.DatetimeIndex(df.index)
+        df = _daily_term_features(panel)["spread_mean"]
         df = df.reindex(dates)
         ma20 = df.rolling(20, min_periods=5).mean()
         std20 = df.rolling(20, min_periods=5).std(ddof=0)
@@ -14697,36 +13667,10 @@ class IntradayOiVolPriceCorr20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, position = panel["close"], panel["position"]
-        ret_abs = close.pct_change(fill_method=None).abs()
-        oi_change = position.diff()
-        day = ret_abs.index.normalize()
-        corrs: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_abs.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_r) < 30:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                o = grp_o[col].dropna()
-                common = r.index.intersection(o.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                o_c = o.loc[common]
-                if r_c.std(ddof=0) < 1e-12 or o_c.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(r_c, o_c)[0, 1])
-                    vals[col] = corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                corrs[dt] = pd.Series(vals)
-        if not corrs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(corrs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_pair_feature(
+            panel["position"].diff(),
+            panel["close"].pct_change(fill_method=None).abs(),
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14803,38 +13747,13 @@ class IntradayPriceOiLead20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change(fill_method=None)
-        oi_change = position.diff()
-        day = ret_1m.index.normalize()
-        leads: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_1m.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_r) < 40:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                o = grp_o[col].dropna()
-                common = r.index.intersection(o.index)
-                if len(common) < 40:
-                    continue
-                r_c = r.loc[common].values
-                o_c = o.loc[common].values
-                # 价格领先: corr(ret_t, ΔOI_{t+1}) 用 t=0..n-2
-                r_t, o_next = r_c[:-1], o_c[1:]
-                # 持仓领先: corr(ret_{t+1}, ΔOI_t)
-                r_next, o_t = r_c[1:], o_c[:-1]
-                c1 = float(np.corrcoef(r_t, o_next)[0, 1]) if r_t.std() > 1e-12 and o_next.std() > 1e-12 else 0.0
-                c2 = float(np.corrcoef(r_next, o_t)[0, 1]) if r_next.std() > 1e-12 and o_t.std() > 1e-12 else 0.0
-                vals[col] = c1 - c2 if not np.isnan(c1) and not np.isnan(c2) else 0.0
-            if vals:
-                leads[dt] = pd.Series(vals)
-        if not leads:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(leads).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        returns = panel["close"].pct_change(fill_method=None)
+        oi_change = panel["position"].diff()
+        daily = _daily_lagged_pair_feature(
+            returns, oi_change, min_rows=40, min_valid=39
+        ) - _daily_lagged_pair_feature(
+            oi_change, returns, min_rows=40, min_valid=39
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -14863,35 +13782,9 @@ class IntradayVolOiCorr20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, position = panel["close"], panel["position"]
-        ret_abs = close.pct_change(fill_method=None).abs()
-        day = ret_abs.index.normalize()
-        corrs: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_abs.loc[day == dt]
-            grp_p = position.loc[day == dt]
-            if len(grp_r) < 30:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                p = grp_p[col].dropna()
-                common = r.index.intersection(p.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                p_c = p.loc[common]
-                if r_c.std(ddof=0) < 1e-12 or p_c.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(r_c, p_c)[0, 1])
-                    vals[col] = -corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                corrs[dt] = pd.Series(vals)
-        if not corrs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(corrs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = -_daily_pair_feature(
+            panel["close"].pct_change(fill_method=None).abs(), panel["position"]
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -15111,44 +14004,7 @@ class IntradayOiBlowupPosition20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close, position = panel["high"], panel["low"], panel["close"], panel["position"]
-        oi_change = position.diff().abs()
-        day = oi_change.index.normalize()
-        positions: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                o = grp_o[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index).intersection(o.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c, o_c = (x.loc[common] for x in (h, l, c, o))
-                rng = h_c.max() - l_c.min()
-                sigma = o_c.std(ddof=0)
-                if rng < 1e-12 or sigma < 1e-12:
-                    vals[col] = 0.5
-                    continue
-                blow_mask = o_c > o_c.mean() + 2.0 * sigma
-                if blow_mask.sum() < 2:
-                    vals[col] = 0.5
-                    continue
-                pos = (c_c[blow_mask] - l_c.min()) / rng
-                vals[col] = float(pos.mean())
-            if vals:
-                positions[dt] = pd.Series(vals)
-        if not positions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(positions).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["blowup_position"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -15177,43 +14033,7 @@ class IntradayOiTorrent20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "volume", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume, position = panel["close"], panel["volume"], panel["position"]
-        ret_1m = close.pct_change(fill_method=None)
-        oi_change = position.diff()
-        day = ret_1m.index.normalize()
-        torrents: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_1m.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_r) < 30:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                v = grp_v[col].dropna()
-                o = grp_o[col].dropna()
-                common = r.index.intersection(v.index).intersection(o.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                v_c = v.loc[common]
-                o_c = o.loc[common]
-                v_mean = v_c.mean()
-                if v_mean < 1e-12:
-                    continue
-                torrent_mask = (r_c < 0) & (v_c > v_mean) & (o_c > 0)
-                if torrent_mask.sum() < 2:
-                    vals[col] = 0.0
-                    continue
-                # 强度: 放量下跌增仓分钟的平均跌幅
-                vals[col] = -float(r_c[torrent_mask].mean())
-            if vals:
-                torrents[dt] = pd.Series(vals)
-        if not torrents:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(torrents).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["torrent"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -15242,38 +14062,7 @@ class IntradayOiHerding20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, position = panel["close"], panel["position"]
-        ret_1m = close.pct_change(fill_method=None)
-        oi_change = position.diff()
-        day = ret_1m.index.normalize()
-        herdings: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_1m.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_r) < 20:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                o = grp_o[col].dropna()
-                common = r.index.intersection(o.index)
-                if len(common) < 20:
-                    continue
-                r_c = r.loc[common]
-                o_c = o.loc[common]
-                # 顺势: 涨时增仓 或 跌时减仓
-                follow = ((r_c > 0) & (o_c > 0)) | ((r_c < 0) & (o_c < 0))
-                valid = (r_c != 0) & (o_c != 0)
-                if valid.sum() < 10:
-                    vals[col] = 0.0
-                    continue
-                vals[col] = float(follow[valid].sum() / valid.sum())
-            if vals:
-                herdings[dt] = pd.Series(vals)
-        if not herdings:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(herdings).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["herding"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -15302,37 +14091,7 @@ class IntradayOiPeakCount20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "position" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        oi_change = panel["position"].diff().abs()
-        day = oi_change.index.normalize()
-        counts: dict = {}
-        for dt in sorted(set(day)):
-            grp = oi_change.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                d = grp[col].dropna()
-                if len(d) < 30:
-                    continue
-                mu, sigma = d.mean(), d.std(ddof=0)
-                if sigma < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                is_jump = d > mu + sigma
-                cnt = 0
-                for i in range(1, len(d) - 1):
-                    if not is_jump.iloc[i]:
-                        continue
-                    if is_jump.iloc[i - 1] and is_jump.iloc[i + 1]:
-                        continue
-                    cnt += 1
-                vals[col] = float(cnt)
-            if vals:
-                counts[dt] = pd.Series(vals)
-        if not counts:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(counts).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["peak_count"]
         return daily.rolling(20, min_periods=3).sum().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -15526,44 +14285,7 @@ class IntradayOiRangePosition20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"high", "low", "close", "position"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close, position = panel["high"], panel["low"], panel["close"], panel["position"]
-        oi_change = position.diff()
-        day = oi_change.index.normalize()
-        positions: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            grp_o = oi_change.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                o = grp_o[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index).intersection(o.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c, o_c = (x.loc[common] for x in (h, l, c, o))
-                rng = h_c.max() - l_c.min()
-                if rng < 1e-12:
-                    vals[col] = 0.5
-                    continue
-                add_mask = o_c > 0
-                if add_mask.sum() < 5:
-                    vals[col] = 0.5
-                    continue
-                pos = (c_c[add_mask] - l_c.min()) / rng
-                w = o_c[add_mask].abs()
-                vals[col] = float((pos * w).sum() / w.sum()) if w.sum() > 1e-12 else 0.5
-            if vals:
-                positions[dt] = pd.Series(vals)
-        if not positions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(positions).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["range_position"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -17084,25 +15806,11 @@ class IntradayVolRegimePersist20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        daily_vol: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                vals[col] = float(r.std(ddof=0))
-            if vals:
-                daily_vol[dt] = pd.Series(vals)
-        if not daily_vol:
+        stats = _minute_return_statistics(panel)
+        valid = stats["count"].ge(20)
+        df = stats["std"].where(valid).where(stats["rows"].ge(20), axis=0)
+        if df.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_vol).T
-        df.index = pd.DatetimeIndex(df.index)
         high_state = df > df.rolling(20, min_periods=5).median()
         persist = (high_state & high_state.shift(1)).astype(float)
         score = persist.rolling(20, min_periods=5).mean()
@@ -19214,36 +17922,10 @@ class IntradayAmihudVolCorr20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change(fill_method=None).abs()
-        amihud = ret_abs / (amount + 1e-12)
-        day = ret_abs.index.normalize()
-        corrs: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_abs.loc[day == dt]
-            grp_a = amihud.loc[day == dt]
-            if len(grp_r) < 30:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                a = grp_a[col].dropna()
-                common = r.index.intersection(a.index)
-                if len(common) < 30:
-                    continue
-                r_c = r.loc[common]
-                a_c = a.loc[common].clip(upper=10.0)
-                if r_c.std(ddof=0) < 1e-12 or a_c.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(r_c, a_c)[0, 1])
-                    vals[col] = -corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                corrs[dt] = pd.Series(vals)
-        if not corrs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(corrs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        ret_abs = panel["close"].pct_change(fill_method=None).abs()
+        daily = -_daily_pair_feature(
+            ret_abs, (ret_abs / (panel["amount"] + 1e-12)).clip(upper=10.0)
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -19325,25 +18007,11 @@ class IntradayCrossVol20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        daily_vol: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                vals[col] = float(r.std(ddof=0))
-            if vals:
-                daily_vol[dt] = pd.Series(vals)
-        if not daily_vol:
+        stats = _minute_return_statistics(panel)
+        valid = stats["count"].ge(20)
+        df = stats["std"].where(valid).where(stats["rows"].ge(20), axis=0)
+        if df.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_vol).T
-        df.index = pd.DatetimeIndex(df.index)
         z = _cs_zscore(df.reindex(index=dates))
         return (-z).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -19964,41 +18632,7 @@ class IntradayVolSurgeLiqBefore20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change(fill_method=None).abs()
-        amihud = ret_abs / (amount + 1e-12)
-        day = ret_abs.index.normalize()
-        interactions: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_abs.loc[day == dt]
-            grp_a = amihud.loc[day == dt]
-            if len(grp_r) < 60:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                a = grp_a[col].dropna()
-                common = r.index.intersection(a.index)
-                if len(common) < 60:
-                    continue
-                r_c, a_c = r.loc[common], a.loc[common]
-                mu, sigma = r_c.mean(), r_c.std(ddof=0)
-                if sigma == 0 or pd.isna(sigma):
-                    continue
-                surge_idx = np.where(r_c.values > mu + 2 * sigma)[0]
-                before = []
-                for idx in surge_idx:
-                    lo = max(0, idx - 20)
-                    win = a_c.iloc[lo:idx].dropna()
-                    if len(win) > 5:
-                        before.append(win.mean())
-                vals[col] = float(np.mean(before)) if before else np.nan
-            if vals:
-                interactions[dt] = pd.Series(vals)
-        if not interactions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(interactions).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_volume_shock_features(panel)["vol_surge_liq_before"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -20676,36 +19310,9 @@ class IntradaySectorSync20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        syncs: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            sub = grp.dropna(how="all")
-            if sub.shape[1] < 2:
-                continue
-            other_mean = _sector_mean(sub)
-            vals = {}
-            for col in sub.columns:
-                r_i = sub[col]
-                r_o = other_mean[col]
-                common = r_i.notna() & r_o.notna()
-                if common.sum() < 20:
-                    continue
-                a = r_i[common].values
-                b = r_o[common].values
-                if a.std(ddof=0) < 1e-12 or b.std(ddof=0) < 1e-12:
-                    vals[col] = 0.0
-                else:
-                    corr_val = float(np.corrcoef(a, b)[0, 1])
-                    vals[col] = corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                syncs[dt] = pd.Series(vals)
-        if not syncs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(syncs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_pair_feature(
+            ret_1m, _sector_mean(ret_1m), min_rows=30, min_valid=20
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -20787,25 +19394,11 @@ class IntradaySectorVolSpill20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        daily_vol: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 20:
-                continue
-            vals = {}
-            for col in grp.columns:
-                r = grp[col].dropna()
-                if len(r) < 20:
-                    continue
-                vals[col] = float(r.std(ddof=0))
-            if vals:
-                daily_vol[dt] = pd.Series(vals)
-        if not daily_vol:
+        stats = _minute_return_statistics(panel)
+        valid = stats["count"].ge(20)
+        df = stats["std"].where(valid).where(stats["rows"].ge(20), axis=0)
+        if df.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(daily_vol).T
-        df.index = pd.DatetimeIndex(df.index)
         spill = _sector_mean(df.reindex(index=dates))
         return (-spill).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -20922,35 +19515,12 @@ class IntradayCrossLeadLag20d(Factor):
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret_1m = panel["close"].pct_change(fill_method=None)
-        day = ret_1m.index.normalize()
-        leads: dict = {}
-        for dt in sorted(set(day)):
-            grp = ret_1m.loc[day == dt]
-            if len(grp) < 40:
-                continue
-            sub = grp.dropna(how="all")
-            if sub.shape[1] < 2:
-                continue
-            other_mean = _sector_mean(sub)
-            vals = {}
-            for col in sub.columns:
-                r_i = sub[col].values
-                r_o = other_mean[col].values
-                mask = np.isfinite(r_i) & np.isfinite(r_o)
-                if mask.sum() < 30:
-                    continue
-                ri, ro = r_i[mask], r_o[mask]
-                # 品种领先: corr(ret_i_t, other_{t+1})
-                c1 = float(np.corrcoef(ri[:-1], ro[1:])[0, 1]) if ri[:-1].std() > 1e-12 and ro[1:].std() > 1e-12 else 0.0
-                # 板块领先: corr(other_t, ret_i_{t+1})
-                c2 = float(np.corrcoef(ro[:-1], ri[1:])[0, 1]) if ro[:-1].std() > 1e-12 and ri[1:].std() > 1e-12 else 0.0
-                vals[col] = c1 - c2 if not np.isnan(c1) and not np.isnan(c2) else 0.0
-            if vals:
-                leads[dt] = pd.Series(vals)
-        if not leads:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(leads).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        other_mean = _sector_mean(ret_1m)
+        daily = _daily_lagged_pair_feature(
+            ret_1m, other_mean, min_rows=40, min_valid=29
+        ) - _daily_lagged_pair_feature(
+            other_mean, ret_1m, min_rows=40, min_valid=29
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -21785,32 +20355,29 @@ class IntradayMultiperiodTrendVote20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="5min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        votes: dict = {}
         windows = (5, 15, 30, 60)
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < max(windows) + 2:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < max(windows) + 2:
-                    continue
-                bullish = 0
-                for w in windows:
-                    ma_now = c.iloc[-1:].mean()
-                    ma_prev = c.iloc[-w - 1:-1].mean()
-                    if ma_now > ma_prev:
-                        bullish += 1
-                vals[col] = float(bullish / len(windows))
-            if vals:
-                votes[dt] = pd.Series(vals)
-        if not votes:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(votes).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        close = panel["close"]
+        index, offsets = _day_offsets(close.index)
+        stats = daily_tail_statistics(close.to_numpy(dtype=float), offsets, windows)
+        valid = (
+            (np.diff(offsets)[:, None] >= max(windows) + 2)
+            & (stats["count"] >= max(windows) + 2)
+        )
+        margin = stats["last"][:, :, None] - stats["means"]
+        bullish = margin > 0.0
+        close_values = close.to_numpy(dtype=float)
+        for day, column, window_index in np.argwhere(np.abs(margin) <= 1e-10):
+            observed = close_values[offsets[day]:offsets[day + 1], column]
+            observed = observed[~np.isnan(observed)]
+            window = windows[window_index]
+            if observed.size >= window + 1:
+                bullish[day, column, window_index] = (
+                    observed[-1] > observed[-window - 1:-1].mean()
+                )
+        votes = bullish.mean(axis=2)
+        daily = pd.DataFrame(
+            np.where(valid, votes, np.nan), index=index, columns=close.columns
+        )
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -22090,6 +20657,46 @@ class IntradayRangeVolSkewDelta20d(Factor):
         return delta.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
+def _breakout_daily_features(data, dates, universe):
+    """Compute the two 5-minute breakout diagnostics in one exact event pass."""
+    dates = pd.DatetimeIndex(dates)
+    cache_key = _panel_cache_key(
+        dates, universe, "5min", _source_cache_namespace(data)
+    )
+    panel = _get_minute_panel(data, dates, universe, freq="5min")
+    if not {"high", "low", "close"}.issubset(panel):
+        return {}
+    with _BREAKOUT_CACHE_LOCK:
+        cached = _BREAKOUT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        high, low, close = panel["high"], panel["low"], panel["close"]
+        index, offsets = _day_offsets(close.index)
+        values = daily_breakout_statistics(
+            high.to_numpy(dtype=float),
+            low.to_numpy(dtype=float),
+            close.to_numpy(dtype=float),
+            offsets,
+        )
+        result = {
+            field: pd.DataFrame(value, index=index, columns=close.columns)
+            for field, value in values.items()
+        }
+        _BREAKOUT_CACHE.clear()
+        _BREAKOUT_CACHE[cache_key] = result
+        return result
+
+
+def _rolling_breakout_feature(data, dates, universe, field):
+    features = _breakout_daily_features(data, dates, universe)
+    if field not in features:
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    return (
+        features[field].rolling(20, min_periods=5).mean()
+        .reindex(dates).shift(1).reindex(columns=universe)
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 399. intraday_false_breakout_retrace — 假突破回撤
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -22114,61 +20721,9 @@ class IntradayFalseBreakoutRetrace20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="5min")
-        if not {"high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        fakes: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                # ATR 近似: 5min (high-low) 的20根均值
-                hl = (h_c - l_c).iloc[-20:]
-                atr = hl.mean()
-                if atr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                retraces = []
-                for i in range(20, len(c_c)):
-                    window_h = h_c.iloc[i - 20:i]
-                    window_l = l_c.iloc[i - 20:i]
-                    px = c_c.iloc[i]
-                    if px >= window_h.max():
-                        # 向上突破后回撤: 之后5根从最高点回落
-                        fwd = h_c.iloc[i:i + 5]
-                        peak = fwd.max() if len(fwd) > 0 else px
-                        close_after = c_c.iloc[min(i + 4, len(c_c) - 1)]
-                        retraces.append((peak - close_after) / atr)
-                    elif px <= window_l.min():
-                        # 向下突破后回抽
-                        fwd = l_c.iloc[i:i + 5]
-                        trough = fwd.min() if len(fwd) > 0 else px
-                        close_after = c_c.iloc[min(i + 4, len(c_c) - 1)]
-                        retraces.append((close_after - trough) / atr)
-                if not retraces:
-                    vals[col] = 0.0
-                else:
-                    vals[col] = float(np.mean(retraces))
-            if vals:
-                fakes[dt] = pd.Series(vals)
-        if not fakes:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(fakes).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_breakout_feature(
+            data, dates, universe, "false_retrace"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -22194,56 +20749,9 @@ class IntradayBreakoutQuality20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="5min")
-        if not {"high", "low", "close"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        high, low, close = panel["high"], panel["low"], panel["close"]
-        day = close.index.normalize()
-        qualities: dict = {}
-        for dt in sorted(set(day)):
-            grp_h = high.loc[day == dt]
-            grp_l = low.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                h = grp_h[col].dropna()
-                l = grp_l[col].dropna()
-                c = grp_c[col].dropna()
-                common = h.index.intersection(l.index).intersection(c.index)
-                if len(common) < 30:
-                    continue
-                h_c, l_c, c_c = (x.loc[common] for x in (h, l, c))
-                hl = (h_c - l_c).iloc[-20:]
-                atr = hl.mean()
-                if atr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                n_break = 0
-                n_hold = 0
-                for i in range(20, len(c_c)):
-                    window_h = h_c.iloc[i - 20:i]
-                    window_l = l_c.iloc[i - 20:i]
-                    px = c_c.iloc[i]
-                    if px >= window_h.max() and window_h.max() - window_h.iloc[-1] > 0:
-                        n_break += 1
-                        close_after = c_c.iloc[min(i + 4, len(c_c) - 1)]
-                        if close_after >= px - 0.5 * atr:
-                            n_hold += 1
-                    elif px <= window_l.min() and window_l.iloc[-1] - window_l.min() > 0:
-                        n_break += 1
-                        close_after = c_c.iloc[min(i + 4, len(c_c) - 1)]
-                        if close_after <= px + 0.5 * atr:
-                            n_hold += 1
-                vals[col] = float(n_hold / n_break) if n_break > 0 else 0.5
-            if vals:
-                qualities[dt] = pd.Series(vals)
-        if not qualities:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(qualities).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_breakout_feature(
+            data, dates, universe, "quality"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -22544,45 +21052,7 @@ class IntradayVolumeOiDivergence20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="5min")
         if not {"position", "volume"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        oi, volume = panel["position"], panel["volume"]
-        day = oi.index.normalize()
-        divergences: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = oi.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            if len(grp_o) < 20:
-                continue
-            vals = {}
-            for col in grp_o.columns:
-                o = grp_o[col].dropna()
-                v = grp_v[col].dropna()
-                common = o.index.intersection(v.index)
-                if len(common) < 20:
-                    continue
-                o_c = o.loc[common]
-                v_c = v.loc[common]
-                d_oi = o_c.diff().dropna()
-                d_vol = v_c.diff().dropna()
-                idx = d_oi.index.intersection(d_vol.index)
-                if len(idx) < 10:
-                    continue
-                d_oi_c = d_oi.loc[idx]
-                d_vol_c = d_vol.loc[idx]
-                vol_up = (d_vol_c > 0).sum()
-                vol_dn = (d_vol_c < 0).sum()
-                oi_up = (d_oi_c > 0).sum()
-                oi_dn = (d_oi_c < 0).sum()
-                n = len(idx)
-                # 放量减仓: vol_up & oi_dn; 缩量增仓: vol_dn & oi_up
-                sell_off = ((d_vol_c > 0) & (d_oi_c < 0)).sum()
-                accumulate = ((d_vol_c < 0) & (d_oi_c > 0)).sum()
-                vals[col] = float((accumulate - sell_off) / n)
-            if vals:
-                divergences[dt] = pd.Series(vals)
-        if not divergences:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(divergences).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["volume_oi_divergence"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -22613,41 +21083,7 @@ class IntradayVolumeOiPriceConfirm20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="5min")
         if not {"position", "volume", "close"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        oi, volume, close = panel["position"], panel["volume"], panel["close"]
-        day = oi.index.normalize()
-        confirms: dict = {}
-        for dt in sorted(set(day)):
-            grp_o = oi.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            grp_c = close.loc[day == dt]
-            if len(grp_o) < 20:
-                continue
-            vals = {}
-            for col in grp_o.columns:
-                o = grp_o[col].dropna()
-                v = grp_v[col].dropna()
-                c = grp_c[col].dropna()
-                common = o.index.intersection(v.index).intersection(c.index)
-                if len(common) < 20:
-                    continue
-                o_c = o.loc[common]
-                v_c = v.loc[common]
-                c_c = c.loc[common]
-                d_oi = np.sign(o_c.diff())
-                d_vol = np.sign(v_c.diff())
-                d_px = np.sign(c_c.diff())
-                valid = (d_oi != 0) & (d_vol != 0) & (d_px != 0)
-                if valid.sum() < 5:
-                    vals[col] = 0.0
-                    continue
-                score = (d_oi[valid] * d_vol[valid] * d_px[valid]).mean()
-                vals[col] = float(score)
-            if vals:
-                confirms[dt] = pd.Series(vals)
-        if not confirms:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(confirms).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_oi_features(panel)["volume_oi_price_confirm"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -23422,31 +21858,7 @@ class IntradayAnnualizedBasisZ20d(Factor):
         panel = _get_term_structure_panel(data, dates, universe, freq="5min")
         if "near_close" not in panel or "far_close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        near, far = panel["near_close"], panel["far_close"]
-        day = near.index.normalize()
-        basis: dict = {}
-        for dt in sorted(set(day)):
-            grp_n = near.loc[day == dt]
-            grp_f = far.loc[day == dt]
-            if len(grp_n) < 20:
-                continue
-            vals = {}
-            for col in grp_n.columns:
-                n = grp_n[col].dropna()
-                f = grp_f[col].dropna()
-                common = n.index.intersection(f.index)
-                if len(common) < 20:
-                    continue
-                b = ((f.loc[common] - n.loc[common]) / n.loc[common].replace(0, np.nan)).dropna()
-                if len(b) < 10:
-                    continue
-                vals[col] = float(b.mean())
-            if vals:
-                basis[dt] = pd.Series(vals)
-        if not basis:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(basis).T
-        df.index = pd.DatetimeIndex(df.index)
+        df = _daily_term_features(panel)["basis"]
         rank = df.reindex(index=dates).rolling(20, min_periods=5).apply(
             lambda x: float(np.nan) if (x.dropna().empty or pd.isna(x.iloc[-1]))
             else float((x.dropna().iloc[:-1] <= x.dropna().iloc[-1]).sum() / max(1, len(x.dropna()) - 1)), raw=False)
@@ -25634,6 +24046,120 @@ def _peak_ridge_valley(close, ret, amp, amp_thr):
             "valley": pd.Series(valley, index=amp.index)}
 
 
+def _peak_ridge_daily_features(data, dates, universe):
+    """Compute the shared daily inputs for the eight price-event factors once."""
+    dates = pd.DatetimeIndex(dates)
+    cache_key = _panel_cache_key(
+        dates, universe, "1min", _source_cache_namespace(data)
+    )
+    panel = _get_minute_panel(data, dates, universe, freq="1min")
+    if "close" not in panel:
+        return {}
+    with _PEAK_RIDGE_CACHE_LOCK:
+        cached = _PEAK_RIDGE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        close = panel["close"]
+        day = close.index.normalize()
+        fields = (
+            "peak_count", "ridge_ret", "ridge_interval_skew", "peak_ret",
+            "valley_ret", "peak_interval_std", "jump_follow_ratio",
+            "peak_ridge_coherence",
+        )
+        values = {field: {} for field in fields}
+        for dt in sorted(set(day)):
+            grp = close.loc[day == dt]
+            if len(grp) < 30:
+                continue
+            daily = {field: {} for field in fields}
+            for col in grp.columns:
+                c = grp[col].dropna()
+                if len(c) < 30:
+                    continue
+                ret = c.pct_change(fill_method=None)
+                amp = ret.abs()
+                thr = amp.std(ddof=0)
+                if thr < 1e-12:
+                    for field in fields:
+                        daily[field][col] = 0.0
+                    daily["peak_ridge_coherence"][col] = 0.5
+                    continue
+                states = _peak_ridge_valley(c, ret, amp, thr)
+                if states is None:
+                    continue
+                peak = states["peak"]
+                ridge = states["ridge"]
+                valley = states["valley"]
+                peak_idx = np.where(peak.values)[0]
+                ridge_idx = np.where(ridge.values)[0]
+                daily["peak_count"][col] = float(peak.sum())
+                daily["ridge_ret"][col] = float(ret[ridge].sum())
+                daily["peak_ret"][col] = float(ret[peak].sum())
+                daily["valley_ret"][col] = float(ret[valley].mean())
+                if len(ridge_idx) < 3:
+                    ridge_skew = 0.0
+                else:
+                    intervals = np.diff(ridge_idx)
+                    if len(intervals) < 2 or np.std(intervals) < 1e-12:
+                        ridge_skew = 0.0
+                    else:
+                        ridge_skew = float(
+                            np.mean((intervals - intervals.mean()) ** 3)
+                            / np.std(intervals) ** 3
+                        )
+                daily["ridge_interval_skew"][col] = ridge_skew
+                daily["peak_interval_std"][col] = (
+                    float(np.std(np.diff(peak_idx), ddof=0))
+                    if len(peak_idx) >= 3 else 0.0
+                )
+                jump_mask = peak.values | ridge.values
+                if jump_mask.sum() < 3:
+                    follow = 0.5
+                else:
+                    r = ret.values
+                    positions = np.where(jump_mask)[0]
+                    valid = [
+                        pos for pos in positions
+                        if pos + 1 < len(r)
+                        and abs(r[pos]) > 1e-12 and abs(r[pos + 1]) > 1e-12
+                    ]
+                    follow = (
+                        float(np.mean([
+                            np.sign(r[pos]) == np.sign(r[pos + 1])
+                            for pos in valid
+                        ]))
+                        if valid else 0.5
+                    )
+                daily["jump_follow_ratio"][col] = follow
+                total = len(peak_idx) + len(ridge_idx)
+                daily["peak_ridge_coherence"][col] = (
+                    float(len(peak_idx) / total) if total > 0 else 0.5
+                )
+            for field in fields:
+                if daily[field]:
+                    values[field][dt] = pd.Series(daily[field])
+        result = {}
+        for field, rows in values.items():
+            if rows:
+                frame = pd.DataFrame(rows).T
+                frame.index = pd.DatetimeIndex(frame.index)
+                result[field] = frame
+        _PEAK_RIDGE_CACHE.clear()
+        _PEAK_RIDGE_CACHE[cache_key] = result
+        return result
+
+
+def _rolling_peak_ridge_feature(data, dates, universe, field, *, negate=False):
+    features = _peak_ridge_daily_features(data, dates, universe)
+    if field not in features:
+        return pd.DataFrame(np.nan, index=dates, columns=universe)
+    daily = -features[field] if negate else features[field]
+    return (
+        daily.rolling(20, min_periods=5).mean()
+        .reindex(dates).shift(1).reindex(columns=universe)
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 461. intraday_peak_moment_count — 价峰时点计数
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25658,38 +24184,9 @@ class IntradayPeakMomentCount20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        counts: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                vals[col] = float(st["peak"].sum())
-            if vals:
-                counts[dt] = pd.Series(vals)
-        if not counts:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(counts).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "peak_count"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25715,38 +24212,9 @@ class IntradayPriceRidgeRet20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        ridge_rets: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                vals[col] = float(ret[st["ridge"]].sum())
-            if vals:
-                ridge_rets[dt] = pd.Series(vals)
-        if not ridge_rets:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ridge_rets).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "ridge_ret"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25837,47 +24305,9 @@ class IntradayPriceRidgeIntervalSkew20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        skews: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                ridge_idx = np.where(st["ridge"].values)[0]
-                if len(ridge_idx) < 3:
-                    vals[col] = 0.0
-                    continue
-                intervals = np.diff(ridge_idx)
-                if len(intervals) < 2 or np.std(intervals) < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                s = float((np.mean((intervals - intervals.mean()) ** 3)) / np.std(intervals) ** 3)
-                vals[col] = s
-            if vals:
-                skews[dt] = pd.Series(vals)
-        if not skews:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(skews).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "ridge_interval_skew"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25973,38 +24403,9 @@ class IntradayPricePeakRet20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        peak_rets: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                vals[col] = float(ret[st["peak"]].sum())
-            if vals:
-                peak_rets[dt] = pd.Series(vals)
-        if not peak_rets:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(peak_rets).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "peak_ret"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26030,38 +24431,9 @@ class IntradayPriceValleyRet20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        valley_rets: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                vals[col] = float(ret[st["valley"]].mean())
-            if vals:
-                valley_rets[dt] = pd.Series(vals)
-        if not valley_rets:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(valley_rets).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "valley_ret"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26087,46 +24459,9 @@ class IntradayPricePeakIntervalStd20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        stds: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                peak_idx = np.where(st["peak"].values)[0]
-                if len(peak_idx) < 3:
-                    vals[col] = 0.0
-                    continue
-                intervals = np.diff(peak_idx)
-                if len(intervals) < 2:
-                    vals[col] = 0.0
-                    continue
-                vals[col] = float(np.std(intervals, ddof=0))
-            if vals:
-                stds[dt] = pd.Series(vals)
-        if not stds:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(stds).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "peak_interval_std", negate=True
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26153,51 +24488,9 @@ class IntradayJumpRetFollowRatio20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        follows: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                jump_mask = st["peak"].values | st["ridge"].values
-                if jump_mask.sum() < 3:
-                    vals[col] = 0.5
-                    continue
-                r = ret.values
-                jump_pos = np.where(jump_mask)[0]
-                n_same = 0
-                n_valid = 0
-                for pos in jump_pos:
-                    if pos + 1 < len(r) and abs(r[pos]) > 1e-12 and abs(r[pos + 1]) > 1e-12:
-                        n_valid += 1
-                        if np.sign(r[pos]) == np.sign(r[pos + 1]):
-                            n_same += 1
-                vals[col] = float(n_same / n_valid) if n_valid > 0 else 0.5
-            if vals:
-                follows[dt] = pd.Series(vals)
-        if not follows:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(follows).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "jump_follow_ratio"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26223,41 +24516,9 @@ class IntradayPeakRidgeCoherence20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                ret = c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.5
-                    continue
-                st = _peak_ridge_valley(c, ret, amp, thr)
-                if st is None:
-                    continue
-                n_peak = int(st["peak"].sum())
-                n_ridge = int(st["ridge"].sum())
-                total = n_peak + n_ridge
-                vals[col] = float(n_peak / total) if total > 0 else 0.5
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        return _rolling_peak_ridge_feature(
+            data, dates, universe, "peak_ridge_coherence"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -27714,59 +25975,7 @@ class IntradaySmartMoneyV420d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "volume" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, volume = panel["close"], panel["volume"]
-        day = close.index.normalize()
-        ratios: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_v = volume.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                v = grp_v[col].dropna()
-                common = c.index.intersection(v.index)
-                if len(common) < 30:
-                    continue
-                c_c = c.loc[common]
-                v_c = v.loc[common]
-                r = c_c.pct_change(fill_method=None).fillna(0)
-                states = (r > 0).astype(int).values  # +态/−态
-                n = len(states)
-                if n < 20:
-                    continue
-                # 马尔可夫转移概率
-                trans = np.zeros((2, 2))
-                for i in range(n - 1):
-                    trans[states[i], states[i + 1]] += 1
-                row_sums = trans.sum(axis=1, keepdims=True)
-                row_sums[row_sums == 0] = 1
-                trans = trans / row_sums
-                # 滚动5分钟序列概率 (初始均匀)
-                probs = np.zeros(n)
-                p0 = np.array([0.5, 0.5])
-                for i in range(n):
-                    if i > 0:
-                        p0 = p0 @ trans
-                    # 观察状态概率
-                    obs = np.array([1.0, 0.0]) if states[i] == 0 else np.array([0.0, 1.0])
-                    probs[i] = p0 @ obs
-                thr = np.percentile(probs, 5)
-                anomaly = probs < thr
-                if anomaly.sum() < 3 or v_c[~anomaly].sum() < 1e-12:
-                    continue
-                vw_anom = (c_c[anomaly] * v_c[anomaly]).sum() / v_c[anomaly].sum()
-                vw_rest = (c_c[~anomaly] * v_c[~anomaly]).sum() / v_c[~anomaly].sum()
-                if vw_rest < 1e-12:
-                    continue
-                vals[col] = float(vw_anom / vw_rest)
-            if vals:
-                ratios[dt] = pd.Series(vals)
-        if not ratios:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(ratios).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_smart_money_features(panel)["price_ratio"]
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -28138,51 +26347,7 @@ class IntradaySmartMoneyV4Vol20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close = panel["close"]
-        day = close.index.normalize()
-        vols: dict = {}
-        for dt in sorted(set(day)):
-            grp = close.loc[day == dt]
-            if len(grp) < 30:
-                continue
-            vals = {}
-            for col in grp.columns:
-                c = grp[col].dropna()
-                if len(c) < 30:
-                    continue
-                r = c.pct_change(fill_method=None).fillna(0)
-                states = (r > 0).astype(int).values
-                n = len(states)
-                if n < 20:
-                    continue
-                trans = np.zeros((2, 2))
-                for i in range(n - 1):
-                    trans[states[i], states[i + 1]] += 1
-                row_sums = trans.sum(axis=1, keepdims=True)
-                row_sums[row_sums == 0] = 1
-                trans = trans / row_sums
-                probs = np.zeros(n)
-                p0 = np.array([0.5, 0.5])
-                for i in range(n):
-                    if i > 0:
-                        p0 = p0 @ trans
-                    obs = np.array([1.0, 0.0]) if states[i] == 0 else np.array([0.0, 1.0])
-                    probs[i] = p0 @ obs
-                thr = np.percentile(probs, 5)
-                anomaly = probs < thr
-                r_vals = r.values
-                all_std = r_vals.std(ddof=0)
-                if all_std < 1e-12 or anomaly.sum() < 3:
-                    vals[col] = 0.0
-                    continue
-                anom_std = r_vals[anomaly].std(ddof=0)
-                vals[col] = float(anom_std / all_std)
-            if vals:
-                vols[dt] = pd.Series(vals)
-        if not vols:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(vols).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_smart_money_features(panel)["volatility_ratio"]
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -28530,23 +26695,38 @@ def _daily_volume_distribution_stability(panel) -> pd.DataFrame:
     if cached is not None:
         return cached
     volume = panel["volume"]
-    day = volume.index.normalize()
-    stabilities: dict = {}
-    for dt in sorted(set(day)):
-        grp = volume.loc[day == dt]
-        if len(grp) < 30:
-            continue
-        vals = {}
-        for col in grp.columns:
-            values = grp[col].dropna()
-            if len(values) < 30 or values.std(ddof=0) < 1e-12:
-                vals[col] = 0.0
+    index, offsets = _day_offsets(volume.index)
+    mode = factor_kernel_mode()
+    candidate = None
+    if mode != "reference":
+        candidate = native_array_kernel(
+            "daily_histogram_stability", volume.to_numpy(dtype=float), offsets
+        )
+    if mode == "native":
+        daily = pd.DataFrame(candidate, index=index, columns=volume.columns)
+    else:
+        day = volume.index.normalize()
+        stabilities: dict = {}
+        for dt in sorted(set(day)):
+            grp = volume.loc[day == dt]
+            if len(grp) < 30:
                 continue
-            normalized = (values - values.mean()) / values.std(ddof=0)
-            vals[col] = histogram_window_l1_stability(normalized.values)
-        if vals:
-            stabilities[dt] = pd.Series(vals)
-    daily = pd.DataFrame(stabilities).T
+            vals = {}
+            for col in grp.columns:
+                values = grp[col].dropna()
+                if len(values) < 30 or values.std(ddof=0) < 1e-12:
+                    vals[col] = 0.0
+                    continue
+                normalized = (values - values.mean()) / values.std(ddof=0)
+                vals[col] = histogram_window_l1_stability(normalized.values)
+            if vals:
+                stabilities[dt] = pd.Series(vals)
+        daily = pd.DataFrame(stabilities).T.reindex(index=index, columns=volume.columns)
+        if mode == "shadow":
+            assert_native_equal(
+                daily.to_numpy(), candidate, "daily_histogram_stability"
+            )
+    daily = daily.dropna(how="all")
     daily.index = pd.DatetimeIndex(daily.index)
     panel[cache_key] = daily
     return daily
@@ -29051,32 +27231,6 @@ class IntradayUpsideVolRatio20d(Factor):
 # 516. intraday_vol_extreme_magnitude — 波动率极大值幅度
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _segmented_ohlc_relative_volatility(close, high, low, window, *, positive_only=False):
-    """Vectorized equivalent of the established non-overlapping OHLC loop."""
-    count = len(close) // int(window)
-    if count == 0:
-        return np.empty(0, dtype=float)
-    usable = count * int(window)
-    segments = np.concatenate(
-        [
-            np.asarray(close[:usable], dtype=float).reshape(count, window),
-            np.asarray(high[:usable], dtype=float).reshape(count, window),
-            np.asarray(low[:usable], dtype=float).reshape(count, window),
-        ],
-        axis=1,
-    )
-    means = segments.mean(axis=1)
-    valid = means > 0
-    values = np.divide(
-        segments.std(axis=1),
-        means,
-        out=np.full(count, np.nan, dtype=float),
-        where=valid,
-    )
-    if positive_only:
-        valid &= values > 0
-    return values[valid]
-
 @register_factor("intraday_vol_extreme_magnitude_20d", category="intraday_advanced")
 class IntradayVolExtremeMagnitude20d(Factor):
     """波动率极大值幅度因子.
@@ -29101,45 +27255,7 @@ class IntradayVolExtremeMagnitude20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "high" not in panel or "low" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, high, low = panel["close"], panel["high"], panel["low"]
-        day = close.index.normalize()
-        magnitudes: dict = {}
-        for dt in sorted(set(day)):
-            vals = {}
-            for col in close.columns:
-                c = close.loc[day == dt, col].dropna()
-                h = high.loc[day == dt, col].dropna()
-                l = low.loc[day == dt, col].dropna()
-                common = c.index.intersection(h.index).intersection(l.index)
-                if len(common) < 40:
-                    continue
-                # 更优波动率: 5分钟窗内 OHLC 波动率
-                vol5 = _segmented_ohlc_relative_volatility(
-                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
-                    l.loc[common].to_numpy(), 5, positive_only=True,
-                )
-                vol30 = _segmented_ohlc_relative_volatility(
-                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
-                    l.loc[common].to_numpy(), 30,
-                )
-                if len(vol5) < 5 or len(vol30) < 3:
-                    vals[col] = 0.0
-                    continue
-                var = np.percentile(vol5, 95)
-                if abs(var) < 1e-12:
-                    vals[col] = 1.0
-                    continue
-                extreme = vol30[vol30 > var]
-                if len(extreme) == 0:
-                    vals[col] = 0.0
-                    continue
-                vals[col] = float(np.mean(extreme) / var)
-            if vals:
-                magnitudes[dt] = pd.Series(vals)
-        if not magnitudes:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(magnitudes).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["vol_extreme_magnitude"]
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
@@ -29809,37 +27925,7 @@ class IntradayVolRatioTrend20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "high" not in panel or "low" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, high, low = panel["close"], panel["high"], panel["low"]
-        day = close.index.normalize()
-        freqs: dict = {}
-        for dt in sorted(set(day)):
-            vals = {}
-            for col in close.columns:
-                c = close.loc[day == dt, col].dropna()
-                h = high.loc[day == dt, col].dropna()
-                l = low.loc[day == dt, col].dropna()
-                common = c.index.intersection(h.index).intersection(l.index)
-                if len(common) < 40:
-                    continue
-                vol5 = _segmented_ohlc_relative_volatility(
-                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
-                    l.loc[common].to_numpy(), 5,
-                )
-                vol30 = _segmented_ohlc_relative_volatility(
-                    c.loc[common].to_numpy(), h.loc[common].to_numpy(),
-                    l.loc[common].to_numpy(), 30,
-                )
-                if len(vol5) < 5 or len(vol30) < 3:
-                    vals[col] = 0.0
-                    continue
-                var = np.percentile(vol5, 95)
-                vals[col] = float(np.mean(vol30 > var))
-            if vals:
-                freqs[dt] = pd.Series(vals)
-        if not freqs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(freqs).T
-        daily.index = pd.DatetimeIndex(daily.index)
+        daily = _daily_price_path_features(panel)["vol_ratio_trend"]
         return (-daily).rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 

@@ -49,7 +49,7 @@
 它们回答的是“预测作用在哪个分钟 horizon”与“排名能保持多久”。旧 `ICTest.ic_decay`
 计算的是 IC 时间序列本身的自相关，不等同于这两项诊断。
 
-默认 `screen` 预筛与正式P0都使用主框架唯一的`FRAMEWORK_UNIVERSE`，结果会明确写入
+默认 `screen` 预筛与正式滚动训练折发现都使用主框架唯一的`FRAMEWORK_UNIVERSE`，结果会明确写入
 `diagnostic_universe_policy=static_declared_universe`。预筛曲线只能定位horizon，不能
 替代`main.py research`的正式IC与点时可用性检验。
 
@@ -174,7 +174,7 @@ from factor_mining.validation import PreparedTarget, ValidationConfig
 ## GP Accelerator（可选）
 
 GP 加速层默认关闭，只作用于 `mining mine` / `mining dev-smoke` 的
-population evaluation，不替换 P0、单因子研究、自有因子库或
+population evaluation，不替换正式滚动研究、单因子研究、自有因子库或
 BacktestEngine。
 
 ```powershell

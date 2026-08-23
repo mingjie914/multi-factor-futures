@@ -40,7 +40,7 @@ from research.validation import (  # noqa: E402
     OOS_END,
     OOS_START,
     SIMULATED_LIVE_START,
-    period_protocol_snapshot,
+    historical_experiment_period_snapshot,
 )
 from research.portfolio_experiment_support import (  # noqa: E402
     FACTORS_8F,
@@ -430,7 +430,7 @@ def main() -> None:
         },
         "production_configuration_modified": False,
         "method_validation_included": bool(args.validate_method),
-        "period_protocol": period_protocol_snapshot(),
+        "period_protocol": historical_experiment_period_snapshot(),
     }
     (output / "resolved_config.json").write_text(
         json.dumps(resolved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -444,7 +444,7 @@ def main() -> None:
         "- 正确性口径：完整字母根精确匹配、决策日前60条IC、最终资产上限投影、收益日按W[T-1]×R[T]记账（等价于收盘目标W[T]从T+1生效）、漂移换手、显式移仓及停牌冻结。\n"
         "- 8f、10f及13f生产结构均为60日ICIR(LW)、Top10/Bottom10、单侧cap3、两侧ERC。\n"
         "- 三个因子集的替代结构均为因子等权、Top12/Bottom12、无cap、两侧逆波动率。\n"
-        f"- 输出两张生产结构及两张双方法对比图，均包含国信趋势指数；OOS固定为{OOS_START}至{OOS_END}，{SIMULATED_LIVE_START}起固定标为simulated_live。\n"
+        f"- 输出两张生产结构及两张双方法对比图，均包含国信趋势指数；{OOS_START}至{OOS_END}及{SIMULATED_LIVE_START}后的标签仅属于该隔离旧实验，不是主框架正式OOS。\n"
         "- 本运行是已知固定因子集重评估，不是修复后重新完成的因子搜索；不会自动修改配置、快照或交易批准门。\n",
         encoding="utf-8",
     )

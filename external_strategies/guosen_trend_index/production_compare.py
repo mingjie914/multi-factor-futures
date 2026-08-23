@@ -43,7 +43,7 @@ from research.validation import (  # noqa: E402
     OOS_END,
     OOS_START,
     SIMULATED_LIVE_START,
-    period_protocol_snapshot,
+    historical_experiment_period_snapshot,
 )
 from external_strategies.guosen_trend_index.strategy import load_snapshot  # noqa: E402
 from strategies.combined import FACTORS as PRODUCTION_10F  # noqa: E402
@@ -436,7 +436,7 @@ def main() -> None:
         "development_segments": ["2016-2019", "2020-2022", "2023-2024"],
         "oos_diagnostic": f"{OOS_START} through {OOS_END}",
         "simulated_live_diagnostic": f"{SIMULATED_LIVE_START} through comparison end",
-        "period_protocol": period_protocol_snapshot(),
+        "period_protocol": historical_experiment_period_snapshot(),
         "full_eligible_count": len(full_eligible),
         "post_2020_eligible_count": len(post_2020_eligible),
         "factor_sets": unique_sets,

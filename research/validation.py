@@ -18,6 +18,8 @@ import numpy as np
 from research.statistics import benjamini_hochberg, simes_p_value
 
 
+# Legacy isolated historical experiment only.  Formal admission uses the
+# rolling bar-count policy in config/default.yaml via workflows.walkforward.
 HISTORICAL_START = "2016-03-31"
 LONG_HISTORY_REPLAY_END = "2026-08-20"
 OOS_START = "2025-01-01"
@@ -33,7 +35,7 @@ _OUTER_FOLDS = (
 
 
 def expanding_window_folds() -> list[dict[str, str]]:
-    """Return copies of the frozen historical research folds."""
+    """Return copies of the isolated legacy historical experiment folds."""
     return [
         {
             "fold": name,
@@ -46,8 +48,8 @@ def expanding_window_folds() -> list[dict[str, str]]:
     ]
 
 
-def period_protocol_snapshot() -> dict:
-    """Return the shared, serializable OOS/simulated-live protocol."""
+def historical_experiment_period_snapshot() -> dict:
+    """Return the isolated legacy experiment's serializable date protocol."""
     return {
         "version": "historical_period_v1",
         "long_history_replay": {
@@ -299,7 +301,7 @@ def locked_oos_direction_gate(
 
 
 def compare_taxonomy_replay(previous: Mapping[str, Any], current: Mapping[str, Any]) -> dict:
-    """Compare factor decisions after a taxonomy-triggered full P0 replay."""
+    """Compare factor decisions after a taxonomy-triggered discovery replay."""
     previous_rows = {
         str(row.get("name", "")): row
         for row in previous.get("all_results", [])

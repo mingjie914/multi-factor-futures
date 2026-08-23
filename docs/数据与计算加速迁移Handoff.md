@@ -56,7 +56,7 @@
   不逐个重写注册类。
 - 当前已存在 `factors/numerics.py` 和 GP rolling backend，应复用这些接入点，
   不另建通用 Operator 框架、DAG 或缓存体系。
-- Polars 1.43.2 是冻结实施版本；Rust 工具链尚未建立。
+- Polars 1.43.2 是冻结实施版本；Rust 1.98工具链、本地PyO3工程和release扩展已建立。
 
 ## 3. 目标架构与职责
 
@@ -187,7 +187,7 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 - 模块名 `_mf_factor_kernels`，不使用 `alpha`，不依赖 `py-alpha-lib`。
 - Rust 只接收 ndarray、shape、window等标量，不接触日期、合约、因子或DataFrame。
 
-最小新增：
+实际最小新增：
 
 ```text
 native/mf_factor_kernels/
@@ -197,10 +197,9 @@ native/mf_factor_kernels/
   src/lib.rs
 ```
 
-Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常转换无法保持清晰时，
-才新增一个薄文件 `factors/native_kernels.py`。不创建多文件通用 backend 包。
-
-探针只实现 `ts_mean`，用于测量转换和FFI，不因为探针成功就替换现有 Bottleneck。
+Python侧已复用单一`factors/numerics.py`承载reference、shadow和native调度，没有创建
+多文件backend包。构建使用`maturin develop --release --manifest-path
+native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\multi_factor`。
 
 ### R2：选择性 Rust 热点
 
@@ -217,8 +216,9 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 
 运行模式：
 
-- `reference`：默认权威路径；Rust缺失不影响项目。
-- `shadow`：reference/native同时计算，返回reference并记录差异和耗时。
+- 未显式配置：扩展存在时自动使用native，扩展不存在时使用reference。
+- `reference`：显式权威回退路径；Rust缺失不影响项目。
+- `shadow`：reference/native同时计算并严格比较，返回reference；差异时失败关闭，不另行生成永久报告。
 - `native`：只允许已逐算子准入的白名单；扩展缺失或不支持时失败，不静默 fallback。
 
 日常因子编写、SPEC、GP、research和回测命令不改变。少数热点因子内部可以等价改为调用
@@ -265,7 +265,7 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 - shadow输出必须记录代码commit、DuckDB release、配置、backend版本和测试样本，但不新增
   每次运行一个永久报告文件；优先写入现有research manifest或benchmark目录。
 - P1/P2 回退只需切换 result backend；D1 回退只需切回 `parquet_futures`。
-- Rust native以逐算子白名单发布；移除一个白名单项即可回退该算子。
+- Rust native以共享数组核心逐族发布；显式设`MF_FACTOR_KERNEL_MODE=reference`即可整体回退。
 - 不在同一次提交中同时切换 DuckDB默认源、Polars生产路径和Rust native。
 - 不删除 Parquet、认证 DuckDB或现有 reference实现。
 
@@ -312,10 +312,11 @@ Python侧优先复用 `factors/numerics.py`；只有可选扩展加载和异常�
 - 适配性研究现在按唯一处理链记录`raw|neutralized`，冻结发现文件缺少合法variant会失败
   关闭；正式mining/screen也已收口到统一配置和DataManager。
 - Parquet与DuckDB现在都从日线具体合约的首个已发布交易日提供品种上市/可用日期；真实
-  U38为38/38无缺失，正式研究与周度回测入口均已完成真实烟测。最终全量回归为689项通过。
-- R1/R2本轮No-Go而非永久排除：低风险热点用已有NumPy能力已获得明确端到端收益，因此不安装
-  Rust工具链。后续每次真实全池profile都重新开放Rust候选；只有边界清晰的纯ndarray
-  算子通过reference、shadow、端到端和RSS门禁后，才逐算子进入native白名单。
+  U38为38/38无缺失，正式研究与周度回测入口均已完成真实烟测。
+- R1/R2已完成首轮准入：原创本地Rust工程保持单线程、只接收ndarray与日分段offset；共享
+  核心覆盖日收益、统计、突破、持仓、聪明钱、K线、价量与价格路径等主流intraday族。
+  真实核心A/B的NaN mask一致，数值差异仅为浮点舍入级；76交易日、38品种、588因子快速
+  全池为588/588无错误、约317秒，相对本轮早期约1,344秒为4.24倍，完整回归通过。
 
 `config/default.yaml`现已收口为唯一38品种、10f观察基线和统一处理契约；旧的四个重复或
 继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段，当前固定

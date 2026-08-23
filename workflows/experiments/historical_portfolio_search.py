@@ -1,6 +1,9 @@
-"""Expanding-window search for native factor aggregation and portfolio methods.
+"""Isolated legacy expanding-window portfolio-method experiment.
 
-The current validated factor library is treated as a fixed research universe.
+This module is not the framework's formal factor-admission workflow.  Formal
+admission uses ``main.py walkforward`` and the rolling policy in the single
+framework config.  Here, the validated factor library is treated as a fixed
+research universe for historical comparison only.
 At each historical fold, every choice is made using the training interval and
 then frozen for the following test interval.  This is a pragmatic historical
 study, not a reconstruction of when each factor idea was originally invented.
@@ -62,7 +65,7 @@ from research.validation import (  # noqa: E402
     OOS_END,
     SIMULATED_LIVE_START,
     expanding_window_folds,
-    period_protocol_snapshot,
+    historical_experiment_period_snapshot,
 )
 
 
@@ -766,7 +769,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--factor-manifest",
-        help="P0 ic_by_window_period.json; required for full factor search",
+        help="immutable discovery ic_by_window_period.json; required for factor search",
     )
     args = parser.parse_args()
     output = Path(args.output)
@@ -794,7 +797,7 @@ def main() -> None:
         "valid_factor_count": len(valid_factors),
         "valid_factors": valid_factors,
         "outer_folds": OUTER_FOLDS,
-        "period_protocol": period_protocol_snapshot(),
+        "period_protocol": historical_experiment_period_snapshot(),
         "method_grid": (
             {
                 "predeclared_recipes": {

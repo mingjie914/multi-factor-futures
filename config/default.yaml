@@ -43,8 +43,8 @@ data:
     required_release_id: '${MF_DATA_RELEASE_ID:}'
     result_backend: pandas
 
-# Current frozen full-history boundary. Commands may narrow dates explicitly;
-# they do not replace the framework contract.
+# Main framework data/research range. Workflows slice this range using the
+# validation policy below; commands may narrow dates only for explicit diagnostics.
 date_range:
   start: '2017-01-01'
   end: '2026-08-20'
@@ -382,6 +382,9 @@ validation_policy:
     daily: 125
     daily_intraday: 42
     1min: 2000
+  # Recent rolling evidence only; long history is reserved for frozen-combination backtests.
+  wf_max_folds_by_frequency:
+    daily_intraday: 5
   # Warm-up days before IC start, per frequency.
   warmup_days_by_frequency:
     daily: 252

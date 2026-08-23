@@ -823,6 +823,21 @@ def _run_screening(runner, all_factors, config_path, t_threshold, output_dir):
     print("筛选完成.")
 
 
+def _research_period_protocol(
+    research_role, factor_start, ic_start, ic_end
+) -> dict:
+    import pandas as pd
+
+    return {
+        "version": "research_period_v2",
+        "role": research_role,
+        "factor_start": pd.Timestamp(factor_start).isoformat(),
+        "ic_start": pd.Timestamp(ic_start).isoformat(),
+        "ic_end": pd.Timestamp(ic_end).isoformat(),
+        "selection_eligible": research_role == "rolling_walkforward_train",
+    }
+
+
 def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                                  factor_start, ic_start, ic_end,
                                  periods_override=None, frequency="daily",
@@ -857,7 +872,6 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from factors.processor import build_processing_context
     from research.governance import factor_family
     from research.validation import (
-        period_protocol_snapshot,
         validate_policy,
         validation_policy_sha256,
     )
@@ -1085,6 +1099,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     # This keeps census peak memory bounded by the batch size.
     print("\n=== 开始 IC 检验 (流式因子分块) ===")
     from pathlib import Path
+    from factors.numerics import factor_kernel_contract
     from research.artifacts import canonical_config_hash, source_tree_hash
 
     source = base_data_mgr.source
@@ -1103,11 +1118,15 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "factor_start": factor_start.isoformat(),
         "ic_start": ic_start.isoformat(),
         "ic_end": ic_end.isoformat(),
-        "frequency": period_ctx.unit.value,
+        "frequency": str(frequency),
+        "period_unit": period_ctx.unit.value,
         "periods_override": list(periods_override or []),
         "policy_sha256": policy_hash,
-        "period_protocol": period_protocol_snapshot(),
+        "period_protocol": _research_period_protocol(
+            research_role, factor_start, ic_start, ic_end
+        ),
         "research_role": research_role,
+        **factor_kernel_contract(),
     }
     research_contract = {
         key: value for key, value in checkpoint_contract.items()
@@ -1868,7 +1887,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 def _run_correlation_analysis(
     runner, config_path, factor_start, ic_start, ic_end,
     method="greedy", threshold=0.6, rolling_window=None, auto_threshold=False,
-    output_dir=None, screening_file=None,
+    output_dir=None, screening_file=None, frequency="daily",
 ):
     """对显著因子做相关性分析 + 聚类.
 
@@ -1906,6 +1925,7 @@ def _run_correlation_analysis(
         return
 
     from pathlib import Path
+    from factors.numerics import factor_kernel_contract
     from research.artifacts import sha256_file, source_tree_hash
 
     with open(ic_json_path, "r", encoding="utf-8") as handle:
@@ -1922,6 +1942,25 @@ def _run_correlation_analysis(
     )
     if current_data_hash != screening_contract.get("data_sha256"):
         raise RuntimeError("screening and correlation data fingerprints differ")
+    for key, expected in {
+        "factor_start": factor_start,
+        "ic_start": ic_start,
+        "ic_end": ic_end,
+    }.items():
+        actual = screening_contract.get(key)
+        if actual is None or (
+            pd.Timestamp(actual).normalize() != pd.Timestamp(expected).normalize()
+        ):
+            raise RuntimeError(f"screening and correlation {key} differ")
+    if str(screening_contract.get("frequency")) != str(frequency):
+        raise RuntimeError("screening and correlation frequencies differ")
+    kernel_contract = factor_kernel_contract()
+    screening_kernel_mode = screening_contract.get("factor_kernel_mode")
+    if (
+        screening_kernel_mode is not None
+        and screening_kernel_mode != kernel_contract["factor_kernel_mode"]
+    ):
+        raise RuntimeError("screening and correlation factor kernels differ")
     analysis_contract = {
         "screening_result_sha256": sha256_file(Path(ic_json_path)),
         "screening_code_sha256": screening_contract.get("code_sha256"),
@@ -1929,6 +1968,7 @@ def _run_correlation_analysis(
         "data_sha256": current_data_hash,
         "research_role": screening_contract.get("research_role"),
         "period_protocol": screening_contract.get("period_protocol"),
+        **kernel_contract,
     }
 
     significant_factors = _load_significant_factors(ic_json_path)
@@ -2034,7 +2074,10 @@ def main():
              "需配合 --multi-period 使用")
     parser.add_argument(
         "--frequency", default="daily",
-        choices=["daily", "1min", "5min", "15min", "30min", "hourly"],
+        choices=[
+            "daily", "daily_intraday", "1min", "5min", "15min", "30min",
+            "hourly",
+        ],
         help="周期单位 (默认 daily). 非日度研究使用数据源的真实 bar 索引")
     parser.add_argument(
         "--t-threshold", type=float, default=1.96,
@@ -2173,6 +2216,7 @@ def main():
             auto_threshold=args.corr_auto_threshold,
             output_dir=output_dir,
             screening_file=screening_file,
+            frequency=args.frequency,
         )
     elif args.all or args.multi_period:
         factor_registry = list_registered("factor").get("factor", {})

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mf-factor-kernels"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "_mf_factor_kernels"
+features = ["pyo3/extension-module"]

@@ -1,20 +1,21 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-08-22）仍为 `NO_TARGETS`：`config/default.yaml` 的10f只是固定观察基线，
+（2026-08-23）仍为 `NO_TARGETS`：`config/default.yaml` 的10f只是固定观察基线，
 `config/target_publication.yaml` 保持关闭且没有获批部署包。挖掘结果只会进入候选池，
 不会自动进入组合或发布目标权重。
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
-> **2026-08-22状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；本机运行
+> **2026-08-23状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；本机运行
 > 已切换为DuckDB＋Polars 1.43.2结果桥接，仓库默认仍为Parquet＋Pandas以保留可移植回退。
-> 统一38品种、164交易日、588因子的新全池画像为588/588无错误，纯因子墙钟由旧画像约
-> 1,517秒降至约1,111秒；本轮只改共享数值核和重复日内整理，不改策略公式或日期语义。
-> 2016-03-31至2026-08-20的冻结历史运行提交599个历史注册类，其中11个不可估计定义已确认
+> 统一38品种、76交易日、588因子的最新单线程快速画像为588/588无错误、约317秒；同口径
+> 本轮早期约1,344秒。Python因子/策略接口不变，已准入共享数组族自动使用本地Rust核心；
+> 本轮只改执行方式和重复日内整理，不改策略公式、日期语义、选约或席位匹配。
+> 2016-03-31至2026-08-20的长历史迁移对照提交599个历史注册类，其中11个不可估计定义已确认
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
-> `|corr|>=0.5`去重为13簇；该H20只作数据更新前的长期对照，尚未按冻结窗口完成WF/OOS
-> 重检，生产批准数为0，目标权重发布门继续关闭。
+> `|corr|>=0.5`去重为13簇。本次588因子迁移重放得到相同H20；它只证明数据/实现语义
+> 一致，不是正式因子准入。正式流程仍须按主配置的最近5个126/42/42滚动WF执行，生产批准数为0。
 
 ## 架构
 
@@ -23,9 +24,11 @@
   -> 认证 DuckDB 镜像（本机运行源；仓库默认可回退）
   -> Polars 结果传输（公共边界仍为 Pandas DataFrame）
   -> DataManager / FrequencyDataProvider
+  -> 单线程 Rust 共享数组核心（Python接口不变；无扩展时reference回退）
   -> 内置 Factor + SPEC + user Factor + mined snapshot bridge
   -> IC/HAC/分层/稳健性研究
-  -> 冻结 walk-forward / locked OOS
+  -> 配置驱动的滚动 walk-forward
+  -> 全部方案冻结后才开始的 locked OOS
   -> 成本、风险、优化与组合回测
   -> 人工批准部署包
   -> close 目标权重发布门（缺少批准时固定 NO_TARGETS）
@@ -60,7 +63,7 @@ python -m pip install -r requirements.txt
 - **[docs/因子创造方法论与完整参考.md](docs/因子创造方法论与完整参考.md)** — 日内因子方法论与首批 170 个历史编号参考
 - **docs/策略基准记录.md** — 主分支 A 与多品种变种 B* 的基准登记
 - **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
-- **docs/扩展窗口历史方法与因子集搜索.md** — 冻结候选清单下的方法与因子集滚动搜索
+- **docs/扩展窗口历史方法与因子集搜索.md** — 隔离的旧版固定日期历史实验，仅作审计
 - **MAINTENANCE.md** — 维护、性能与版本控制
 - **docs/性能评估与优化报告.md**、**docs/因子监控与归因仪表盘_设计文档.md** — 性能基线与观察工具
 - **[docs/数据与计算加速迁移Handoff.md](docs/数据与计算加速迁移Handoff.md)** — DuckDB、Polars与选择性Rust分阶段实施边界
@@ -91,8 +94,10 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   --accelerator-mode v2-lite --accelerator-chunk-size 50 --jobs 4 `
   --use-fast-rolling
 
-# 冻结验证、回测与目标权重发布检查
+# 正式滚动验证、回测与目标权重发布检查
 & $PY -X utf8 -B main.py walkforward --help
+& $PY -X utf8 -B main.py walkforward --config config/default.yaml `
+  --wf-only --is-intraday --run-root runs/walkforward/<run_id>
 & $PY -X utf8 -B main.py summarize --help
 & $PY -X utf8 -B main.py backtest --help
 & $PY -X utf8 -B main.py multi --help
@@ -130,6 +135,18 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 绑定的release ID并重启；旧ID会失败关闭，不能自动漂移到未经确认的数据。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 
+## 计算内核
+
+因子、信号、组合和回测继续使用原有Python/Pandas接口；已准入的分钟数组统计会在本地
+`_mf_factor_kernels`扩展可用时自动进入单线程Rust实现，扩展不存在时使用同语义Python
+reference。`MF_FACTOR_KERNEL_MODE=reference|shadow|native`仅用于回退、双算验证和强制
+native；显式`native`在扩展缺失时失败关闭，不静默降级。Rust工程位于
+`native/mf_factor_kernels/`，构建与验证命令见
+[`docs/数据与计算加速迁移Handoff.md`](docs/数据与计算加速迁移Handoff.md)。实现未引入
+Rayon，不能以增加计算线程换取速度。
+正式研究启动时应显式设置`MF_FACTOR_KERNEL_MODE=native`；实际模式和扩展版本会写入
+现有`research_contract`，不新建第二套配置。
+
 ## 研究治理
 
 正式查看真实历史上的 IC、HAC t 值、收益或最优周期时，必须冻结公式、频率、日期、
@@ -138,8 +155,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 执行完整流程。
 
 GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手仅作诊断，二者都不是正式
-入围证据。SQLite 只管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过筛选，也必须继续
-经过相关性、容量、成本、风险、冻结OOS和`simulated_live`审核。
+入围证据。SQLite 只管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过
+筛选，也必须继续经过相关性、容量、成本、风险、滚动样本外和最终冻结后的新数据审核。
 
 成本口径分两阶段：筛选期将年化半换手还原为完整成交名义，再乘每单位 0.02% 的成本率；
 因子通过后的研究回测按实际生效日的 `executed_traded_notional` 计提同一成本，并按总暴露
@@ -150,12 +167,14 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 逐笔成本模型，但默认年化移仓费不会因此重复计费。
 
 本次政策升级前生成的本地结果和日期化报告已经清除；它们不得再作为当前结论引用。
-冻结历史对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
+长历史迁移对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
 提交规模。其研究契约、代码/配置/数据哈希用于更新后同区间重放比较，不代表当前数据
 更新后的正式结论。
-历史研究阶段由`research/validation.py::period_protocol_snapshot()`单一维护：最后一折OOS固定结束于
-`2026-05-14`，`2026-05-15`起至本地最新数据固定标为`simulated_live`。运行日期和数据库
-最新日期不得反向改写OOS边界；`holdout_ledger.jsonl`只记录历史样本消费事实，不是边界配置。
+正式研究窗口由`config/default.yaml::validation_policy`单一维护。日内因子日度输出当前
+使用126个交易日训练、42个交易日测试、42个交易日步长、90个日历日预热和最近5折；代码按认证
+交易日历生成折，不维护第二套固定日期。`research/validation.py`中的固定扩展窗口只服务
+`workflows/experiments/`旧版隔离实验。最终locked OOS只能从研究方案完全冻结后的新数据
+开始；`holdout_ledger.jsonl`记录样本消费事实，不能把已查看历史重新标成未见样本。
 
 ## 验证与保留
 

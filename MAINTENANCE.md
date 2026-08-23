@@ -27,6 +27,27 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 完整测试在当前开发机约 25 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
 持续集成更适合检查明显回退，而不是维护容易过期的固定秒数或测试项数量。
 
+## Rust数值核心
+
+本地扩展保持单线程，不使用Rayon。修改`native/mf_factor_kernels/`后在VS开发环境中构建：
+
+```powershell
+. 'E:\rust\vs-buildtools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation
+$env:RUSTUP_HOME = 'E:\rust\rustup'
+$env:CARGO_HOME = 'E:\rust\cargo'
+$env:CARGO_TARGET_DIR = 'E:\rust\target\multi_factor'
+$env:CARGO_BUILD_JOBS = '1'
+$env:VIRTUAL_ENV = 'E:\Python\Pythonvenv'
+$env:Path = "E:\rust\cargo\bin;E:\Python\Pythonvenv\Scripts;$env:Path"
+& $PY -m maturin develop --release --manifest-path native/mf_factor_kernels/Cargo.toml
+```
+
+扩展存在时框架自动使用native；`MF_FACTOR_KERNEL_MODE=shadow`用于双算验收，
+`reference`用于回退，显式`native`在扩展缺失时失败关闭。新增核心必须先通过真实数组
+reference/shadow对照，再运行全量测试与单线程全池画像。
+正式research任务显式设置`MF_FACTOR_KERNEL_MODE=native`；运行时模式和扩展版本写入
+既有`research_contract`，同时代码哈希覆盖Rust源码与Cargo锁文件。
+
 ## 性能原则
 
 - 先用剖析结果优化。当前 GP 主要是 CPU、内存带宽和 Pandas/NumPy 滚动计算，GPU
@@ -40,8 +61,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   v2-lite，并核对 NaN mask、factor value、IC、direction、candidate 集合和排序。
 - 分钟数据按明确训练区间加载，超过特征内存预算时失败关闭，不用交换分区硬撑。
 - 并行因子共享同一请求的分钟面板；冷缓存只允许一次读取，避免多个 worker 重复扫描
-  同一批已发布行情。可复用的已测内层循环放在 `factors/numerics.py`，不得全局替换 Pandas
-  算子，也不得在没有逐值差分和端到端基准时引入原生构建依赖。
+  同一批已发布行情。可复用的已测内层循环放在 `factors/numerics.py`并按共享计算族接入
+  Rust；没有逐值差分、shadow和端到端基准时不得新增native核心。
 - 全量`factors.library.intraday`日频研究按400个目标交易日＋128日预热分块，避免把
   全历史分钟面板和因子中间量同时驻留内存；当前最长跨日依赖为120日，增加更长窗口时
   必须先提高并验证重叠长度。后置检验和相关分析复用同一分块助手；64仅是因子批大小。
@@ -109,13 +130,14 @@ SQLite candidate catalog -> immutable JSON snapshot
 因子统计准入、板块适配、后置交易属性检验与 Ridge 的完整先后关系见
 `docs/因子检验与准入流程.md`。修改任何正式门槛或多重检验方法时必须同步更新
 该文档及研究结果中的方法元数据。研究 bundle 同时绑定验证策略 SHA-256 与 taxonomy
-SHA-256；任一变化必须新建输出目录并全量重跑 P0。失效 bundle 在完成必要外部归档后
-应从工作区删除。
+SHA-256；任一变化必须新建输出目录并按影响范围重跑迁移对照或正式滚动WF。失效 bundle
+在完成必要外部归档后应从工作区删除。
 
-当前正式P0证据为`runs/factor_research/20260820_intraday599_rebuild/`。目录名记录最初
+当前长历史迁移对照为`runs/factor_research/20260820_intraday599_rebuild/`。目录名记录最初
 599个历史注册类；11个不可估计死定义已清理，现行日内发现池为588。结果中的
 `research_contract`绑定运行时代码、配置、Parquet元数据和候选名；20个统计发现经
-`|corr|>=0.5`去重为13个观察候选，生产批准仍为0。
+`|corr|>=0.5`去重为13个观察候选。该结果不参与当前选择；正式证据来自主配置驱动的
+滚动WF，生产批准仍为0。
 
 ## 清理策略
 

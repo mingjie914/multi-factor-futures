@@ -22,5 +22,6 @@ matplotlib>=3.5,<4
 ta_cn[cn]==0.5.2
 TA-Lib>=0.6,<1
 
-# 验证
+# 验证与本地Rust构建
 pytest>=8,<10
+maturin==1.14.1

@@ -1,7 +1,7 @@
 """多段 walk-forward 验证 + 蒙特卡洛扰动 + 参数敏感性分析.
 
-验证策略鲁棒性, 不优化参数, 只做诊断:
-1. 4 段滚动样本外验证: 每段 1 年样本外, 报告所有段表现一致性
+验证策略鲁棒性, 训练段选择并冻结到紧邻测试段:
+1. 按主配置bar数生成滚动样本外验证, 报告所有测试段表现一致性
 2. 蒙特卡洛扰动测试: 子组合权重 ±20% 随机扰动 1000 次, 看夏普分布
 3. 参数敏感性分析: retrain_freq / holding_period ±20%, 看夏普稳定性
 
@@ -29,7 +29,6 @@ if _PROJECT_ROOT not in sys.path:
 from core.logger import setup_logger
 from pipeline.runner import PipelineRunner
 from core.config import load_config
-from research.validation import OOS_END, SIMULATED_LIVE_START
 
 setup_logger("multi_factor")
 
@@ -72,12 +71,25 @@ def _calendar_coverage_bounds(
     return dates[grace], dates[-grace - 1] if grace else dates[-1]
 
 
-def _candidate_factor_names() -> list[str]:
+def _candidate_factor_names(module_prefix: str | None = None) -> list[str]:
     # Importing the module registers both built-in and SPEC factors.
     import workflows.factor_adaptivity  # noqa: F401
     from core.registry import list_registered
 
-    return sorted(list_registered("factor").get("factor", {}).keys())
+    registry = list_registered("factor").get("factor", {})
+    if module_prefix:
+        registry = {
+            name: cls for name, cls in registry.items()
+            if cls.__module__.startswith(module_prefix)
+        }
+    return sorted(registry)
+
+
+def _warmup_start(config, frequency: str, start: str) -> pd.Timestamp:
+    warmup_days = int(
+        config.validation_policy.warmup_days_by_frequency.get(frequency, 252)
+    )
+    return pd.Timestamp(start) - pd.Timedelta(days=warmup_days)
 
 
 def _horizon_targets(config, period: float):
@@ -351,10 +363,9 @@ def _build_fold_bundle(
     train_config = copy.deepcopy(base_config)
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
-    warmup_days = int(
-        base_config.validation_policy.warmup_days_by_frequency.get(frequency, 252)
-    )
-    factor_start = (pd.Timestamp(train_start) - pd.Timedelta(days=warmup_days)).date().isoformat()
+    factor_start = _warmup_start(
+        base_config, frequency, train_start
+    ).date().isoformat()
     train_runner = PipelineRunner(config=train_config)
     discovery = _run_multi_period_screening(
         train_runner,
@@ -368,6 +379,7 @@ def _build_fold_bundle(
         frequency=frequency,
         output_dir=str(output_dir),
         adaptivity_file=None,
+        research_role="rolling_walkforward_train",
     )
     discovered_names = list(discovery.get("final_factors", []))
     if not discovered_names:
@@ -451,7 +463,9 @@ def _load_existing_fold_bundle(
     return bundle
 
 
-def _evaluate_fold_factor_ics(runner, bundle, test_start: str, test_end: str) -> dict:
+def _evaluate_fold_factor_ics(
+    runner, bundle, test_start: str, test_end: str, *, frequency: str
+) -> dict:
     """Compute factor-level OOS ICs on one untouched walk-forward test fold."""
     from factors.processor import build_processing_context
     from workflows.research import _joint_ic_ols_statistics
@@ -461,7 +475,7 @@ def _evaluate_fold_factor_ics(runner, bundle, test_start: str, test_end: str) ->
     summary = summary[summary["factor"].astype(str).isin(selected)].copy()
     if summary.empty:
         return {}
-    factor_start = pd.Timestamp(test_start) - pd.DateOffset(years=1)
+    factor_start = _warmup_start(runner.config, frequency, test_start)
     calendar = runner.data_manager.get_calendar(factor_start, test_end)
     calendar = pd.DatetimeIndex(calendar)
     universe = pd.Index(runner.config.universe)
@@ -588,8 +602,7 @@ def summarize_factor_fold_survival(
             ),
             "observation_transition_ready": False,
             "requires_positive_new_locked_oos": True,
-            "locked_oos_status": f"frozen_oos_ends_{OOS_END}",
-            "simulated_live_status": f"active_since_{SIMULATED_LIVE_START}",
+            "validation_role": "rolling_walkforward_oos",
             "production_approved": False,
         }
     return summary
@@ -650,7 +663,7 @@ def _build_rolling_folds(
     return folds
 
 
-def walk_forward_4fold(
+def rolling_walk_forward(
     base_config,
     *,
     run_root: str | Path = None,
@@ -662,6 +675,7 @@ def walk_forward_4fold(
     reuse_artifacts: bool = False,
     frequency: str = "daily",
     is_intraday: bool = False,
+    module_prefix: str | None = None,
     calendar=None,
 ):
     """Nested walk-forward with rolling test folds sized by bar counts.
@@ -684,6 +698,8 @@ def walk_forward_4fold(
         if is_intraday and ctx.unit.value == "daily"
         else ctx.unit.value
     )
+    if is_intraday and module_prefix is None:
+        module_prefix = "factors.library.intraday"
     train_bars = int(policy.wf_train_bars_by_frequency.get(_freq_key, 500))
     test_bars = int(policy.wf_test_bars_by_frequency.get(_freq_key, 125))
     step_bars = int(policy.wf_step_bars_by_frequency.get(_freq_key, 125))
@@ -705,10 +721,25 @@ def walk_forward_4fold(
     calendar = calendar[
         (calendar >= configured_start) & (calendar <= configured_end)
     ]
+    configured_max_folds = policy.wf_max_folds_by_frequency.get(_freq_key)
+    if configured_max_folds is not None:
+        configured_max_folds = int(configured_max_folds)
+        if configured_max_folds < 1:
+            raise ValueError(
+                f"wf_max_folds_by_frequency[{_freq_key}] must be at least 1"
+            )
+        required_bars = (
+            train_bars + test_bars + (configured_max_folds - 1) * step_bars
+        )
+        fold_calendar = calendar[-required_bars:]
+    else:
+        fold_calendar = calendar
     segments = _build_rolling_folds(
-        calendar, train_bars, test_bars, step_bars,
+        fold_calendar, train_bars, test_bars, step_bars,
         frequency=_freq_key,
     )
+    if configured_max_folds is not None:
+        segments = segments[-configured_max_folds:]
     if not segments:
         raise RuntimeError(
             "walk-forward 无法生成任何折叠段；"
@@ -732,7 +763,7 @@ def walk_forward_4fold(
     test_ranges = {(test_start, test_end) for _, _, _, test_start, test_end in segments}
     if len(test_ranges) != len(segments):
         raise ValueError("walk-forward 测试区间存在重复")
-    candidate_factors = candidate_factors or _candidate_factor_names()
+    candidate_factors = candidate_factors or _candidate_factor_names(module_prefix)
     if not candidate_factors:
         raise RuntimeError("没有已注册候选因子")
     if run_root is None:
@@ -781,7 +812,7 @@ def walk_forward_4fold(
         try:
             t0 = time.time()
             fold_dir = run_root / name / "artifacts"
-            if reuse_artifacts:
+            if reuse_artifacts and (fold_dir / "manifest.json").is_file():
                 bundle = _load_existing_fold_bundle(
                     base_config,
                     train_start=train_start,
@@ -816,7 +847,7 @@ def walk_forward_4fold(
                 drop_empty_sleeves=True,
             )
             factor_oos = _evaluate_fold_factor_ics(
-                runner, bundle, test_start, test_end
+                runner, bundle, test_start, test_end, frequency=_freq_key
             )
             result = run_backtest_with_config(cfg, quiet=True, runner=runner)
             nav = result.combined_result.nav.dropna()
@@ -880,6 +911,7 @@ def walk_forward_4fold(
                     "artifact_id": bundle.artifact_id,
                     "selected_factors": m["selected_factors"],
                     "candidate_factor_count": len(candidate_factors),
+                    "candidate_module_prefix": module_prefix,
                     "fdr_method": fdr_method,
                 },
             )
@@ -1197,6 +1229,10 @@ def main():
         help="候选因子逗号分隔；默认使用全部已注册因子",
     )
     parser.add_argument(
+        "--module-prefix", default=None,
+        help="候选因子的注册类模块前缀；例如 factors.library.intraday",
+    )
+    parser.add_argument(
         "--run-root", required=True,
         help="显式冻结运行目录",
     )
@@ -1211,7 +1247,7 @@ def main():
     )
     parser.add_argument(
         "--reuse-artifacts", action="store_true",
-        help="复用 --run-root 中已冻结的逐折研究 bundle，仅恢复组合回测",
+        help="续跑 --run-root：复用完整折bundle，并从首个未完成折继续",
     )
     args = parser.parse_args()
 
@@ -1255,7 +1291,7 @@ def main():
     all_results = {}
 
     if not args.sens_only and not args.mc_only:
-        wf_results = walk_forward_4fold(
+        wf_results = rolling_walk_forward(
             base_config,
             run_root=run_root,
             candidate_factors=candidate_factors,
@@ -1266,6 +1302,7 @@ def main():
             reuse_artifacts=args.reuse_artifacts,
             frequency=args.frequency,
             is_intraday=args.is_intraday,
+            module_prefix=args.module_prefix,
         )
         all_results["walk_forward"] = wf_results
         all_results["factor_fold_survival"] = summarize_factor_fold_survival(
@@ -1300,6 +1337,14 @@ def main():
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(serialize(all_results), f, ensure_ascii=False, indent=2, default=str)
     print(f"\n所有验证结果已保存: {out_path}")
+    failures = [
+        row for row in all_results.get("walk_forward", [])
+        if "error" in row or row.get("observation_channel")
+    ]
+    if failures:
+        raise RuntimeError(
+            f"walk-forward incomplete: {len(failures)} fold(s) failed or stayed observational"
+        )
 
     print("\n" + "=" * 70)
     print("验证完成")

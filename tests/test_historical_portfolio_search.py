@@ -36,7 +36,7 @@ def test_historical_period_protocol_is_frozen_and_copy_safe():
         OOS_END,
         SIMULATED_LIVE_START,
         expanding_window_folds,
-        period_protocol_snapshot,
+        historical_experiment_period_snapshot,
     )
 
     folds = expanding_window_folds()
@@ -44,7 +44,7 @@ def test_historical_period_protocol_is_frozen_and_copy_safe():
     assert folds[-1]["test_end"] == OOS_END == "2026-05-14"
     assert SIMULATED_LIVE_START == "2026-05-15"
     assert LONG_HISTORY_REPLAY_END == "2026-08-20"
-    assert period_protocol_snapshot()["long_history_replay"]["role"] == "frozen_control_only"
+    assert historical_experiment_period_snapshot()["long_history_replay"]["role"] == "frozen_control_only"
     folds[-1]["test_end"] = "2099-12-31"
     assert expanding_window_folds()[-1]["test_end"] == "2026-05-14"
 

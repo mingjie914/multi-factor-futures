@@ -4,7 +4,22 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import factors.numerics as numerics
+
 from factors.numerics import (
+    daily_breakout_statistics,
+    daily_candle_path_statistics,
+    daily_lagged_pair_statistics,
+    daily_oi_statistics,
+    daily_pair_statistics,
+    daily_price_volume_statistics,
+    daily_price_path_statistics,
+    daily_return_statistics,
+    daily_return_path_statistics,
+    daily_smart_money_statistics,
+    daily_tail_statistics,
+    daily_unary_statistics,
+    daily_volume_shock_statistics,
     histogram_window_l1_stability,
     rolling_linear_slope,
     rolling_split_sum_difference,
@@ -12,12 +27,14 @@ from factors.numerics import (
 )
 
 from factors.library.intraday import (
+    _daily_feature_frames,
+    _daily_hlc_features,
     _daily_range_volume_ratio,
     _daily_volume_distribution_stability,
     _post_extreme_amount_persistence,
-    _segmented_ohlc_relative_volatility,
     IntradayDfTest20d,
     IntradayKlineShortestPathIlliq20d,
+    IntradayMfdfaWidth20d,
     IntradayOiSurgeFollow20d,
     IntradayOiSurgeReversal20d,
     IntradayPricePeakCount20d,
@@ -28,31 +45,66 @@ from factors.library.intraday import (
 )
 
 
-@pytest.mark.parametrize("window,positive_only", [(5, False), (5, True), (30, False)])
-def test_segmented_ohlc_volatility_matches_established_loop(window, positive_only):
-    rng = np.random.default_rng(20260822)
-    close = rng.lognormal(mean=4.0, sigma=0.1, size=67)
-    high = close + rng.random(67)
-    low = close - rng.random(67)
-    close[:window] = 100.0
-    high[:window] = 100.0
-    low[:window] = 100.0
-    expected = []
-    for start in range(0, len(close) - window + 1, window):
-        segment = np.concatenate([
-            close[start:start + window],
-            high[start:start + window],
-            low[start:start + window],
-        ])
-        mean = segment.mean()
-        value = segment.std(ddof=0) / mean if mean > 0 else np.nan
-        if mean > 0 and (not positive_only or value > 0):
-            expected.append(value)
+def test_factor_kernel_mode_auto_selects_installed_native(monkeypatch):
+    monkeypatch.delenv("MF_FACTOR_KERNEL_MODE", raising=False)
+    monkeypatch.setattr(numerics.importlib.util, "find_spec", lambda name: object())
+    assert numerics.factor_kernel_mode() == "native"
+    monkeypatch.setattr(numerics.importlib.util, "find_spec", lambda name: None)
+    assert numerics.factor_kernel_mode() == "reference"
 
-    actual = _segmented_ohlc_relative_volatility(
-        close, high, low, window, positive_only=positive_only
+
+def test_explicit_native_fails_closed_when_extension_is_missing(monkeypatch):
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "native")
+
+    def missing_module():
+        raise ImportError("missing")
+
+    monkeypatch.setattr(numerics, "_load_native_module", missing_module)
+    with pytest.raises(RuntimeError, match="not installed"):
+        numerics.daily_unary_statistics(
+            np.ones((2, 1), dtype=float), np.array([0, 2], dtype=np.int64)
+        )
+
+
+def test_shared_daily_frames_omit_only_fully_missing_dates():
+    dates = pd.bdate_range("2025-01-02", periods=3)
+    frames = _daily_feature_frames(
+        {"metric": np.array([[1.0, np.nan], [np.nan, np.nan], [2.0, 3.0]])},
+        dates,
+        ["A", "B"],
     )
-    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+
+    assert frames["metric"].index.equals(dates[[0, 2]])
+    assert np.isnan(frames["metric"].loc[dates[0], "B"])
+
+
+def test_price_path_volatility_extremes_exclude_flat_five_bar_segments(monkeypatch):
+    pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "shadow")
+    close = np.arange(120, dtype=float) % 17 + 100.0
+    close[:5] = 100.0
+    matrix = close[:, None]
+    offsets = np.array([0, len(close)], dtype=np.int64)
+
+    result = daily_price_path_statistics(
+        matrix, matrix, matrix, matrix, np.ones_like(matrix), offsets
+    )
+    segments5 = close.reshape(-1, 5)
+    vol5_all = segments5.std(axis=1) / segments5.mean(axis=1)
+    vol5_positive = vol5_all[vol5_all > 0]
+    segments30 = close.reshape(-1, 30)
+    vol30 = segments30.std(axis=1) / segments30.mean(axis=1)
+    magnitude_threshold = np.percentile(vol5_positive, 95)
+    extreme = vol30[vol30 > magnitude_threshold]
+    expected_magnitude = (
+        extreme.mean() / magnitude_threshold if len(extreme) else 0.0
+    )
+    trend_threshold = np.percentile(vol5_all, 95)
+
+    assert result["vol_extreme_magnitude"][0, 0] == pytest.approx(expected_magnitude)
+    assert result["vol_ratio_trend"][0, 0] == pytest.approx(
+        np.mean(vol30 > trend_threshold)
+    )
 
 
 def test_post_extreme_amount_persistence_matches_established_loop():
@@ -264,6 +316,142 @@ def test_histogram_stability_kernel_matches_window_rest_reference():
     )
 
 
+@pytest.mark.parametrize("mode", ["reference", "shadow"])
+def test_daily_return_statistics_matches_adjacent_pandas_semantics(monkeypatch, mode):
+    if mode == "shadow":
+        pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", mode)
+    values = np.array([
+        [100.0, 50.0], [101.0, np.nan], [np.nan, 51.0], [102.0, 52.0],
+        [103.0, 52.0], [104.0, 51.0], [105.0, 53.0], [106.0, 54.0],
+    ])
+    offsets = np.array([0, 4, 8], dtype=np.int64)
+    index = pd.DatetimeIndex(
+        [pd.Timestamp("2026-01-02")] * 4 + [pd.Timestamp("2026-01-05")] * 4
+    )
+    returns = pd.DataFrame(values, index=index).pct_change(fill_method=None)
+    grouped = returns.groupby(returns.index)
+
+    actual = daily_return_statistics(values, offsets)
+
+    for field, expected in {
+        "count": grouped.count(),
+        "sum": grouped.sum(),
+        "mean": grouped.mean(),
+        "std": grouped.std(ddof=0),
+        "max": grouped.max(),
+        "skew": grouped.skew(),
+    }.items():
+        np.testing.assert_allclose(
+            actual[field], expected, atol=1e-14, rtol=1e-12, equal_nan=True
+        )
+
+
+def test_native_daily_unary_and_pair_statistics_match_pandas(monkeypatch):
+    pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "shadow")
+    left = np.array([
+        [1.0, 2.0], [2.0, np.nan], [3.0, 4.0], [4.0, 8.0],
+        [2.0, 7.0], [3.0, 6.0], [np.nan, 5.0], [8.0, 4.0],
+    ])
+    right = np.array([
+        [8.0, 1.0], [6.0, 2.0], [4.0, np.nan], [2.0, 4.0],
+        [1.0, 8.0], [3.0, 6.0], [5.0, 4.0], [7.0, 2.0],
+    ])
+    offsets = np.array([0, 4, 8], dtype=np.int64)
+
+    unary = daily_unary_statistics(left, offsets)
+    pair = daily_pair_statistics(left, right, offsets)
+    lagged = daily_lagged_pair_statistics(left, right, offsets)
+    tail = daily_tail_statistics(left, offsets, [1, 2])
+
+    for day, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        for column in range(left.shape[1]):
+            series = pd.Series(left[start:end, column]).dropna()
+            assert unary["mean"][day, column] == pytest.approx(series.mean())
+            assert unary["std"][day, column] == pytest.approx(series.std(ddof=0))
+            assert unary["skew"][day, column] == pytest.approx(series.skew())
+            frame = pd.DataFrame({
+                "left": left[start:end, column],
+                "right": right[start:end, column],
+            }).dropna()
+            assert pair["covariance"][day, column] == pytest.approx(
+                np.cov(frame["left"], frame["right"], ddof=0)[0, 1]
+            )
+            assert pair["correlation"][day, column] == pytest.approx(
+                frame["left"].corr(frame["right"])
+            )
+            lagged_left = frame["left"].iloc[:-1].reset_index(drop=True)
+            lagged_right = frame["right"].iloc[1:].reset_index(drop=True)
+            expected_lagged = (
+                lagged_left.corr(lagged_right)
+                if len(lagged_left) >= 2
+                and lagged_left.std(ddof=0) > 0
+                and lagged_right.std(ddof=0) > 0
+                else np.nan
+            )
+            np.testing.assert_allclose(
+                lagged["correlation"][day, column], expected_lagged, equal_nan=True
+            )
+            assert tail["last"][day, column] == series.iloc[-1]
+            if len(series) >= 3:
+                assert tail["means"][day, column, 1] == pytest.approx(
+                    series.iloc[-3:-1].mean()
+                )
+
+
+def test_native_hlc_family_matches_established_daily_formulas(monkeypatch):
+    pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "shadow")
+    rng = np.random.default_rng(20260824)
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    index = pd.DatetimeIndex([
+        day + pd.Timedelta(minutes=minute)
+        for day in dates for minute in range(35)
+    ])
+    close = pd.DataFrame(
+        100.0 + rng.normal(size=(len(index), 2)), index=index, columns=["A", "B"]
+    )
+    high = close + rng.random(close.shape)
+    low = close - rng.random(close.shape)
+    high.iloc[5, 0] = np.nan
+    low.iloc[42, 1] = np.nan
+    panel = {"high": high, "low": low, "close": close}
+
+    actual = _daily_hlc_features(panel)
+    expected = {name: {} for name in actual}
+    day = index.normalize()
+    for dt in dates:
+        for column in close.columns:
+            frame = pd.concat(
+                [high.loc[day == dt, column], low.loc[day == dt, column],
+                 close.loc[day == dt, column]], axis=1
+            ).dropna()
+            frame.columns = ["high", "low", "close"]
+            ratio = (
+                (frame["high"] - frame["close"])
+                / (frame["close"] - frame["low"]).replace(0, np.nan)
+            ).dropna()
+            if len(frame) >= 20 and len(ratio) >= 10:
+                expected["range_asymmetry"].setdefault(dt, {})[column] = -ratio.mean()
+            if len(frame) >= 30:
+                width = frame["high"].max() - frame["low"].min()
+                expected["range_position"].setdefault(dt, {})[column] = (
+                    0.5 if width < 1e-12
+                    else ((frame["close"] - frame["low"].min()) / width).mean()
+                )
+                expected["anchor_distance"].setdefault(dt, {})[column] = (
+                    0.0 if width < 1e-12 else -np.minimum(
+                        (frame["high"].max() - frame["close"]) / width,
+                        (frame["close"] - frame["low"].min()) / width,
+                    ).mean()
+                )
+
+    for name, values in expected.items():
+        frame = pd.DataFrame(values).T.reindex(index=dates, columns=close.columns)
+        np.testing.assert_allclose(actual[name], frame, atol=1e-13, rtol=1e-12)
+
+
 def test_volume_distribution_stability_reuses_the_minute_panel_lifetime():
     index = pd.date_range("2025-01-02 09:00", periods=70, freq="min")
     panel = {"volume": pd.DataFrame({"A": np.arange(70.0) + 1.0}, index=index)}
@@ -272,6 +460,82 @@ def test_volume_distribution_stability_reuses_the_minute_panel_lifetime():
     second = _daily_volume_distribution_stability(panel)
 
     assert second is first
+
+
+def test_native_daily_path_kernels_match_reference(monkeypatch):
+    pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "shadow")
+    rng = np.random.default_rng(20260823)
+    dates = pd.bdate_range("2025-01-02", periods=7)
+    index = pd.DatetimeIndex([
+        day + pd.Timedelta(minutes=minute)
+        for day in dates for minute in range(70)
+    ])
+    close = pd.DataFrame(
+        100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.002, len(index)))) ,
+        index=index,
+        columns=["A"],
+    )
+    volume = pd.DataFrame(
+        rng.lognormal(8.0, 0.7, len(index)), index=index, columns=["A"]
+    )
+    high, low = close + 0.5, close - 0.5
+    open_px = close.shift(1).fillna(close)
+    position = pd.DataFrame(
+        1e5 + np.cumsum(rng.normal(0.0, 50.0, len(index))),
+        index=index,
+        columns=["A"],
+    )
+    panel = {
+        "close": close, "high": high, "low": low,
+        "volume": volume, "position": position,
+    }
+    import factors.library.intraday as intraday
+    monkeypatch.setattr(intraday, "_get_minute_panel", lambda *args, **kwargs: panel)
+
+    stability = _daily_volume_distribution_stability(panel)
+    width = IntradayMfdfaWidth20d().compute(None, dates, ["A"])
+    offsets = np.arange(0, len(index) + 1, 70, dtype=np.int64)
+    breakout = daily_breakout_statistics(
+        high.to_numpy(),
+        low.to_numpy(),
+        close.to_numpy(),
+        offsets,
+    )
+    smart_money = daily_smart_money_statistics(
+        close.to_numpy(), volume.to_numpy(), offsets
+    )
+    oi_features = daily_oi_statistics(
+        high.to_numpy(), low.to_numpy(), close.to_numpy(), volume.to_numpy(),
+        position.to_numpy(), offsets,
+    )
+    return_path = daily_return_path_statistics(close.to_numpy(), offsets)
+    volume_shock = daily_volume_shock_statistics(
+        close.to_numpy(), volume.to_numpy(),
+        (close * volume).to_numpy(), offsets,
+    )
+    candle_path = daily_candle_path_statistics(
+        open_px.to_numpy(), high.to_numpy(), low.to_numpy(), close.to_numpy(), offsets
+    )
+    price_volume = daily_price_volume_statistics(
+        high.to_numpy(), low.to_numpy(), close.to_numpy(), volume.to_numpy(),
+        (close * volume).to_numpy(), offsets,
+    )
+    price_path = daily_price_path_statistics(
+        open_px.to_numpy(), high.to_numpy(), low.to_numpy(), close.to_numpy(),
+        volume.to_numpy(), offsets,
+    )
+
+    assert np.isfinite(stability.to_numpy()).all()
+    assert np.isfinite(width.iloc[-1, 0])
+    assert np.isfinite(breakout["false_retrace"]).all()
+    assert np.isfinite(smart_money["volatility_ratio"]).all()
+    assert np.isfinite(oi_features["peak_count"]).all()
+    assert np.isfinite(return_path["permutation_entropy"]).all()
+    assert np.isfinite(volume_shock["large_order_impact"]).all()
+    assert np.isfinite(candle_path["adx"]).all()
+    assert np.isfinite(price_volume["obv_slope"]).all()
+    assert np.isfinite(price_path["choppiness"]).all()
 
 
 def test_rolling_split_sum_difference_matches_window_reference():

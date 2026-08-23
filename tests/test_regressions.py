@@ -24,6 +24,16 @@ def test_factor_synthesizer_preserves_cross_sectional_missingness():
     assert result.iloc[0]["A"] == 0.0
 
 
+def test_source_tree_hash_covers_rust_sources(tmp_path):
+    from research.artifacts import source_tree_hash
+
+    source = tmp_path / "kernel.rs"
+    source.write_text("fn value() -> i32 { 1 }", encoding="utf-8")
+    before = source_tree_hash(tmp_path)
+    source.write_text("fn value() -> i32 { 2 }", encoding="utf-8")
+    assert source_tree_hash(tmp_path) != before
+
+
 def test_factor_processor_rejects_all_unavailable_final_output():
     from factors.processor import FactorProcessor
 
@@ -1006,6 +1016,27 @@ def test_research_artifact_bundle_validates_time_config_and_file_hash(tmp_path):
         ResearchArtifactBundle.load(tmp_path)
 
 
+def test_research_config_hash_ignores_only_runtime_report_directory():
+    from research.artifacts import canonical_config_hash
+
+    left = {
+        "market": "futures",
+        "backtest": {"report_dir": "runs/a", "rebalance_freq": 5},
+    }
+    right = {
+        "market": "futures",
+        "backtest": {"report_dir": "runs/b", "rebalance_freq": 5},
+    }
+    changed = {
+        "market": "futures",
+        "backtest": {"report_dir": "runs/b", "rebalance_freq": 10},
+    }
+
+    assert canonical_config_hash(left) == canonical_config_hash(right)
+    assert canonical_config_hash(left) != canonical_config_hash(changed)
+    assert left["backtest"]["report_dir"] == "runs/a"
+
+
 def test_streamed_dataframe_hash_collection_matches_materialized_collection():
     from research.artifacts import (
         dataframe_collection_sha256,
@@ -1593,7 +1624,7 @@ def test_nested_walkforward_fold_test_ranges_are_unique(monkeypatch, tmp_path):
         "research.sample_policy.assess_sample_counts",
         lambda *a, **kw: mock_assessment,
     )
-    results = validation.walk_forward_4fold(
+    results = validation.rolling_walk_forward(
         load_config("config/default.yaml"),
         run_root=tmp_path / "run",
         candidate_factors=["momentum_20d"],

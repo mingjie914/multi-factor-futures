@@ -416,6 +416,9 @@ class ValidationPolicyConfig(StrictConfigModel):
     wf_step_bars_by_frequency: Dict[str, int] = {
         "daily": 125, "daily_intraday": 42, "1min": 2000,
     }
+    wf_max_folds_by_frequency: Dict[str, int] = {
+        "daily_intraday": 5,
+    }
     warmup_days_by_frequency: Dict[str, int] = {
         "daily": 252, "daily_intraday": 90, "1min": 60,
     }

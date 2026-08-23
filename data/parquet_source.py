@@ -548,6 +548,7 @@ class ParquetFuturesSource(DataSource):
         start,
         end,
         columns: Iterable[str],
+        roots: Iterable[str] | None = None,
     ) -> tuple[pd.DataFrame, list[str], set[str]]:
         files = self._month_files(native_frequency, start, end)
         if not files:
@@ -604,9 +605,10 @@ class ParquetFuturesSource(DataSource):
         start,
         end,
         columns: Iterable[str],
+        roots: Iterable[str] | None = None,
     ) -> pd.DataFrame:
         combined, requested, available = self._read_storage_partitions(
-            native_frequency, start, end, columns
+            native_frequency, start, end, columns, roots=roots
         )
         if not requested:
             return combined
@@ -622,7 +624,7 @@ class ParquetFuturesSource(DataSource):
             if len(canonical) < before and missing_checks:
                 validation_columns = list(combined.columns) + missing_checks
                 validation, _, _ = self._read_storage_partitions(
-                    native_frequency, start, end, validation_columns
+                    native_frequency, start, end, validation_columns, roots=roots
                 )
                 if validation.empty:
                     return pd.DataFrame(columns=requested)
@@ -1421,7 +1423,7 @@ class ParquetFuturesSource(DataSource):
             *(field_map[field] for field in requested),
         ]
         raw = self._read_partitions(
-            native_frequency, read_start, end_ts, raw_columns
+            native_frequency, read_start, end_ts, raw_columns, roots=roots
         )
         raw = self._annotate_symbols(raw)
         if raw.empty:

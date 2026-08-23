@@ -22,7 +22,7 @@ from external_strategies.guosen_trend_index.production_compare import (
 )
 
 
-def test_current_comparison_keeps_oos_fixed_and_extends_only_simulated_live():
+def test_legacy_external_comparison_keeps_its_internal_date_labels():
     periods = dict(
         (name, (start, end))
         for name, start, end in _report_periods(pd.Timestamp("2026-09-30"))
