@@ -7,6 +7,18 @@
 
 - `factor_research/holdout_ledger.jsonl`：只追加的已消费 holdout 记录，禁止删除、
   修改或把其中日期重新称为未见样本。
+- `factor_validation/20260824_intraday588_is126_oos42_cutoff_20260515/`：本次588个
+  日内因子的标准准入证据。保存588行全量明细、75行通过明细、IS筛选产物、OOS统计、
+  摘要和文件哈希合同；研究窗口固定截至2026-05-15。
+
+以后同类检验统一写入`factor_validation/<run_id>/`，至少包含
+`factor_validation_full.csv`、`passed_factors.csv`、`validation_summary.json`、
+`oos_factor_ic.json`和`run_contract.json`，逐假设IS证据统一放入`artifacts/`。不得为单次
+需求在项目根目录新增一次性脚本或散落结果。
+
+确定组合回测统一写入`portfolio_backtest/<run_id>/`。由IDE入口
+`run_portfolio_workflow.py`运行时，每个策略保存独立结构化结果，run根目录保存配置路径与
+哈希、策略库完整快照与哈希、横向指标、`nav_comparison.csv`及多曲线图；run目录不得覆盖复用。
 
 ## 历史审计证据
 

@@ -1120,6 +1120,12 @@ def run_adaptivity_analysis(
         periods: 持有期列表 (周期数)
         sectors_filter: 仅分析指定板块 (None=全部)
     """
+    if config is None and runner is None:
+        config = load_config(config_path)
+    active_config = runner.config if runner is not None else config
+    from core.date_policy import require_research_end
+
+    ic_end = require_research_end(active_config, ic_end)
     periods = periods or DEFAULT_PERIODS
     periods = sorted(set(periods))
     workers = max(1, int(workers or min(4, os.cpu_count() or 1)))
@@ -1673,8 +1679,8 @@ def main():
         "--ic-start", default="2021-01-01",
         help="IC检验起始日 (默认: 2021-01-01)")
     parser.add_argument(
-        "--ic-end", default="2025-06-30",
-        help="IC检验结束日 (默认: 2025-06-30)")
+        "--ic-end", default=None,
+        help="IC检验结束日 (默认: date_policy.research_cutoff；不得晚于该日)")
     parser.add_argument(
         "--output-dir", required=True,
         help="显式输出目录")

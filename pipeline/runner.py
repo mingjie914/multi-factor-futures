@@ -98,6 +98,21 @@ class PipelineRunner:
         from core.logger import setup_logger
         setup_logger("multi_factor", logging.INFO)
 
+    def _validate_effective_factor_periods(
+        self, assignments: dict[int, list[str]]
+    ) -> None:
+        library_config = self.config.factor_library
+        if not library_config.enforce_portfolio_periods:
+            return
+        from research.effective_factor_library import (
+            validate_effective_factor_periods,
+        )
+
+        library_path = Path(library_config.path)
+        if not library_path.is_absolute():
+            library_path = Path(__file__).resolve().parents[1] / library_path
+        validate_effective_factor_periods(library_path, assignments)
+
     def _load_research_artifacts(self):
         """Load and validate one immutable point-in-time artifact bundle."""
         artifact_cfg = getattr(self.config, "research_artifacts", None)
@@ -160,6 +175,9 @@ class PipelineRunner:
 
     def _build_data_layer(self):
         self.data_manager = DataManager.from_config(self.config)
+        from core.date_policy import resolve_observation_end
+
+        resolve_observation_end(self.config, self.data_manager)
         self.cache = self.data_manager.cache
         logger.info(f"数据层: source={self.config.data.source}")
 
@@ -459,6 +477,11 @@ class PipelineRunner:
                             universe: Universe = None) -> Dict[str, Any]:
         """仅跑因子检验."""
         dr = self.config.date_range
+        from core.date_policy import research_cutoff
+
+        research_end = min(
+            pd.Timestamp(dr.end).normalize(), research_cutoff(self.config)
+        )
 
         # 优先使用传入的 universe, 其次使用 config 中的 universe
         if universe is None or len(universe) == 0:
@@ -473,10 +496,12 @@ class PipelineRunner:
         if len(universe) == 0:
             raise ValueError("因子研究 universe 为空")
 
-        logger.info(f"步骤1/5: 获取交易日历 {dr.start} ~ {dr.end}")
+        logger.info(f"步骤1/5: 获取交易日历 {dr.start} ~ {research_end.date()}")
         if dates is None:
             full_dates = _require_trade_calendar(
-                self.data_manager.get_calendar(dr.start, dr.end), dr.start, dr.end
+                self.data_manager.get_calendar(dr.start, research_end),
+                dr.start,
+                research_end,
             )
         else:
             full_dates = pd.DatetimeIndex(dates)
@@ -486,6 +511,10 @@ class PipelineRunner:
                 or not full_dates.is_monotonic_increasing
             ):
                 raise ValueError("factor-research dates must be non-empty, unique and sorted")
+            if pd.Timestamp(full_dates[-1]).normalize() > research_end:
+                raise ValueError(
+                    "factor-research dates exceed date_policy.research_cutoff"
+                )
             calendar = _require_trade_calendar(
                 self.data_manager.get_calendar(full_dates[0], full_dates[-1]),
                 full_dates[0],
@@ -586,6 +615,9 @@ class PipelineRunner:
     def run_full_pipeline(self, dates: DateIndex = None,
                           universe: Universe = None):
         """端到端全流程."""
+        self._validate_effective_factor_periods({
+            int(self.config.backtest.holding_period): list(self.config.factors)
+        })
         dr = self.config.date_range
         if dates is None:
             calendar = _require_trade_calendar(
@@ -665,6 +697,12 @@ class PipelineRunner:
         sub_configs = self.config.sub_portfolios
         if not sub_configs:
             raise ValueError("sub_portfolios 配置为空, 请先在 config 中配置子组合")
+        assignments: dict[int, list[str]] = {}
+        for sub_config in sub_configs:
+            assignments.setdefault(int(sub_config.holding_period), []).extend(
+                sub_config.factors
+            )
+        self._validate_effective_factor_periods(assignments)
         names = [str(config.name).strip() for config in sub_configs]
         if any(not name for name in names) or len(names) != len(set(names)):
             raise ValueError("sub-portfolio names must be non-empty and unique")

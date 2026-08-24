@@ -62,7 +62,10 @@ def test_formal_mining_uses_the_unified_framework_data_source(monkeypatch):
         "close": pd.DataFrame(100.0, index=index, columns=FRAMEWORK_UNIVERSE)
     }
     source.close = lambda: setattr(source, "closed", True)
-    config = SimpleNamespace(universe=FRAMEWORK_UNIVERSE)
+    config = SimpleNamespace(
+        universe=FRAMEWORK_UNIVERSE,
+        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
+    )
     monkeypatch.setattr("core.config.load_config", lambda path: config)
     monkeypatch.setattr(
         "data.manager.DataManager.from_config",

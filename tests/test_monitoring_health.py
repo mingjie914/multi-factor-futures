@@ -16,8 +16,8 @@ from core.sectors import FRAMEWORK_UNIVERSE
 from strategies.combined import FACTORS, SECTOR_MAP, UNIVERSE38
 
 
-def test_monitoring_uses_current_strategy_definition():
-    assert C.PRODUCTION_FACTORS == FACTORS
+def test_monitoring_uses_legacy_observation_definition():
+    assert C.OBSERVATION_FACTORS == FACTORS
     assert C.SECTORS == SECTOR_MAP
     assert C.UNIVERSE38 == UNIVERSE38
 

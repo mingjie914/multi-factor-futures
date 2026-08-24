@@ -36,7 +36,7 @@ STATE_RETIRED = "RETIRED"
 
 # ---- 固定观察因子、板块与品种池 ----
 # 从当前策略常量构造只读本地容器，避免再次维护一套会过期的生产定义。
-PRODUCTION_FACTORS: dict[str, int] = dict(FACTORS)
+OBSERVATION_FACTORS: dict[str, int] = dict(FACTORS)
 SECTORS: dict[str, list[str]] = {
     sector: list(members) for sector, members in SECTOR_MAP.items()
 }
@@ -44,6 +44,6 @@ UNIVERSE38: list[str] = list(STRATEGY_UNIVERSE)
 SIGNAL_TOP_N = 10            # 多空组合: 因子值前/后 N 名品种(信号组合收益与归因用)
 
 # ---- 回测配置(信号构建时引用) ----
-BACKTEST_CONFIG = "config/default.yaml"
+OBSERVATION_CONFIG = "config/default.yaml"
 DATA_START = "2025-01-01"
 # 信号构建窗口上限: 运行时自动截断到数据源可用最后交易日(见 run_monitoring.cmd_build_signals)

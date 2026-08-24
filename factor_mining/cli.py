@@ -79,15 +79,18 @@ def _repository(args) -> CandidateRepository:
 
 def _load_market_panels(args, universe, start, end, feature_config):
     require_framework_universe(universe)
+    from core.config import load_config
+    from core.date_policy import require_research_end
+
+    config = load_config(args.config)
+    end = require_research_end(config, end)
     if args.data_root is not None:
         return LocalParquetData(LocalParquetSpec(Path(args.data_root))).load_panels(
             universe, start, end, feature_config
         )
 
-    from core.config import load_config
     from data.manager import DataManager
 
-    config = load_config(args.config)
     require_framework_universe(config.universe)
     manager = DataManager.from_config(config)
     fields = list(dict.fromkeys(feature_config.raw_fields))
@@ -331,6 +334,12 @@ def _run_search(args, panels, run_id: str, repository: CandidateRepository | Non
 
 
 def _mine(args) -> int:
+    from core.config import load_config
+    from core.date_policy import require_research_end
+
+    args.end = require_research_end(
+        load_config(args.config), args.end
+    ).date().isoformat()
     feature_config = _feature_config(args)
     run_payload = {
         "start": args.start,
@@ -551,6 +560,12 @@ def _record_prescreen_outcome(
 
 
 def _screen(args) -> int:
+    from core.config import load_config
+    from core.date_policy import require_research_end
+
+    args.end = require_research_end(
+        load_config(args.config), args.end
+    ).date().isoformat()
     repository = _repository(args)
     candidate_ids = (
         args.candidate_ids

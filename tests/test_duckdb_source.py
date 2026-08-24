@@ -168,6 +168,18 @@ def test_duckdb_result_backend_env_override(monkeypatch):
     assert load_config("config/default.yaml").data.duckdb.result_backend == "polars"
 
 
+def test_default_config_separates_research_cutoff_and_observation_end(monkeypatch):
+    monkeypatch.delenv("MF_DATA_SOURCE", raising=False)
+    monkeypatch.delenv("MF_DATE_END", raising=False)
+    monkeypatch.delenv("MF_RESEARCH_CUTOFF", raising=False)
+
+    config = load_config("config/default.yaml")
+
+    assert config.data.source == "duckdb_futures"
+    assert config.date_policy.research_cutoff == "2026-05-15"
+    assert config.date_range.end == "latest_available"
+
+
 def test_duckdb_research_fingerprint_covers_seat_release(tmp_path):
     _, _, table_root, database = _fixture(tmp_path)
     source = DuckDBFuturesSource(

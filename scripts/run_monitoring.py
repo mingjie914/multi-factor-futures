@@ -32,7 +32,7 @@ def cmd_build_signals() -> None:
     from factors.engine import FactorEngine
     from factors import library as _factor_library  # noqa: F401
 
-    cfg = load_config(C.BACKTEST_CONFIG)
+    cfg = load_config(C.OBSERVATION_CONFIG)
     manager = DataManager.from_config(cfg)
     univ = list(C.UNIVERSE38)
     start = pd.Timestamp(C.DATA_START)
@@ -45,8 +45,8 @@ def cmd_build_signals() -> None:
         raise RuntimeError("monitoring source returned an empty trading calendar")
     cal = cal_all[(cal_all >= start) & (cal_all <= end)]
     engine = FactorEngine(manager)
-    comp = engine.compute_factors(list(C.PRODUCTION_FACTORS), cal, univ, parallel=True)
-    signals = {n: comp[n] for n in C.PRODUCTION_FACTORS if n in comp}
+    comp = engine.compute_factors(list(C.OBSERVATION_FACTORS), cal, univ, parallel=True)
+    signals = {n: comp[n] for n in C.OBSERVATION_FACTORS if n in comp}
     close = manager.get("close", cal, univ)
     returns, _ = manager.prepare_close_data(close)
     io.save_signals(signals, returns, close)

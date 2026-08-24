@@ -99,6 +99,17 @@ def main():
 
     print(f"\n回测结果: {result.summary()}")
 
+    result.save(
+        runner.config.backtest.report_dir,
+        metadata={
+            "experiment": "single_portfolio_backtest",
+            "config": config_path,
+            "start": runner.config.date_range.start,
+            "end": runner.config.date_range.end,
+        },
+    )
+    print(f"  结构化回测结果 -> {runner.config.backtest.report_dir}")
+
     if not args.no_plot:
         try:
             result.plot(save_dir=runner.config.backtest.report_dir)

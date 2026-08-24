@@ -128,6 +128,9 @@ def test_all_factor_selection_respects_frequency_and_module_family():
     assert _select_registered_factors(
         registry, "daily", "factors.library.intraday"
     ) == ["a"]
+    assert _select_registered_factors(
+        registry, "daily_intraday", "factors.library.intraday"
+    ) == ["a"]
     assert _select_registered_factors(registry, "1min") == ["b"]
 
 

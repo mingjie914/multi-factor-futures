@@ -360,6 +360,8 @@ def _build_fold_bundle(
             "walk-forward discovery is frozen to validation_policy hierarchical FDR"
         )
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     train_config = copy.deepcopy(base_config)
     train_config.research_artifacts.enabled = False
     train_config.research_artifacts.path = ""
@@ -686,6 +688,9 @@ def rolling_walk_forward(
     """
     from core.period import PeriodContext
 
+    from core.date_policy import apply_research_end
+
+    apply_research_end(base_config, base_config.date_range.end)
     policy = base_config.validation_policy
     ctx = PeriodContext.from_string(frequency)
     if not ctx.is_daily:
@@ -1255,8 +1260,12 @@ def main():
     if not os.path.isabs(config_path):
         config_path = os.path.join(_PROJECT_ROOT, config_path)
     base_config = load_config(config_path)
-    if args.end:
-        base_config.date_range.end = pd.Timestamp(args.end).date().isoformat()
+    from core.date_policy import apply_research_end
+
+    try:
+        apply_research_end(base_config, args.end)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.practical_profile:
         _apply_practical_profile(base_config)
     if args.alpha_type:

@@ -2,7 +2,7 @@
 # local.yaml 已在 .gitignore 中，不能覆盖品种、因子、处理或回测语义。
 
 data:
-  source: parquet_futures
+  source: duckdb_futures
   parquet:
     root_path: 'E:\\path\\to\\local\\futures-parquet'
   duckdb:

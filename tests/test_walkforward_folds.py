@@ -3,9 +3,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pytest
 
 from core.config import load_config
 from workflows.walkforward import (
+    _build_fold_bundle,
     _build_rolling_folds,
     _candidate_factor_names,
     _warmup_start,
@@ -28,7 +30,37 @@ def test_intraday_walkforward_uses_configured_90_day_warmup():
     )
 
 
-def test_only_rolling_training_contract_is_selection_eligible():
+def test_fold_bundle_creates_artifact_directory_before_checkpoint(monkeypatch, tmp_path):
+    output_dir = tmp_path / "fold" / "artifacts"
+    monkeypatch.setattr("pipeline.runner.PipelineRunner", lambda config: object())
+
+    def stop_after_directory_check(*args, **kwargs):
+        assert output_dir.is_dir()
+        raise RuntimeError("stop after directory check")
+
+    monkeypatch.setattr(
+        "workflows.research._run_multi_period_screening",
+        stop_after_directory_check,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after directory check"):
+        _build_fold_bundle(
+            load_config("config/default.yaml"),
+            name="fold-1",
+            train_start="2025-01-01",
+            train_end="2025-07-01",
+            output_dir=output_dir,
+            candidate_factors=["intraday_probe"],
+            build_correlation=False,
+            fdr_method="hierarchical",
+            frequency="daily_intraday",
+        )
+
+
+def test_only_declared_training_contracts_are_selection_eligible():
+    factor_validation = _research_period_protocol(
+        "factor_validation_is", "2026-01-01", "2026-04-01", "2026-08-01"
+    )
     rolling = _research_period_protocol(
         "rolling_walkforward_train", "2026-01-01", "2026-04-01", "2026-08-01"
     )
@@ -36,6 +68,7 @@ def test_only_rolling_training_contract_is_selection_eligible():
         "long_history_replay", "2016-03-31", "2016-03-31", "2026-08-20"
     )
 
+    assert factor_validation["selection_eligible"] is True
     assert rolling["selection_eligible"] is True
     assert control["selection_eligible"] is False
 
@@ -94,7 +127,7 @@ def test_intraday_walkforward_uses_only_five_most_recent_folds(monkeypatch, tmp_
     )
 
     assert len(results) == len(observed) == 5
-    assert results[-1]["test_end"] == calendar[-1].date().isoformat()
+    assert results[-1]["test_end"] == "2026-05-15"
 
 
 def test_short_walkforward_calendar_retries_without_name_error():

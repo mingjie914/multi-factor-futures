@@ -64,10 +64,11 @@ def main() -> None:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     base = load_config(args.config)
+    from core.date_policy import apply_research_end
+
     if args.start:
         base.date_range.start = args.start
-    if args.end:
-        base.date_range.end = args.end
+    apply_research_end(base, args.end)
 
     requested = [item.strip() for item in args.variants.split(",") if item.strip()]
     unknown = sorted(set(requested) - set(VARIANTS))

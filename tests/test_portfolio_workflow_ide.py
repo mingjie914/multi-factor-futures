@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+
+import run_portfolio_workflow as ide
+from backtest.engine import BacktestResult
+from core.config import load_config, load_strategy_library
+from core.sectors import FRAMEWORK_UNIVERSE
+
+
+def _write_config(tmp_path, *, approved_period=5, holding_period=5):
+    library = tmp_path / "library.json"
+    library.write_text(json.dumps({
+        "schema_version": 1,
+        "factors": [{
+            "factor": "factor_a",
+            "status": "effective",
+            "selected_period": approved_period,
+            "approved_periods": [approved_period],
+        }],
+    }), encoding="utf-8")
+    config = tmp_path / "strategy.yaml"
+    config.write_text(
+        f"universe: {json.dumps(list(FRAMEWORK_UNIVERSE))}\n"
+        "factors: [factor_a]\n"
+        f"factor_library:\n  path: '{library.as_posix()}'\n"
+        "  enforce_portfolio_periods: true\n"
+        f"backtest:\n  holding_period: {holding_period}\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _write_catalog(tmp_path, config, *, plot=False):
+    catalog = tmp_path / "strategy_library.yaml"
+    catalog.write_text(
+        "schema_version: 1\n"
+        f"effective_factor_library: '{(tmp_path / 'library.json').as_posix()}'\n"
+        f"output_root: '{(tmp_path / 'runs').as_posix()}'\n"
+        f"plot: {str(plot).lower()}\n"
+        "factor_sets:\n"
+        "  - id: subset_a\n"
+        "    status: active\n"
+        "    description: test subset\n"
+        "    factors: [factor_a]\n"
+        "    selection_context: {purpose: test}\n"
+        "strategies:\n"
+        "  - id: probe\n"
+        "    status: preferred\n"
+        "    source: effective_library\n"
+        "    factor_set_id: subset_a\n"
+        f"    config_path: '{config.as_posix()}'\n"
+        "    mode: single\n",
+        encoding="utf-8",
+    )
+    return catalog
+
+
+def test_ide_strategy_validation_enforces_library_periods(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, approved_period=5, holding_period=10)
+    catalog = _write_catalog(tmp_path, config)
+    monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
+
+    try:
+        ide._validated_specs()
+    except ValueError as exc:
+        assert "period 10 not approved" in str(exc)
+    else:
+        raise AssertionError("IDE workflow accepted an unapproved factor period")
+
+
+def test_catalog_rejects_unknown_factor_even_before_strategy_use(tmp_path, monkeypatch):
+    config = _write_config(tmp_path)
+    catalog = _write_catalog(tmp_path, config)
+    text = catalog.read_text(encoding="utf-8").replace(
+        "factors: [factor_a]", "factors: [factor_a, unknown_factor]"
+    )
+    catalog.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
+
+    try:
+        ide._validated_specs()
+    except ValueError as exc:
+        assert "contains non-effective factors" in str(exc)
+    else:
+        raise AssertionError("catalog accepted a non-effective factor")
+
+
+def test_catalog_allows_only_one_preferred_strategy(tmp_path):
+    config = _write_config(tmp_path)
+    catalog = _write_catalog(tmp_path, config)
+    text = catalog.read_text(encoding="utf-8")
+    duplicate = text[text.index("  - id: probe\n"):].replace(
+        "  - id: probe\n", "  - id: probe_2\n", 1
+    )
+    catalog.write_text(text + duplicate, encoding="utf-8")
+
+    try:
+        load_strategy_library(catalog)
+    except ValueError as exc:
+        assert "multiple preferred strategies" in str(exc)
+    else:
+        raise AssertionError("catalog accepted multiple preferred strategies")
+
+
+def test_config_kinds_cannot_be_routed_through_the_wrong_loader():
+    root = Path(__file__).resolve().parents[1]
+    wrong_pairs = (
+        (load_config, root / "config" / "strategy_library.yaml"),
+        (load_config, root / "config" / "target_publication.yaml"),
+        (load_strategy_library, root / "config" / "default.yaml"),
+    )
+    for loader, path in wrong_pairs:
+        try:
+            loader(path)
+        except (TypeError, ValueError):
+            continue
+        raise AssertionError(f"{path.name} was accepted by the wrong config loader")
+
+
+def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
+    config = _write_config(tmp_path)
+    catalog = _write_catalog(tmp_path, config)
+    monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
+    monkeypatch.setattr(ide, "RUN_ID", "run-1")
+
+    class FakeRunner:
+        def __init__(self, config):
+            self.config = config
+            self.config.date_range.end = "2026-08-24"
+
+        def run_full_pipeline(self):
+            dates = pd.date_range("2026-08-20", periods=3)
+            return BacktestResult(
+                nav=pd.Series([1.0, 1.01, 1.02], index=dates),
+                weights_history=pd.DataFrame(),
+                metrics={"sharpe": 1.0},
+            )
+
+    monkeypatch.setattr(ide, "PipelineRunner", FakeRunner)
+    output = ide.run_and_compare()
+
+    assert (output / "probe" / "metrics.json").is_file()
+    assert (output / "comparison.csv").is_file()
+    assert (output / "nav_comparison.csv").is_file()
+    assert (output / "run_contract.json").is_file()
+    contract = json.loads((output / "run_contract.json").read_text(encoding="utf-8"))
+    assert contract["strategy_library"]["snapshot"]["strategies"][0]["status"] == "preferred"

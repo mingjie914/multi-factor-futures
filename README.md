@@ -7,28 +7,29 @@
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
-> **2026-08-23状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；本机运行
-> 已切换为DuckDB＋Polars 1.43.2结果桥接，仓库默认仍为Parquet＋Pandas以保留可移植回退。
+> **2026-08-24状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；框架默认运行
+> 源已切换为认证DuckDB，本机使用Polars 1.43.2结果桥接；Parquet保留为发布与回退层。
 > 统一38品种、76交易日、588因子的最新单线程快速画像为588/588无错误、约326秒；同口径
 > 本轮早期约1,344秒。Python因子/策略接口不变，已准入共享数组族自动使用本地Rust核心；
 > 本轮只改执行方式和重复日内整理，不改策略公式、日期语义、选约或席位匹配。
 > 2016-03-31至2026-08-20的长历史迁移对照提交599个历史注册类，其中11个不可估计定义已确认
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
 > `|corr|>=0.5`去重为13簇。本次588因子迁移重放得到相同H20；它只证明数据/实现语义
-> 一致，不是正式因子准入。正式流程仍须按主配置的最近5个126/42/42滚动WF执行，生产批准数为0。
+> 一致，不是正式因子准入。2026-08-24已按90日历日预热 + 126交易日IS + 42交易日OOS
+> 完成588因子的统一检验，75个通过并进入结构化有效因子库；生产批准数仍为0。
 
 ## 架构
 
 ```text
 已发布的本地 Parquet（权威、审计、恢复）
-  -> 认证 DuckDB 镜像（本机运行源；仓库默认可回退）
+  -> 认证 DuckDB 镜像（框架默认运行源；release绑定失败关闭）
   -> Polars 结果传输（公共边界仍为 Pandas DataFrame）
   -> DataManager / FrequencyDataProvider
   -> 单线程 Rust 共享数组核心（Python接口不变；无扩展时reference回退）
   -> 内置 Factor + SPEC + user Factor + mined snapshot bridge
   -> IC/HAC/分层/稳健性研究
   -> 配置驱动的滚动 walk-forward
-  -> 全部方案冻结后才开始的 locked OOS
+  -> 统一 research_cutoff 后冻结组合的前向观察
   -> 成本、风险、优化与组合回测
   -> 人工批准部署包
   -> close 目标权重发布门（缺少批准时固定 NO_TARGETS）
@@ -59,7 +60,10 @@ python -m pip install -r requirements.txt
 - **[框架工作流程与使用方法.md](框架工作流程与使用方法.md)** — 标准工作流程（因子层可变/组合层固化）+ 快速上手（主入口）
 - **[docs/多因子框架研究手册.md](docs/多因子框架研究手册.md)** — 总体研究方法与四层架构
 - **docs/因子检验与准入流程.md** — 因子检验与准入流程（v2 策略）
-- **docs/有效因子库.md** — H20长期统计发现、13个去重观察候选与固定10f口径
+- **docs/有效因子库.md** — 当前75个有效因子的结构化库、证据与日常入库流程
+- **run_factor_workflow.py** — IDE日常因子检验/入库的唯一显式分支入口
+- **config/strategy_library.yaml** — 平行因子子集与策略库的唯一人类可读目录
+- **run_portfolio_workflow.py** — IDE校验或运行策略库，持久保存各策略结果和多曲线净值比较
 - **[docs/因子创造方法论与完整参考.md](docs/因子创造方法论与完整参考.md)** — 日内因子方法论与首批 170 个历史编号参考
 - **docs/策略基准记录.md** — 主分支 A 与多品种变种 B* 的基准登记
 - **docs/周期一致性与多频率共存设计指南.md** — 周期/频率设计原则
@@ -71,6 +75,16 @@ python -m pip install -r requirements.txt
 
 ## 常用入口
 
+因子检验日常入口优先使用IDE直接运行`run_factor_workflow.py`。顶部代码枚举明确区分
+“检验全部日内因子”和“将已审阅run入库”，且没有全历史分支。以下`main.py`命令用于
+自动化和其他兼容工作流：
+
+组合回测优先在IDE运行`run_portfolio_workflow.py`。因子子集、策略状态和完整策略YAML路径
+统一登记在`config/strategy_library.yaml`；入口代码不再保存策略名单。默认分支只校验目录、
+有效库成员、子集与配置一致性及周期；明确切换到`RUN_AND_COMPARE`后才
+运行至认证数据源最新完整日期。结果写入新的`runs/portfolio_backtest/<run_id>/`，不会覆盖
+旧run，并统一生成指标、配置哈希、逐策略净值和多曲线比较。
+
 ```powershell
 $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
@@ -79,10 +93,9 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -X utf8 -B main.py research --help
 & $PY -X utf8 -B main.py adaptivity --help
 
-# intraday.py 的588个日频输出发现因子
-& $PY -X utf8 -B main.py research --config config/default.yaml `
-  --all --multi-period --frequency daily `
-  --module-prefix factors.library.intraday --run-id <study_id>
+# 自动化兼容入口；IDE日常操作仍运行run_factor_workflow.py
+& $PY -X utf8 -B main.py factor-validation `
+  --config config/default.yaml --run-id <study_id>
 
 # 因子挖掘（合成冒烟不会写候选库）
 & $PY -X utf8 -B main.py mining dev-smoke `
@@ -121,19 +134,27 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 ## 配置边界
 
-- `config/default.yaml`：研究、筛选、回测、监控与主策略共用的唯一框架配置，包含固定
-  38品种、10f观察基线和统一处理语义；默认只读本地Parquet，`duckdb_futures`是认证镜像。
+- `config/default.yaml`：全框架默认契约及旧10f观察基线，包含38品种和统一处理语义；默认
+  读取认证DuckDB，Parquet保留为权威发布与回退层。确定的新策略使用各自完整YAML。
 - `config/local.yaml`：只保存本机数据路径、认证release与数据运行时选择，已被Git忽略；
   加载器禁止它覆盖品种、因子、处理或回测语义。
 - `config/target_publication.yaml`：独立目标权重发布门，不能传给 `load_config()`当作研究配置。
 - 除成本模型的自定义参数外，未知配置键会直接报错，避免拼写错误被静默忽略。
+- 一个确定策略由一份完整框架YAML定义；多套方案的ID、状态、因子子集和YAML路径只登记在
+  `config/strategy_library.yaml`，不在入口代码重复维护模块参数。
 
-本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；切换认证库时另设
-`MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`、当前`MF_DATA_RELEASE_ID`和可选的
+本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；认证运行库通过
+`MF_DUCKDB_PATH`、当前`MF_DATA_RELEASE_ID`和可选的
 `MF_DUCKDB_RESULT_BACKEND=pandas|polars|shadow`。仓库默认后端为`pandas`；只有通过
 真实A/B的本机部署才设为`polars`。夜间DuckDB发布新release后，必须先验证成功，再更新
 绑定的release ID并重启；旧ID会失败关闭，不能自动漂移到未经确认的数据。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
+
+时间采用两条互不混用的轴：`date_policy.research_cutoff`是所有因子发现、挖掘、适配性、
+策略比较和滚动WF的统一含端点截止日；`date_range.end: latest_available`仅供冻结组合回测、
+净值、监控和报告解析认证数据源的最新完整交易日。截止日后的数据不得反向参与选择或调参。
+需要调整研究边界时只修改`date_policy.research_cutoff`（或显式环境覆盖
+`MF_RESEARCH_CUTOFF`）；研究命令传入更晚日期会失败关闭。
 
 ## 计算内核
 
@@ -170,9 +191,10 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 长历史迁移对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
 提交规模。其研究契约、代码/配置/数据哈希用于更新后同区间重放比较，不代表当前数据
 更新后的正式结论。
-正式研究窗口由`config/default.yaml::validation_policy`单一维护。日内因子日度输出当前
-使用126个交易日训练、42个交易日测试、42个交易日步长、90个日历日预热和最近5折；代码按认证
-交易日历生成折，不维护第二套固定日期。`research/validation.py`中的固定扩展窗口只服务
+正式因子检验窗口由`config/default.yaml::validation_policy`单一维护。日内因子日度输出当前
+使用90个日历日预热、126个交易日IS和紧邻的42个交易日OOS，按认证交易日历从统一
+`research_cutoff`向前解析。默认工作流只生成这一组窗口，不滚动扩展也不使用全历史。
+`research/validation.py`中的固定扩展窗口只服务
 `workflows/experiments/`旧版隔离实验。最终locked OOS只能从研究方案完全冻结后的新数据
 开始；`holdout_ledger.jsonl`记录样本消费事实，不能把已查看历史重新标成未见样本。
 

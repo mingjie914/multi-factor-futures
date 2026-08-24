@@ -40,15 +40,15 @@
   `e5b668b69d03658b716422ad953bddcbb46b154c312663078919f445068c9bfd`。
 - Schema：`futures_data_v1_seat_contract_v2`。
 - 表：4 张行情、6 张席位、2 张元数据。
-- 当前主框架已支持 `parquet_futures` 与 `duckdb_futures`；仓库默认仍为 Parquet，
-  通过环境配置切换 DuckDB。
+- 当前主框架支持 `parquet_futures` 与 `duckdb_futures`；默认运行源已切换为认证DuckDB，
+  Parquet保留为权威发布与回退层。
 - 正式`factor_mining mine/screen`默认复用`config/default.yaml`与DataManager；显式
   `--data-root`仅保留为Parquet审计/回退入口，不维护第二份框架配置。
 
 ### 2.2 计算层
 
-- `config/default.yaml` 是研究、筛选、回测、监控和主策略的唯一框架配置；
-  `target_publication.yaml` 只是发布审批门，不是第二套策略配置。
+- `config/default.yaml` 是研究基线和旧10f观察基线；确定策略使用各自完整框架YAML，并由
+  `config/strategy_library.yaml`统一登记。`target_publication.yaml`仍只是独立发布审批门。
 - `core.sectors.FRAMEWORK_UNIVERSE` 是唯一有序品种契约；当前为38品种。配置文件保留显式
   列表便于审计，但加载时必须与代码契约完全一致。
 - 公共契约仍是 Pandas `DataFrame(dates × roots)`。
@@ -112,7 +112,7 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 
 实施：
 
-1. 等待当晚 Parquet 与席位发布成功，再执行 `update_duckdb.py --mode sync`。
+1. 等待当晚 Parquet 与席位发布成功，再直接运行 `update_duckdb.py`（无参数固定进入日常增量同步）。
 2. 在维护窗口关闭持有旧 DuckDB 连接的长进程。
 3. 设置 `MF_DATA_SOURCE=duckdb_futures`、`MF_DUCKDB_PATH`、`MF_PARQUET_ROOT` 和本次
    `MF_DATA_RELEASE_ID`，重启进程。
@@ -291,7 +291,7 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
 截至2026-08-22，本轮实施结论如下：
 
 - D0完成：唯一依赖清单、Polars 1.43.2、全量回归和双远端基线已冻结。
-- D1a完成：本机运行源已绑定认证DuckDB release；仓库默认仍为Parquet。当前manifest与
+- D1a完成：本机运行源已绑定认证DuckDB release；框架默认已切换为DuckDB。当前manifest与
   component ID一致、`changed_partitions={}`，因此没有执行无意义的重复sync。
 - D1b待完成：仍需连续观察至少两个新的夜间增量release；这不影响当前认证库随时可读或
   通过环境变量回退Parquet，但完成观察前不得把增量运行稳定性写成已验收。
@@ -318,7 +318,7 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
   真实核心A/B的NaN mask一致，数值差异仅为浮点舍入级；76交易日、38品种、588因子快速
   全池为588/588无错误、约326秒，相对本轮早期约1,344秒为4.13倍，完整回归通过。
 
-`config/default.yaml`现已收口为唯一38品种、10f观察基线和统一处理契约；旧的四个重复或
+`config/default.yaml`现已收口为38品种、10f观察基线和统一处理契约；旧的四个重复或
 继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段，当前固定
 `duckdb_futures + polars + required_release_id`，不能覆盖品种、因子、处理或回测语义。
 当前主框架处理链是MAD＋Z-score且未声明中性化；research现在按实际步骤记录`raw`，不再

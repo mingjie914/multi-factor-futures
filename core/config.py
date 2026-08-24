@@ -103,8 +103,8 @@ class DuckDBConfig(StrictConfigModel):
 
 
 class DataSourceConfig(StrictConfigModel):
-    """Published local-Parquet selection, quality marks, and cache settings."""
-    source: str = "parquet_futures"
+    """Certified runtime-source selection, quality marks, and cache settings."""
+    source: str = "duckdb_futures"
     cache: Dict[str, Any] = {}
     audited_nontrading_closes: Dict[str, List[str]] = {}
     parquet: Optional[ParquetConfig] = None
@@ -114,7 +114,21 @@ class DataSourceConfig(StrictConfigModel):
 class DateRangeConfig(StrictConfigModel):
     """Backtest / analysis date range."""
     start: str = "2018-01-01"
-    end: str = "2024-12-31"
+    end: str = "latest_available"
+
+
+class DatePolicyConfig(StrictConfigModel):
+    """Global separation between research evidence and forward observation."""
+
+    research_cutoff: str = "2026-05-15"
+
+
+class FactorLibraryConfig(StrictConfigModel):
+    """Structured effective-factor library; loading never promotes a strategy."""
+
+    path: str = "./factor_library/library.json"
+    # Enable only for strategies whose factors must all come from the library.
+    enforce_portfolio_periods: bool = False
 
 
 class ProcessingStepConfig(StrictConfigModel):
@@ -443,6 +457,39 @@ class HorizonEnsembleConfig(StrictConfigModel):
     retrain_freq_by_horizon: Dict[str, int] = {}
 
 
+class FactorSetEntry(StrictConfigModel):
+    """Reusable, unranked subset selected from the effective-factor library."""
+
+    id: str
+    status: Literal["active", "archived"] = "active"
+    description: str = ""
+    factors: List[str]
+    selection_context: Dict[str, Any] = {}
+
+
+class StrategyLibraryEntry(StrictConfigModel):
+    """One parallel strategy definition backed by a complete framework YAML."""
+
+    id: str
+    status: Literal["preferred", "observing", "archived"] = "observing"
+    source: Literal["effective_library", "legacy_observation"] = "effective_library"
+    factor_set_id: str = ""
+    config_path: str
+    mode: Literal["single", "multi"] = "single"
+    description: str = ""
+
+
+class StrategyLibraryConfig(StrictConfigModel):
+    """Small catalog connecting factor subsets to parallel strategies."""
+
+    schema_version: Literal[1] = 1
+    effective_factor_library: str = "./factor_library/library.json"
+    output_root: str = "./runs/portfolio_backtest"
+    plot: bool = True
+    factor_sets: List[FactorSetEntry] = []
+    strategies: List[StrategyLibraryEntry] = []
+
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -451,19 +498,18 @@ class FrameworkConfig(StrictConfigModel):
     """Top-level framework configuration.
 
     Field names match the YAML keys in config/default.yaml:
-        market, seed, data, date_range, factors, validated_candidates,
+        market, seed, data, date_policy, date_range, factors,
         processing, testing,
         alpha, risk, optimization, costs, backtest
     """
     market: str = "futures"
     seed: int = 42
     data: DataSourceConfig = DataSourceConfig()
+    date_policy: DatePolicyConfig = DatePolicyConfig()
     date_range: DateRangeConfig = DateRangeConfig()
+    factor_library: FactorLibraryConfig = FactorLibraryConfig()
     universe: List[str] = []
     factors: List[str] = []
-    # Audited research watchlist only; runtime workflows never promote these
-    # names into ``factors`` automatically.
-    validated_candidates: List[str] = []
     processing: List[ProcessingStepConfig] = []
     testing: FactorTestConfig = FactorTestConfig()
     alpha: AlphaConfig = AlphaConfig()
@@ -495,6 +541,7 @@ _ENV_MAP = {
     "MF_DUCKDB_PATH": (("data", "duckdb", "path"), str),
     "MF_DATA_RELEASE_ID": (("data", "duckdb", "required_release_id"), str),
     "MF_DUCKDB_RESULT_BACKEND": (("data", "duckdb", "result_backend"), str),
+    "MF_RESEARCH_CUTOFF": (("date_policy", "research_cutoff"), str),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
     "MF_DATE_END": (("date_range", "end"), str),
@@ -566,8 +613,45 @@ def load_config(path: str) -> FrameworkConfig:
     raw = _apply_env_overrides(raw)
 
     config = FrameworkConfig(**raw)
+    from core.date_policy import research_cutoff
+
+    research_cutoff(config)
     require_framework_universe(config.universe)
     return config
+
+
+def load_strategy_library(path: str) -> StrategyLibraryConfig:
+    """Load and structurally validate the factor-set/strategy catalog."""
+    path = os.path.abspath(path)
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) if path.endswith((".yaml", ".yml")) else json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("strategy library must contain a mapping")
+    catalog = StrategyLibraryConfig(**_expand_env_vars(raw))
+    factor_set_ids = [entry.id.strip() for entry in catalog.factor_sets]
+    strategy_ids = [entry.id.strip() for entry in catalog.strategies]
+    if any(not value for value in factor_set_ids) or len(factor_set_ids) != len(set(factor_set_ids)):
+        raise ValueError("factor-set ids must be non-empty and unique")
+    if any(not value for value in strategy_ids) or len(strategy_ids) != len(set(strategy_ids)):
+        raise ValueError("strategy ids must be non-empty and unique")
+    factor_sets = {entry.id: entry for entry in catalog.factor_sets}
+    for entry in catalog.factor_sets:
+        if not entry.factors or len(entry.factors) != len(set(entry.factors)):
+            raise ValueError(f"factor set {entry.id!r} must contain unique factors")
+    preferred = [entry.id for entry in catalog.strategies if entry.status == "preferred"]
+    if len(preferred) > 1:
+        raise ValueError(f"strategy library has multiple preferred strategies: {preferred}")
+    for entry in catalog.strategies:
+        if entry.source == "effective_library":
+            if entry.factor_set_id not in factor_sets:
+                raise ValueError(
+                    f"strategy {entry.id!r} references unknown factor set {entry.factor_set_id!r}"
+                )
+            if factor_sets[entry.factor_set_id].status != "active" and entry.status != "archived":
+                raise ValueError(f"active strategy {entry.id!r} references an archived factor set")
+        elif entry.factor_set_id:
+            raise ValueError(f"legacy strategy {entry.id!r} cannot claim an effective factor set")
+    return catalog
 
 
 def _validate_local_overrides(local_raw: dict) -> None:

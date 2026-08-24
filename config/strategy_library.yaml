@@ -1,0 +1,30 @@
+# Parallel factor subsets and strategies. This is the human-readable catalog;
+# complete module parameters remain in each strategy's FrameworkConfig YAML.
+schema_version: 1
+effective_factor_library: ./factor_library/library.json
+output_root: ./runs/portfolio_backtest
+plot: true
+
+# Add reusable effective-library subsets here. They are peers, not rankings.
+# selection_context records why the subset exists; it is evidence metadata and
+# never silently changes leverage, universe, risk, or weighting parameters.
+# Example:
+#   - id: metals_balanced
+#     status: active
+#     description: Factors retained for a metals-focused constrained portfolio.
+#     factors: [factor_a, factor_b]
+#     selection_context: {purpose: metals, max_instruments: 8, leverage: low}
+factor_sets: []
+
+strategies:
+  # Effective-library example fields: id, status=preferred|observing|archived,
+  # source=effective_library, factor_set_id, config_path and mode=single|multi.
+  # Existing fixed 10f definition is retained only as a legacy observation.
+  # It does not claim membership in the effective-factor subset catalog.
+  - id: current_single_baseline
+    status: observing
+    source: legacy_observation
+    factor_set_id: ''
+    config_path: config/default.yaml
+    mode: single
+    description: Fixed 10f observation baseline; not production approved.

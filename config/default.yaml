@@ -3,8 +3,9 @@ market: futures
 seed: 42
 
 data:
-  # Portable default: Parquet remains authoritative and is also the rollback source.
-  source: parquet_futures
+  # Certified DuckDB is the default runtime source. Parquet remains the
+  # authoritative publication and rollback layer.
+  source: duckdb_futures
   # Only exchange/source-verified market closures belong here. Unknown
   # post-listing close gaps fail closed and must be repaired at the data source.
   audited_nontrading_closes:
@@ -36,18 +37,30 @@ data:
     curve_cache_path: './cache/curve_aggregates'
     selected_cache_enabled: true
     selected_cache_path: './cache/selected_contracts'
-  # Certified optional runtime store.  Production switches through MF_DATA_SOURCE
-  # in a maintenance window and binds the current certified release explicitly.
+  # The machine-local path and certified release remain explicit and fail closed.
   duckdb:
     path: '${MF_DUCKDB_PATH:}'
     required_release_id: '${MF_DATA_RELEASE_ID:}'
     result_backend: pandas
 
-# Main framework data/research range. Workflows slice this range using the
-# validation policy below; commands may narrow dates only for explicit diagnostics.
+# One inclusive cutoff governs every factor/strategy selection and validation
+# workflow. Rows after it are forward observation only and cannot feed admission.
+date_policy:
+  research_cutoff: '2026-05-15'
+
+# Observation/backtest range. ``latest_available`` is resolved through the
+# selected certified source when a runtime or reporting workflow starts.
 date_range:
   start: '2017-01-01'
-  end: '2026-08-20'
+  end: latest_available
+
+# Structured research library. Consumers must opt in; membership never changes
+# strategy factors or publishes targets automatically.
+factor_library:
+  path: './factor_library/library.json'
+  # Legacy baseline below is not an effective-library portfolio. New confirmed
+  # strategy configs should set this true to reject unapproved factor periods.
+  enforce_portfolio_periods: false
 
 universe:
   - A
@@ -101,22 +114,6 @@ factors:
   - intraday_open_close_volume_ratio_20d
   - intraday_turnover_velocity_20d
   - intraday_price_delay_20d
-
-# Audited watchlist only. These names never enter factors automatically.
-validated_candidates:
-  - intraday_basis_momentum_20d
-  - intraday_price_peak_count_20d
-  - intraday_torrent_up_20d
-  - intraday_support_test_20d
-  - intraday_upper_wick_ratio_20d
-  - intraday_path_bandwidth_20d
-  - intraday_term_spread_vol_20d
-  - intraday_overconfidence_intensity_20d
-  - intraday_wick_symmetry_20d
-  - intraday_volume_vol_20d
-  - intraday_sector_sync_20d
-  - intraday_residual_skew_20d
-  - intraday_tail_ratio_20d
 
 processing:
   - type: winsorize

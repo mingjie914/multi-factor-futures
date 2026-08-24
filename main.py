@@ -14,6 +14,12 @@ if PROJECT_ROOT not in sys.path:
 
 WORKFLOW_COMMANDS = {
     "research": ("workflows.research", "factor tests and census studies"),
+    "factor-validation": (
+        "workflows.factor_validation", "default 126 IS + 42 OOS factor validation"
+    ),
+    "factor-library": (
+        "workflows.factor_library", "effective-factor library management"
+    ),
     "adaptivity": ("workflows.factor_adaptivity", "sector/horizon diagnostics"),
     "backtest": ("workflows.backtest", "single-portfolio backtest"),
     "multi": ("workflows.multi_backtest", "multi-sleeve portfolio backtest"),
@@ -41,6 +47,15 @@ def _check_dependencies() -> list[str]:
 
 def _print_help() -> None:
     print("Multi-factor futures research and target-weight framework")
+    print(
+        "Preferred IDE factor workflow: open run_factor_workflow.py, choose one "
+        "FactorWorkflow branch, and press Run."
+    )
+    print(
+        "Portfolio catalog: edit config/strategy_library.yaml; then open "
+        "run_portfolio_workflow.py, validate it, and explicitly choose "
+        "RUN_AND_COMPARE."
+    )
     print(
         "\nUsage: python main.py <command> "
         "[--mined-snapshot PATH] [options]\n"

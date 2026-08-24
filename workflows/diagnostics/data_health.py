@@ -687,6 +687,10 @@ def check_health(config_path: str, *, strict: bool = False) -> dict:
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "config": str(Path(config_path).resolve()),
         "selected_source": selected_source,
+        "date_policy": {
+            "research_cutoff": config.date_policy.research_cutoff,
+            "observation_end": config.date_range.end,
+        },
         "parquet": {"status": "not_selected"},
         "duckdb": {"status": "not_selected"},
         "historical_parquet_schemas": {"status": "not_checked"},
@@ -719,12 +723,16 @@ def check_health(config_path: str, *, strict: bool = False) -> dict:
             result["historical_daily_contract_keys"] = (
                 _check_all_daily_contract_keys(parquet_config)
             )
-            historical_end = config.date_range.end
-            latest_daily_date = result["parquet"].get("latest_daily_date")
-            if latest_daily_date and pd.Timestamp(latest_daily_date) > pd.Timestamp(
-                historical_end
-            ):
-                historical_end = latest_daily_date
+            latest_daily_date = (
+                result["duckdb"].get("latest_market_date")
+                or result["parquet"].get("latest_daily_date")
+            )
+            if not latest_daily_date:
+                raise RuntimeError(
+                    "selected source did not report its latest complete market date"
+                )
+            historical_end = latest_daily_date
+            result["date_policy"]["resolved_observation_end"] = latest_daily_date
             result["historical_daily"] = _check_historical_parquet_contracts(
                 parquet_config,
                 list(config.universe),

@@ -105,7 +105,7 @@ class FactorHealthMonitor:
     """
 
     def __init__(self, factors: dict[str, int] | None = None):
-        self.factors = dict(factors) if factors is not None else dict(C.PRODUCTION_FACTORS)
+        self.factors = dict(factors) if factors is not None else dict(C.OBSERVATION_FACTORS)
         # 每因子历史: daily_ic(序列), port_ret(多空日收益), state(当前)
         self._daily_ic: dict[str, pd.Series] = {}
         self._port_ret: dict[str, pd.Series] = {}

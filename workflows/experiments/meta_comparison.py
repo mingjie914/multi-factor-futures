@@ -39,10 +39,11 @@ def main() -> None:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
+    from core.date_policy import apply_research_end
+
     if args.start:
         config.date_range.start = args.start
-    if args.end:
-        config.date_range.end = args.end
+    apply_research_end(config, args.end)
     if args.alpha_type:
         config.alpha.type = args.alpha_type
         params = dict(config.alpha.params)

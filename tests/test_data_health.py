@@ -153,7 +153,10 @@ def test_parquet_health_checks_only_published_local_source(tmp_path, monkeypatch
         parquet={"root_path": str(tmp_path)},
         cache={"path": str(tmp_path / "cache")},
         audited_nontrading_closes={},
-    ))
+    ),
+        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
+        date_range=SimpleNamespace(start="2026-05-01", end="latest_available"),
+    )
     monkeypatch.setattr(data_health, "load_config", lambda path: config)
     monkeypatch.setattr(
         data_health,
@@ -291,13 +294,14 @@ def test_strict_health_runs_full_history_gate(tmp_path, monkeypatch):
             audited_nontrading_closes={},
         ),
         universe=["A"],
+        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
         date_range=SimpleNamespace(start="2026-08-03", end="2026-08-06"),
     )
     monkeypatch.setattr(data_health, "load_config", lambda path: config)
     monkeypatch.setattr(
         data_health,
         "_check_latest_parquet_contract_keys",
-        lambda value: {"status": "ok"},
+        lambda value: {"status": "ok", "latest_daily_date": "2026-08-06"},
     )
     monkeypatch.setattr(
         data_health,

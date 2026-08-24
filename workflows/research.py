@@ -62,10 +62,13 @@ from core.period import (
     parse_holding_periods,
 )
 from core.factor_contract import normalise_frequency
-from research.validation import HISTORICAL_START, LONG_HISTORY_REPLAY_END
 
 
 _RESEARCH_CHECKPOINT_NAME = ".multi_period_checkpoint.json"
+_SELECTION_ELIGIBLE_RESEARCH_ROLES = {
+    "factor_validation_is",
+    "rolling_walkforward_train",
+}
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -834,7 +837,7 @@ def _research_period_protocol(
         "factor_start": pd.Timestamp(factor_start).isoformat(),
         "ic_start": pd.Timestamp(ic_start).isoformat(),
         "ic_end": pd.Timestamp(ic_end).isoformat(),
-        "selection_eligible": research_role == "rolling_walkforward_train",
+        "selection_eligible": research_role in _SELECTION_ELIGIBLE_RESEARCH_ROLES,
     }
 
 
@@ -2087,10 +2090,13 @@ def main():
         help="IC检验起始日期 (默认: 配置文件的 date_range.start)")
     parser.add_argument(
         "--end", default=None,
-        help="IC检验结束日期 (默认: 配置文件的 date_range.end)")
+        help="IC检验结束日期 (默认: date_policy.research_cutoff；不得晚于该日)")
     parser.add_argument(
         "--factor-start", default=None,
         help="因子计算起始日（默认按配置的频率预热天数向前推）")
+    parser.add_argument(
+        "--full-history", action="store_true",
+        help="显式启用截至统一研究截止日的全历史检验；未指定时默认使用预热+126 IS+42 OOS中的IS段")
     parser.add_argument(
         "--correlation", action="store_true",
         help="对显著因子做相关性分析 + 聚类, 生成 factor_correlation.json "
@@ -2133,6 +2139,24 @@ def main():
         parser.error("--all 与 --factors 不能同时使用")
     if args.periods and not args.multi_period:
         parser.error("--periods 必须配合 --multi-period 使用")
+    if args.full_history and (args.start or args.end):
+        parser.error("--full-history 不能与 --start/--end 同时使用")
+    if bool(args.start) != bool(args.end):
+        parser.error("自定义研究区间必须同时提供 --start 和 --end")
+    if (
+        args.all
+        and args.multi_period
+        and args.frequency == "daily_intraday"
+        and args.module_prefix == "factors.library.intraday"
+        and not args.full_history
+        and not args.start
+        and not args.correlation
+    ):
+        parser.error(
+            "日内全量有效性检验必须运行 run_factor_workflow.py 的 "
+            "VALIDATE_ALL_INTRADAY 分支；research入口只提供显式区间研究，"
+            "拒绝猜测默认路由"
+        )
     if args.refuse_existing_output and args.research_role == "unspecified":
         parser.error("规范化研究使用 --refuse-existing-output 时必须显式指定 --research-role")
 
@@ -2183,25 +2207,49 @@ def main():
     print(f"  研究输出目录: {output_dir}")
 
     # 日期范围
-    ic_start = pd.Timestamp(args.start) if args.start else pd.Timestamp(runner.config.date_range.start)
-    ic_end = pd.Timestamp(args.end) if args.end else pd.Timestamp(runner.config.date_range.end)
-    warmup_days = int(
-        runner.config.validation_policy.warmup_days_by_frequency.get(
-            args.frequency, 252
-        )
-    )
-    factor_start = pd.Timestamp(args.factor_start) if args.factor_start else (
-        ic_start - pd.Timedelta(days=warmup_days)
+    from core.date_policy import factor_validation_window, require_research_end
+
+    try:
+        if args.full_history:
+            ic_start = pd.Timestamp(runner.config.date_range.start)
+            ic_end = require_research_end(runner.config)
+            warmup_days = int(
+                runner.config.validation_policy.warmup_days_by_frequency.get(
+                    args.frequency, 252
+                )
+            )
+            default_factor_start = ic_start - pd.Timedelta(days=warmup_days)
+        elif args.start and args.end:
+            ic_start = pd.Timestamp(args.start)
+            ic_end = require_research_end(runner.config, args.end)
+            warmup_days = int(
+                runner.config.validation_policy.warmup_days_by_frequency.get(
+                    args.frequency, 252
+                )
+            )
+            default_factor_start = ic_start - pd.Timedelta(days=warmup_days)
+        else:
+            window = factor_validation_window(
+                runner.config,
+                runner.data_manager,
+                frequency=args.frequency,
+            )
+            ic_start = window.is_start
+            ic_end = window.is_end
+            default_factor_start = window.factor_start
+    except ValueError as exc:
+        parser.error(str(exc))
+    factor_start = (
+        pd.Timestamp(args.factor_start)
+        if args.factor_start
+        else default_factor_start
     )
     if ic_start > ic_end:
         parser.error("--start 必须早于或等于 --end")
-    if args.research_role == "long_history_replay" and (
-        ic_start != pd.Timestamp(HISTORICAL_START)
-        or ic_end != pd.Timestamp(LONG_HISTORY_REPLAY_END)
-    ):
+    if args.research_role == "long_history_replay" and not args.full_history:
         parser.error(
-            "long_history_replay requires "
-            f"{HISTORICAL_START} through {LONG_HISTORY_REPLAY_END}"
+            "long_history_replay必须显式使用--full-history；结束日仍由"
+            "date_policy.research_cutoff统一决定"
         )
     runner.config.date_range.start = str(ic_start.date())
     runner.config.date_range.end = str(ic_end.date())

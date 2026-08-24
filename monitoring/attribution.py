@@ -59,7 +59,7 @@ class AttributionReport:
                  sector_map: dict[str, list[str]] | None = None):
         self.signals = signals or {}
         self.returns = returns if returns is not None else pd.DataFrame()
-        self.factors = dict(factors) if factors is not None else dict(C.PRODUCTION_FACTORS)
+        self.factors = dict(factors) if factors is not None else dict(C.OBSERVATION_FACTORS)
         self.sector_map = sector_map or C.SECTORS
         frames = _load_ledger_csv(ledger_dir) if ledger_dir else {}
         self.ledger = frames
