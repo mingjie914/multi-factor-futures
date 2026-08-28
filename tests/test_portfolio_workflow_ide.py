@@ -24,6 +24,9 @@ def _write_config(tmp_path, *, approved_period=5, holding_period=5):
     }), encoding="utf-8")
     config = tmp_path / "strategy.yaml"
     config.write_text(
+        "date_range:\n"
+        f"  start: '{ide.COMPARISON_START}'\n"
+        "  end: latest_available\n"
         f"universe: {json.dumps(list(FRAMEWORK_UNIVERSE))}\n"
         "factors: [factor_a]\n"
         f"factor_library:\n  path: '{library.as_posix()}'\n"
@@ -89,6 +92,29 @@ def test_catalog_rejects_unknown_factor_even_before_strategy_use(tmp_path, monke
         raise AssertionError("catalog accepted a non-effective factor")
 
 
+def test_legacy_peer_comparison_scope_is_in_memory_only(tmp_path, monkeypatch):
+    config = _write_config(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            f"start: '{ide.COMPARISON_START}'", "start: '2017-01-01'"
+        ),
+        encoding="utf-8",
+    )
+    catalog = _write_catalog(tmp_path, config)
+    text = catalog.read_text(encoding="utf-8").replace(
+        "source: effective_library", "source: legacy_observation"
+    ).replace("factor_set_id: subset_a", "factor_set_id: ''")
+    catalog.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
+
+    _catalog_path, _loaded, specs = ide._validated_specs()
+    strategy, _path, resolved = specs[0]
+    assert strategy.source == "legacy_observation"
+    assert resolved.date_range.start == ide.COMPARISON_START
+    assert not any(step.type == "fillna" for step in resolved.processing)
+    assert "2017-01-01" in config.read_text(encoding="utf-8")
+
+
 def test_catalog_allows_only_one_preferred_strategy(tmp_path):
     config = _write_config(tmp_path)
     catalog = _write_catalog(tmp_path, config)
@@ -149,3 +175,30 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert (output / "run_contract.json").is_file()
     contract = json.loads((output / "run_contract.json").read_text(encoding="utf-8"))
     assert contract["strategy_library"]["snapshot"]["strategies"][0]["status"] == "preferred"
+
+
+def test_all_strategy_branch_selects_current_and_archived_peers(monkeypatch):
+    monkeypatch.setattr(
+        ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_ALL
+    )
+    _catalog_path, _catalog, specs = ide._validated_specs()
+    assert [strategy.id for strategy, _path, _config in specs] == list(
+        ide.ALL_STRATEGY_IDS
+    )
+
+
+def test_common_h5_branch_routes_without_catalog_admission(monkeypatch):
+    called = {}
+
+    def fake_compare(**kwargs):
+        called.update(kwargs)
+        return Path("runs/portfolio_backtest/common_h5_probe")
+
+    monkeypatch.setattr(
+        ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_COMMON_H5_MATCHED
+    )
+    monkeypatch.setattr(ide, "run_common_h5_compare", fake_compare)
+
+    ide.main()
+
+    assert called == {"ic_horizon": 5}

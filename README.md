@@ -62,6 +62,7 @@ python -m pip install -r requirements.txt
 - **docs/因子检验与准入流程.md** — 因子检验与准入流程（v2 策略）
 - **docs/有效因子库.md** — 当前75个有效因子的结构化库、证据与日常入库流程
 - **run_factor_workflow.py** — IDE日常因子检验/入库的唯一显式分支入口
+- **workflows/factor_selection.py** — 从当前有效库派生周期匹配、去冗后的平行因子子集并保存选择证据
 - **config/strategy_library.yaml** — 平行因子子集与策略库的唯一人类可读目录
 - **run_portfolio_workflow.py** — IDE校验或运行策略库，持久保存各策略结果和多曲线净值比较
 - **[docs/因子创造方法论与完整参考.md](docs/因子创造方法论与完整参考.md)** — 日内因子方法论与首批 170 个历史编号参考
@@ -81,9 +82,27 @@ python -m pip install -r requirements.txt
 
 组合回测优先在IDE运行`run_portfolio_workflow.py`。因子子集、策略状态和完整策略YAML路径
 统一登记在`config/strategy_library.yaml`；入口代码不再保存策略名单。默认分支只校验目录、
-有效库成员、子集与配置一致性及周期；明确切换到`RUN_AND_COMPARE`后才
-运行至认证数据源最新完整日期。结果写入新的`runs/portfolio_backtest/<run_id>/`，不会覆盖
-旧run，并统一生成指标、配置哈希、逐策略净值和多曲线比较。
+有效库成员、子集与配置一致性及周期；明确切换到`RUN_AND_COMPARE`后，所有选定策略均以
+`config/default.yaml::production_portfolio`为同一方法基线（`lw_abs`、Top10/Bottom10、
+板块cap3、ERC、总敞口2），只比较因子集合，并运行至认证数据源最新完整日期。只有要比较
+YAML中模型/风险/优化器的显式挑战方案时才切换`RUN_AND_COMPARE_CONFIGURED`；该分支不应
+被当作默认组合方法。结果写入新的`runs/portfolio_backtest/<run_id>/`，不会覆盖旧run，
+并统一生成指标、配置哈希、逐策略净值和多曲线比较。
+
+早期固定集合以归档策略登记在同一目录中，不进入普通比较。需要按当前 DuckDB、当前账本和
+默认生产方法重评 6f/8f/13f 时，在 IDE 中切换`RUN_AND_COMPARE_SNAPSHOT_AUDIT`；该分支
+只读取快照中的因子与方向定义，结果仍写入标准`portfolio_backtest/<run_id>/`。
+需要将旧10、平衡、紧凑与 6f/8f/13f 六个策略放在同一张净值图时，切换
+`RUN_AND_COMPARE_ALL`；该分支只改变因子集合，仍使用同一默认生产方法。
+
+周期对照也必须使用显式 IDE 分支，不能把六策略统一图误认为多周期子组合：
+`RUN_AND_COMPARE_CONFIGURED` 才会按各 YAML 的 `sub_portfolios` 实际运行 5/10/20
+子组合，但它同时采用 YAML 中声明的模型、风险和 meta-optimizer，属于完整配置挑战；
+它不能单独证明“周期匹配”带来的增益。共同 H5 因子筛选证据可用
+`run_factor_workflow.py` 的 `SELECT_COMMON_H5_SUBSETS`，随后用
+`RUN_AND_COMPARE_COMMON_H5`（默认日度 IC）与
+`RUN_AND_COMPARE_COMMON_H5_MATCHED`（统一 H5 IC 敏感性）逐条比较。后两条只读取独立
+研究run，不会把共同 H5 因子自动写入有效因子库。
 
 ```powershell
 $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'

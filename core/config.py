@@ -261,6 +261,23 @@ class UniverseSelectionConfig(StrictConfigModel):
     sector_maximums: Dict[str, int] = {}
 
 
+class ICMonitorConfig(StrictConfigModel):
+    """Rolling IC health monitor injected into multi-sleeve backtests.
+
+    The defaults preserve the framework's existing runtime behavior.  A
+    strategy may disable the monitor explicitly when evaluating a fixed,
+    already-selected factor subset; this does not change factor validation or
+    the global default.
+    """
+
+    enabled: bool = True
+    window: int = 60
+    min_ic: float = 0.02
+    decay_tolerance: int = 1
+    reactivation_ic: float = 0.03
+    min_cross_section: int = 3
+
+
 class BacktestConfig(StrictConfigModel):
     """Backtest engine configuration."""
     rebalance_freq: str = "weekly"
@@ -270,6 +287,7 @@ class BacktestConfig(StrictConfigModel):
     training_window: int = 750    # 日频正式训练窗口下限 ~3年
     retrain_freq: int = 10        # 重训频率 (交易日)
     holding_period: int = 5       # 持有期 (周期数, 非天数; daily频率下1周期=1交易日)
+    ic_monitor: ICMonitorConfig = ICMonitorConfig()
 
 
 class SubPortfolioConfig(StrictConfigModel):
@@ -474,6 +492,10 @@ class StrategyLibraryEntry(StrictConfigModel):
     status: Literal["preferred", "observing", "archived"] = "observing"
     source: Literal["effective_library", "legacy_observation"] = "effective_library"
     factor_set_id: str = ""
+    # Optional immutable factor-definition module for archived snapshot audits.
+    # It is read only by the explicit snapshot-audit IDE branch; normal
+    # strategy runs never import archived definitions.
+    factor_definition_path: str = ""
     config_path: str
     mode: Literal["single", "multi"] = "single"
     description: str = ""
@@ -647,10 +669,21 @@ def load_strategy_library(path: str) -> StrategyLibraryConfig:
                 raise ValueError(
                     f"strategy {entry.id!r} references unknown factor set {entry.factor_set_id!r}"
                 )
+            if entry.factor_definition_path:
+                raise ValueError(
+                    f"effective-library strategy {entry.id!r} cannot use a "
+                    "factor definition path"
+                )
             if factor_sets[entry.factor_set_id].status != "active" and entry.status != "archived":
                 raise ValueError(f"active strategy {entry.id!r} references an archived factor set")
-        elif entry.factor_set_id:
-            raise ValueError(f"legacy strategy {entry.id!r} cannot claim an effective factor set")
+        else:
+            if entry.factor_set_id:
+                raise ValueError(f"legacy strategy {entry.id!r} cannot claim an effective factor set")
+            if not entry.factor_definition_path and entry.status == "archived":
+                raise ValueError(
+                    f"archived legacy strategy {entry.id!r} must declare a "
+                    "factor definition path"
+                )
     return catalog
 
 

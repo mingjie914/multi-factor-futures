@@ -129,8 +129,10 @@ testing:
   layered: {n_groups: 3, rebalance: monthly}
   regression: {method: fama_macbeth, weighted: false}
 
-# Ridge is a post-screening estimator. Raw OLS/HAC and multiplicity control
-# are performed by the research workflow before a factor can reach this layer.
+# Ridge is the enabled post-screening estimator. sector_grouped_lasso is a
+# registered parallel alternative, but is never selected unless a strategy
+# configuration explicitly sets alpha.type to it. Neither model changes the
+# effective-factor library. Raw OLS/HAC and multiplicity control happen first.
 alpha:
   type: sector_grouped_ridge
   params:

@@ -845,18 +845,23 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                                  factor_start, ic_start, ic_end,
                                  periods_override=None, frequency="daily",
                                  output_dir=None, adaptivity_file=None,
-                                 research_role="unspecified"):
+                                 research_role="unspecified",
+                                 common_horizon=None):
     """按冻结契约执行多持有期筛选.
 
     持有期为"周期数"语义 (非天数); 当 frequency=daily 时, 1个周期=1个交易日.
 
-    两种持有期选取模式:
+    三种持有期选取模式:
       1. 冻结契约模式 (默认, periods_override=None):
          - 每个因子使用注册时冻结的 validation_horizons；
          - 仅当治理配置显式声明该因子家族时，使用冻结的 family_horizons。
       2. 显式持有期模式 (periods_override=[1,5,10,20,40]):
          - 仅允许因子注册契约与显式集合完全一致的同质批次
          - 不允许用该参数扩大或缩小冻结的因子内假设家族
+      3. 共同周期对照模式 (common_horizon=1/5/...):
+         - 保留因子原始注册契约，但另建独立研究合同，所有因子只使用
+           一个预先声明的共同 forward-return 周期；不修改因子类本身。
+         - 仅供旧日度口径或共同周期敏感性对照，不得写回当前有效库。
 
     因子计算从 factor_start 开始（含配置预热）, IC 检验从 ic_start 开始.
     使用 Newey-West HAC 调整 t 统计量.
@@ -948,28 +953,49 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     # 构造周期上下文；分钟数据加载后会用实际 bar 数校准年化因子。
     period_ctx = PeriodContext.from_string(frequency)
 
+    if common_horizon is not None:
+        common_horizon = int(common_horizon)
+        if common_horizon < 1:
+            raise ValueError("common_horizon must be a positive bar count")
+        if periods_override is not None:
+            raise ValueError(
+                "common_horizon and periods_override are mutually exclusive"
+            )
+
     # Freeze the exact factor-frequency-horizon contract before any data read.
-    # Formal research must never broaden a factor's hypothesis family through
-    # a CLI or family override that disagrees with its registered contract.
+    # Formal default research must never broaden a factor's hypothesis family
+    # through a CLI or family override that disagrees with its registered
+    # contract.  The explicit common-horizon branch is a separate, auditable
+    # comparison contract and does not mutate the factor registration.
     factor_horizons: dict[str, tuple[int, ...]] = {}
+    declared_factor_horizons: dict[str, tuple[int, ...]] = {}
     factor_training_bars: dict[str, int] = {}
     factor_training_days: dict[str, int] = {}
     factor_requires_training_contract: dict[str, bool] = {}
     for factor_name in all_factors:
         factor = registry_get("factor", factor_name)()
-        requested = (
-            tuple(periods_override)
-            if periods_override is not None
-            else tuple(
-                (policy.family_horizons or {}).get(_factor_family(factor_name))
-                or getattr(factor, "validation_horizons", ())
-            )
-        )
-        factor_horizons[factor_name] = validate_factor_contract(
+        declared = validate_factor_contract(
             factor,
             provider_frequency=period_ctx.unit.value,
-            requested_horizons=requested,
+            requested_horizons=None,
         )
+        declared_factor_horizons[factor_name] = declared
+        if common_horizon is not None:
+            factor_horizons[factor_name] = (common_horizon,)
+        else:
+            requested = (
+                tuple(periods_override)
+                if periods_override is not None
+                else tuple(
+                    (policy.family_horizons or {}).get(_factor_family(factor_name))
+                    or declared
+                )
+            )
+            factor_horizons[factor_name] = validate_factor_contract(
+                factor,
+                provider_frequency=period_ctx.unit.value,
+                requested_horizons=requested,
+            )
         factor_training_bars[factor_name] = int(
             getattr(factor, "training_bars", 0) or 0
         )
@@ -994,7 +1020,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
           f"{period_ctx.bars_per_day}个bar/交易日)")
 
     # 持有期选取模式
-    if periods_override is not None:
+    if common_horizon is not None:
+        print(
+            f"  持有期模式: 共同周期对照 H={common_horizon}，"
+            "不改变因子注册契约"
+        )
+    elif periods_override is not None:
         print(
             f"  持有期模式: 冻结显式列表 {periods_override} "
             "(必须与每个因子契约完全一致)"
@@ -1124,6 +1155,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "frequency": str(frequency),
         "period_unit": period_ctx.unit.value,
         "periods_override": list(periods_override or []),
+        "horizon_mode": (
+            "common_horizon" if common_horizon is not None
+            else ("explicit" if periods_override is not None else "registered_contract")
+        ),
+        "common_horizon": common_horizon,
+        "declared_horizon_contract": "factor_registry",
         "policy_sha256": policy_hash,
         "period_protocol": _research_period_protocol(
             research_role, factor_start, ic_start, ic_end

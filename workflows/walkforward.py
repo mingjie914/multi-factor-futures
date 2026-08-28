@@ -1216,7 +1216,7 @@ def main():
     )
     parser.add_argument(
         "--alpha-type",
-        choices=["sector_grouped_ols", "sector_grouped_ridge"],
+        choices=["sector_grouped_ols", "sector_grouped_ridge", "sector_grouped_lasso"],
         default=None,
         help="覆盖 Alpha 模型用于候选比较",
     )
@@ -1276,12 +1276,21 @@ def main():
                 "ridge_alphas": [0.01, 0.1, 1.0, 10.0],
                 "ridge_cv_folds": 3,
             })
+        elif args.alpha_type == "sector_grouped_lasso":
+            params.pop("ridge_alphas", None)
+            params.pop("ridge_cv_folds", None)
+            params.update({
+                "lasso_alphas": [1e-6, 1e-5, 1e-4, 1e-3],
+                "lasso_cv_folds": 3,
+            })
         else:
             params.pop("ridge_alphas", None)
             params.pop("ridge_cv_folds", None)
             params["ridge_alpha"] = 0.0
         base_config.alpha.params = params
-    if base_config.alpha.type in {"sector_grouped_ols", "sector_grouped_ridge"}:
+    if base_config.alpha.type in {
+        "sector_grouped_ols", "sector_grouped_ridge", "sector_grouped_lasso"
+    }:
         params = dict(base_config.alpha.params)
         params["unmapped_sector_policy"] = "zero"
         base_config.alpha.params = params

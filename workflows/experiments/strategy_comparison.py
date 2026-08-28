@@ -21,11 +21,19 @@ VARIANTS = {
         "alpha_type": "sector_grouped_ridge",
         "asset_selection": False,
     },
+    "sector_grouped_lasso": {
+        "alpha_type": "sector_grouped_lasso",
+        "asset_selection": False,
+    },
     "ridge_hysteresis_top_n": {
         "alpha_type": "sector_grouped_ridge",
         "asset_selection": True,
     },
 }
+
+DEFAULT_VARIANTS = [
+    "sector_grouped_ols", "sector_grouped_ridge", "ridge_hysteresis_top_n"
+]
 
 
 def _configure(base, variant: str):
@@ -37,6 +45,13 @@ def _configure(base, variant: str):
         params.update({
             "ridge_alphas": [0.01, 0.1, 1.0, 10.0],
             "ridge_cv_folds": 3,
+        })
+    elif settings["alpha_type"] == "sector_grouped_lasso":
+        params.pop("ridge_alphas", None)
+        params.pop("ridge_cv_folds", None)
+        params.update({
+            "lasso_alphas": [1e-6, 1e-5, 1e-4, 1e-3],
+            "lasso_cv_folds": 3,
         })
     else:
         params.pop("ridge_alphas", None)
@@ -57,7 +72,7 @@ def main() -> None:
     parser.add_argument("--end", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
-        "--variants", default=",".join(VARIANTS), help="Comma-separated variants"
+        "--variants", default=",".join(DEFAULT_VARIANTS), help="Comma-separated variants"
     )
     args = parser.parse_args()
 

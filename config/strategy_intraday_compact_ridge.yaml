@@ -1,0 +1,233 @@
+# Reusable compact candidate built from the effective-library selection run.
+# It keeps the same risk/model contract as the balanced peer; only the
+# effective-library factor subset differs.
+market: futures
+seed: 42
+
+data:
+  source: duckdb_futures
+  cache:
+    enabled: false
+  audited_nontrading_closes:
+    NI:
+      - '2022-03-10'
+
+date_policy:
+  research_cutoff: '2026-05-15'
+date_range:
+  start: '2024-01-01'
+  end: latest_available
+
+factor_library:
+  path: './factor_library/library.json'
+  enforce_portfolio_periods: true
+
+universe:
+  - A
+  - AG
+  - AL
+  - AU
+  - CU
+  - FU
+  - HC
+  - I
+  - IC
+  - IF
+  - IH
+  - J
+  - JM
+  - M
+  - MA
+  - NI
+  - P
+  - RB
+  - RM
+  - RU
+  - SA
+  - SN
+  - SR
+  - T
+  - TA
+  - TL
+  - TS
+  - Y
+  - ZN
+  - IM
+  - TF
+  - CF
+  - OI
+  - LH
+  - JD
+  - SC
+  - V
+  - UR
+
+factors:
+  - intraday_amihud_vol_corr_20d
+  - intraday_close_drift_20d
+  - intraday_df_test_20d
+  - intraday_diff_autocorr_long_20d
+  - intraday_extreme_freq_balance_20d
+  - intraday_following_price_confirm_20d
+  - intraday_following_volume_ratio_20d
+  - intraday_large_order_impact_20d
+  - intraday_level_clustering_20d
+  - intraday_liq_resilience_20d
+  - intraday_oi_quantile_range_20d
+  - intraday_open_state_trend_20d
+  - intraday_order_flow_memory_20d
+  - intraday_permutation_entropy_20d
+  - intraday_price_delay_20d
+  - intraday_price_volume_divergence_20d
+  - intraday_roll_spread_20d
+  - intraday_rv_compression_breakout_20d
+  - intraday_sector_sync_20d
+  - intraday_session_symmetry_20d
+  - intraday_term_half_life_20d
+  - intraday_trend_resid_kurt_20d
+  - intraday_zero_volume_run_20d
+  - vol_clustering_20d
+
+processing:
+  - type: winsorize
+    params: {method: mad, n_sigma: 3}
+  - type: standardize
+    params: {method: zscore, by_date: true}
+  # Missing minute coverage is a neutral, not predictive, exposure for the
+  # fixed subset backtest; eligibility masking is still applied first.
+  - type: fillna
+    params: {method: zero}
+
+alpha:
+  type: sector_grouped_ridge
+  params:
+    fit_intercept: true
+    min_samples_per_sector: 100
+    fallback_to_global: false
+    ridge_alphas: [0.01, 0.1, 1.0, 10.0]
+    ridge_cv_folds: 3
+
+risk:
+  type: barra_futures
+  style_factors: [carry, momentum, volatility, skewness, liquidity]
+  estimation_window: 252
+  covariance_estimator: shrinkage
+
+optimization:
+  type: hierarchical_asset_risk_parity
+  risk_aversion: 2.0
+  cost_penalty: 0.5
+  hierarchical_asset_risk_parity:
+    target_volatility: 0.10
+    max_leverage: 2.0
+    covariance_shrinkage: 0.30
+    periods_per_year: 252
+    volatility_floor: 0.01
+    asset_class_budgets: {}
+    commodity_sector_budgets: {}
+  dynamic_risk_limits:
+    enabled: true
+    asset_vol_budget: 0.025
+    sector_vol_budget: 0.06
+    hard_asset_cap: 1.0
+    gross_cap: 2.0
+    net_cap: 0.5
+    atr_window: 20
+    risk_window: 60
+    covariance_shrinkage: 0.30
+  constraints:
+    - {type: net_exposure, lower: -0.5, upper: 0.5}
+    - {type: leverage, limit: 2.0, vol_target: 0.0}
+    - {type: sector_exposure, limit: 0.3}
+    - {type: turnover, limit: 0.30}
+
+costs:
+  type: simple_futures
+  turnover_cost_rate: 0.0002
+  annual_fee: 0.0
+  annual_roll_cost: 0.00105
+  periods_per_year: 252
+  cost_stage: post_screen_backtest
+
+universe_selection:
+  enabled: false
+asset_selection:
+  enabled: false
+
+backtest:
+  rebalance_freq: weekly
+  benchmark: csi300
+  plot: true
+  report_dir: ./reports
+  training_window: 750
+  retrain_freq: 10
+  holding_period: 5
+  # Fixed effective-library subset comparison; the framework default remains enabled.
+  ic_monitor:
+    enabled: false
+
+sub_portfolios:
+  - name: short_term
+    factors:
+      - intraday_order_flow_memory_20d
+      - intraday_level_clustering_20d
+      - intraday_term_half_life_20d
+      - intraday_open_state_trend_20d
+      - intraday_sector_sync_20d
+    rebalance_freq: weekly
+    holding_period: 5
+    retrain_freq: 5
+    training_window: 750
+    capital_weight: 0.34
+    frequency: daily
+  - name: mid_term
+    factors:
+      - intraday_diff_autocorr_long_20d
+      - intraday_extreme_freq_balance_20d
+      - intraday_following_price_confirm_20d
+      - intraday_price_volume_divergence_20d
+      - intraday_df_test_20d
+      - intraday_following_volume_ratio_20d
+      - intraday_liq_resilience_20d
+      - intraday_zero_volume_run_20d
+    rebalance_freq: weekly
+    holding_period: 10
+    retrain_freq: 10
+    training_window: 750
+    capital_weight: 0.33
+    frequency: daily
+  - name: long_term
+    factors:
+      - intraday_roll_spread_20d
+      - intraday_permutation_entropy_20d
+      - intraday_close_drift_20d
+      - intraday_sector_vol_div_20d
+      - intraday_session_symmetry_20d
+      - intraday_large_order_impact_20d
+      - intraday_price_delay_20d
+      - intraday_trend_resid_kurt_20d
+      - intraday_rv_compression_breakout_20d
+      - intraday_oi_quantile_range_20d
+      - vol_clustering_20d
+      - intraday_amihud_vol_corr_20d
+    rebalance_freq: weekly
+    holding_period: 20
+    retrain_freq: 20
+    training_window: 750
+    capital_weight: 0.33
+    frequency: daily
+
+meta_optimizer:
+  enabled: false
+  method: shrinkage_min_variance
+  reweight_freq: 20
+  min_weight: 0.01
+  max_weight: 0.60
+  target_volatility: 0.10
+  estimation_window: 252
+  covariance_shrinkage: 0.30
+  enforce_underlying_constraints: true
+
+factor_synthesis:
+  enabled: false
+  confirm_map: []

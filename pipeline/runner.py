@@ -778,12 +778,23 @@ class PipelineRunner:
                     else factor_synthesizer
                 )
 
-            # 注入 IC 监控器 (滚动 IC 跟踪 + 自动失效剔除)
-            # decay_tolerance=1: 修复 +len(recent) bug 后, 用最激进剔除恢复正则化效果
-            from alpha.ic_monitor import ICMonitor
-            sub_backtester.ic_monitor = ICMonitor(
-                window=60, min_ic=0.02, decay_tolerance=1, reactivation_ic=0.03
-            )
+            # 注入 IC 监控器 (滚动 IC 跟踪 + 自动失效剔除)。默认值保持
+            # 既有运行口径；固定因子子集的候选策略可在其 YAML 中显式关闭，
+            # 避免把“候选集比较”再次变成运行期的隐式因子选择。
+            monitor_cfg = getattr(self.config.backtest, "ic_monitor", None)
+            if monitor_cfg is None or bool(getattr(monitor_cfg, "enabled", True)):
+                from alpha.ic_monitor import ICMonitor
+                sub_backtester.ic_monitor = ICMonitor(
+                    window=int(getattr(monitor_cfg, "window", 60)),
+                    min_ic=float(getattr(monitor_cfg, "min_ic", 0.02)),
+                    decay_tolerance=int(getattr(monitor_cfg, "decay_tolerance", 1)),
+                    reactivation_ic=float(
+                        getattr(monitor_cfg, "reactivation_ic", 0.03)
+                    ),
+                    min_cross_section=int(
+                        getattr(monitor_cfg, "min_cross_section", 3)
+                    ),
+                )
 
             # 为子组合创建独立的 alpha_model（可带分板块因子集）。
             alpha_cfg = self.config.alpha
@@ -1070,7 +1081,7 @@ class PipelineRunner:
     def _build_sub_alpha_model(self, sp_cfg, alpha_cfg, alpha_params):
         """为子组合创建独立的 alpha_model（可选分板块因子集）.
 
-        若适配性数据可用且 alpha 类型为 sector_grouped_ols,
+        若适配性数据可用且 alpha 类型为板块分组线性模型,
         创建带 sector_factor_map 的独立模型实例; 否则回退到全局模型.
 
         Args:
@@ -1086,7 +1097,11 @@ class PipelineRunner:
 
         if (
             sector_factor_map
-            and alpha_cfg.type in {"sector_grouped_ols", "sector_grouped_ridge"}
+            and alpha_cfg.type in {
+                "sector_grouped_ols",
+                "sector_grouped_ridge",
+                "sector_grouped_lasso",
+            }
         ):
             from alpha import ols  # noqa: F401
             sub_params = dict(alpha_params)

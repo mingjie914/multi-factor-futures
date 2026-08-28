@@ -8,6 +8,7 @@ v2 改进: 因子方向自适应 (近期 IC 符号翻转).
 """
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -144,6 +145,129 @@ def _select_ridge_alpha_time_series(
     if not valid_scores:
         raise RuntimeError("ridge validation produced no usable fold")
     # Prefer the stronger regularizer when validation losses are exactly tied.
+    return min(valid_scores, key=lambda alpha: (valid_scores[alpha], -alpha))
+
+
+def _fit_lasso_coefficients(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    fit_intercept: bool,
+    lasso_alpha: float,
+    max_iter: int = 5000,
+    tol: float = 1e-8,
+) -> tuple[np.ndarray, float]:
+    """Fit sklearn Lasso on training-standardized features.
+
+    The optimized objective is ``||y-Xb||^2/(2n) + alpha*||b||_1``. The
+    intercept is not penalized and coefficients use the original feature scale.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if X.ndim != 2 or X.shape[0] != y.size or X.shape[0] == 0 or X.shape[1] == 0:
+        raise ValueError("lasso fit requires non-empty aligned 2D inputs")
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError("lasso fit inputs contain NaN/Inf")
+    alpha = float(lasso_alpha)
+    if alpha <= 0.0:
+        raise ValueError("lasso_alpha must be positive")
+    if int(max_iter) <= 0 or float(tol) <= 0.0:
+        raise ValueError("lasso max_iter and tol must be positive")
+
+    if fit_intercept:
+        x_mean = X.mean(axis=0)
+        y_mean = float(y.mean())
+        X_centered = X - x_mean
+        y_centered = y - y_mean
+    else:
+        x_mean = np.zeros(X.shape[1], dtype=float)
+        y_mean = 0.0
+        X_centered = X
+        y_centered = y
+
+    scale = np.sqrt(np.mean(X_centered ** 2, axis=0))
+    usable = scale > np.finfo(float).eps
+    Z = np.zeros_like(X_centered)
+    Z[:, usable] = X_centered[:, usable] / scale[usable]
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.linear_model import Lasso
+
+    model = Lasso(
+        alpha=alpha,
+        fit_intercept=False,
+        max_iter=int(max_iter),
+        tol=float(tol),
+        selection="cyclic",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        try:
+            model.fit(Z, y_centered)
+        except ConvergenceWarning as exc:
+            raise RuntimeError("lasso coordinate descent did not converge") from exc
+
+    coef = np.zeros(X.shape[1], dtype=float)
+    coef[usable] = np.asarray(model.coef_, dtype=float)[usable] / scale[usable]
+    intercept = y_mean - float(x_mean @ coef) if fit_intercept else 0.0
+    return coef, float(intercept)
+
+
+def _select_lasso_alpha_time_series(
+    X: np.ndarray,
+    y: np.ndarray,
+    dates,
+    alphas: List[float],
+    *,
+    fit_intercept: bool,
+    n_folds: int = 3,
+    max_iter: int = 5000,
+    tol: float = 1e-8,
+) -> float:
+    """Choose Lasso strength with ordered expanding-window validation."""
+    candidates = sorted({float(value) for value in alphas if float(value) > 0.0})
+    if not candidates:
+        raise ValueError("lasso_alphas must contain a positive candidate")
+    date_values = pd.DatetimeIndex(dates)
+    unique_dates = date_values.unique().sort_values()
+    if len(unique_dates) < 20:
+        raise ValueError("lasso validation requires at least 20 distinct dates")
+
+    n_folds = max(int(n_folds), 1)
+    initial = max(int(len(unique_dates) * 0.5), 10)
+    remaining = len(unique_dates) - initial
+    fold_size = max(remaining // n_folds, 1)
+    losses = {alpha: [] for alpha in candidates}
+    for fold in range(n_folds):
+        train_end = initial + fold * fold_size
+        valid_end = len(unique_dates) if fold == n_folds - 1 else min(
+            train_end + fold_size, len(unique_dates)
+        )
+        if train_end >= valid_end:
+            continue
+        train_cutoff = unique_dates[train_end - 1]
+        valid_cutoff = unique_dates[valid_end - 1]
+        train_mask = date_values <= train_cutoff
+        valid_mask = (date_values > train_cutoff) & (date_values <= valid_cutoff)
+        if train_mask.sum() <= X.shape[1] or valid_mask.sum() == 0:
+            continue
+        for alpha in candidates:
+            coef, intercept = _fit_lasso_coefficients(
+                X[train_mask], y[train_mask],
+                fit_intercept=fit_intercept,
+                lasso_alpha=alpha,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            error = y[valid_mask] - (X[valid_mask] @ coef + intercept)
+            losses[alpha].append(float(np.mean(error ** 2)))
+    valid_scores = {
+        alpha: float(np.mean(values))
+        for alpha, values in losses.items()
+        if values
+    }
+    if not valid_scores:
+        raise RuntimeError("lasso validation produced no usable fold")
+    # Prefer the sparser solution when validation losses are exactly tied.
     return min(valid_scores, key=lambda alpha: (valid_scores[alpha], -alpha))
 
 
@@ -639,11 +763,10 @@ class SectorGroupedOLSModel(ReturnModel):
         # 全局模型 (回退用) — 使用全部因子
         row_dates = pd.DatetimeIndex(merged.index.get_level_values(0))
         global_alpha = self._choose_ridge_alpha(X_vals, y_vals, row_dates)
-        self._global_coef, self._global_intercept = _fit_linear_coefficients(
+        self._global_coef, self._global_intercept = self._fit_coefficients(
             X_vals,
             y_vals,
-            fit_intercept=self._fit_intercept,
-            ridge_alpha=global_alpha,
+            global_alpha,
         )
         self.selected_alpha_["global"] = global_alpha
         # 全局模型使用全部因子列
@@ -714,11 +837,10 @@ class SectorGroupedOLSModel(ReturnModel):
                 }
                 continue
             sector_alpha = self._choose_ridge_alpha(X_sec, y_sec, sector_dates)
-            coef_s, intercept_s = _fit_linear_coefficients(
+            coef_s, intercept_s = self._fit_coefficients(
                 X_sec,
                 y_sec,
-                fit_intercept=self._fit_intercept,
-                ridge_alpha=sector_alpha,
+                sector_alpha,
             )
             self.selected_alpha_[sec] = sector_alpha
             self._sector_models[sec] = {
@@ -740,6 +862,14 @@ class SectorGroupedOLSModel(ReturnModel):
             self._ridge_alphas,
             fit_intercept=self._fit_intercept,
             n_folds=self._ridge_cv_folds,
+        )
+
+    def _fit_coefficients(self, X, y, alpha) -> tuple[np.ndarray, float]:
+        return _fit_linear_coefficients(
+            X,
+            y,
+            fit_intercept=self._fit_intercept,
+            ridge_alpha=alpha,
         )
 
     def predict(
@@ -799,4 +929,79 @@ class SectorGroupedRidgeModel(SectorGroupedOLSModel):
             ridge_alpha=ridge_alpha,
             ridge_alphas=(ridge_alphas or [0.01, 0.1, 1.0, 10.0]),
             ridge_cv_folds=ridge_cv_folds,
+        )
+
+
+@register("return_model", "sector_grouped_lasso")
+class SectorGroupedLassoModel(SectorGroupedOLSModel):
+    """Inactive-by-default sector Lasso alternative to sector-grouped Ridge."""
+
+    def __init__(
+        self,
+        fit_intercept: bool = True,
+        min_samples_per_sector: int = 100,
+        fallback_to_global: bool = True,
+        sector_factor_map: Optional[Dict[str, List[str]]] = None,
+        factor_weight_caps: Optional[Dict[str, float]] = None,
+        unmapped_sector_policy: str = "global",
+        lasso_alpha: float = 1e-4,
+        lasso_alphas: Optional[List[float]] = None,
+        lasso_cv_folds: int = 3,
+        max_iter: int = 5000,
+        tol: float = 1e-8,
+    ):
+        candidates = (
+            [1e-6, 1e-5, 1e-4, 1e-3]
+            if lasso_alphas is None else list(lasso_alphas)
+        )
+        if float(lasso_alpha) <= 0.0:
+            raise ValueError("lasso_alpha must be positive")
+        if any(float(value) <= 0.0 for value in candidates):
+            raise ValueError("lasso_alphas values must be positive")
+        if int(lasso_cv_folds) <= 0:
+            raise ValueError("lasso_cv_folds must be positive")
+        if int(max_iter) <= 0 or float(tol) <= 0.0:
+            raise ValueError("lasso max_iter and tol must be positive")
+        self._lasso_alpha = float(lasso_alpha)
+        self._lasso_alphas = candidates
+        self._lasso_cv_folds = int(lasso_cv_folds)
+        self._lasso_max_iter = int(max_iter)
+        self._lasso_tol = float(tol)
+        # Reuse the sector fitting/routing contract. The base candidate list
+        # also activates its short-history fallback guard.
+        super().__init__(
+            fit_intercept=fit_intercept,
+            min_samples_per_sector=min_samples_per_sector,
+            fallback_to_global=fallback_to_global,
+            sector_factor_map=sector_factor_map,
+            factor_weight_caps=factor_weight_caps,
+            unmapped_sector_policy=unmapped_sector_policy,
+            ridge_alpha=0.0,
+            ridge_alphas=candidates,
+            ridge_cv_folds=lasso_cv_folds,
+        )
+
+    def _choose_ridge_alpha(self, X, y, dates) -> float:
+        # This inherited hook selects the active model's regularization level.
+        if not self._lasso_alphas:
+            return self._lasso_alpha
+        return _select_lasso_alpha_time_series(
+            X,
+            y,
+            dates,
+            self._lasso_alphas,
+            fit_intercept=self._fit_intercept,
+            n_folds=self._lasso_cv_folds,
+            max_iter=self._lasso_max_iter,
+            tol=self._lasso_tol,
+        )
+
+    def _fit_coefficients(self, X, y, alpha) -> tuple[np.ndarray, float]:
+        return _fit_lasso_coefficients(
+            X,
+            y,
+            fit_intercept=self._fit_intercept,
+            lasso_alpha=alpha,
+            max_iter=self._lasso_max_iter,
+            tol=self._lasso_tol,
         )

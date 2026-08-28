@@ -14,12 +14,96 @@ plot: true
 #     description: Factors retained for a metals-focused constrained portfolio.
 #     factors: [factor_a, factor_b]
 #     selection_context: {purpose: metals, max_instruments: 8, leverage: low}
-factor_sets: []
+factor_sets:
+  - id: intraday_balanced_core
+    status: active
+    description: 75个有效日内因子按批准周期分组、相关簇代表的平衡候选集；不代表优先级。
+    factors:
+      - intraday_amihud_sector_relative_20d
+      - intraday_amihud_vol_corr_20d
+      - intraday_close_drift_20d
+      - intraday_df_test_20d
+      - intraday_diff_autocorr_long_20d
+      - intraday_extreme_freq_balance_20d
+      - intraday_following_price_confirm_20d
+      - intraday_following_volume_ratio_20d
+      - intraday_large_order_impact_20d
+      - intraday_level_clustering_20d
+      - intraday_liq_resilience_20d
+      - intraday_oi_quantile_range_20d
+      - intraday_open_state_trend_20d
+      - intraday_order_flow_memory_20d
+      - intraday_permutation_entropy_20d
+      - intraday_price_delay_20d
+      - intraday_price_volume_divergence_20d
+      - intraday_resid_momentum_20d
+      - intraday_roll_spread_20d
+      - intraday_rv_compression_breakout_20d
+      - intraday_sector_sync_20d
+      - intraday_sector_vol_div_20d
+      - intraday_session_consistency_20d
+      - intraday_session_symmetry_20d
+      - intraday_term_half_life_20d
+      - intraday_term_jump_intensity_20d
+      - intraday_term_roll_yield_20d
+      - intraday_trend_resid_kurt_20d
+      - intraday_vol_regime_duration_ratio_20d
+      - intraday_zero_volume_run_20d
+      - kyle_lambda_stability_20d
+      - vol_clustering_20d
+    selection_context:
+      run_id: 20260825_intraday_effective_library_is126_oos42_cutoff_20260515
+      source: effective_library
+      research_cutoff: '2026-05-15'
+      method: complete_linkage_abs_rank_exposure_corr_0.50
+      horizon_counts: {5: 5, 10: 8, 20: 19}
+      role: peer_candidate
+  - id: intraday_compact_core
+    status: active
+    description: 平衡候选集的有界、家族多样化版本；不代表优先级。
+    factors:
+      - intraday_amihud_vol_corr_20d
+      - intraday_close_drift_20d
+      - intraday_df_test_20d
+      - intraday_diff_autocorr_long_20d
+      - intraday_extreme_freq_balance_20d
+      - intraday_following_price_confirm_20d
+      - intraday_following_volume_ratio_20d
+      - intraday_large_order_impact_20d
+      - intraday_level_clustering_20d
+      - intraday_liq_resilience_20d
+      - intraday_oi_quantile_range_20d
+      - intraday_open_state_trend_20d
+      - intraday_order_flow_memory_20d
+      - intraday_permutation_entropy_20d
+      - intraday_price_delay_20d
+      - intraday_price_volume_divergence_20d
+      - intraday_roll_spread_20d
+      - intraday_rv_compression_breakout_20d
+      - intraday_sector_sync_20d
+      - intraday_sector_vol_div_20d
+      - intraday_session_symmetry_20d
+      - intraday_term_half_life_20d
+      - intraday_trend_resid_kurt_20d
+      - intraday_zero_volume_run_20d
+      - vol_clustering_20d
+    selection_context:
+      run_id: 20260825_intraday_effective_library_is126_oos42_cutoff_20260515
+      source: effective_library
+      research_cutoff: '2026-05-15'
+      method: complete_linkage_abs_rank_exposure_corr_0.50_family_cap_2
+      horizon_counts: {5: 5, 10: 8, 20: 12}
+      role: peer_candidate
 
 strategies:
+  # The two effective-library IDs and YAML filenames retain their historical
+  # ``_ridge`` suffix for run/artifact compatibility; display names and
+  # portfolio semantics are factor-set based, not Ridge-owned.
   # Effective-library example fields: id, status=preferred|observing|archived,
   # source=effective_library, factor_set_id, config_path and mode=single|multi.
-  # Existing fixed 10f definition is retained only as a legacy observation.
+  # Existing fixed 10f definition is retained only as a parallel observation.
+  # Its IDE comparison route uses config/default.yaml::production_portfolio
+  # (ICIR + Top10/Bottom10 + cap3 + ERC), not the generic model/risk pipeline.
   # It does not claim membership in the effective-factor subset catalog.
   - id: current_single_baseline
     status: observing
@@ -27,4 +111,45 @@ strategies:
     factor_set_id: ''
     config_path: config/default.yaml
     mode: single
-    description: Fixed 10f observation baseline; not production approved.
+    description: Fixed 10f observation baseline using the default production recipe; not production approved.
+  - id: intraday_balanced_ridge
+    status: observing
+    source: effective_library
+    factor_set_id: intraday_balanced_core
+    config_path: config/strategy_intraday_balanced_ridge.yaml
+    mode: multi
+    description: 平衡有效因子子集；默认生产方法基线，周期匹配固定为5/10/20。
+  - id: intraday_compact_ridge
+    status: observing
+    source: effective_library
+    factor_set_id: intraday_compact_core
+    config_path: config/strategy_intraday_compact_ridge.yaml
+    mode: multi
+    description: 紧凑有效因子子集；默认生产方法基线，周期匹配固定为5/10/20。
+  # Archived snapshot definitions are excluded from ordinary comparisons.
+  # Select them only through RUN_AND_COMPARE_SNAPSHOT_AUDIT; the current
+  # default recipe is then applied to the frozen factor set.
+  - id: snapshot_6f_icir
+    status: archived
+    source: legacy_observation
+    factor_set_id: ''
+    factor_definition_path: snapshot/6f_icir/combined.py
+    config_path: config/default.yaml
+    mode: single
+    description: 历史6f ICIR因子集；仅允许通过快照审计分支按当前方法重评。
+  - id: snapshot_8f_icir
+    status: archived
+    source: legacy_observation
+    factor_set_id: ''
+    factor_definition_path: snapshot/8f_icir/combined.py
+    config_path: config/default.yaml
+    mode: single
+    description: 历史8f ICIR因子集；仅允许通过快照审计分支按当前方法重评。
+  - id: snapshot_13f_icir
+    status: archived
+    source: legacy_observation
+    factor_set_id: ''
+    factor_definition_path: snapshot/13f_icir/combined.py
+    config_path: config/default.yaml
+    mode: single
+    description: 历史13f ICIR因子集；仅允许通过快照审计分支按当前方法重评。

@@ -8,6 +8,7 @@ experiment drivers.
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Mapping
 
 import pandas as pd
 
@@ -109,6 +110,7 @@ FACTOR_DIRECTIONS = {
     "intraday_volume_time_shape_20d": 1,
     "intraday_extreme_freq_balance_20d": -1,
     "intraday_term_vol_ratio_20d": 1, "intraday_turnover_velocity_20d": 1,
+    "intraday_torrent_down_20d": -1,
     "intraday_settle_close_basis_20d": -1, "intraday_settle_drift_20d": 1,
     "intraday_settle_vol_ratio_20d": 1, "intraday_term_slope_20d": 1,
     "intraday_oi_log_change_vol_20d": -1,
@@ -182,7 +184,7 @@ def configured_futures_cost_model() -> SimpleFuturesCost:
 
 
 def latest_local_date(data_manager=None) -> pd.Timestamp:
-    """Read the newest date through the configured formal Parquet source."""
+    """Read the newest date through the configured formal data source."""
     if data_manager is None:
         data_manager = DataManager.from_config(
             load_config("config/default.yaml")
@@ -198,13 +200,24 @@ def latest_local_date(data_manager=None) -> pd.Timestamp:
 class ExperimentEnvironment:
     """Shared data, factor, calendar and causal-risk caches for research."""
 
-    def __init__(self, factors: dict[str, int] | None = None):
+    def __init__(
+        self,
+        factors: dict[str, int] | None = None,
+        *,
+        start: str | pd.Timestamp = "2015-12-01",
+        end: str | pd.Timestamp | None = None,
+    ):
         self.cfg = load_config("config/default.yaml")
         self.data_manager = DataManager.from_config(self.cfg)
+        end_date = (
+            pd.Timestamp(end).normalize()
+            if end is not None
+            else latest_local_date(self.data_manager)
+        )
         self.cal = pd.DatetimeIndex(
             self.data_manager.get_calendar(
-                pd.Timestamp("2015-12-01"),
-                latest_local_date(self.data_manager),
+                pd.Timestamp(start).normalize(),
+                end_date,
             )
         )
         self.u = list(UNIVERSE38)
@@ -258,8 +271,19 @@ class FactorPanelRunner:
                         raise
             return result
 
-    def __init__(self, factor_names: list[str] | None = None):
-        self.env = ExperimentEnvironment(BASELINE_6F)
+    def __init__(
+        self,
+        factor_names: list[str] | None = None,
+        *,
+        start: str | pd.Timestamp = "2015-12-01",
+        end: str | pd.Timestamp | None = None,
+        factor_directions: Mapping[str, int] | None = None,
+        ic_horizon: int = 1,
+    ):
+        self.ic_horizon = int(ic_horizon)
+        if self.ic_horizon < 1:
+            raise ValueError("ic_horizon must be a positive daily-bar horizon")
+        self.env = ExperimentEnvironment(BASELINE_6F, start=start, end=end)
         self.cal = self.env.cal
         self.u = self.env.u
         self.daily_ret = self.env.daily_ret
@@ -294,18 +318,44 @@ class FactorPanelRunner:
                 f"factors never produced finite values: {missing}"
             )
         self.ranks: dict[str, pd.DataFrame] = {}
+        explicit_directions = {
+            str(name): int(direction)
+            for name, direction in dict(factor_directions or {}).items()
+        }
+        invalid_directions = {
+            name: direction
+            for name, direction in explicit_directions.items()
+            if direction not in {-1, 1}
+        }
+        if invalid_directions:
+            raise ValueError(
+                f"factor directions must be ±1: {invalid_directions}"
+            )
         for name in all_factors:
             if name not in comp:
                 continue
             rank = comp[name].rank(axis=1, pct=True)
-            direction = FACTOR_DIRECTIONS.get(
-                name, NEW_FACTOR_DIRECTIONS.get(name, 1)
+            direction = explicit_directions.get(
+                name,
+                FACTOR_DIRECTIONS.get(
+                    name, NEW_FACTOR_DIRECTIONS.get(name, 1)
+                ),
             )
             self.ranks[name] = rank if direction == 1 else (1 - rank)
-        # 因子值T用于决策T，并预测下一交易日T+1收益。
+        # 因子值 T 用于决策 T。默认口径预测 T+1；显式敏感性分支可
+        # 使用同一因子面板对齐 T→T+h 的未来日度收益，但不会改写因子注册。
+        if self.ic_horizon == 1:
+            ic_returns = self.daily_ret
+        else:
+            forward = self.env.data_manager.get_forward_returns(
+                self.cal, self.u, period=self.ic_horizon
+            )
+            # rank_information_coefficients shifts its input by -1 because
+            # the historical default input is a return-at-T+1 panel.
+            ic_returns = forward.shift(1)
         self.ic = rank_information_coefficients(
             self.ranks,
-            self.daily_ret,
+            ic_returns,
             minimum_cross_section=3,
         )
         # Full minute panels are no longer needed once daily factor/IC matrices

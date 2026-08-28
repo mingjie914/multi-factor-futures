@@ -653,6 +653,59 @@ def test_ridge_alpha_selection_is_time_ordered_and_coefficients_shrink():
     assert selected_before_perturbation in {0.01, 0.1, 1.0}
 
 
+def test_lasso_is_sparse_sector_model_and_default_remains_ridge():
+    from pathlib import Path
+
+    from alpha.ols import (
+        SectorGroupedLassoModel,
+        _fit_lasso_coefficients,
+        _select_lasso_alpha_time_series,
+    )
+    from core.config import load_config
+    from core.registry import create
+
+    rng = np.random.default_rng(77)
+    X = rng.normal(size=(500, 4))
+    y = 0.4 + 1.5 * X[:, 0] - 0.8 * X[:, 2] + rng.normal(scale=0.03, size=500)
+    coef, intercept = _fit_lasso_coefficients(
+        X, y, fit_intercept=True, lasso_alpha=0.05
+    )
+    assert coef[1] == pytest.approx(0.0, abs=1e-12)
+    assert coef[3] == pytest.approx(0.0, abs=1e-12)
+    assert coef[0] > 1.3 and coef[2] < -0.6
+    assert intercept == pytest.approx(0.4, abs=0.02)
+
+    dates = pd.date_range("2024-01-02", periods=40, freq="B")
+    row_dates = np.repeat(dates.to_numpy(), 12)
+    selected = _select_lasso_alpha_time_series(
+        X[:480], y[:480], row_dates,
+        [1e-4, 1e-3, 1e-2], fit_intercept=True, n_folds=3,
+    )
+    assert selected in {1e-4, 1e-3, 1e-2}
+
+    factor = pd.DataFrame(
+        np.tile(np.asarray([-1.0, 1.0]), (len(dates), 1)),
+        index=dates,
+        columns=["RB", "HC"],
+    )
+    model = create(
+        "return_model",
+        "sector_grouped_lasso",
+        min_samples_per_sector=1,
+        lasso_alphas=[1e-6, 1e-5],
+    )
+    assert isinstance(model, SectorGroupedLassoModel)
+    model.fit({"signal": factor}, factor * 0.02)
+    predicted = model.predict({"signal": factor}, pd.Index(factor.columns), dates[-1])
+    assert np.sign(predicted.loc["RB"]) == -1
+    assert np.sign(predicted.loc["HC"]) == 1
+    assert model.selected_alpha_["global"] in {1e-6, 1e-5}
+
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(str(root / "config" / "default.yaml"))
+    assert config.alpha.type == "sector_grouped_ridge"
+
+
 def test_meta_robust_baselines_return_bounded_diversified_weights():
     from optimization.meta_optimizer import MetaOptimizer
 

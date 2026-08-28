@@ -32,12 +32,18 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_csv(path: Path, rows: list[dict]) -> None:
-    if not rows:
+def _write_csv(
+    path: Path,
+    rows: list[dict],
+    *,
+    fieldnames: list[str] | None = None,
+) -> None:
+    if not rows and not fieldnames:
         raise ValueError(f"refusing to write empty validation table: {path}")
+    columns = list(fieldnames or rows[0])
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temporary, path)
@@ -217,35 +223,72 @@ def run_default_factor_validation(
     run_id: str,
     config_path: str = "config/default.yaml",
     module_prefix: str = "factors.library.intraday",
+    common_horizon: int | None = None,
 ) -> Path:
-    """Run the only default factor-test branch used by IDE and CLI entrypoints."""
+    """Run the standard validation or an explicit common-horizon comparison."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
         raise ValueError("run_id 仅允许字母、数字、点、下划线和连字符")
     project = Path(__file__).resolve().parents[1]
     run_dir = project / "runs" / "factor_validation" / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if run_dir.exists():
+        if (run_dir / "run_contract.json").exists():
+            raise FileExistsError(
+                f"validation run already finalized: {run_dir}"
+            )
+        checkpoint = run_dir / "artifacts" / ".multi_period_checkpoint.json"
+        screening_artifact = run_dir / "artifacts" / "ic_by_window_period.json"
+        if not checkpoint.exists() and not screening_artifact.exists():
+            raise FileExistsError(
+                f"validation run exists without a resumable research artifact: {run_dir}"
+            )
+        # A failed finalization (for example, zero passed factors) may be
+        # resumed from its immutable research checkpoint without recomputing
+        # the 588-factor scan or overwriting a finalized run.
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
     artifacts = run_dir / "artifacts"
-    artifacts.mkdir()
+    artifacts.mkdir(exist_ok=True)
     config = load_config(config_path)
     runner = PipelineRunner(config=config)
     window = factor_validation_window(
         config, runner.data_manager, frequency="daily_intraday"
     )
     names = _candidate_factor_names(module_prefix)
-    screening = _run_multi_period_screening(
-        runner,
-        names,
-        config_path,
-        1.96,
-        window.factor_start,
-        window.is_start,
-        window.is_end,
-        periods_override=None,
-        frequency="daily_intraday",
-        output_dir=str(artifacts),
-        adaptivity_file=None,
-        research_role="factor_validation_is",
-    )
+    screening_path = artifacts / "ic_by_window_period.json"
+    if screening_path.exists():
+        screening = json.loads(screening_path.read_text(encoding="utf-8"))
+        contract = dict(screening.get("research_contract", {}))
+        expected_mode = (
+            "common_horizon" if common_horizon is not None
+            else "registered_contract"
+        )
+        if contract.get("horizon_mode") != expected_mode or (
+            common_horizon is not None
+            and int(contract.get("common_horizon", 0)) != int(common_horizon)
+        ):
+            raise ValueError(
+                "existing factor screening artifact does not match the requested "
+                "horizon contract"
+            )
+        # The expensive screening phase is already immutable.  This path is
+        # only a post-screen finalization/resume and never recomputes or
+        # changes its factor statistics.
+    else:
+        screening = _run_multi_period_screening(
+            runner,
+            names,
+            config_path,
+            1.96,
+            window.factor_start,
+            window.is_start,
+            window.is_end,
+            periods_override=None,
+            frequency="daily_intraday",
+            output_dir=str(artifacts),
+            adaptivity_file=None,
+            research_role="factor_validation_is",
+            common_horizon=common_horizon,
+        )
     oos = _evaluate_oos(config, screening, window, frequency="daily_intraday")
     rows = _result_rows(screening, oos)
     passed = sorted(
@@ -255,7 +298,11 @@ def run_default_factor_validation(
         ),
     )
     _write_csv(run_dir / "factor_validation_full.csv", rows)
-    _write_csv(run_dir / "passed_factors.csv", passed)
+    _write_csv(
+        run_dir / "passed_factors.csv",
+        passed,
+        fieldnames=list(rows[0]) if rows else ["factor", "final_pass"],
+    )
     (run_dir / "oos_factor_ic.json").write_text(
         json.dumps(oos, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -287,17 +334,54 @@ def run_default_factor_validation(
         "oos_evaluated": len(oos),
         "final_pass_count": len(passed),
         "final_gate": "IS final candidate AND oriented OOS IC > 0",
+        "horizon_mode": (
+            "common_horizon" if common_horizon is not None else "registered_contract"
+        ),
+        "common_horizon": common_horizon,
         "passed_factors": [row["factor"] for row in passed],
     }
     (run_dir / "validation_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    # Bind the durable screening JSON and funnel to an artifact manifest.  A
+    # post-screen resume may already have these files but must never overwrite
+    # an existing manifest.
+    manifest_path = artifacts / "manifest.json"
+    if not manifest_path.exists():
+        from research.artifacts import ResearchArtifactBundle
+
+        research_contract = dict(screening.get("research_contract", {}))
+        ResearchArtifactBundle.create(
+            artifacts,
+            artifact_id=f"{run_id}:screening",
+            train_start=window.is_start,
+            train_end=window.is_end,
+            data_sha256=str(research_contract["data_sha256"]),
+            config_sha256=str(research_contract["config_sha256"]),
+            code_sha256=str(research_contract["code_sha256"]),
+            files={
+                "ic_by_window_period.json": artifacts / "ic_by_window_period.json",
+                "validation_funnel.json": artifacts / "validation_funnel.json",
+            },
+            metadata={
+                "workflow": "factor-validation",
+                "horizon_mode": summary["horizon_mode"],
+                "common_horizon": common_horizon,
+            },
+        )
     contract = {
         "schema_version": 1,
         "run_id": run_id,
         "workflow": "factor-validation",
         "window_policy": "default_warmup_plus_126_is_plus_42_oos",
+        "horizon_policy": {
+            "mode": (
+                "common_horizon" if common_horizon is not None
+                else "registered_contract"
+            ),
+            "common_horizon": common_horizon,
+        },
         "research_contract": screening.get("research_contract", {}),
         "oos_start": window.oos_start.date().isoformat(),
         "oos_end": window.oos_end.date().isoformat(),
@@ -319,6 +403,30 @@ def run_default_factor_validation(
     print(f"全量明细: {run_dir / 'factor_validation_full.csv'}")
     print(f"通过因子: {len(passed)}/{len(rows)}")
     return run_dir
+
+
+def run_common_horizon_factor_validation(
+    *,
+    run_id: str,
+    common_horizon: int,
+    config_path: str = "config/default.yaml",
+    module_prefix: str = "factors.library.intraday",
+) -> Path:
+    """Run a governed, non-default common-horizon comparison.
+
+    The factor registry remains unchanged.  The result is an independent
+    research bundle and cannot be admitted by changing the current library
+    implicitly.
+    """
+    horizon = int(common_horizon)
+    if horizon < 1:
+        raise ValueError("common_horizon must be positive")
+    return run_default_factor_validation(
+        run_id=run_id,
+        config_path=config_path,
+        module_prefix=module_prefix,
+        common_horizon=horizon,
+    )
 
 
 def main() -> None:
