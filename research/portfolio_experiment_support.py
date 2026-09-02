@@ -7,6 +7,10 @@ experiment drivers.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import os
 from pathlib import Path
 from collections.abc import Mapping
 
@@ -240,6 +244,7 @@ class FactorPanelRunner:
     FACTOR_CHUNK_SIZE = 400
     # 当前日内库最长跨日依赖为 120 个交易日；留 128 日预热保证边界一致。
     FACTOR_CHUNK_OVERLAP = 128
+    CHECKPOINT_SCHEMA_VERSION = 1
 
     @classmethod
     def _iter_factor_chunks(cls, calendar):
@@ -271,6 +276,108 @@ class FactorPanelRunner:
                         raise
             return result
 
+    @staticmethod
+    def _source_tree_fingerprint() -> str:
+        root = Path(__file__).resolve().parents[1]
+        digest = hashlib.sha256()
+        files = [Path(__file__).resolve()]
+        for directory in ("core", "data", "factors"):
+            files.extend(sorted((root / directory).rglob("*.py")))
+        for path in sorted(set(files), key=lambda item: item.as_posix()):
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    def _checkpoint_contract(self, factor_names: list[str]) -> dict:
+        source = self.env.data_manager.source
+        dates = pd.DatetimeIndex(self.cal).asi8
+        source_fingerprint = getattr(
+            source, "checkpoint_source_fingerprint", None
+        )
+        return {
+            "schema_version": self.CHECKPOINT_SCHEMA_VERSION,
+            "factors": factor_names,
+            "universe": list(self.u),
+            "calendar_sha256": hashlib.sha256(dates.tobytes()).hexdigest(),
+            "calendar_start": pd.Timestamp(self.cal.min()).isoformat(),
+            "calendar_end": pd.Timestamp(self.cal.max()).isoformat(),
+            "source_fingerprint": (
+                str(source_fingerprint(self.cal.min(), self.cal.max()))
+                if callable(source_fingerprint)
+                else str(getattr(
+                    source, "cache_namespace", source.__class__.__name__
+                ))
+            ),
+            "source_tree_sha256": self._source_tree_fingerprint(),
+        }
+
+    @staticmethod
+    def _checkpoint_factor_file(directory: Path, factor: str) -> Path:
+        suffix = hashlib.sha256(factor.encode("utf-8")).hexdigest()[:16]
+        return directory / f"factor_{suffix}.parquet"
+
+    def _load_factor_checkpoint(
+        self, directory: Path | None, factor_names: list[str]
+    ) -> tuple[dict[str, pd.DataFrame], dict | None]:
+        if directory is None:
+            return {}, None
+        directory.mkdir(parents=True, exist_ok=True)
+        contract = self._checkpoint_contract(factor_names)
+        manifest_path = directory / "manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("contract") != contract:
+                raise RuntimeError("factor-panel checkpoint contract changed")
+        else:
+            manifest = {"contract": contract, "completed": {}}
+            temporary = manifest_path.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(manifest_path)
+
+        loaded = {}
+        for factor, filename in dict(manifest.get("completed") or {}).items():
+            if factor not in factor_names:
+                raise RuntimeError("factor-panel checkpoint contains an unknown factor")
+            path = directory / str(filename)
+            if not path.is_file():
+                raise RuntimeError(f"factor-panel checkpoint is missing {path.name}")
+            frame = pd.read_parquet(path)
+            frame.index = pd.DatetimeIndex(frame.index)
+            if not frame.index.equals(self.cal) or list(frame.columns) != list(self.u):
+                raise RuntimeError(
+                    f"factor-panel checkpoint axes changed for {factor}"
+                )
+            frame.index = self.cal
+            loaded[factor] = frame
+        return loaded, manifest
+
+    def _save_factor_checkpoint(
+        self,
+        directory: Path | None,
+        manifest: dict | None,
+        factors: Mapping[str, pd.DataFrame],
+    ) -> None:
+        if directory is None or manifest is None or not factors:
+            return
+        completed = dict(manifest.get("completed") or {})
+        for factor, frame in factors.items():
+            path = self._checkpoint_factor_file(directory, factor)
+            temporary = path.with_suffix(f".{os.getpid()}.tmp")
+            frame.to_parquet(temporary)
+            temporary.replace(path)
+            completed[factor] = path.name
+        manifest["completed"] = completed
+        manifest_path = directory / "manifest.json"
+        temporary = manifest_path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(manifest_path)
+
     def __init__(
         self,
         factor_names: list[str] | None = None,
@@ -279,6 +386,7 @@ class FactorPanelRunner:
         end: str | pd.Timestamp | None = None,
         factor_directions: Mapping[str, int] | None = None,
         ic_horizon: int = 1,
+        checkpoint_dir: str | Path | None = None,
     ):
         self.ic_horizon = int(ic_horizon)
         if self.ic_horizon < 1:
@@ -297,27 +405,71 @@ class FactorPanelRunner:
                 else list(BASELINE_6F) + VALIDATED_47_FACTORS + NEW_VALIDATED_21
             )
         )
-        comp: dict[str, pd.DataFrame] = {}
-        for target_dates, request_dates in self._iter_factor_chunks(self.cal):
-            for offset in range(0, len(all_factors), 10):
+        checkpoint_path = (
+            Path(checkpoint_dir).resolve() if checkpoint_dir is not None else None
+        )
+        comp, checkpoint_manifest = self._load_factor_checkpoint(
+            checkpoint_path, all_factors
+        )
+        self.checkpoint_loaded_factor_count = len(comp)
+        for offset in range(0, len(all_factors), 10):
+            batch_names = [
+                name for name in all_factors[offset:offset + 10]
+                if name not in comp
+            ]
+            if not batch_names:
+                continue
+            batch: dict[str, pd.DataFrame] = {}
+            for target_dates, request_dates in self._iter_factor_chunks(self.cal):
                 part = self._compute_part(
                     self.env.engine,
-                    all_factors[offset:offset + 10],
+                    batch_names,
                     request_dates,
                     self.u,
-                    comp,
+                    {**comp, **batch},
                 )
                 for name, values in part.items():
-                    if name not in comp:
-                        comp[name] = values.reindex(self.cal)
+                    if name not in batch:
+                        batch[name] = values.reindex(self.cal)
                     else:
-                        comp[name].loc[target_dates] = values.reindex(target_dates)
+                        batch[name].loc[target_dates] = values.reindex(target_dates)
+            comp.update(batch)
+            self._save_factor_checkpoint(
+                checkpoint_path, checkpoint_manifest, batch
+            )
+        self.computed_factor_count = len(comp) - self.checkpoint_loaded_factor_count
         missing = [name for name in all_factors if name not in comp]
         if missing:
             raise FactorComputationError(
                 f"factors never produced finite values: {missing}"
             )
-        self.ranks: dict[str, pd.DataFrame] = {}
+        self.raw_ranks: dict[str, pd.DataFrame] = {
+            name: comp[name].rank(axis=1, pct=True)
+            for name in all_factors
+            if name in comp
+        }
+        self.ranks = self._oriented_ranks(
+            all_factors, factor_directions=factor_directions
+        )
+        self._ic_returns = self._build_ic_returns()
+        self.ic = rank_information_coefficients(
+            self.ranks,
+            self._ic_returns,
+            minimum_cross_section=3,
+        )
+        # Full minute panels are no longer needed once daily factor/IC matrices
+        # have been materialized. Keep only the persistent v4 source cache.
+        from factors.library.intraday import clear_transient_data_caches
+
+        clear_transient_data_caches()
+
+    def _oriented_ranks(
+        self,
+        factor_names,
+        *,
+        factor_directions: Mapping[str, int] | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """Apply one strategy's directions without recomputing factor values."""
         explicit_directions = {
             str(name): int(direction)
             for name, direction in dict(factor_directions or {}).items()
@@ -331,38 +483,54 @@ class FactorPanelRunner:
             raise ValueError(
                 f"factor directions must be ±1: {invalid_directions}"
             )
-        for name in all_factors:
-            if name not in comp:
-                continue
-            rank = comp[name].rank(axis=1, pct=True)
+        missing = [name for name in factor_names if name not in self.raw_ranks]
+        if missing:
+            raise FactorComputationError(
+                f"shared factor panel does not contain: {missing}"
+            )
+        ranks: dict[str, pd.DataFrame] = {}
+        for name in factor_names:
+            rank = self.raw_ranks[name]
             direction = explicit_directions.get(
                 name,
                 FACTOR_DIRECTIONS.get(
                     name, NEW_FACTOR_DIRECTIONS.get(name, 1)
                 ),
             )
-            self.ranks[name] = rank if direction == 1 else (1 - rank)
+            ranks[name] = rank if direction == 1 else (1 - rank)
+        return ranks
+
+    def _build_ic_returns(self) -> pd.DataFrame:
+        """Return the frozen future-return panel used by every shared view."""
         # 因子值 T 用于决策 T。默认口径预测 T+1；显式敏感性分支可
         # 使用同一因子面板对齐 T→T+h 的未来日度收益，但不会改写因子注册。
         if self.ic_horizon == 1:
-            ic_returns = self.daily_ret
-        else:
-            forward = self.env.data_manager.get_forward_returns(
-                self.cal, self.u, period=self.ic_horizon
-            )
-            # rank_information_coefficients shifts its input by -1 because
-            # the historical default input is a return-at-T+1 panel.
-            ic_returns = forward.shift(1)
-        self.ic = rank_information_coefficients(
-            self.ranks,
-            ic_returns,
+            return self.daily_ret
+        forward = self.env.data_manager.get_forward_returns(
+            self.cal, self.u, period=self.ic_horizon
+        )
+        # rank_information_coefficients shifts its input by -1 because
+        # the historical default input is a return-at-T+1 panel.
+        return forward.shift(1)
+
+    def for_factors(
+        self,
+        factor_names,
+        *,
+        factor_directions: Mapping[str, int] | None = None,
+    ) -> "FactorPanelRunner":
+        """Create a cheap strategy view over one already-computed factor panel."""
+        view = copy.copy(self)
+        names = list(dict.fromkeys(str(name) for name in factor_names))
+        view.ranks = self._oriented_ranks(
+            names, factor_directions=factor_directions
+        )
+        view.ic = rank_information_coefficients(
+            view.ranks,
+            self._ic_returns,
             minimum_cross_section=3,
         )
-        # Full minute panels are no longer needed once daily factor/IC matrices
-        # have been materialized. Keep only the persistent v4 source cache.
-        from factors.library.intraday import clear_transient_data_caches
-
-        clear_transient_data_caches()
+        return view
 
     def get_contract_schedule(self) -> pd.DataFrame | None:
         """Load the causal concrete-contract schedule only when accounting needs it."""

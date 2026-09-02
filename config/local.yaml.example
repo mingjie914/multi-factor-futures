@@ -8,4 +8,3 @@ data:
   duckdb:
     path: 'E:\\path\\to\\local\\futures_data.duckdb'
     required_release_id: ''
-    result_backend: pandas

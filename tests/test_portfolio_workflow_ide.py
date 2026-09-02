@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -173,8 +174,11 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert (output / "comparison.csv").is_file()
     assert (output / "nav_comparison.csv").is_file()
     assert (output / "run_contract.json").is_file()
+    assert (output / "performance.json").is_file()
     contract = json.loads((output / "run_contract.json").read_text(encoding="utf-8"))
+    assert contract["status"] == "complete"
     assert contract["strategy_library"]["snapshot"]["strategies"][0]["status"] == "preferred"
+    assert contract["artifacts"]["performance.json"]["sha256"]
 
 
 def test_all_strategy_branch_selects_current_and_archived_peers(monkeypatch):
@@ -185,6 +189,40 @@ def test_all_strategy_branch_selects_current_and_archived_peers(monkeypatch):
     assert [strategy.id for strategy, _path, _config in specs] == list(
         ide.ALL_STRATEGY_IDS
     )
+
+
+def test_shared_production_panel_computes_union_once(monkeypatch):
+    calls = []
+
+    class FakePanelRunner:
+        def __init__(self, factors, **kwargs):
+            calls.append((list(factors), kwargs))
+            self.raw_ranks = {name: object() for name in factors}
+
+    monkeypatch.setattr(
+        "research.portfolio_experiment_support.FactorPanelRunner",
+        FakePanelRunner,
+    )
+    monkeypatch.setattr(
+        "research.portfolio_experiment_support.latest_local_date",
+        lambda: "2026-08-28",
+    )
+    specs = [
+        (object(), Path("a.yaml"), SimpleNamespace(
+            factors=["factor_a", "shared"],
+            date_range=SimpleNamespace(end="latest_available"),
+        )),
+        (object(), Path("b.yaml"), SimpleNamespace(
+            factors=["shared", "factor_b"],
+            date_range=SimpleNamespace(end="2026-08-20"),
+        )),
+    ]
+
+    runner = ide._build_shared_production_panel(specs)
+
+    assert list(runner.raw_ranks) == ["factor_a", "shared", "factor_b"]
+    assert len(calls) == 1
+    assert calls[0][1]["end"] == pd.Timestamp("2026-08-28")
 
 
 def test_common_h5_branch_routes_without_catalog_admission(monkeypatch):

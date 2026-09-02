@@ -122,6 +122,131 @@ def test_factor_panel_schedule_is_frozen_before_data_environment_is_detached():
     assert runner.get_contract_schedule() is expected
 
 
+def test_factor_panel_strategy_views_reuse_values_and_keep_directions_independent():
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    raw_rank = pd.DataFrame(
+        [[1 / 3, 2 / 3, 1.0]] * len(dates),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    returns = pd.DataFrame(
+        [[0.01, 0.02, 0.03]] * len(dates),
+        index=dates,
+        columns=raw_rank.columns,
+    )
+    runner = FactorPanelRunner.__new__(FactorPanelRunner)
+    runner.raw_ranks = {"factor_a": raw_rank}
+    runner._ic_returns = returns
+
+    positive = runner.for_factors(
+        ["factor_a"], factor_directions={"factor_a": 1}
+    )
+    negative = runner.for_factors(
+        ["factor_a"], factor_directions={"factor_a": -1}
+    )
+
+    assert positive.raw_ranks is runner.raw_ranks
+    pd.testing.assert_frame_equal(positive.ranks["factor_a"], raw_rank)
+    pd.testing.assert_frame_equal(negative.ranks["factor_a"], 1 - raw_rank)
+    pd.testing.assert_frame_equal(runner.raw_ranks["factor_a"], raw_rank)
+    assert positive.ic["factor_a"].dropna().gt(0).all()
+    assert negative.ic["factor_a"].dropna().lt(0).all()
+
+
+def test_factor_panel_checkpoint_resumes_and_rejects_contract_drift(tmp_path):
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    values = pd.DataFrame(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        index=dates,
+        columns=["A", "B"],
+    )
+
+    def runner(namespace):
+        item = FactorPanelRunner.__new__(FactorPanelRunner)
+        item.cal = dates
+        item.u = ["A", "B"]
+        item.env = SimpleNamespace(data_manager=SimpleNamespace(
+            source=SimpleNamespace(cache_namespace=namespace)
+        ))
+        return item
+
+    first = runner("release-a")
+    loaded, manifest = first._load_factor_checkpoint(tmp_path, ["factor_a"])
+    assert loaded == {}
+    first._save_factor_checkpoint(
+        tmp_path, manifest, {"factor_a": values}
+    )
+
+    resumed, _ = runner("release-a")._load_factor_checkpoint(
+        tmp_path, ["factor_a"]
+    )
+    pd.testing.assert_frame_equal(resumed["factor_a"], values)
+
+    with np.testing.assert_raises_regex(RuntimeError, "contract changed"):
+        runner("release-b")._load_factor_checkpoint(tmp_path, ["factor_a"])
+
+
+def test_factor_panel_runner_resumes_after_completed_batch(tmp_path, monkeypatch):
+    import research.portfolio_experiment_support as support
+
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    universe = ["A", "B", "C"]
+    calls = []
+    state = {"fail": True}
+
+    class Engine:
+        def compute_factors(self, names, request_dates, requested_universe, parallel=False):
+            del parallel
+            calls.append(tuple(names))
+            assert list(requested_universe) == universe
+            if state["fail"] and "factor_10" in names:
+                raise RuntimeError("injected interruption")
+            return {
+                name: pd.DataFrame(
+                    np.tile([1.0, 2.0, 3.0], (len(request_dates), 1)),
+                    index=request_dates,
+                    columns=universe,
+                )
+                for name in names
+            }
+
+    class Environment:
+        def __init__(self, factors, *, start, end):
+            del factors, start, end
+            self.cal = dates
+            self.u = universe
+            self.engine = Engine()
+            self.daily_ret = pd.DataFrame(
+                np.tile([0.01, 0.02, 0.03], (len(dates), 1)),
+                index=dates,
+                columns=universe,
+            )
+            self.close_tradable = self.daily_ret.notna()
+            self.data_manager = SimpleNamespace(source=SimpleNamespace(
+                cache_namespace="release-a",
+                checkpoint_source_fingerprint=lambda start, end: "slice-a",
+            ))
+            self.sector_of = {}
+
+    monkeypatch.setattr(support, "ExperimentEnvironment", Environment)
+    monkeypatch.setattr(
+        FactorPanelRunner, "_source_tree_fingerprint", staticmethod(lambda: "code-a")
+    )
+    factors = [f"factor_{index:02d}" for index in range(11)]
+    with np.testing.assert_raises_regex(RuntimeError, "injected interruption"):
+        FactorPanelRunner(factors, checkpoint_dir=tmp_path)
+
+    first_run_calls = list(calls)
+    assert first_run_calls[0] == tuple(factors[:10])
+    state["fail"] = False
+    calls.clear()
+    resumed = FactorPanelRunner(factors, checkpoint_dir=tmp_path)
+
+    assert calls == [("factor_10",)]
+    assert resumed.checkpoint_loaded_factor_count == 10
+    assert resumed.computed_factor_count == 1
+
+
 def test_return_metrics_include_drawdown_from_initial_capital():
     metrics = performance_metrics(pd.Series([-0.50, 0.0]))
 

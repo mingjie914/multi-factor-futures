@@ -8,7 +8,8 @@
 `strategies/combined.py`的研究比较，不代表交易获批或已经具备生产替代资格。
 
 > **2026-08-24状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；框架默认运行
-> 源已切换为认证DuckDB，本机使用Polars 1.43.2结果桥接；Parquet保留为发布与回退层。
+> 源已切换为认证DuckDB；行情长表读取、选约、连续合约、重采样与期限曲线使用Polars，
+> 仅在现有DataProvider日期×品种矩阵接口处转换为Pandas。Parquet保留为发布与回退层。
 > 统一38品种、76交易日、588因子的最新单线程快速画像为588/588无错误、约326秒；同口径
 > 本轮早期约1,344秒。Python因子/策略接口不变，已准入共享数组族自动使用本地Rust核心；
 > 本轮只改执行方式和重复日内整理，不改策略公式、日期语义、选约或席位匹配。
@@ -23,7 +24,8 @@
 ```text
 已发布的本地 Parquet（权威、审计、恢复）
   -> 认证 DuckDB 镜像（框架默认运行源；release绑定失败关闭）
-  -> Polars 结果传输（公共边界仍为 Pandas DataFrame）
+  -> Polars 长表热路径（读取、选约、连续合约、重采样、期限曲线）
+  -> DataProvider 矩阵边界（兼容既有 Pandas 因子接口）
   -> DataManager / FrequencyDataProvider
   -> 单线程 Rust 共享数组核心（Python接口不变；无扩展时reference回退）
   -> 内置 Factor + SPEC + user Factor + mined snapshot bridge
@@ -163,9 +165,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   `config/strategy_library.yaml`，不在入口代码重复维护模块参数。
 
 本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；认证运行库通过
-`MF_DUCKDB_PATH`、当前`MF_DATA_RELEASE_ID`和可选的
-`MF_DUCKDB_RESULT_BACKEND=pandas|polars|shadow`。仓库默认后端为`pandas`；只有通过
-真实A/B的本机部署才设为`polars`。夜间DuckDB发布新release后，必须先验证成功，再更新
+`MF_DUCKDB_PATH`和当前`MF_DATA_RELEASE_ID`绑定。DuckDB读取固定使用Polars生产路径，
+不再存在容易误路由的结果后端开关。夜间DuckDB发布新release后，必须先验证成功，再更新
 绑定的release ID并重启；旧ID会失败关闭，不能自动漂移到未经确认的数据。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 

@@ -1,6 +1,6 @@
 # 数据与计算加速迁移实施 Handoff
 
-> 基线日期：2026-08-22
+> 状态日期：2026-09-02
 >
 > 解释器：`E:\Python\Pythonvenv\Scripts\python.exe`（Python 3.12.10）
 >
@@ -37,7 +37,7 @@
 - 认证运行库：
   `E:\程明杰公司内容\期货行情数据\本地表\futures_data.duckdb`。
 - 当前认证 release：
-  `e5b668b69d03658b716422ad953bddcbb46b154c312663078919f445068c9bfd`。
+  `871374be31c76832605a9915473619c05381c337465c18b58b9922a171dda644`。
 - Schema：`futures_data_v1_seat_contract_v2`。
 - 表：4 张行情、6 张席位、2 张元数据。
 - 当前主框架支持 `parquet_futures` 与 `duckdb_futures`；默认运行源已切换为认证DuckDB，
@@ -68,8 +68,10 @@ Parquet（权威、审计、恢复）
 DuckDB（认证物理镜像）
         ↓ SQL 投影、过滤
 Polars（长表读取与经准入的数据热点）
-        ↓ 唯一受控边界
-Pandas DataProvider 矩阵（过渡期公共契约）
+        ↓ 长表读取、选约、连续合约、重采样、期限曲线
+Polars（生产表格热路径）
+        ↓ 唯一受控兼容边界
+Pandas DataProvider 矩阵（既有因子公共契约）
         ↓
 现有因子 / SPEC / GP / research / backtest
         ↓ 仅对 profile 热点
@@ -82,7 +84,7 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 |---|---|---|
 | 分区完整性、列投影、日期/品种过滤 | DuckDB SQL | 已有物理表和发布元数据 |
 | 长表排序、连接、group aggregation、批量派生 | Polars | Arrow 数据布局、表达式和并行执行 |
-| 日期×品种标签对齐、期限结构矩阵、回测矩阵 | Pandas，初期保留 | 现有索引语义成熟，迁移收益不明确 |
+| DataProvider输出、因子/组合/回测矩阵 | Pandas兼容边界 | 冻结既有索引与插件接口；长表整理不再回流Pandas |
 | 已向量化 NumPy/Bottleneck 算子 | 保留现状 | FFI 或转换可能比计算更贵 |
 | `rolling.apply`、逐窗口 percentile/slope 等热点 | Rust 候选 | Python 回调和窗口循环有明确加速空间 |
 | GP 内部纯 ndarray rolling | Rust 候选 | 边界清晰，无需理解 DataFrame 或期货语义 |
@@ -123,42 +125,25 @@ Pandas DataProvider 矩阵（过渡期公共契约）
 不修改仓库默认源为 DuckDB：空路径的公开 checkout 必须仍可按显式配置启动；正式运行源
 由部署环境冻结并记录。
 
-### P1：Polars 结果桥接
+### P1：DuckDB原生Polars读取（已完成）
 
-目标：验证 DuckDB→Polars 的传输收益，公共输出仍为 Pandas。
+DuckDB查询统一通过`.pl()`进入Polars；公开DataProvider仍返回既有Pandas矩阵。迁移期的
+`pandas|polars|shadow`运行开关已经删除，避免IDE运行与环境变量把同一配置路由到不同实现。
+语义对照由测试固定，不在生产运行时重复读取两份数据。
 
-最小代码计划：
-
-- 修改 `requirements.txt`：固定已验证的 Polars 版本（D0 已完成）。
-- 修改 `core/config.py`：在 `DuckDBConfig` 增加
-  `result_backend: pandas | polars | shadow = pandas`，并增加对应环境覆盖。
-- 修改 `config/default.yaml`：显式默认 `pandas`。
-- 修改 `data/duckdb_source.py`：复用唯一 `_execute_df()`，通过 DuckDB `.pl()` 获取结果，
-  显式规范日期/时间/dtype/列顺序后只转换一次为 Pandas。
-- 扩展现有 `tests/test_duckdb_source.py`，首期不新增生产文件或新数据源类。
-
-模式：
-
-- `pandas`：权威现有路径。
-- `shadow`：两种方式均读取，按语义比较，返回 Pandas reference。
-- `polars`：仅在门禁通过后启用，仍返回现有 Pandas 公共对象。
-
-基准必须覆盖日线长区间、1分钟多品种、30分钟重采样、期限曲线和六张席位表。只测
-`.pl()` 微基准不构成准入证据。
-
-### P2：Polars 数据层热点
+### P2：Polars 数据层热点（已完成）
 
 目标：减少真实研究中的读取、整理和聚合成本。
 
-实施顺序：
+行情分区读取、合约代码规范化、交易日归属、去重、主力选择、连续复权计划、分钟重采样、
+期限曲线与缓存均在现有`parquet_source.py`/`duckdb_source.py`内使用Polars实现，没有新增
+frame/backend抽象文件。连续合约切换状态使用小型Python循环，曲线密集状态传播使用NumPy；
+两者属于明确的状态/数值边界，不把表格热路径退回Pandas。DataProvider边界仍返回
+`DataFrame(dates × roots)`，因子插件无需迁移。
 
-1. 对 DuckDB SQL、结果转换、主力计划、pivot、重采样、曲线与席位聚合分别 profile。
-2. 只迁移占端到端时间显著的长表操作；小对象和标签矩阵继续 Pandas。
-3. 第一处与第二处共同需要 Polars helper 时，才允许新增一个 `data/frame_ops.py`；
-   在此之前保持逻辑位于现有数据源文件。
-4. DataProvider 边界仍返回 `DataFrame(dates × roots)`，因子代码不感知 Polars。
-5. 主框架P2稳定后，`factor_mining`正式入口已复用DataManager；独立`LocalParquetData`
-   仅保留为显式Parquet审计/回退API，不再是正式CLI默认路径。
+多策略生产比较先计算因子并集，再向各策略提供只读子视图；每完成10个因子写入同一运行
+目录下的临时checkpoint。checkpoint绑定代码、日历、品种和相关数据分区摘要，成功生成完整
+运行契约后自动清除；显式复用同一`RUN_ID`可在中断后续算，普通新运行不会误用旧缓存。
 
 ### C0：重新剖析因子计算
 
@@ -264,7 +249,8 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
 - 每个阶段独立提交，提交信息注明 source/backend 和已通过门禁。
 - shadow输出必须记录代码commit、DuckDB release、配置、backend版本和测试样本，但不新增
   每次运行一个永久报告文件；优先写入现有research manifest或benchmark目录。
-- P1/P2 回退只需切换 result backend；D1 回退只需切回 `parquet_futures`。
+- P1/P2若需回退应回退对应代码提交；不保留第二套生产后端路由。D1回退仍只需切回
+  `parquet_futures`。
 - Rust native以共享数组核心逐族发布；显式设`MF_FACTOR_KERNEL_MODE=reference`即可整体回退。
 - 不在同一次提交中同时切换 DuckDB默认源、Polars生产路径和Rust native。
 - 不删除 Parquet、认证 DuckDB或现有 reference实现。
@@ -288,17 +274,22 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
 
 ## 9. 当前阶段结论
 
-截至2026-08-22，本轮实施结论如下：
+截至2026-09-02，本轮实施结论如下：
 
 - D0完成：唯一依赖清单、Polars 1.43.2、全量回归和双远端基线已冻结。
 - D1a完成：本机运行源已绑定认证DuckDB release；框架默认已切换为DuckDB。当前manifest与
   component ID一致、`changed_partitions={}`，因此没有执行无意义的重复sync。
 - D1b待完成：仍需连续观察至少两个新的夜间增量release；这不影响当前认证库随时可读或
   通过环境变量回退Parquet，但完成观察前不得把增量运行稳定性写成已验收。
-- P1完成：`pandas|polars|shadow`桥接已进入唯一`_execute_df()`边界；本机启用Polars，
-  公共DataFrame、行情频率、期限结构和六张席位表语义保持不变。代码提交为`ffcd1b1`。
-- P2停止扩张：席位长表和实际席位因子达到准入门；行情与期限结构仅有个位数改善，继续
-  把标签矩阵或日期匹配改写为Polars不符合收益/风险边界。
+- P1/P2完成：DuckDB固定进入Polars；行情长表、连续合约、选约、重采样和期限曲线不再以
+  Pandas作为生产表格执行器。唯一Pandas转换位于既有DataProvider矩阵兼容边界；生产配置
+  不再暴露结果后端开关。
+- 多策略比较已消除逐策略重复因子计算，并增加按10因子批次的受约束断点续传。checkpoint
+  只保留到完整报告与哈希契约写成，成功后自动清理，不形成长期缓存或新工作流分支。
+- 同一认证release、38品种、2024Q1、1分钟close+volume、关闭磁盘缓存并清空应用缓存的
+  5次实测中，将既有T-1合约计划下推到DuckDB后，墙钟中位数由4.315秒降至1.160秒，
+  采样峰值工作集增量由1840.7MiB降至166.8MiB；输出shape保持`34140×38`，并以2024年1月
+  全矩阵逐值精确对照通过。该结果只归因于减少非目标合约行传输，不外推为完整策略倍数。
 - C0完成：四个重复Python窗口因子已在`6ee134b`改为共享日度聚合和小型NumPy核，真实
   输出哈希完全一致。随后完成38品种、164交易日、588因子全池画像：纯因子计算约
   1,517秒；期限结构共享预热约214秒，主流intraday仍是主要计算热点。
@@ -320,7 +311,7 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
 
 `config/default.yaml`现已收口为38品种、10f观察基线和统一处理契约；旧的四个重复或
 继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段，当前固定
-`duckdb_futures + polars + required_release_id`，不能覆盖品种、因子、处理或回测语义。
+`duckdb_futures + required_release_id`，不能覆盖品种、因子、处理或回测语义。
 当前主框架处理链是MAD＋Z-score且未声明中性化；research现在按实际步骤记录`raw`，不再
 把未中性化结果误标为`neutralized`。正式mining/screen和主框架入口均校验同一有序品种
 契约；只有经完整38品种screen写出的绑定快照可挂载到主框架，普通池快照或旧未绑定快照

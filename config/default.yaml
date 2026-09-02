@@ -41,7 +41,6 @@ data:
   duckdb:
     path: '${MF_DUCKDB_PATH:}'
     required_release_id: '${MF_DATA_RELEASE_ID:}'
-    result_backend: pandas
 
 # One inclusive cutoff governs every factor/strategy selection and validation
 # workflow. Rows after it are forward observation only and cannot feed admission.

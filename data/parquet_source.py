@@ -8,6 +8,7 @@ using prices that were already known at the end of ``t-1``.
 from __future__ import annotations
 
 from collections import OrderedDict
+from bisect import bisect_left
 from datetime import date
 import hashlib
 import json
@@ -19,6 +20,7 @@ from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
+import polars as pl
 
 from core.interfaces import DataSource
 from core.registry import register
@@ -26,8 +28,8 @@ from core.sectors import sector_for
 from data.contract_symbols import (
     CONTRACT_SYMBOL_SEMANTICS_VERSION,
     MARKET_FIELDS,
-    canonicalize_contract_aliases,
-    contract_symbol_parts,
+    canonicalize_contract_aliases_polars,
+    contract_symbol_parts_polars,
 )
 
 
@@ -185,7 +187,7 @@ class ParquetFuturesSource(DataSource):
         if self.selected_cache_enabled:
             self.selected_cache_path.mkdir(parents=True, exist_ok=True)
         self._schema_cache: Dict[tuple[Path, int, int], set[str]] = {}
-        self._plan_cache: OrderedDict[tuple, pd.DataFrame] = OrderedDict()
+        self._plan_cache: OrderedDict[tuple, pl.DataFrame] = OrderedDict()
         self._panel_cache: OrderedDict[tuple, Dict[str, pd.DataFrame]] = OrderedDict()
         self._panel_lock = threading.RLock()
 
@@ -291,6 +293,32 @@ class ParquetFuturesSource(DataSource):
         )
         return self._files_fingerprint(self.root_path, files)
 
+    def checkpoint_source_fingerprint(self, start, end) -> str:
+        """Fingerprint only storage that can affect the requested factor slice."""
+        start_ts = pd.Timestamp(start).normalize() - pd.Timedelta(
+            days=self.schedule_buffer_days
+        )
+        end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=7)
+        files = []
+        for frequency in self.datasets:
+            files.extend(self._month_files(frequency, start_ts, end_ts))
+        seat_root = self.root_path / self.seat_dataset
+        if seat_root.is_dir():
+            first = start_ts.to_period("M")
+            last = end_ts.to_period("M")
+            for path in seat_root.rglob("*.parquet"):
+                periods = [part.split("=", 1)[1] for part in path.parts
+                           if part.startswith("year_month=")]
+                if not periods:
+                    continue
+                try:
+                    period = pd.Period(periods[-1], freq="M")
+                except ValueError:
+                    continue
+                if first <= period <= last:
+                    files.append(path)
+        return self._files_fingerprint(self.root_path, files)
+
     def _selected_cache_files(
         self,
         frequency: str,
@@ -320,7 +348,7 @@ class ParquetFuturesSource(DataSource):
             self.selected_cache_path / f"{stem}.json",
         )
 
-    def _read_selected_cache(
+    def _read_selected_cache_polars(
         self,
         frequency: str,
         start: pd.Timestamp,
@@ -328,7 +356,7 @@ class ParquetFuturesSource(DataSource):
         tickers: tuple[str, ...],
         fields: tuple[str, ...],
         source_fingerprint: str,
-    ) -> Optional[pd.DataFrame]:
+    ) -> Optional[pl.DataFrame]:
         if not self.selected_cache_enabled:
             return None
         data_path, metadata_path = self._selected_cache_files(
@@ -353,10 +381,22 @@ class ParquetFuturesSource(DataSource):
             }
             if any(metadata.get(key) != value for key, value in expected.items()):
                 return None
-            frame = pd.read_parquet(data_path)
+            frame = pl.read_parquet(data_path).with_columns(
+                pl.col("trade_datetime").cast(pl.Datetime("ns"))
+            )
             required = {"trade_datetime", "root", *fields}
-            frame["trade_datetime"] = pd.to_datetime(frame["trade_datetime"])
-            if not self._valid_cached_long_frame(frame, required, tickers):
+            if not required.issubset(frame.columns) or frame.is_empty():
+                return None
+            if frame.select(
+                pl.col("trade_datetime").is_null().any()
+                | pl.col("root").is_null().any()
+            ).item():
+                return None
+            if frame.select(
+                pl.struct(["trade_datetime", "root"]).is_duplicated().any()
+            ).item():
+                return None
+            if not set(frame["root"].cast(pl.String).unique()).issubset(tickers):
                 return None
             return frame
         except Exception:
@@ -365,7 +405,7 @@ class ParquetFuturesSource(DataSource):
 
     def _write_selected_cache(
         self,
-        frame: pd.DataFrame,
+        frame: pd.DataFrame | pl.DataFrame,
         frequency: str,
         start: pd.Timestamp,
         end: pd.Timestamp,
@@ -373,7 +413,8 @@ class ParquetFuturesSource(DataSource):
         fields: tuple[str, ...],
         source_fingerprint: str,
     ) -> None:
-        if not self.selected_cache_enabled or frame.empty:
+        is_empty = frame.empty if isinstance(frame, pd.DataFrame) else frame.is_empty()
+        if not self.selected_cache_enabled or is_empty:
             return
         data_path, metadata_path = self._selected_cache_files(
             frequency, start, end, tickers, fields
@@ -395,7 +436,10 @@ class ParquetFuturesSource(DataSource):
             "root_active_from": self._active_epoch_config,
         }
         try:
-            frame.to_parquet(data_temp, index=False)
+            polars_frame = (
+                pl.from_pandas(frame) if isinstance(frame, pd.DataFrame) else frame
+            )
+            polars_frame.write_parquet(data_temp)
             metadata_temp.write_text(
                 json.dumps(metadata, ensure_ascii=True, sort_keys=True),
                 encoding="utf-8",
@@ -433,13 +477,13 @@ class ParquetFuturesSource(DataSource):
             self.curve_cache_path / f"{stem}.json",
         )
 
-    def _read_curve_month_cache(
+    def _read_curve_month_cache_polars(
         self,
         frequency: str,
         period: pd.Period,
         tickers: tuple[str, ...],
         source_fingerprint: str,
-    ) -> Optional[pd.DataFrame]:
+    ) -> Optional[pl.DataFrame]:
         if not self.curve_cache_enabled:
             return None
         data_path, metadata_path = self._curve_cache_files(
@@ -460,39 +504,38 @@ class ParquetFuturesSource(DataSource):
             }
             if any(metadata.get(key) != value for key, value in expected.items()):
                 return None
-            frame = pd.read_parquet(data_path)
+            frame = pl.read_parquet(data_path).with_columns(
+                pl.col("trade_datetime").cast(pl.Datetime("ns"))
+            )
             required = {"trade_datetime", "root", *_CURVE_FIELDS}
-            frame["trade_datetime"] = pd.to_datetime(frame["trade_datetime"])
-            if not self._valid_cached_long_frame(frame, required, tickers):
+            if not required.issubset(frame.columns) or frame.is_empty():
+                return None
+            if frame.select(
+                pl.col("trade_datetime").is_null().any()
+                | pl.col("root").is_null().any()
+            ).item():
+                return None
+            if frame.select(
+                pl.struct(["trade_datetime", "root"]).is_duplicated().any()
+            ).item():
+                return None
+            if not set(frame["root"].cast(pl.String).unique()).issubset(tickers):
                 return None
             return frame
         except Exception:
             logger.warning("curve aggregate cache read failed: %s", data_path)
             return None
 
-    @staticmethod
-    def _valid_cached_long_frame(
-        frame: pd.DataFrame,
-        required: set[str],
-        tickers: tuple[str, ...],
-    ) -> bool:
-        if not required.issubset(frame.columns) or frame.empty:
-            return False
-        if frame["trade_datetime"].isna().any() or frame["root"].isna().any():
-            return False
-        if frame.duplicated(["trade_datetime", "root"]).any():
-            return False
-        return set(frame["root"].astype(str)).issubset(tickers)
-
     def _write_curve_month_cache(
         self,
-        frame: pd.DataFrame,
+        frame: pd.DataFrame | pl.DataFrame,
         frequency: str,
         period: pd.Period,
         tickers: tuple[str, ...],
         source_fingerprint: str,
     ) -> None:
-        if not self.curve_cache_enabled or frame.empty:
+        is_empty = frame.empty if isinstance(frame, pd.DataFrame) else frame.is_empty()
+        if not self.curve_cache_enabled or is_empty:
             return
         data_path, metadata_path = self._curve_cache_files(
             frequency, period, tickers
@@ -510,7 +553,10 @@ class ParquetFuturesSource(DataSource):
             "root_active_from": self._active_epoch_config,
         }
         try:
-            frame.to_parquet(data_temp, index=False)
+            polars_frame = (
+                pl.from_pandas(frame) if isinstance(frame, pd.DataFrame) else frame
+            )
+            polars_frame.write_parquet(data_temp)
             metadata_temp.write_text(
                 json.dumps(metadata, ensure_ascii=True, sort_keys=True),
                 encoding="utf-8",
@@ -542,22 +588,23 @@ class ParquetFuturesSource(DataSource):
         self._schema_cache[key] = columns
         return columns
 
-    def _read_storage_partitions(
+    def _read_storage_partitions_polars(
         self,
         native_frequency: str,
         start,
         end,
         columns: Iterable[str],
         roots: Iterable[str] | None = None,
-    ) -> tuple[pd.DataFrame, list[str], set[str]]:
+    ) -> tuple[pl.DataFrame, list[str], set[str]]:
+        """Read raw Parquet partitions into the canonical Polars boundary."""
+        del roots  # Parquet fallback preserves the existing post-read root filter.
         files = self._month_files(native_frequency, start, end)
+        requested_columns = list(dict.fromkeys(columns))
         if not files:
-            requested = list(dict.fromkeys(columns))
-            return pd.DataFrame(columns=requested), requested, set()
+            return pl.DataFrame(), requested_columns, set()
         schemas = [self._available_columns(path) for path in files]
         available = set.intersection(*schemas)
         present_anywhere = set.union(*schemas)
-        requested_columns = list(dict.fromkeys(columns))
         schema_sensitive = list(requested_columns)
         if "symbol" in requested_columns:
             schema_sensitive.extend(
@@ -574,110 +621,129 @@ class ParquetFuturesSource(DataSource):
             )
         requested = [column for column in requested_columns if column in available]
         if not requested:
-            return pd.DataFrame(), [], available
+            return pl.DataFrame(), [], available
         selected = list(requested)
         if "symbol" in selected:
             for column in ("exchange", "trade_date", "trade_datetime"):
                 if column in available and column not in selected:
                     selected.append(column)
-        filters = [
-            ("trade_date", ">=", pd.Timestamp(start).date()),
-            ("trade_date", "<=", pd.Timestamp(end).date()),
-        ]
-        # 逐文件读取再 concat: 避免 pyarrow 多文件 schema merge 时
-        # dictionary 编码 vs plain string 的 year_month 列类型冲突 (ArrowTypeError)
+        start_date = pd.Timestamp(start).date()
+        end_date = pd.Timestamp(end).date()
         frames = []
-        for f in files:
+        for path in files:
             try:
-                df = pd.read_parquet(f, columns=selected, filters=filters)
-                if not df.empty:
-                    frames.append(df)
+                frame = pl.read_parquet(path, columns=selected).filter(
+                    pl.col("trade_date").cast(pl.Date).is_between(
+                        start_date, end_date, closed="both"
+                    )
+                )
             except Exception as exc:
-                raise RuntimeError(f"failed to read market partition: {f}") from exc
+                raise RuntimeError(f"failed to read market partition: {path}") from exc
+            if frame.height:
+                frames.append(frame)
         if not frames:
-            return pd.DataFrame(columns=requested), requested, available
-        combined = pd.concat(frames, ignore_index=True)
-        return combined, requested, available
+            return pl.DataFrame(), requested, available
+        return pl.concat(frames, how="vertical_relaxed"), requested, available
 
-    def _read_partitions(
+    def _read_partitions_polars(
         self,
         native_frequency: str,
         start,
         end,
         columns: Iterable[str],
         roots: Iterable[str] | None = None,
-    ) -> pd.DataFrame:
-        combined, requested, available = self._read_storage_partitions(
+    ) -> pl.DataFrame:
+        """Apply alias semantics while retaining a Polars result."""
+        combined, requested, available = self._read_storage_partitions_polars(
             native_frequency, start, end, columns, roots=roots
         )
-        if not requested:
-            return combined
-        if combined.empty:
-            return combined.loc[:, requested]
-        if "symbol" in combined:
-            before = len(combined)
-            canonical = canonicalize_contract_aliases(combined)
+        if not requested or combined.is_empty():
+            return combined.select(requested) if requested else combined
+        if "symbol" in combined.columns:
+            before = combined.height
+            canonical = canonicalize_contract_aliases_polars(combined)
             missing_checks = [
                 field for field in MARKET_FIELDS
                 if field in available and field not in combined.columns
             ]
-            if len(canonical) < before and missing_checks:
+            if canonical.height < before and missing_checks:
                 validation_columns = list(combined.columns) + missing_checks
-                validation, _, _ = self._read_storage_partitions(
-                    native_frequency, start, end, validation_columns, roots=roots
+                validation, _, _ = self._read_storage_partitions_polars(
+                    native_frequency,
+                    start,
+                    end,
+                    validation_columns,
+                    roots=roots,
                 )
-                if validation.empty:
-                    return pd.DataFrame(columns=requested)
-                canonical = canonicalize_contract_aliases(validation)
+                if validation.is_empty():
+                    return pl.DataFrame(schema={name: pl.Null for name in requested})
+                canonical = canonicalize_contract_aliases_polars(validation)
             combined = canonical
-        return combined.loc[:, requested]
+        return combined.select(requested)
 
-    def _annotate_symbols(self, frame: pd.DataFrame) -> pd.DataFrame:
-        if frame.empty or "symbol" not in frame:
+    def _annotate_symbols_polars(self, frame: pl.DataFrame) -> pl.DataFrame:
+        """Polars equivalent of symbol parsing and economic-epoch filtering."""
+        if frame.is_empty() or "symbol" not in frame.columns:
             return frame
-        result = frame.copy()
-        parts = contract_symbol_parts(result["symbol"])
-        for column in (
-            "symbol", "root", "suffix", "delivery_year",
-            "delivery_month", "is_concrete",
-        ):
-            result[column] = parts[column]
-        result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.normalize()
-        result = result.dropna(subset=["root", "suffix", "trade_date"])
+        parts = contract_symbol_parts_polars(frame["symbol"])
+        result = frame.with_columns(
+            *(parts[column] for column in (
+                "symbol", "root", "suffix", "delivery_year",
+                "delivery_month", "is_concrete",
+            )),
+            pl.col("trade_date").cast(pl.Date),
+        ).drop_nulls(["root", "suffix", "trade_date"])
         if self.root_active_from:
-            active_from = result["root"].map(self.root_active_from)
-            result = result.loc[
-                active_from.isna() | result["trade_date"].ge(active_from)
-            ]
+            active = pl.DataFrame({
+                "root": list(self.root_active_from),
+                "__active_from": [
+                    pd.Timestamp(value).date()
+                    for value in self.root_active_from.values()
+                ],
+            })
+            result = result.join(active, on="root", how="left").filter(
+                pl.col("__active_from").is_null()
+                | (pl.col("trade_date") >= pl.col("__active_from"))
+            ).drop("__active_from")
         return result
 
-    def _assign_intraday_trade_dates(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Replace vendor natural dates with exchange trading dates."""
-        if frame.empty:
+    def _assign_intraday_trade_dates_polars(
+        self, frame: pl.DataFrame
+    ) -> pl.DataFrame:
+        """Map natural timestamps to exchange dates without a pandas frame."""
+        if frame.is_empty():
             return frame
-        result = frame.copy()
-        timestamps = pd.to_datetime(result["trade_datetime"], errors="coerce")
-        natural_dates = timestamps.dt.normalize()
-        targets = natural_dates.where(
-            timestamps.dt.hour.lt(18), natural_dates + pd.Timedelta(days=1)
-        )
+        timestamps = frame["trade_datetime"].cast(pl.Datetime("ns"))
+        natural = timestamps.dt.date()
+        targets = pl.DataFrame({
+            "natural": natural,
+            "hour": timestamps.dt.hour(),
+        }).select(
+            pl.when(pl.col("hour") >= 18)
+            .then(pl.col("natural") + pl.duration(days=1))
+            .otherwise(pl.col("natural"))
+            .alias("target")
+        )["target"]
+        target_values = targets.to_numpy().astype("datetime64[D]")
         calendar = self.fetch_calendar(
-            targets.min() - pd.Timedelta(days=7),
-            targets.max() + pd.Timedelta(days=7),
+            pd.Timestamp(target_values.min()) - pd.Timedelta(days=7),
+            pd.Timestamp(target_values.max()) + pd.Timedelta(days=7),
         )
-        calendar = pd.DatetimeIndex(calendar).normalize().unique().sort_values()
-        if len(calendar) == 0:
+        calendar_values = (
+            pd.DatetimeIndex(calendar).normalize().unique().sort_values()
+            .to_numpy(dtype="datetime64[D]")
+        )
+        if not len(calendar_values):
             raise ValueError(
                 "cannot assign exchange trading dates: daily parquet calendar is empty"
             )
-        locations = calendar.searchsorted(targets.to_numpy(), side="left")
-        assigned = np.full(
-            len(targets), np.datetime64("NaT", "ns"), dtype="datetime64[ns]"
+        locations = np.searchsorted(calendar_values, target_values, side="left")
+        assigned = np.full(len(target_values), np.datetime64("NaT", "D"))
+        valid = locations < len(calendar_values)
+        assigned[valid] = calendar_values[locations[valid]]
+        return frame.with_columns(
+            pl.Series("trade_date", assigned).cast(pl.Date)
         )
-        valid = locations < len(calendar)
-        assigned[valid] = calendar.to_numpy()[locations[valid]]
-        result["trade_date"] = assigned
-        return result
 
     def trading_session_index(self, timestamps) -> pd.DatetimeIndex:
         """Map wall-clock bars onto an ordered exchange-trading-day clock.
@@ -691,10 +757,10 @@ class ParquetFuturesSource(DataSource):
         wall_clock = pd.DatetimeIndex(timestamps)
         if wall_clock.tz is not None:
             wall_clock = wall_clock.tz_localize(None)
-        dated = self._assign_intraday_trade_dates(
-            pd.DataFrame({"trade_datetime": wall_clock})
-        )
-        trading_days = pd.DatetimeIndex(dated["trade_date"])
+        dated = self._assign_intraday_trade_dates_polars(pl.DataFrame({
+            "trade_datetime": wall_clock.to_numpy(dtype="datetime64[ns]")
+        }))
+        trading_days = pd.DatetimeIndex(dated["trade_date"].to_numpy())
         if trading_days.isna().any():
             raise ValueError("cannot map every intraday bar to a trading day")
 
@@ -706,49 +772,19 @@ class ParquetFuturesSource(DataSource):
         return pd.DatetimeIndex(session_index)
 
     @staticmethod
-    def _deduplicate(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-        if frame.empty:
+    def _deduplicate_polars(frame: pl.DataFrame, keys: list[str]) -> pl.DataFrame:
+        if frame.is_empty():
             return frame
         sort_columns = list(keys)
         if "sequence" in frame.columns:
             sort_columns.append("sequence")
-        return (
-            frame.sort_values(sort_columns)
-            .drop_duplicates(keys, keep="last")
-            .reset_index(drop=True)
+        return frame.sort(sort_columns).unique(
+            subset=keys, keep="last", maintain_order=True
         )
 
-    def _infer_vendor_main(
-        self, frame: pd.DataFrame, tickers: tuple[str, ...]
-    ) -> pd.DataFrame:
-        """Choose the highest-open-interest real contract for each root/date."""
-        frame = self._annotate_symbols(frame)
-        frame = frame.loc[frame["root"].isin(tickers)]
-        concrete = frame.loc[frame["is_concrete"]].copy()
-        concrete = self._deduplicate(concrete, ["trade_date", "root", "symbol"])
-        close = pd.to_numeric(concrete["close"], errors="coerce")
-        position = pd.to_numeric(concrete["position"], errors="coerce")
-        liquid = concrete.loc[
-            concrete["volume"].fillna(0).gt(0)
-            & close.gt(0)
-            & np.isfinite(close)
-            & position.gt(0)
-            & np.isfinite(position)
-        ]
-        return (
-            liquid.sort_values(
-                ["trade_date", "root", "position", "volume", "symbol"],
-                ascending=[True, True, False, False, True],
-                na_position="last",
-            )
-            .drop_duplicates(["trade_date", "root"], keep="first")
-            [["trade_date", "root", "symbol"]]
-            .sort_values(["root", "trade_date"])
-        )
-
-    def _continuous_plan(
+    def _continuous_plan_polars(
         self, tickers: tuple[str, ...], start, end
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         start_ts = pd.Timestamp(start).normalize()
         end_ts = pd.Timestamp(end).normalize()
         buffer_start = start_ts - pd.Timedelta(days=self.schedule_buffer_days)
@@ -761,176 +797,203 @@ class ParquetFuturesSource(DataSource):
         cached = self._plan_cache.get(key)
         if cached is not None:
             self._plan_cache.move_to_end(key)
-            return cached.copy(deep=False)
+            return cached.clone()
 
-        daily = self._read_partitions(
+        daily = self._read_partitions_polars(
             "daily",
             buffer_start,
             end_ts,
-            [
-                "symbol", "trade_date", "close", "volume", "position",
-                "sequence",
-            ],
+            ["symbol", "trade_date", "close", "volume", "position", "sequence"],
+            roots=tickers,
         )
-        daily = self._annotate_symbols(daily)
-        calendar = pd.DatetimeIndex(
-            daily.loc[daily["is_concrete"], "trade_date"].dropna().unique()
-        ).sort_values()
-        daily = daily.loc[daily["root"].isin(tickers)]
-        observed = self._infer_vendor_main(daily, tickers)
-        grid = pd.MultiIndex.from_product(
-            [tickers, calendar], names=["root", "trade_date"]
-        ).to_frame(index=False)
-        mapping = grid.merge(
-            observed, on=["root", "trade_date"], how="left", validate="one_to_one"
-        ).sort_values(["root", "trade_date"])
+        daily = self._annotate_symbols_polars(daily)
+        if daily.is_empty():
+            return pl.DataFrame()
+        daily = daily.filter(pl.col("root").is_in(tickers))
+        concrete = self._deduplicate_polars(
+            daily.filter(pl.col("is_concrete")),
+            ["trade_date", "root", "symbol"],
+        ).with_columns(
+            pl.col("close").cast(pl.Float64, strict=False),
+            pl.col("volume").cast(pl.Float64, strict=False),
+            pl.col("position").cast(pl.Float64, strict=False),
+        )
+        calendar = concrete["trade_date"].drop_nulls().unique().sort()
+        if not len(calendar):
+            return pl.DataFrame()
 
-        concrete = daily.loc[daily["is_concrete"]].copy()
-        concrete = self._deduplicate(concrete, ["trade_date", "root", "symbol"])
-        executable_close = pd.to_numeric(concrete["close"], errors="coerce")
-        executable = concrete.loc[
-            concrete["volume"].fillna(0).gt(0)
-            & executable_close.gt(0)
-            & np.isfinite(executable_close)
-        ]
-
-        # A newly observed dominant can become tomorrow's contract only when
-        # both the held and proposed contracts are executable at today's close.
-        # Partial/suspended data therefore keeps the prior causal decision; it
-        # never falls forward to the same-day dominant.
-        decisions = pd.Series(index=mapping.index, dtype=object)
-        for root, group in mapping.groupby("root", sort=False):
-            quoted_by_date = (
-                executable.loc[executable["root"].eq(root)]
-                .groupby("trade_date")["symbol"]
-                .agg(set)
-                .to_dict()
+        observed = (
+            concrete.filter(
+                (pl.col("volume").fill_null(0.0) > 0.0)
+                & (pl.col("close") > 0.0)
+                & pl.col("close").is_finite()
+                & (pl.col("position") > 0.0)
+                & pl.col("position").is_finite()
             )
-            current_contract = None
-            for row in group.itertuples():
-                candidate = None if pd.isna(row.symbol) else str(row.symbol)
-                if candidate is not None:
-                    if current_contract is None:
-                        current_contract = candidate
-                    elif candidate != current_contract:
-                        quoted = quoted_by_date.get(row.trade_date, set())
-                        if current_contract in quoted and candidate in quoted:
-                            current_contract = candidate
-                decisions.loc[row.Index] = current_contract
-        mapping["decision_contract"] = decisions
-        mapping["contract"] = mapping.groupby("root")[
-            "decision_contract"
-        ].shift(self.dominant_lag_days)
+            .sort(
+                ["trade_date", "root", "position", "volume", "symbol"],
+                descending=[False, False, True, True, False],
+                nulls_last=True,
+            )
+            .unique(
+                subset=["trade_date", "root"], keep="first", maintain_order=True
+            )
+            .select("trade_date", "root", pl.col("symbol").alias("observed"))
+        )
+        grid = pl.DataFrame({"root": list(tickers)}).join(
+            pl.DataFrame({"trade_date": calendar}), how="cross"
+        ).sort(["root", "trade_date"])
+        mapping = grid.join(
+            observed,
+            on=["root", "trade_date"],
+            how="left",
+            validate="1:1",
+        )
+
+        executable = concrete.filter(
+            (pl.col("volume").fill_null(0.0) > 0.0)
+            & (pl.col("close") > 0.0)
+            & pl.col("close").is_finite()
+        )
+        quoted_by_date: dict[tuple[str, date], set[str]] = {}
+        for row in executable.select("root", "trade_date", "symbol").iter_rows():
+            quoted_by_date.setdefault((row[0], row[1]), set()).add(row[2])
+
+        decisions: list[str | None] = []
+        current_root = None
+        current_contract = None
+        for root, trade_date, observed_contract in mapping.select(
+            "root", "trade_date", "observed"
+        ).iter_rows():
+            if root != current_root:
+                current_root = root
+                current_contract = None
+            if observed_contract is not None:
+                if current_contract is None:
+                    current_contract = observed_contract
+                elif observed_contract != current_contract:
+                    quoted = quoted_by_date.get((root, trade_date), set())
+                    if current_contract in quoted and observed_contract in quoted:
+                        current_contract = observed_contract
+            decisions.append(current_contract)
+        mapping = mapping.with_columns(
+            pl.Series("decision_contract", decisions, dtype=pl.String)
+        ).with_columns(
+            pl.col("decision_contract")
+            .shift(self.dominant_lag_days)
+            .over("root")
+            .alias("contract")
+        )
+
+        closes = {
+            (root, trade_date, symbol): close
+            for root, trade_date, symbol, close in concrete.select(
+                "root", "trade_date", "symbol", "close"
+            ).iter_rows()
+        }
         plans = []
-        for root, group in mapping.groupby("root", sort=False):
-            adjustment = 1.0
-            previous_contract = None
-            previous_date = None
-            for row in group.itertuples(index=False):
-                if pd.isna(row.contract):
-                    # No prior-day liquid contract: publish no synthetic price
-                    # and restart only after a new causal schedule is available.
-                    adjustment = 1.0
-                    previous_contract = None
-                    previous_date = None
-                    continue
-                contract = str(row.contract)
-                if (
-                    previous_contract is not None
-                    and contract != previous_contract
-                    and previous_date is not None
-                ):
-                    root_prices = concrete.loc[
-                        concrete["root"].eq(root)
-                        & concrete["symbol"].isin([previous_contract, contract])
-                        # Both legs must be executable at the preceding close.
-                        & concrete["trade_date"].eq(previous_date),
-                        ["trade_date", "symbol", "close"],
-                    ].pivot_table(
-                        index="trade_date", columns="symbol", values="close",
-                        aggfunc="last",
+        current_root = None
+        adjustment = 1.0
+        previous_contract = None
+        previous_date = None
+        for root, trade_date, contract in mapping.select(
+            "root", "trade_date", "contract"
+        ).iter_rows():
+            if root != current_root:
+                current_root = root
+                adjustment = 1.0
+                previous_contract = None
+                previous_date = None
+            if contract is None:
+                adjustment = 1.0
+                previous_contract = None
+                previous_date = None
+                continue
+            if previous_contract is not None and contract != previous_contract:
+                old_close = closes.get((root, previous_date, previous_contract))
+                new_close = closes.get((root, previous_date, contract))
+                if old_close is None or new_close is None:
+                    from data.continuous_contract import RolloverAdjustmentError
+
+                    raise RolloverAdjustmentError(
+                        f"no common close on {previous_date} for "
+                        f"{previous_contract}->{contract}"
                     )
-                    if previous_contract not in root_prices or contract not in root_prices:
-                        common = pd.DataFrame()
-                    else:
-                        common = root_prices[
-                            [previous_contract, contract]
-                        ].dropna(how="any")
-                    if common.empty:
-                        # 换月对无共同交易日: fail-closed (与 continuous_contract.py 一致)
-                        # 数据补全后 2015-2026 全历史无触发 (已验证 skip=0);
-                        # 若未来数据缺失则显式报错, 不静默生成断层连续序列
-                        from data.continuous_contract import RolloverAdjustmentError
+                if (
+                    not np.isfinite(old_close) or old_close <= 0.0
+                    or not np.isfinite(new_close) or new_close <= 0.0
+                ):
+                    raise ValueError(
+                        f"invalid rollover closes for {previous_contract}->{contract}: "
+                        f"old={old_close}, new={new_close}"
+                    )
+                adjustment *= old_close / new_close
+            plans.append((trade_date, root, contract, adjustment))
+            previous_contract = contract
+            previous_date = trade_date
 
-                        raise RolloverAdjustmentError(
-                            f"no common close on {previous_date.date()} for "
-                            f"{previous_contract}->{contract}"
-                        )
-                    old_close = float(common.iloc[-1][previous_contract])
-                    new_close = float(common.iloc[-1][contract])
-                    if (
-                        not np.isfinite(old_close) or old_close <= 0.0
-                        or not np.isfinite(new_close) or new_close <= 0.0
-                    ):
-                        raise ValueError(
-                            f"invalid rollover closes for {previous_contract}->{contract}: "
-                            f"old={old_close}, new={new_close}"
-                        )
-                    adjustment *= old_close / new_close
-                plans.append(
-                    {
-                        "trade_date": row.trade_date,
-                        "root": root,
-                        "contract": contract,
-                        "adjustment": adjustment,
-                    }
+        plan = pl.DataFrame(
+            plans,
+            schema={
+                "trade_date": pl.Date,
+                "root": pl.String,
+                "contract": pl.String,
+                "adjustment": pl.Float64,
+            },
+            orient="row",
+        )
+        if not plan.is_empty():
+            plan = plan.filter(
+                pl.col("trade_date").is_between(
+                    start_ts.date(), end_ts.date(), closed="both"
                 )
-                previous_contract = contract
-                previous_date = row.trade_date
-
-        plan = pd.DataFrame(plans)
-        if not plan.empty:
-            plan = plan.loc[
-                plan["trade_date"].between(start_ts, end_ts)
-            ].reset_index(drop=True)
+            )
         self._plan_cache[key] = plan
         while len(self._plan_cache) > 4:
             self._plan_cache.popitem(last=False)
-        return plan.copy(deep=False)
+        return plan.clone()
 
     @staticmethod
-    def _resample_long(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
-        if frame.empty:
+    def _resample_long_polars(frame: pl.DataFrame, rule: str) -> pl.DataFrame:
+        if frame.is_empty():
             return frame
-        work = frame.copy()
-        work["trade_datetime"] = pd.to_datetime(
-            work["trade_datetime"]
-        ).dt.floor(rule)
-        aggregations = {
-            field: method
-            for field, method in _BAR_AGGREGATIONS.items()
-            if field in work.columns
-        }
-        return (
-            work.groupby(["trade_datetime", "root"], sort=True, as_index=False)
-            .agg(aggregations)
-        )
+        polars_rule = rule.replace("min", "m")
+        work = frame.with_columns(
+            pl.col("trade_datetime").dt.truncate(polars_rule)
+        ).sort(["trade_datetime", "root"])
+        aggregations = []
+        for field, method in _BAR_AGGREGATIONS.items():
+            if field not in work.columns:
+                continue
+            values = pl.col(field).drop_nulls()
+            expression = {
+                "first": values.first(),
+                "last": values.last(),
+                "max": pl.col(field).max(),
+                "min": pl.col(field).min(),
+                "sum": pl.col(field).sum(),
+            }[method]
+            aggregations.append(expression.alias(field))
+        return work.group_by(
+            ["trade_datetime", "root"], maintain_order=True
+        ).agg(aggregations)
 
-    def _selected_long(
+    def _selected_long_polars(
         self,
         tickers: tuple[str, ...],
         start,
         end,
         frequency: str,
         fields: tuple[str, ...],
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
+        """Build the selected-contract long table without a pandas hot path."""
         native_frequency, resample_rule = self._frequency_routes[frequency]
         start_ts = pd.Timestamp(start)
         end_ts = pd.Timestamp(end)
         source_fingerprint = self._selected_cache_source_fingerprint(
             native_frequency, start_ts, end_ts
         )
-        cached = self._read_selected_cache(
+        cached = self._read_selected_cache_polars(
             frequency,
             start_ts,
             end_ts,
@@ -940,12 +1003,14 @@ class ParquetFuturesSource(DataSource):
         )
         if cached is not None:
             return cached
-        plan = self._continuous_plan(tickers, start, end)
-        if plan.empty:
-            return pd.DataFrame()
+        plan_polars = self._continuous_plan_polars(tickers, start, end)
+        if plan_polars.is_empty():
+            return pl.DataFrame()
 
-        raw_fields = [_RAW_FIELD_MAP[field] for field in fields if field in _RAW_FIELD_MAP]
-        columns = ["symbol", "trade_datetime", "trade_date", "sequence"] + raw_fields
+        raw_fields = [
+            _RAW_FIELD_MAP[field] for field in fields if field in _RAW_FIELD_MAP
+        ]
+        columns = ["symbol", "trade_datetime", "trade_date", "sequence", *raw_fields]
         frames = []
         for period in pd.period_range(
             pd.Timestamp(start).to_period("M"),
@@ -959,59 +1024,73 @@ class ParquetFuturesSource(DataSource):
                 if native_frequency == "daily"
                 else month_start.normalize() - pd.Timedelta(days=7)
             )
-            raw = self._read_partitions(
-                native_frequency, read_start, month_end, columns
-            )
-            if raw.empty:
-                continue
-            raw = self._annotate_symbols(raw)
-            if native_frequency != "daily":
-                raw = self._assign_intraday_trade_dates(raw)
-            raw = raw.loc[
-                raw["root"].isin(tickers)
-                & raw["is_concrete"]
-            ]
-            month_plan = plan.loc[
-                plan["trade_date"].between(
-                    pd.Timestamp(month_start).normalize(),
-                    pd.Timestamp(month_end).normalize(),
+            month_plan = plan_polars.filter(
+                pl.col("trade_date").is_between(
+                    month_start.normalize().date(),
+                    month_end.normalize().date(),
+                    closed="both",
                 )
-            ]
-            selected = raw.merge(
+            )
+            raw = self._read_selected_partitions_polars(
+                native_frequency,
+                read_start,
+                month_end,
+                columns,
+                tickers,
+                month_plan,
+            )
+            if raw.is_empty():
+                continue
+            raw = self._annotate_symbols_polars(raw)
+            if native_frequency != "daily":
+                raw = self._assign_intraday_trade_dates_polars(raw)
+            raw = raw.filter(
+                pl.col("root").is_in(tickers) & pl.col("is_concrete")
+            )
+            selected = raw.join(
                 month_plan,
                 on=["trade_date", "root"],
                 how="inner",
-                validate="many_to_one",
-            )
-            selected = selected.loc[selected["symbol"].eq(selected["contract"])]
-            if selected.empty:
+                validate="m:1",
+            ).filter(pl.col("symbol") == pl.col("contract"))
+            if selected.is_empty():
                 continue
-            selected["trade_datetime"] = pd.to_datetime(selected["trade_datetime"])
-            selected = self._deduplicate(
+            selected = selected.with_columns(
+                pl.col("trade_datetime").cast(pl.Datetime("ns"))
+            )
+            selected = self._deduplicate_polars(
                 selected, ["trade_datetime", "root"]
             )
+            aliases = []
             for field in fields:
                 raw_field = _RAW_FIELD_MAP.get(field)
                 if (
                     raw_field is not None
-                    and raw_field in selected
-                    and field not in selected
+                    and raw_field in selected.columns
+                    and field not in selected.columns
                 ):
-                    selected[field] = selected[raw_field]
-            for field in _PRICE_FIELDS.intersection(fields):
-                selected[field] = selected[field].astype(float) * selected["adjustment"]
-            keep = ["trade_datetime", "root"] + [
-                field for field in fields if field in selected.columns
+                    aliases.append(pl.col(raw_field).alias(field))
+            if aliases:
+                selected = selected.with_columns(aliases)
+            prices = [
+                (pl.col(field).cast(pl.Float64) * pl.col("adjustment")).alias(field)
+                for field in _PRICE_FIELDS.intersection(fields)
+                if field in selected.columns
             ]
-            frames.append(selected[keep])
+            if prices:
+                selected = selected.with_columns(prices)
+            keep = ["trade_datetime", "root", *(
+                field for field in fields if field in selected.columns
+            )]
+            frames.append(selected.select(keep))
 
         if not frames:
-            return pd.DataFrame()
-        result = pd.concat(frames, ignore_index=True)
-        result = self._deduplicate(result, ["trade_datetime", "root"])
+            return pl.DataFrame()
+        result = pl.concat(frames, how="vertical_relaxed")
+        result = self._deduplicate_polars(result, ["trade_datetime", "root"])
         if resample_rule:
-            result = self._resample_long(result, resample_rule)
-        result = result.sort_values(["trade_datetime", "root"]).reset_index(drop=True)
+            result = self._resample_long_polars(result, resample_rule)
+        result = result.sort(["trade_datetime", "root"])
         self._write_selected_cache(
             result,
             frequency,
@@ -1023,15 +1102,29 @@ class ParquetFuturesSource(DataSource):
         )
         return result
 
-    def _daily_curve_long(
+    def _read_selected_partitions_polars(
+        self,
+        native_frequency: str,
+        start,
+        end,
+        columns: Iterable[str],
+        roots: tuple[str, ...],
+        _plan: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Read candidate rows; DuckDB overrides this to push down the plan."""
+        return self._read_partitions_polars(
+            native_frequency, start, end, columns, roots=roots
+        )
+
+    def _daily_curve_long_polars(
         self,
         tickers: tuple[str, ...],
         start,
         end,
-    ) -> pd.DataFrame:
-        """Aggregate concrete-contract OI without using synthetic contracts."""
+    ) -> pl.DataFrame:
+        """Aggregate daily concrete-contract curve state in Polars."""
         buffer_start = pd.Timestamp(start).normalize() - pd.Timedelta(days=10)
-        raw = self._read_partitions(
+        raw = self._read_partitions_polars(
             "daily",
             buffer_start,
             pd.Timestamp(end).normalize(),
@@ -1039,180 +1132,209 @@ class ParquetFuturesSource(DataSource):
                 "symbol", "trade_datetime", "trade_date", "position",
                 "volume", "sequence",
             ],
+            roots=tickers,
         )
-        raw = self._annotate_symbols(raw)
-        if raw.empty:
-            return pd.DataFrame()
-        concrete = raw.loc[
-            raw["root"].isin(tickers)
-            & raw["is_concrete"]
-        ].copy()
-        concrete = self._deduplicate(
-            concrete, ["trade_date", "root", "symbol"]
+        raw = self._annotate_symbols_polars(raw)
+        if raw.is_empty():
+            return pl.DataFrame()
+        concrete = self._deduplicate_polars(
+            raw.filter(pl.col("root").is_in(tickers) & pl.col("is_concrete")),
+            ["trade_date", "root", "symbol"],
         )
-        if concrete.empty:
-            return pd.DataFrame()
-        concrete["position"] = pd.to_numeric(
-            concrete["position"], errors="coerce"
-        ).clip(lower=0.0)
-        concrete["volume"] = pd.to_numeric(
-            concrete["volume"], errors="coerce"
-        ).clip(lower=0.0)
-        concrete = concrete.sort_values(["root", "symbol", "trade_date"])
-        previous = concrete.groupby(["root", "symbol"])["position"].shift(1)
-        concrete["oi_increased"] = (
-            concrete["position"].gt(previous).where(previous.notna())
+        if concrete.is_empty():
+            return pl.DataFrame()
+        concrete = concrete.with_columns(
+            pl.col("position").cast(pl.Float64, strict=False).clip(0.0, None),
+            pl.col("volume").cast(pl.Float64, strict=False).clip(0.0, None),
+        ).sort(["root", "symbol", "trade_date"])
+        previous = pl.col("position").shift(1).over(["root", "symbol"])
+        concrete = concrete.with_columns(
+            pl.when(previous.is_not_null())
+            .then(pl.col("position") > previous)
+            .otherwise(None)
+            .alias("oi_increased"),
+            pl.col("position").pow(2).alias("position_sq"),
         )
-        concrete["position_sq"] = concrete["position"].pow(2)
-
         keys = ["trade_date", "root"]
-        aggregate = concrete.groupby(keys, sort=True).agg(
-            curve_total_oi=("position", "sum"),
-            curve_total_volume=("volume", "sum"),
-            curve_contract_count=("position", lambda value: int(value.gt(0).sum())),
-            curve_oi_breadth=("oi_increased", "mean"),
-            position_sq_sum=("position_sq", "sum"),
+        aggregate = concrete.group_by(keys, maintain_order=True).agg(
+            pl.col("position").sum().alias("curve_total_oi"),
+            pl.col("volume").sum().alias("curve_total_volume"),
+            (pl.col("position") > 0).sum().alias("curve_contract_count"),
+            pl.col("oi_increased").mean().alias("curve_oi_breadth"),
+            pl.col("position_sq").sum().alias("position_sq_sum"),
         )
         top2 = (
-            concrete.sort_values(
-                keys + ["position"],
-                ascending=[True, True, False],
-                na_position="last",
+            concrete.sort(
+                [*keys, "position"],
+                descending=[False, False, True],
+                nulls_last=True,
             )
-            .groupby(keys, sort=True)
+            .group_by(keys, maintain_order=True)
             .head(2)
-            .groupby(keys, sort=True)["position"]
-            .sum()
-            .rename("curve_top2_oi")
+            .group_by(keys, maintain_order=True)
+            .agg(pl.col("position").sum().alias("curve_top2_oi"))
         )
-        aggregate = aggregate.join(top2, how="left")
-        denominator = aggregate["curve_total_oi"].replace(0.0, np.nan)
-        aggregate["curve_oi_concentration"] = (
-            aggregate["curve_top2_oi"] / denominator
+        result = aggregate.join(top2, on=keys, how="left", validate="1:1")
+        denominator = pl.when(pl.col("curve_total_oi") != 0.0).then(
+            pl.col("curve_total_oi")
+        ).otherwise(None)
+        return (
+            result.with_columns(
+                (pl.col("curve_top2_oi") / denominator).alias(
+                    "curve_oi_concentration"
+                ),
+                (pl.col("position_sq_sum") / denominator.pow(2)).alias(
+                    "curve_oi_hhi"
+                ),
+            )
+            .drop("position_sq_sum")
+            .rename({"trade_date": "trade_datetime"})
+            .with_columns(pl.col("trade_datetime").cast(pl.Datetime("ns")))
+            .filter(
+                pl.col("trade_datetime").is_between(
+                    pd.Timestamp(start).normalize().to_datetime64(),
+                    pd.Timestamp(end).normalize().to_datetime64(),
+                    closed="both",
+                )
+            )
+            .sort(["trade_datetime", "root"])
         )
-        aggregate["curve_oi_hhi"] = (
-            aggregate.pop("position_sq_sum") / denominator.pow(2)
-        )
-        result = aggregate.reset_index().rename(
-            columns={"trade_date": "trade_datetime"}
-        )
-        result["trade_datetime"] = pd.to_datetime(result["trade_datetime"])
-        start_ts = pd.Timestamp(start).normalize()
-        end_ts = pd.Timestamp(end).normalize()
-        return result.loc[
-            result["trade_datetime"].between(start_ts, end_ts)
-        ].sort_values(["trade_datetime", "root"]).reset_index(drop=True)
 
     @staticmethod
-    def _aggregate_intraday_states(
-        raw: pd.DataFrame,
-        daily: pd.DataFrame,
-    ) -> pd.DataFrame:
-        frames = []
-        daily_by_root = {
-            root: group for root, group in daily.groupby("root", sort=False)
+    def _aggregate_intraday_states_polars(
+        raw: pl.DataFrame,
+        daily: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Use Polars for state shaping and NumPy for dense state arithmetic."""
+        if raw.is_empty():
+            return pl.DataFrame()
+        daily_states: dict[str, dict[date, dict[str, float]]] = {}
+        for root, trade_date, symbol, position in daily.select(
+            "root", "trade_date", "symbol", "position"
+        ).sort(["root", "trade_date", "symbol"]).iter_rows():
+            value = float(position) if position is not None else 0.0
+            if not np.isfinite(value):
+                value = 0.0
+            daily_states.setdefault(root, {}).setdefault(trade_date, {})[
+                symbol
+            ] = max(value, 0.0)
+        daily_dates = {
+            root: sorted(by_date) for root, by_date in daily_states.items()
         }
-        for (root, trade_date), group in raw.groupby(
-            ["root", "trade_date"], sort=True
-        ):
-            day = pd.Timestamp(trade_date).normalize()
-            root_daily = daily_by_root.get(root, pd.DataFrame())
-            baseline = pd.Series(dtype=float)
-            if not root_daily.empty:
-                previous_dates = root_daily.loc[
-                    root_daily["trade_date"].lt(day), "trade_date"
-                ]
-                if not previous_dates.empty:
-                    baseline_date = previous_dates.max()
-                    baseline_rows = root_daily.loc[
-                        root_daily["trade_date"].eq(baseline_date)
-                    ]
-                    baseline = baseline_rows.set_index("symbol")["position"]
 
-            observed = group.pivot_table(
+        frames = []
+        grouped = raw.sort(["root", "trade_date", "trade_datetime"]).partition_by(
+            ["root", "trade_date"], maintain_order=True, as_dict=True
+        )
+        for key, group in grouped.items():
+            root, trade_date = key
+            dates = daily_dates.get(root, [])
+            location = bisect_left(dates, trade_date)
+            baseline = (
+                daily_states[root][dates[location - 1]]
+                if location > 0 else {}
+            )
+            observed = group.select(
+                "trade_datetime", "symbol", "position"
+            ).pivot(
+                on="symbol",
                 index="trade_datetime",
-                columns="symbol",
                 values="position",
-                aggfunc="last",
-            ).sort_index()
-            if observed.empty:
+                aggregate_function="last",
+            ).sort("trade_datetime")
+            contracts = sorted(
+                set(observed.columns).difference({"trade_datetime"}) | set(baseline)
+            )
+            if not contracts:
                 continue
-            contracts = observed.columns.union(baseline.index)
-            observed = observed.reindex(columns=contracts)
-            initial = baseline.reindex(contracts).fillna(0.0)
-            states = observed.copy()
-            states.iloc[0] = states.iloc[0].fillna(initial)
-            states = states.ffill().fillna(0.0).clip(lower=0.0)
+            missing = [contract for contract in contracts if contract not in observed]
+            if missing:
+                observed = observed.with_columns(
+                    *(pl.lit(None).cast(pl.Float64).alias(item) for item in missing)
+                )
+            observed = observed.with_columns(
+                *(pl.col(item).cast(pl.Float64, strict=False).fill_nan(None)
+                  for item in contracts)
+            ).select("trade_datetime", *contracts)
+            values = observed.select(contracts).to_numpy().astype(float, copy=False)
+            initial = np.array(
+                [baseline.get(contract, 0.0) for contract in contracts], dtype=float
+            )
+            first_missing = np.isnan(values[0])
+            values[0, first_missing] = initial[first_missing]
+            row_numbers = np.arange(len(values))
+            for column in range(values.shape[1]):
+                valid = ~np.isnan(values[:, column])
+                indices = np.where(valid, row_numbers, 0)
+                np.maximum.accumulate(indices, out=indices)
+                values[:, column] = values[indices, column]
+            values = np.clip(np.nan_to_num(values, nan=0.0), 0.0, None)
 
-            state_values = states.to_numpy(dtype=float, copy=False)
-            total_oi = state_values.sum(axis=1)
-            if state_values.shape[1] <= 2:
-                top2_oi = total_oi.copy()
-            else:
-                top2_oi = np.partition(
-                    state_values, state_values.shape[1] - 2, axis=1
-                )[:, -2:].sum(axis=1)
-            contract_count = (state_values > 0.0).sum(axis=1)
+            total_oi = values.sum(axis=1)
+            top2_oi = (
+                total_oi.copy()
+                if values.shape[1] <= 2
+                else np.partition(values, values.shape[1] - 2, axis=1)[:, -2:].sum(axis=1)
+            )
+            contract_count = (values > 0.0).sum(axis=1)
             denominator = np.where(total_oi > 0.0, total_oi, np.nan)
-            concentration = top2_oi / denominator
-            hhi = np.square(state_values).sum(axis=1) / np.square(denominator)
-
-            previous_states = states.shift(1)
-            previous_states.iloc[0] = initial
-            comparable = previous_states.notna()
-            increased = states.gt(previous_states) & comparable
-            breadth_denominator = comparable.sum(axis=1).replace(0, np.nan)
-            breadth = increased.sum(axis=1) / breadth_denominator
-
-            volume = group.pivot_table(
-                index="trade_datetime",
-                columns="symbol",
-                values="volume",
-                aggfunc="sum",
-            ).reindex(index=states.index).fillna(0.0).sum(axis=1)
-            frames.append(pd.DataFrame({
-                "trade_datetime": states.index,
-                "root": root,
+            previous = np.vstack([initial, values[:-1]])
+            breadth = (values > previous).sum(axis=1) / values.shape[1]
+            volume = {
+                timestamp: value
+                for timestamp, value in group.group_by(
+                    "trade_datetime", maintain_order=True
+                ).agg(
+                    pl.col("volume").fill_nan(None).sum().alias("volume")
+                ).iter_rows()
+            }
+            timestamps = observed["trade_datetime"].to_list()
+            frames.append(pl.DataFrame({
+                "trade_datetime": timestamps,
+                "root": [root] * len(timestamps),
                 "curve_total_oi": total_oi,
                 "curve_top2_oi": top2_oi,
-                "curve_total_volume": volume.to_numpy(dtype=float),
+                "curve_total_volume": [float(volume.get(item, 0.0) or 0.0)
+                                       for item in timestamps],
                 "curve_contract_count": contract_count,
-                "curve_oi_breadth": breadth.to_numpy(dtype=float),
-                "curve_oi_concentration": concentration,
-                "curve_oi_hhi": hhi,
+                "curve_oi_breadth": breadth,
+                "curve_oi_concentration": top2_oi / denominator,
+                "curve_oi_hhi": np.square(values).sum(axis=1)
+                / np.square(denominator),
             }))
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-
-    @staticmethod
-    def _resample_curve_long(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
-        if frame.empty:
-            return frame
-        work = frame.copy()
-        work["trade_datetime"] = pd.to_datetime(
-            work["trade_datetime"]
-        ).dt.floor(rule)
         return (
-            work.groupby(["trade_datetime", "root"], sort=True, as_index=False)
-            .agg({
-                "curve_total_oi": "last",
-                "curve_top2_oi": "last",
-                "curve_total_volume": "sum",
-                "curve_contract_count": "last",
-                "curve_oi_breadth": "mean",
-                "curve_oi_concentration": "last",
-                "curve_oi_hhi": "last",
-            })
+            pl.concat(frames, how="vertical_relaxed")
+            if frames else pl.DataFrame()
         )
 
-    def _intraday_curve_long(
+    @staticmethod
+    def _resample_curve_long_polars(
+        frame: pl.DataFrame, rule: str
+    ) -> pl.DataFrame:
+        if frame.is_empty():
+            return frame
+        work = frame.with_columns(
+            pl.col("trade_datetime").dt.truncate(rule.replace("min", "m"))
+        ).sort(["trade_datetime", "root"])
+        return work.group_by(
+            ["trade_datetime", "root"], maintain_order=True
+        ).agg(
+            pl.col("curve_total_oi").drop_nulls().last(),
+            pl.col("curve_top2_oi").drop_nulls().last(),
+            pl.col("curve_total_volume").sum(),
+            pl.col("curve_contract_count").drop_nulls().last(),
+            pl.col("curve_oi_breadth").fill_nan(None).mean(),
+            pl.col("curve_oi_concentration").drop_nulls().last(),
+            pl.col("curve_oi_hhi").drop_nulls().last(),
+        )
+
+    def _intraday_curve_long_polars(
         self,
         tickers: tuple[str, ...],
         start,
         end,
         frequency: str,
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         native_frequency, resample_rule = self._frequency_routes[frequency]
         frames = []
         for period in pd.period_range(
@@ -1225,88 +1347,120 @@ class ParquetFuturesSource(DataSource):
             source_fingerprint = self._curve_cache_source_fingerprint(
                 native_frequency, month_start, month_end
             )
-            cached = self._read_curve_month_cache(
+            cached = self._read_curve_month_cache_polars(
                 frequency, period, tickers, source_fingerprint
             )
             if cached is not None:
                 frames.append(cached)
                 continue
-            raw = self._read_partitions(
+            raw = self._read_partitions_polars(
                 native_frequency,
                 month_start.normalize() - pd.Timedelta(days=7),
                 month_end,
-                [
-                    "symbol", "trade_datetime", "trade_date", "position",
-                    "volume",
-                ],
+                ["symbol", "trade_datetime", "trade_date", "position", "volume"],
+                roots=tickers,
             )
-            raw = self._annotate_symbols(raw)
-            raw = self._assign_intraday_trade_dates(raw)
-            raw = raw.loc[
-                raw["root"].isin(tickers)
-                & raw["is_concrete"]
-            ].copy()
-            raw = raw.loc[
-                raw["trade_date"].between(
-                    month_start.normalize(), month_end.normalize()
+            raw = self._annotate_symbols_polars(raw)
+            raw = self._assign_intraday_trade_dates_polars(raw)
+            raw = raw.filter(
+                pl.col("root").is_in(tickers)
+                & pl.col("is_concrete")
+                & pl.col("trade_date").is_between(
+                    month_start.normalize().date(),
+                    month_end.normalize().date(),
+                    closed="both",
                 )
-            ]
-            raw = self._deduplicate(
+            )
+            raw = self._deduplicate_polars(
                 raw, ["trade_datetime", "root", "symbol"]
             )
-            if raw.empty:
+            if raw.is_empty():
                 continue
-            raw["position"] = pd.to_numeric(
-                raw["position"], errors="coerce"
-            ).clip(lower=0.0)
-            raw["volume"] = pd.to_numeric(
-                raw["volume"], errors="coerce"
-            ).clip(lower=0.0)
+            raw = raw.with_columns(
+                pl.col("position").cast(pl.Float64, strict=False).fill_nan(None)
+                .clip(0.0, None),
+                pl.col("volume").cast(pl.Float64, strict=False).fill_nan(None)
+                .clip(0.0, None),
+            )
 
-            daily = self._read_partitions(
+            daily = self._read_partitions_polars(
                 "daily",
                 month_start.normalize() - pd.Timedelta(days=15),
                 month_end.normalize(),
                 ["symbol", "trade_date", "position", "sequence"],
+                roots=tickers,
             )
-            daily = self._annotate_symbols(daily)
-            daily = daily.loc[
-                daily["root"].isin(tickers)
-                & daily["is_concrete"]
-            ].copy()
-            daily = self._deduplicate(
-                daily, ["trade_date", "root", "symbol"]
+            daily = self._annotate_symbols_polars(daily)
+            daily = self._deduplicate_polars(
+                daily.filter(
+                    pl.col("root").is_in(tickers) & pl.col("is_concrete")
+                ),
+                ["trade_date", "root", "symbol"],
+            ).with_columns(
+                pl.col("position").cast(pl.Float64, strict=False).fill_nan(None)
+                .clip(0.0, None)
             )
-            daily["position"] = pd.to_numeric(
-                daily["position"], errors="coerce"
-            ).clip(lower=0.0)
-            aggregate = self._aggregate_intraday_states(raw, daily)
-            if not aggregate.empty:
-                if resample_rule:
-                    aggregate = self._resample_curve_long(
-                        aggregate, resample_rule
-                    )
-                self._write_curve_month_cache(
-                    aggregate,
-                    frequency,
-                    period,
-                    tickers,
-                    source_fingerprint,
+            aggregate = self._aggregate_intraday_states_polars(raw, daily)
+            if aggregate.is_empty():
+                continue
+            if resample_rule:
+                aggregate = self._resample_curve_long_polars(
+                    aggregate, resample_rule
                 )
-                frames.append(aggregate)
+            self._write_curve_month_cache(
+                aggregate,
+                frequency,
+                period,
+                tickers,
+                source_fingerprint,
+            )
+            frames.append(aggregate)
         if not frames:
-            return pd.DataFrame()
-        result = pd.concat(frames, ignore_index=True)
-        result = self._deduplicate(result, ["trade_datetime", "root"])
-        dated = self._assign_intraday_trade_dates(
-            result[["trade_datetime"]].copy()
+            return pl.DataFrame()
+        result = self._deduplicate_polars(
+            pl.concat(frames, how="vertical_relaxed"),
+            ["trade_datetime", "root"],
+        ).with_columns(pl.col("trade_datetime").cast(pl.Datetime("ns")))
+        dated = self._assign_intraday_trade_dates_polars(
+            result.select("trade_datetime")
         )
-        start_date = pd.Timestamp(start).normalize()
-        end_date = pd.Timestamp(end).normalize()
-        result = result.loc[
-            dated["trade_date"].between(start_date, end_date).to_numpy()
-        ]
-        return result.sort_values(["trade_datetime", "root"]).reset_index(drop=True)
+        result = result.with_columns(dated["trade_date"]).filter(
+            pl.col("trade_date").is_between(
+                pd.Timestamp(start).normalize().date(),
+                pd.Timestamp(end).normalize().date(),
+                closed="both",
+            )
+        ).drop("trade_date")
+        return result.sort(["trade_datetime", "root"])
+
+    @staticmethod
+    def _polars_long_panels(
+        frame: pl.DataFrame,
+        fields: Iterable[str],
+        tickers: tuple[str, ...],
+    ) -> Dict[str, pd.DataFrame]:
+        panels = {}
+        for field in fields:
+            if field not in frame.columns:
+                continue
+            wide = frame.select("trade_datetime", "root", field).pivot(
+                on="root",
+                index="trade_datetime",
+                values=field,
+                aggregate_function="last",
+            ).sort("trade_datetime")
+            missing = [root for root in tickers if root not in wide.columns]
+            if missing:
+                wide = wide.with_columns(
+                    *(pl.lit(None).cast(pl.Float64).alias(root) for root in missing)
+                )
+            panel = wide.select("trade_datetime", *tickers).to_pandas().set_index(
+                "trade_datetime"
+            )
+            panel.index = pd.DatetimeIndex(panel.index)
+            panel.columns.name = "root"
+            panels[field] = panel
+        return panels
 
     def _build_panels(
         self,
@@ -1320,32 +1474,27 @@ class ParquetFuturesSource(DataSource):
         curve_fields = tuple(field for field in fields if field in _CURVE_FIELDS)
         panels: Dict[str, pd.DataFrame] = {}
         if available_fields:
-            long = self._selected_long(
+            long = self._selected_long_polars(
                 tickers, start, end, frequency, available_fields
             )
-            for field in available_fields:
-                if field not in long:
-                    continue
-                panel = long.pivot(
-                    index="trade_datetime", columns="root", values=field
-                )
-                panel.index = pd.DatetimeIndex(panel.index)
-                panels[field] = panel.sort_index().reindex(columns=tickers)
+            panels.update(self._polars_long_panels(
+                long, available_fields, tickers
+            ))
         if curve_fields:
             if frequency == "daily":
-                curve_long = self._daily_curve_long(tickers, start, end)
+                curve_long_polars = self._daily_curve_long_polars(
+                    tickers, start, end
+                )
+                panels.update(self._polars_long_panels(
+                    curve_long_polars, curve_fields, tickers
+                ))
             else:
-                curve_long = self._intraday_curve_long(
+                curve_long_polars = self._intraday_curve_long_polars(
                     tickers, start, end, frequency
                 )
-            for field in curve_fields:
-                if field not in curve_long:
-                    continue
-                panel = curve_long.pivot(
-                    index="trade_datetime", columns="root", values=field
-                )
-                panel.index = pd.DatetimeIndex(panel.index)
-                panels[field] = panel.sort_index().reindex(columns=tickers)
+                panels.update(self._polars_long_panels(
+                    curve_long_polars, curve_fields, tickers
+                ))
         if "oi_change" in fields and "oi" in panels:
             panels["oi_change"] = panels["oi"].diff()
         return panels
@@ -1364,37 +1513,30 @@ class ParquetFuturesSource(DataSource):
     def fetch_contract_schedule(self, tickers, start, end) -> pd.DataFrame:
         """Return the concrete contract effective for each root/trading day."""
         roots = self._normalise_tickers(tickers)
-        plan = self._continuous_plan(roots, start, end)
-        if plan.empty:
+        plan = self._continuous_plan_polars(roots, start, end)
+        if plan.is_empty():
             return pd.DataFrame(columns=roots, dtype=object)
         schedule = plan.pivot(
-            index="trade_date", columns="root", values="contract"
-        )
-        schedule.index = pd.DatetimeIndex(schedule.index)
+            on="root", index="trade_date", values="contract"
+        ).select("trade_date", *roots).to_pandas().set_index("trade_date")
+        schedule.index = pd.DatetimeIndex(schedule.index).rename("trade_date")
+        schedule.columns.name = "root"
         return schedule.sort_index().reindex(columns=roots)
 
-    def fetch_contract_curve_at_frequency(
+    def _contract_curve_polars(
         self,
         tickers,
         start,
         end,
         fields: List[str],
         frequency: str = "daily",
-    ) -> pd.DataFrame:
-        """Return exact concrete-contract rows for curve-based factors.
-
-        Unlike :meth:`fetch_price_at_frequency`, this method does not select a
-        dominant contract or adjust prices.  It centralizes partition checks,
-        alias canonicalization, exact root parsing, economic epochs, exchange
-        trading dates and duplicate handling for factors that genuinely need
-        more than one listed contract.
-        """
+    ) -> pl.DataFrame:
         frequency = _normalise_frequency(frequency)
         roots = self._normalise_tickers(tickers)
         start_ts = pd.Timestamp(start)
         end_ts = pd.Timestamp(end)
         if not roots or start_ts > end_ts:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
         field_map = {
             "open": "open",
@@ -1422,25 +1564,26 @@ class ParquetFuturesSource(DataSource):
             "symbol", "trade_datetime", "trade_date", "sequence",
             *(field_map[field] for field in requested),
         ]
-        raw = self._read_partitions(
+        raw = self._read_partitions_polars(
             native_frequency, read_start, end_ts, raw_columns, roots=roots
         )
-        raw = self._annotate_symbols(raw)
-        if raw.empty:
-            return pd.DataFrame()
+        raw = self._annotate_symbols_polars(raw)
+        if raw.is_empty():
+            return pl.DataFrame()
         if native_frequency != "daily":
-            raw = self._assign_intraday_trade_dates(raw)
-        raw = raw.loc[
-            raw["root"].isin(roots)
-            & raw["is_concrete"]
-            & raw["trade_date"].between(
-                start_ts.normalize(), end_ts.normalize()
+            raw = self._assign_intraday_trade_dates_polars(raw)
+        raw = raw.filter(
+            pl.col("root").is_in(roots)
+            & pl.col("is_concrete")
+            & pl.col("trade_date").is_between(
+                start_ts.normalize().date(), end_ts.normalize().date(),
+                closed="both",
             )
-        ].copy()
-        if raw.empty:
-            return pd.DataFrame()
+        )
+        if raw.is_empty():
+            return pl.DataFrame()
 
-        raw = self._deduplicate(
+        raw = self._deduplicate_polars(
             raw, ["trade_datetime", "root", "symbol"]
         )
         rename = {
@@ -1448,33 +1591,49 @@ class ParquetFuturesSource(DataSource):
             for requested_field, source_field in field_map.items()
             if requested_field in requested and source_field != requested_field
         }
-        raw = raw.rename(columns=rename)
+        raw = raw.rename(rename)
         keep = [
             "trade_datetime", "trade_date", "root", "symbol",
             *requested,
         ]
-        raw = raw.loc[:, list(dict.fromkeys(keep))]
+        raw = raw.select(list(dict.fromkeys(keep)))
 
         if resample_rule and native_frequency != "daily":
-            raw["_bar_time"] = pd.to_datetime(
-                raw["trade_datetime"]
-            ).dt.floor(resample_rule)
-            aggregations = {
-                field: _BAR_AGGREGATIONS[field] for field in requested
-            }
-            raw = (
-                raw.sort_values("_bar_time")
-                .groupby(
-                    ["_bar_time", "trade_date", "root", "symbol"],
-                    sort=True,
-                    as_index=False,
-                )
-                .agg(aggregations)
-                .rename(columns={"_bar_time": "trade_datetime"})
-            )
-        return raw.sort_values(
-            ["trade_datetime", "root", "symbol"]
-        ).reset_index(drop=True)
+            raw = raw.with_columns(
+                pl.col("trade_datetime")
+                .dt.truncate(resample_rule.replace("min", "m"))
+                .alias("_bar_time")
+            ).sort("_bar_time")
+            aggregations = []
+            for field in requested:
+                method = _BAR_AGGREGATIONS[field]
+                values = pl.col(field).drop_nulls()
+                expression = {
+                    "first": values.first(),
+                    "last": values.last(),
+                    "max": pl.col(field).max(),
+                    "min": pl.col(field).min(),
+                    "sum": pl.col(field).sum(),
+                }[method]
+                aggregations.append(expression.alias(field))
+            raw = raw.group_by(
+                ["_bar_time", "trade_date", "root", "symbol"],
+                maintain_order=True,
+            ).agg(aggregations).rename({"_bar_time": "trade_datetime"})
+        return raw.sort(["trade_datetime", "root", "symbol"])
+
+    def fetch_contract_curve_at_frequency(
+        self,
+        tickers,
+        start,
+        end,
+        fields: List[str],
+        frequency: str = "daily",
+    ) -> pd.DataFrame:
+        """Return exact, unadjusted concrete-contract rows."""
+        return self._contract_curve_polars(
+            tickers, start, end, fields, frequency
+        ).to_pandas()
 
     def fetch_contract_pair_prices(
         self, tickers, start, end, field: str = "close"
@@ -1483,7 +1642,7 @@ class ParquetFuturesSource(DataSource):
         roots = self._normalise_tickers(tickers)
         if field not in {"open", "high", "low", "close", "settle"}:
             raise ValueError(f"unsupported contract-pair field: {field!r}")
-        curve = self.fetch_contract_curve_at_frequency(
+        curve = self._contract_curve_polars(
             roots,
             start,
             end,
@@ -1492,35 +1651,45 @@ class ParquetFuturesSource(DataSource):
         )
         calendar = self.fetch_calendar(start, end)
         empty = pd.DataFrame(index=calendar, columns=roots, dtype=float)
-        if curve.empty:
+        if curve.is_empty():
             return {"near": empty.copy(), "far": empty.copy()}
 
-        value = pd.to_numeric(curve[field], errors="coerce")
-        position = pd.to_numeric(curve["position"], errors="coerce")
-        curve = curve.loc[
-            value.gt(0.0) & np.isfinite(value) & position.gt(0.0)
-        ].copy()
-        if curve.empty:
+        curve = curve.with_columns(
+            pl.col(field).cast(pl.Float64, strict=False),
+            pl.col("position").cast(pl.Float64, strict=False),
+        ).filter(
+            pl.col(field).is_finite()
+            & (pl.col(field) > 0.0)
+            & (pl.col("position") > 0.0)
+        )
+        if curve.is_empty():
             return {"near": empty.copy(), "far": empty.copy()}
-        parts = contract_symbol_parts(curve["symbol"])
-        curve["delivery_year"] = parts["delivery_year"].to_numpy()
-        curve["delivery_month"] = parts["delivery_month"].to_numpy()
-        curve = curve.dropna(subset=["delivery_year", "delivery_month"])
-        curve = curve.sort_values([
+        parts = contract_symbol_parts_polars(curve["symbol"])
+        curve = curve.with_columns(
+            parts["delivery_year"], parts["delivery_month"]
+        ).drop_nulls(["delivery_year", "delivery_month"]).sort([
             "trade_date", "root", "delivery_year", "delivery_month", "symbol"
-        ])
-        curve["_maturity_rank"] = (
-            curve.groupby(["trade_date", "root"]).cumcount() + 1
+        ]).with_columns(
+            pl.int_range(1, pl.len() + 1)
+            .over(["trade_date", "root"])
+            .alias("_maturity_rank")
         )
 
         result = {}
         for label, rank in (("near", 1), ("far", 2)):
-            selected = curve.loc[curve["_maturity_rank"].eq(rank)]
-            panel = selected.pivot(
-                index="trade_date", columns="root", values=field
+            selected = curve.filter(
+                pl.col("_maturity_rank") == rank
+            ).select(
+                pl.col("trade_date").cast(pl.Datetime("ns")).alias(
+                    "trade_datetime"
+                ),
+                "root",
+                field,
             )
-            panel.index = pd.DatetimeIndex(panel.index)
-            result[label] = panel.reindex(index=calendar, columns=roots)
+            panels = self._polars_long_panels(selected, [field], roots)
+            result[label] = panels.get(field, empty).reindex(
+                index=calendar, columns=roots
+            )
         return result
 
     def fetch_price_at_frequency(
@@ -1610,12 +1779,12 @@ class ParquetFuturesSource(DataSource):
 
     def fetch_index_constituents(self, index_code: str, date) -> pd.Index:
         timestamp = pd.Timestamp(date)
-        frame = self._read_partitions(
+        frame = self._read_partitions_polars(
             "daily", timestamp - pd.Timedelta(days=45), timestamp,
             ["symbol", "trade_date"],
         )
-        frame = self._annotate_symbols(frame)
-        roots = sorted(frame.loc[frame["is_concrete"], "root"].unique())
+        frame = self._annotate_symbols_polars(frame)
+        roots = frame.filter(pl.col("is_concrete"))["root"].unique().sort().to_list()
         return pd.Index(roots)
 
     def fetch_listing_dates(self, tickers) -> pd.Series:
@@ -1635,16 +1804,25 @@ class ParquetFuturesSource(DataSource):
                 "daily parquet shards lack listing-date columns: "
                 + ", ".join(missing[:5])
             )
-        frame = self._annotate_symbols(pd.concat([
-            pd.read_parquet(path, columns=["symbol", "trade_date"])
-            .groupby("symbol", as_index=False)["trade_date"].min()
+        frame = pl.concat([
+            pl.read_parquet(path, columns=["symbol", "trade_date"])
+            .group_by("symbol").agg(pl.col("trade_date").min())
             for path in files
-        ], ignore_index=True))
-        listing = (
-            frame.loc[frame["is_concrete"] & frame["root"].isin(roots)]
-            .groupby("root")["trade_date"].min()
+        ], how="vertical_relaxed")
+        listing = self._annotate_symbols_polars(frame).filter(
+            pl.col("is_concrete") & pl.col("root").is_in(roots)
+        ).group_by("root").agg(pl.col("trade_date").min())
+        aligned = pl.DataFrame({"root": list(roots)}).join(
+            listing, on="root", how="left"
         )
-        return pd.to_datetime(listing.reindex(roots)).astype("datetime64[ns]")
+        result = pd.Series(
+            pd.to_datetime(aligned["trade_date"].to_list()),
+            index=list(roots),
+            name="trade_date",
+            dtype="datetime64[ns]",
+        )
+        result.index.name = "root"
+        return result
 
     def fetch_latest_trade_date(self) -> pd.Timestamp:
         """Return the newest published daily trade date from physical shards."""
@@ -1673,17 +1851,18 @@ class ParquetFuturesSource(DataSource):
                 "latest daily parquet shards lack trade_date: "
                 + ", ".join(missing[:5])
             )
-        latest = max(
-            pd.to_datetime(
-                pd.read_parquet(path, columns=["trade_date"])["trade_date"],
-                errors="coerce",
-            ).max()
+        latest_values = [
+            pl.read_parquet(path, columns=["trade_date"])
+            .select(pl.col("trade_date").cast(pl.Date).max())
+            .item()
             for path in files
-        )
-        if pd.isna(latest):
+        ]
+        latest_values = [value for value in latest_values if value is not None]
+        if not latest_values:
             raise RuntimeError(
                 f"latest daily parquet shards contain no valid trade_date: {directory}"
             )
+        latest = max(latest_values)
         return pd.Timestamp(latest).normalize()
 
     def fetch_calendar(self, start, end) -> pd.DatetimeIndex:
@@ -1699,15 +1878,17 @@ class ParquetFuturesSource(DataSource):
         )
         if key in self._CALENDAR_CACHE:
             return self._CALENDAR_CACHE[key]
-        frame = self._read_partitions(
+        frame = self._read_partitions_polars(
             "daily", start_ts, end_ts, ["symbol", "trade_date"]
         )
-        frame = self._annotate_symbols(frame)
-        if frame.empty:
+        frame = self._annotate_symbols_polars(frame)
+        if frame.is_empty():
             res = pd.DatetimeIndex([])
         else:
-            dates = frame.loc[frame["is_concrete"], "trade_date"].dropna().unique()
-            res = pd.DatetimeIndex(sorted(dates))
+            dates = frame.filter(pl.col("is_concrete")).select(
+                pl.col("trade_date").drop_nulls().unique().sort()
+            )["trade_date"]
+            res = pd.DatetimeIndex(dates.to_numpy().astype("datetime64[ns]"))
         # LRU: 最多缓存 32 个日历 (回测窗口固定, 命中率高)
         if len(self._CALENDAR_CACHE) >= 32:
             self._CALENDAR_CACHE.pop(next(iter(self._CALENDAR_CACHE)))

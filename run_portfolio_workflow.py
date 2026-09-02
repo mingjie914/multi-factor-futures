@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import runpy
+import shutil
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -501,6 +503,41 @@ def _effective_factor_directions(config, factors: list[str]) -> dict[str, int]:
     return {name: directions[name] for name in factors}
 
 
+def _build_shared_production_panel(
+    specs, *, ic_horizon: int = 1, checkpoint_dir: Path | None = None
+):
+    """Compute the union factor panel once for one peer-comparison run."""
+    from research.portfolio_experiment_support import (
+        FactorPanelRunner,
+        latest_local_date,
+    )
+
+    factors = list(dict.fromkeys(
+        str(name)
+        for _strategy, _config_path, config in specs
+        for name in config.factors
+    ))
+    if not factors:
+        raise ValueError("production comparison has no factors")
+    latest = pd.Timestamp(latest_local_date()).normalize()
+    configured_ends = [
+        latest
+        if str(config.date_range.end) == "latest_available"
+        else min(pd.Timestamp(config.date_range.end).normalize(), latest)
+        for _strategy, _config_path, config in specs
+    ]
+    return FactorPanelRunner(
+        factors,
+        start=(
+            pd.Timestamp(COMPARISON_START)
+            - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS)
+        ),
+        end=max(configured_ends),
+        ic_horizon=int(ic_horizon),
+        checkpoint_dir=checkpoint_dir,
+    )
+
+
 def _run_production_portfolio(
     config,
     strategy_dir: Path,
@@ -570,13 +607,23 @@ def _run_production_portfolio(
         getattr(panel_runner_override, "ic_horizon", 1)
     ) != ic_horizon:
         raise ValueError("shared panel IC horizon does not match the requested route")
-    panel_runner = panel_runner_override or FactorPanelRunner(
-        factors,
-        start=panel_start,
-        end=end,
-        factor_directions=factor_directions,
-        ic_horizon=ic_horizon,
-    )
+    if panel_runner_override is None:
+        panel_runner = FactorPanelRunner(
+            factors,
+            start=panel_start,
+            end=end,
+            factor_directions=factor_directions,
+            ic_horizon=ic_horizon,
+        )
+    else:
+        # Load the concrete-contract schedule once on the shared owner before
+        # creating a shallow strategy view. Factor values are never recomputed;
+        # directions and IC remain strategy-specific.
+        panel_runner_override.get_contract_schedule()
+        panel_runner = panel_runner_override.for_factors(
+            factors,
+            factor_directions=factor_directions,
+        )
     panel_runner.get_contract_schedule()
     panel_runner.env = CausalEligibilityEnvironment(
         panel_runner.cal,
@@ -614,6 +661,12 @@ def _run_production_portfolio(
             name="cost",
         ),
     )
+    shared_panel_meta = {
+        "shared": panel_runner_override is not None,
+        "computed_factor_count": len(
+            getattr(panel_runner_override, "raw_ranks", {})
+        ) if panel_runner_override is not None else len(factors),
+    }
     result.save(strategy_dir, metadata={
         "route": route,
         "strategy": strategy_id,
@@ -624,6 +677,7 @@ def _run_production_portfolio(
         "observation_end": end.date().isoformat(),
         "recipe": recipe.to_dict(),
         "ic_horizon": ic_horizon,
+        "factor_panel": shared_panel_meta,
         "production_config_path": str(_resolve("config/default.yaml")),
         "production_config_sha256": hashlib.sha256(
             _resolve("config/default.yaml").read_bytes()
@@ -640,6 +694,7 @@ def _run_production_portfolio(
             "factor_direction_source": direction_source,
             "recipe": recipe.to_dict(),
             "ic_horizon": ic_horizon,
+            "factor_panel": shared_panel_meta,
             "production_config_path": str(_resolve("config/default.yaml")),
             "production_config_sha256": hashlib.sha256(
                 _resolve("config/default.yaml").read_bytes()
@@ -655,6 +710,7 @@ def _run_production_portfolio(
         "factor_direction_source": direction_source,
         "recipe": recipe.to_dict(),
         "ic_horizon": ic_horizon,
+        "factor_panel": shared_panel_meta,
         "production_config_path": str(_resolve("config/default.yaml")),
         "production_config_sha256": hashlib.sha256(
             _resolve("config/default.yaml").read_bytes()
@@ -753,25 +809,75 @@ def _write_segment_report(
 
 
 def run_and_compare() -> Path:
+    run_started = time.perf_counter()
     catalog_path, catalog, specs = _validated_specs()
     run_id = RUN_ID or datetime.now().strftime("%Y%m%d_%H%M%S")
     output = _resolve(catalog.output_root) / run_id
-    output.mkdir(parents=True, exist_ok=False)
+    production_method_compare = WORKFLOW in {
+        PortfolioWorkflow.RUN_AND_COMPARE,
+        PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
+        PortfolioWorkflow.RUN_AND_COMPARE_ALL,
+    }
+    checkpoint_dir = output / ".factor_panel_checkpoint"
+    if output.exists():
+        contract_path = output / "run_contract.json"
+        completed = False
+        if contract_path.is_file():
+            try:
+                completed = json.loads(
+                    contract_path.read_text(encoding="utf-8")
+                ).get("status") == "complete"
+            except (json.JSONDecodeError, OSError):
+                pass
+        resumable = (
+            RUN_ID is not None
+            and production_method_compare
+            and checkpoint_dir.is_dir()
+            and not completed
+        )
+        if not resumable:
+            raise FileExistsError(output)
+    else:
+        output.mkdir(parents=True)
+    if production_method_compare:
+        checkpoint_dir.mkdir(exist_ok=True)
     rows, navs, configs = [], {}, {}
     failures: list[dict] = []
     strategy_results: list[tuple[object, object, object]] = []
     cutoffs: set[pd.Timestamp] = set()
+    panel_started = time.perf_counter()
+    shared_panel_runner = None
+    if production_method_compare:
+        shared_panel_runner = _build_shared_production_panel(
+            specs, checkpoint_dir=checkpoint_dir
+        )
+    performance = {
+        "schema_version": 1,
+        "shared_factor_panel_seconds": (
+            time.perf_counter() - panel_started
+            if shared_panel_runner is not None else 0.0
+        ),
+        "shared_factor_panel": (
+            {
+                "factor_count": len(shared_panel_runner.raw_ranks),
+                "checkpoint_loaded_factor_count": int(
+                    shared_panel_runner.checkpoint_loaded_factor_count
+                ),
+                "computed_factor_count": int(
+                    shared_panel_runner.computed_factor_count
+                ),
+            }
+            if shared_panel_runner is not None else None
+        ),
+        "strategies": [],
+    }
 
     for strategy, config_path, config in specs:
+        strategy_started = time.perf_counter()
         name, mode = strategy.id, strategy.mode
         strategy_dir = output / name
         config.backtest.report_dir = str(strategy_dir)
         cutoffs.add(research_cutoff(config))
-        production_method_compare = WORKFLOW in {
-            PortfolioWorkflow.RUN_AND_COMPARE,
-            PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
-            PortfolioWorkflow.RUN_AND_COMPARE_ALL,
-        }
         snapshot_definition = None
         try:
             snapshot_definition = (
@@ -803,6 +909,7 @@ def run_and_compare() -> Path:
                         }
                         if snapshot_definition is not None else None
                     ),
+                    panel_runner_override=shared_panel_runner,
                 )
                 runner = None
                 if catalog.plot:
@@ -886,6 +993,11 @@ def run_and_compare() -> Path:
                 "resolved": _config_dict(config),
                 "failure": failure,
             }
+            performance["strategies"].append({
+                "strategy": name,
+                "status": "failed",
+                "seconds": time.perf_counter() - strategy_started,
+            })
             continue
         strategy_results.append((strategy, combined, config))
         navs[name] = combined.nav / float(combined.nav.iloc[0])
@@ -917,6 +1029,11 @@ def run_and_compare() -> Path:
             ),
             "resolved": _config_dict(config),
         }
+        performance["strategies"].append({
+            "strategy": name,
+            "status": "complete",
+            "seconds": time.perf_counter() - strategy_started,
+        })
 
     comparison = pd.DataFrame(rows).set_index("strategy")
     comparison.to_csv(output / "comparison.csv", encoding="utf-8-sig")
@@ -924,17 +1041,28 @@ def run_and_compare() -> Path:
     nav_table.to_csv(output / "nav_comparison.csv")
     (output / "run_contract.json").write_text(json.dumps({
         "schema_version": 1,
+        "status": "finalizing",
         "run_id": run_id,
         "comparison_start": COMPARISON_START,
         "comparison_policy": {
             "construction_route": (
                 "default_production_portfolio"
-                if WORKFLOW in {
-                    PortfolioWorkflow.RUN_AND_COMPARE,
-                    PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
-                    PortfolioWorkflow.RUN_AND_COMPARE_ALL,
-                }
+                if production_method_compare
                 else "catalog_configured"
+            ),
+            "shared_factor_panel": (
+                {
+                    "enabled": True,
+                    "computed_factor_count": len(shared_panel_runner.raw_ranks),
+                    "checkpoint_loaded_factor_count": int(
+                        shared_panel_runner.checkpoint_loaded_factor_count
+                    ),
+                    "newly_computed_factor_count": int(
+                        shared_panel_runner.computed_factor_count
+                    ),
+                }
+                if shared_panel_runner is not None
+                else {"enabled": False}
             ),
             "legacy_route": "legacy_production_portfolio",
             "legacy_missing_exposure": "fillna_zero"
@@ -960,11 +1088,7 @@ def run_and_compare() -> Path:
         strategy_results,
         next(iter(cutoffs)),
         production_method_compare=(
-            WORKFLOW in {
-                PortfolioWorkflow.RUN_AND_COMPARE,
-                PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
-                PortfolioWorkflow.RUN_AND_COMPARE_ALL,
-            }
+            production_method_compare
         ),
         failures=failures,
     )
@@ -973,6 +1097,11 @@ def run_and_compare() -> Path:
             json.dumps(failures, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+    performance["total_seconds"] = time.perf_counter() - run_started
+    (output / "performance.json").write_text(
+        json.dumps(performance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     # Bind the durable comparison artifacts to the same immutable run
     # contract.  Missing optional plots are simply omitted; the CSV/Markdown
     # report hashes are always recorded when those files were produced.
@@ -985,16 +1114,20 @@ def run_and_compare() -> Path:
         "portfolio_report.md",
         "nav_comparison.png",
         "snapshot_failures.json",
+        "performance.json",
     )
     contract["artifacts"] = {
         name: {"sha256": hashlib.sha256((output / name).read_bytes()).hexdigest()}
         for name in artifact_names
         if (output / name).exists()
     }
+    contract["status"] = "complete"
     contract_path.write_text(
         json.dumps(contract, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    if checkpoint_dir.is_dir():
+        shutil.rmtree(checkpoint_dir)
     return output
 
 

@@ -7,6 +7,7 @@ import sys
 
 import duckdb
 import pandas as pd
+import polars as pl
 import pytest
 
 from core.config import load_config
@@ -110,15 +111,14 @@ def _fixture(tmp_path: Path, *, build: bool = True):
     return updater, root, table_root, database
 
 
-@pytest.mark.parametrize("result_backend", ["pandas", "polars", "shadow"])
 def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(
-    tmp_path, result_backend
+    tmp_path
 ):
     updater, root, table_root, database = _fixture(tmp_path)
     config = {"root_path": str(table_root), "eager_fields": False}
     parquet = ParquetFuturesSource(config)
     database_source = DuckDBFuturesSource(
-        {"path": str(database), "result_backend": result_backend}, config
+        {"path": str(database)}, config
     )
     try:
         for frequency in ("daily", "1min", "5min", "15min", "30min", "hourly"):
@@ -163,9 +163,71 @@ def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(
         con.close()
 
 
-def test_duckdb_result_backend_env_override(monkeypatch):
-    monkeypatch.setenv("MF_DUCKDB_RESULT_BACKEND", "polars")
-    assert load_config("config/default.yaml").data.duckdb.result_backend == "polars"
+def test_duckdb_exposes_a_native_polars_query_boundary(tmp_path):
+    _, _, table_root, database = _fixture(tmp_path)
+    source = DuckDBFuturesSource(
+        {"path": str(database)},
+        {"root_path": str(table_root), "eager_fields": False},
+    )
+    try:
+        frame = source._execute_polars(
+            "SELECT trade_date, symbol, close FROM market.bars_1d "
+            "ORDER BY trade_date, symbol"
+        )
+        assert isinstance(frame, pl.DataFrame)
+        assert frame.columns == ["trade_date", "symbol", "close"]
+        assert frame.height == 6
+
+        raw, requested, available = source._read_storage_partitions_polars(
+            "daily",
+            "2024-01-02",
+            "2024-01-04",
+            ["trade_date", "symbol", "close"],
+            ["A"],
+        )
+        assert isinstance(raw, pl.DataFrame)
+        assert requested == ["trade_date", "symbol", "close"]
+        assert set(requested) <= available
+        assert raw.schema["trade_date"] == pl.Date
+        assert raw["symbol"].to_list() == [
+            "A2401", "A2405", "A2401", "A2405", "A2401", "A2405"
+        ]
+        selected = source._read_selected_partitions_polars(
+            "daily",
+            "2024-01-02",
+            "2024-01-04",
+            ["trade_date", "symbol", "close"],
+            ("A",),
+            pl.DataFrame({
+                "trade_date": [date(2024, 1, 3)],
+                "root": ["A"],
+                "contract": ["A2401"],
+            }),
+        )
+        assert selected["symbol"].to_list() == ["A2401", "A2401", "A2401"]
+    finally:
+        source.close()
+
+
+def test_duckdb_price_pipeline_has_no_pandas_query_boundary(tmp_path):
+    _, _, table_root, database = _fixture(tmp_path)
+    source = DuckDBFuturesSource(
+        {"path": str(database)},
+        {"root_path": str(table_root), "eager_fields": False},
+    )
+    assert not hasattr(source, "_execute_df")
+    try:
+        panel = source.fetch_price_at_frequency(
+            ["A"],
+            "2024-01-02",
+            "2024-01-04",
+            ["open", "close", "volume"],
+            "5min",
+        )
+    finally:
+        source.close()
+
+    assert panel["close"].loc["2024-01-03 09:05", "A"] == 105.0
 
 
 def test_default_config_separates_research_cutoff_and_observation_end(monkeypatch):
@@ -180,7 +242,7 @@ def test_default_config_separates_research_cutoff_and_observation_end(monkeypatc
     assert config.date_range.end == "latest_available"
 
 
-def test_duckdb_research_fingerprint_covers_seat_release(tmp_path):
+def test_duckdb_market_cache_fingerprint_is_partition_scoped(tmp_path):
     _, _, table_root, database = _fixture(tmp_path)
     source = DuckDBFuturesSource(
         {"path": str(database)},
@@ -188,20 +250,33 @@ def test_duckdb_research_fingerprint_covers_seat_release(tmp_path):
     )
     try:
         before = source._files_fingerprint(Path(), [Path("1min/month")])
+        source.release_id = "later-daily-release"
+        source.market_component_id = "market-revision"
         source.seat_component_id = "seat-revision"
         after = source._files_fingerprint(Path(), [Path("1min/month")])
-        assert before != after
+        assert before == after
     finally:
         source.close()
 
 
-def test_duckdb_rejects_unknown_result_backend(tmp_path):
+def test_checkpoint_fingerprint_is_slice_based_not_release_id(tmp_path):
     _, _, table_root, database = _fixture(tmp_path)
-    with pytest.raises(ValueError, match="result_backend"):
-        DuckDBFuturesSource(
-            {"path": str(database), "result_backend": "unknown"},
-            {"root_path": str(table_root), "eager_fields": False},
+    source = DuckDBFuturesSource(
+        {"path": str(database)},
+        {"root_path": str(table_root), "eager_fields": False},
+    )
+    try:
+        before = source.checkpoint_source_fingerprint(
+            "2024-01-02", "2024-01-04"
         )
+        source.release_id = "later-daily-release"
+        after = source.checkpoint_source_fingerprint(
+            "2024-01-02", "2024-01-04"
+        )
+    finally:
+        source.close()
+
+    assert before == after
 
 
 def test_duckdb_month_update_is_exact_and_rolls_back_on_failure(tmp_path, monkeypatch):

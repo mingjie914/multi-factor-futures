@@ -6,6 +6,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import polars as pl
 
 
 _CZCE_EXCHANGES = {"CZC", "CZCE", "ZCE"}
@@ -57,6 +58,97 @@ def contract_symbol_parts(symbols: pd.Series) -> pd.DataFrame:
     )
 
 
+def contract_symbol_parts_polars(symbols: pl.Series) -> pl.DataFrame:
+    """Polars equivalent of :func:`contract_symbol_parts`."""
+    name = symbols.name or "symbol"
+    frame = pl.DataFrame({name: symbols}).with_columns(
+        pl.col(name).cast(pl.String).str.strip_chars().str.to_uppercase().alias("symbol")
+    )
+    root = pl.col("symbol").str.extract(r"^([A-Z]+)(\d+)$", 1)
+    suffix = pl.col("symbol").str.extract(r"^([A-Z]+)(\d+)$", 2)
+    concrete = suffix.str.contains(r"^\d{4}$")
+    year = suffix.str.slice(0, 2).cast(pl.Int32, strict=False) + 2000
+    month = suffix.str.slice(2, 2).cast(pl.Int32, strict=False)
+    valid = root.is_not_null() & concrete.fill_null(False) & month.is_between(1, 12)
+    return frame.select(
+        "symbol",
+        root.alias("root"),
+        suffix.alias("suffix"),
+        pl.when(valid).then(year).otherwise(None).alias("delivery_year"),
+        pl.when(valid).then(month).otherwise(None).alias("delivery_month"),
+        valid.alias("is_concrete"),
+    )
+
+
+def canonicalize_contract_aliases_polars(
+    frame: pl.DataFrame,
+    *,
+    key_columns: Iterable[str] | None = None,
+    market_fields: Iterable[str] = MARKET_FIELDS,
+) -> pl.DataFrame:
+    """Canonicalize aliases with the same fail-closed rules in Polars."""
+    if frame.is_empty() or "symbol" not in frame.columns:
+        return frame
+    missing = sorted({"exchange", "trade_date"} - set(frame.columns))
+    if missing:
+        raise ValueError(f"contract canonicalization requires columns: {missing}")
+
+    result = frame.with_columns(
+        pl.col("symbol").cast(pl.String).str.strip_chars().str.to_uppercase(),
+        pl.col("exchange").cast(pl.String).str.strip_chars().str.to_uppercase(),
+        pl.col("trade_date").cast(pl.Date),
+    ).with_columns(
+        pl.col("symbol").alias("__original_symbol"),
+        pl.col("symbol").str.extract(r"^([A-Z]+)(\d)(\d{2})$", 1).alias("__root3"),
+        pl.col("symbol").str.extract(r"^([A-Z]+)(\d)(\d{2})$", 2).alias("__year_digit"),
+        pl.col("symbol").str.extract(r"^([A-Z]+)(\d)(\d{2})$", 3).alias("__month2"),
+    )
+    czce = pl.col("exchange").is_in(list(_CZCE_EXCHANGES)) & pl.col("__root3").is_not_null()
+    month = pl.col("__month2").cast(pl.Int32, strict=False)
+    invalid = result.filter(czce & ~month.is_between(1, 12))
+    if invalid.height:
+        sample = invalid["symbol"].unique(maintain_order=True).head(5).to_list()
+        raise ValueError(f"invalid CZCE contract month: {sample}")
+    trade_year = pl.col("trade_date").dt.year()
+    year_digit = pl.col("__year_digit").cast(pl.Int32, strict=False)
+    delivery_year = (trade_year // 10) * 10 + year_digit
+    delivery_year = pl.when(delivery_year < trade_year).then(
+        delivery_year + 10
+    ).otherwise(delivery_year)
+    canonical = pl.concat_str(
+        pl.col("__root3"),
+        (delivery_year % 100).cast(pl.String).str.pad_start(2, "0"),
+        month.cast(pl.String).str.pad_start(2, "0"),
+    )
+    result = result.with_columns(
+        pl.when(czce).then(canonical).otherwise(pl.col("symbol")).alias("symbol")
+    )
+
+    if key_columns is None:
+        time_column = "trade_datetime" if "trade_datetime" in result.columns else "trade_date"
+        keys = ["exchange", "symbol", time_column]
+    else:
+        keys = list(key_columns)
+    missing_keys = [column for column in keys if column not in result.columns]
+    if missing_keys:
+        raise ValueError(f"contract alias keys missing: {missing_keys}")
+    fields = [column for column in market_fields if column in result.columns]
+    aggregates = [pl.len().alias("__rows")]
+    aggregates.extend(pl.col(field).n_unique().alias(f"__n_{field}") for field in fields)
+    groups = result.group_by(keys, maintain_order=True).agg(aggregates)
+    conflict_expr = pl.any_horizontal(
+        [pl.col(f"__n_{field}") > 1 for field in fields]
+    ) if fields else pl.lit(False)
+    conflicts = groups.filter((pl.col("__rows") > 1) & conflict_expr)
+    if conflicts.height:
+        raise ContractAliasConflictError(
+            "conflicting contract aliases after CZCE canonicalization: "
+            f"groups={conflicts.height}, samples={conflicts.select(keys).head(5).to_dicts()}"
+        )
+    return (
+        result.unique(subset=keys, keep="last", maintain_order=True)
+        .drop("__original_symbol", "__root3", "__year_digit", "__month2")
+    )
 def _canonical_symbols(frame: pd.DataFrame) -> pd.Series:
     symbols = frame["symbol"].astype(str).str.strip().str.upper()
     exchanges = frame["exchange"].astype(str).str.strip().str.upper()
@@ -157,5 +249,7 @@ __all__ = [
     "ContractAliasConflictError",
     "MARKET_FIELDS",
     "canonicalize_contract_aliases",
+    "canonicalize_contract_aliases_polars",
     "contract_symbol_parts",
+    "contract_symbol_parts_polars",
 ]

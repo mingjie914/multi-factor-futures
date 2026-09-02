@@ -10,6 +10,7 @@ from typing import Iterable, Optional
 
 import duckdb
 import pandas as pd
+import polars as pl
 
 from core.registry import register
 from data.parquet_source import MissingParquetPartitionError, ParquetFuturesSource
@@ -50,11 +51,6 @@ class DuckDBFuturesSource(ParquetFuturesSource):
     ) -> None:
         super().__init__(parquet_config=parquet_config, _validate_storage=False)
         config = dict(duckdb_config or {})
-        self.result_backend = str(config.get("result_backend", "pandas")).strip()
-        if self.result_backend not in {"pandas", "polars", "shadow"}:
-            raise ValueError(
-                "duckdb.result_backend must be pandas, polars, or shadow"
-            )
         path_text = str(config.get("path", "")).strip()
         if not path_text:
             raise ValueError("duckdb.path is required")
@@ -94,28 +90,12 @@ class DuckDBFuturesSource(ParquetFuturesSource):
                 self._db.close()
                 self._db = None
 
-    def _execute_df(self, sql: str, params=None) -> pd.DataFrame:
+    def _execute_polars(self, sql: str, params=None) -> pl.DataFrame:
+        """Execute one query and preserve DuckDB's native Polars result."""
         with self._db_lock:
             if self._db is None:
                 raise RuntimeError("DuckDB source is closed")
-            parameters = params or []
-            if self.result_backend == "pandas":
-                return self._db.execute(sql, parameters).fetchdf()
-            candidate = self._db.execute(sql, parameters).pl().to_pandas(
-                use_pyarrow_extension_array=False
-            )
-            if self.result_backend == "polars":
-                return candidate
-            reference = self._db.execute(sql, parameters).fetchdf()
-            pd.testing.assert_frame_equal(
-                reference,
-                candidate,
-                check_dtype=False,
-                check_index_type=False,
-                check_column_type=False,
-                check_freq=False,
-            )
-            return reference
+            return self._db.execute(sql, params or []).pl()
 
     def _partition_rows(self, native_frequency: str) -> list[tuple[str, str]]:
         dataset, _ = _MARKET_TABLES[native_frequency]
@@ -158,9 +138,7 @@ class DuckDBFuturesSource(ParquetFuturesSource):
 
     def _files_fingerprint(self, _root_path: Path, files: Iterable[Path]) -> str:
         return _fingerprint({
-            "release_id": self.release_id,
-            "market_component_id": self.market_component_id,
-            "seat_component_id": self.seat_component_id,
+            "schema_version": _SCHEMA_VERSION,
             "partitions": sorted(str(path) for path in files),
         })
 
@@ -176,6 +154,32 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             end.normalize() + pd.Timedelta(days=7),
         ))
         return self._files_fingerprint(self.root_path, files)
+
+    def checkpoint_source_fingerprint(self, start, end) -> str:
+        """Fingerprint relevant partitions without coupling to the latest release."""
+        first = str(
+            (pd.Timestamp(start).normalize() - pd.Timedelta(
+                days=self.schedule_buffer_days
+            )).to_period("M")
+        )
+        last = str(
+            (pd.Timestamp(end).normalize() + pd.Timedelta(days=7)).to_period("M")
+        )
+        with self._db_lock:
+            if self._db is None:
+                raise RuntimeError("DuckDB source is closed")
+            rows = self._db.execute(
+                "SELECT component, dataset, year_month, source_files_sha256 "
+                "FROM meta.partitions WHERE year_month >= ? AND year_month <= ? "
+                "ORDER BY component, dataset, year_month",
+                [first, last],
+            ).fetchall()
+        return _fingerprint({
+            "schema_version": _SCHEMA_VERSION,
+            "first_month": first,
+            "last_month": last,
+            "partitions": rows,
+        })
 
     def _curve_cache_source_fingerprint(
         self,
@@ -236,14 +240,15 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         units = {variants[value] for value in hashes}
         return "ns" if "ns" in units else "us"
 
-    def _read_storage_partitions(
+    def _storage_query(
         self,
         native_frequency: str,
         start,
         end,
         columns: Iterable[str],
         roots: Iterable[str] | None = None,
-    ) -> tuple[pd.DataFrame, list[str], set[str]]:
+    ) -> tuple[str | None, list, list[str], list[str], set[str], dict, list[tuple]]:
+        """Build the one filtered storage query shared by both frame backends."""
         self._month_files(native_frequency, start, end)
         _, table = _MARKET_TABLES[native_frequency]
         with self._db_lock:
@@ -255,7 +260,7 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         requested_columns = list(dict.fromkeys(columns))
         requested = [column for column in requested_columns if column in available]
         if not requested:
-            return pd.DataFrame(), [], available
+            return None, [], [], [], available, types, described
         selected = list(requested)
         if "symbol" in selected:
             for column in ("exchange", "trade_date", "trade_datetime"):
@@ -282,16 +287,101 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             params.extend(f"^{re.escape(root)}[0-9]+$" for root in normalised_roots)
         if order:
             sql += " ORDER BY " + ", ".join(f'"{column}"' for column in order)
-        frame = self._execute_df(sql, params)
+        return sql, params, requested, selected, available, types, described
+
+    def _read_storage_partitions_polars(
+        self,
+        native_frequency: str,
+        start,
+        end,
+        columns: Iterable[str],
+        roots: Iterable[str] | None = None,
+    ) -> tuple[pl.DataFrame, list[str], set[str]]:
+        """Read one filtered raw market slice without crossing into pandas."""
+        sql, params, requested, selected, available, types, described = (
+            self._storage_query(
+                native_frequency, start, end, columns, roots
+            )
+        )
+        if sql is None:
+            return pl.DataFrame(), requested, available
+        frame = self._execute_polars(sql, params)
         timestamp_unit = self._timestamp_unit(
             native_frequency, start, end, described
         )
+        casts = []
         for column in selected:
-            if types[column] == "DATE" and column in frame:
-                frame[column] = frame[column].astype("datetime64[s]")
-            elif types[column].startswith("TIMESTAMP") and column in frame:
-                frame[column] = frame[column].astype(f"datetime64[{timestamp_unit}]")
+            if column not in frame.columns:
+                continue
+            if types[column] == "DATE":
+                casts.append(pl.col(column).cast(pl.Date))
+            elif types[column].startswith("TIMESTAMP"):
+                casts.append(pl.col(column).cast(pl.Datetime(timestamp_unit)))
+        if casts:
+            frame = frame.with_columns(casts)
         return frame, requested, available
+
+    def _read_selected_partitions_polars(
+        self,
+        native_frequency: str,
+        start,
+        end,
+        columns: Iterable[str],
+        roots: tuple[str, ...],
+        plan: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Join the causal contract plan before minute rows leave DuckDB."""
+        if plan.is_empty():
+            return pl.DataFrame()
+        _, _, requested, selected, _, types, described = self._storage_query(
+            native_frequency, start, end, columns, roots
+        )
+        if not requested:
+            return pl.DataFrame()
+        _, table = _MARKET_TABLES[native_frequency]
+        projection = ", ".join(f'b."{column}"' for column in selected)
+        order = [
+            column
+            for column in ("trade_datetime", "exchange", "symbol", "sequence")
+            if column in selected
+        ]
+        sql = (
+            f"SELECT {projection} FROM {table} b JOIN _mf_selected_plan p ON "
+            "("
+            "upper(trim(b.symbol)) = p.contract OR ("
+            "upper(trim(b.exchange)) IN ('CZC', 'CZCE', 'ZCE') AND "
+            "upper(trim(b.symbol)) = regexp_extract(p.contract, '^([A-Z]+)', 1) "
+            "|| substr(regexp_extract(p.contract, '([0-9]{4})$', 1), 2, 3))) "
+            "WHERE b.trade_date >= ? AND b.trade_date <= ?"
+        )
+        if order:
+            sql += " ORDER BY " + ", ".join(f'b."{column}"' for column in order)
+        with self._db_lock:
+            if self._db is None:
+                raise RuntimeError("DuckDB source is closed")
+            self._db.register(
+                "_mf_selected_plan",
+                plan.select("contract").unique().to_arrow(),
+            )
+            try:
+                frame = self._db.execute(
+                    sql,
+                    [pd.Timestamp(start).date(), pd.Timestamp(end).date()],
+                ).pl()
+            finally:
+                self._db.unregister("_mf_selected_plan")
+        timestamp_unit = self._timestamp_unit(
+            native_frequency, start, end, described
+        )
+        casts = []
+        for column in selected:
+            if column not in frame.columns:
+                continue
+            if types[column] == "DATE":
+                casts.append(pl.col(column).cast(pl.Date))
+            elif types[column].startswith("TIMESTAMP"):
+                casts.append(pl.col(column).cast(pl.Datetime(timestamp_unit)))
+        return frame.with_columns(casts) if casts else frame
 
     def fetch_term_contracts_at_frequency(
         self, tickers, start, end, frequency: str = "1min"
@@ -343,25 +433,28 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             WHERE maturity_rank <= 2
             ORDER BY trade_datetime, root, expiry, symbol
         """
-        frame = self._execute_df(
+        frame = self._execute_polars(
             sql,
             [read_start.date(), end_ts.normalize().date(), *roots],
         )
-        if frame.empty:
-            return frame
-        frame = self._annotate_symbols(frame)
-        frame = self._assign_intraday_trade_dates(frame)
-        return frame.loc[
-            frame["root"].isin(roots)
-            & frame["is_concrete"]
-            & frame["trade_date"].between(
-                start_ts.normalize(), end_ts.normalize()
+        if frame.is_empty():
+            return frame.to_pandas()
+        frame = self._annotate_symbols_polars(frame)
+        frame = self._assign_intraday_trade_dates_polars(frame)
+        return frame.filter(
+            pl.col("root").is_in(roots)
+            & pl.col("is_concrete")
+            & pl.col("trade_date").is_between(
+                start_ts.normalize().date(), end_ts.normalize().date(),
+                closed="both",
             )
-        ].sort_values(["trade_datetime", "root", "symbol"]).reset_index(drop=True)
+        ).sort(["trade_datetime", "root", "symbol"]).to_pandas()
 
     def fetch_latest_trade_date(self) -> pd.Timestamp:
-        frame = self._execute_df("SELECT MAX(trade_date) AS latest FROM market.bars_1d")
-        latest = frame.iloc[0, 0]
+        frame = self._execute_polars(
+            "SELECT MAX(trade_date) AS latest FROM market.bars_1d"
+        )
+        latest = frame.item(0, 0)
         if pd.isna(latest):
             raise RuntimeError("DuckDB daily table has no trade_date")
         return pd.Timestamp(latest).normalize()
@@ -370,15 +463,24 @@ class DuckDBFuturesSource(ParquetFuturesSource):
         roots = self._normalise_tickers(tickers)
         if not roots:
             return pd.Series(dtype="datetime64[ns]")
-        frame = self._annotate_symbols(self._execute_df(
+        frame = self._annotate_symbols_polars(self._execute_polars(
             "SELECT symbol, MIN(trade_date) AS trade_date "
             "FROM market.bars_1d GROUP BY symbol ORDER BY symbol"
         ))
-        listing = (
-            frame.loc[frame["is_concrete"] & frame["root"].isin(roots)]
-            .groupby("root")["trade_date"].min()
+        listing = frame.filter(
+            pl.col("is_concrete") & pl.col("root").is_in(roots)
+        ).group_by("root").agg(pl.col("trade_date").min())
+        aligned = pl.DataFrame({"root": list(roots)}).join(
+            listing, on="root", how="left"
         )
-        return pd.to_datetime(listing.reindex(roots)).astype("datetime64[ns]")
+        result = pd.Series(
+            pd.to_datetime(aligned["trade_date"].to_list()),
+            index=list(roots),
+            name="trade_date",
+            dtype="datetime64[ns]",
+        )
+        result.index.name = "root"
+        return result
 
     def fetch_seat_table(
         self,
@@ -417,14 +519,18 @@ class DuckDBFuturesSource(ParquetFuturesSource):
             + f"AND root IN ({placeholders}) ORDER BY "
             + ", ".join(f'"{column}"' for column in order)
         )
-        frame = self._execute_df(
+        frame = self._execute_polars(
             sql,
             [pd.Timestamp(start).date(), pd.Timestamp(end).date(), *normalised_roots],
         )
-        for column in selected:
-            if types[column] == "DATE" and column in frame:
-                frame[column] = pd.to_datetime(frame[column]).dt.date
-        return frame
+        casts = [
+            pl.col(column).cast(pl.Date)
+            for column in selected
+            if types[column] == "DATE" and column in frame.columns
+        ]
+        if casts:
+            frame = frame.with_columns(casts)
+        return frame.to_pandas()
 
 
 __all__ = ["DuckDBFuturesSource"]

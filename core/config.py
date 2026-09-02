@@ -99,7 +99,6 @@ class DuckDBConfig(StrictConfigModel):
 
     path: str = ""
     required_release_id: str = ""
-    result_backend: Literal["pandas", "polars", "shadow"] = "pandas"
 
 
 class DataSourceConfig(StrictConfigModel):
@@ -562,7 +561,6 @@ _ENV_MAP = {
     "MF_PARQUET_ROOT": (("data", "parquet", "root_path"), str),
     "MF_DUCKDB_PATH": (("data", "duckdb", "path"), str),
     "MF_DATA_RELEASE_ID": (("data", "duckdb", "required_release_id"), str),
-    "MF_DUCKDB_RESULT_BACKEND": (("data", "duckdb", "result_backend"), str),
     "MF_RESEARCH_CUTOFF": (("date_policy", "research_cutoff"), str),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
@@ -694,7 +692,6 @@ def _validate_local_overrides(local_raw: dict) -> None:
         "data.parquet.root_path",
         "data.duckdb.path",
         "data.duckdb.required_release_id",
-        "data.duckdb.result_backend",
     }
 
     def _leaf_paths(value: Any, prefix: str = "") -> List[str]:

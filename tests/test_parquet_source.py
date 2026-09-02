@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytest
 
 from core.config import load_config
@@ -102,6 +103,42 @@ def _fixture_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_parquet_partition_boundary_is_polars_and_canonical(tmp_path):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
+    })
+    columns = ["exchange", "symbol", "trade_date", "close", "volume"]
+    actual = source._read_partitions_polars(
+        "daily", "2024-01-02", "2024-01-04", columns
+    )
+
+    assert isinstance(actual, pl.DataFrame)
+    assert actual.height == 12
+    assert actual.schema["trade_date"] == pl.Date
+    assert actual["symbol"].head(4).to_list() == [
+        "A2401", "A2405", "A2409", "A9999"
+    ]
+
+
+@pytest.mark.parametrize("frequency", ["daily", "1min", "5min", "15min"])
+def test_selected_contract_production_path_reads_bars_with_polars(
+    tmp_path, frequency
+):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
+    })
+    fields = ("open", "high", "low", "close", "volume", "oi", "settle")
+    source._continuous_plan_polars(("A",), "2024-01-02", "2024-01-04 23:59")
+    assert not hasattr(source, "_selected_long")
+
+    actual = source._selected_long_polars(
+        ("A",), "2024-01-02", "2024-01-04 23:59", frequency, fields
+    ).to_pandas()
+
+    assert isinstance(actual, pd.DataFrame)
+    assert not actual.empty
+
+
 def test_daily_uses_previous_day_main_and_causal_roll_adjustment(tmp_path):
     root = _fixture_root(tmp_path)
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
@@ -116,6 +153,26 @@ def test_daily_uses_previous_day_main_and_causal_roll_adjustment(tmp_path):
     expected_roll_adjusted = 126.0 * (102.0 / 120.0)
     assert np.isclose(panel["close"].loc["2024-01-04", "A"], expected_roll_adjusted)
     assert panel["oi"].loc["2024-01-04", "A"] == 1800.0
+
+
+def test_continuous_plan_polars_preserves_t_minus_one_and_roll_adjustment(
+    tmp_path
+):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
+    })
+
+    plan = source._continuous_plan_polars(
+        ("A",), "2024-01-02", "2024-01-04"
+    )
+
+    assert isinstance(plan, pl.DataFrame)
+    assert plan["contract"].to_list() == ["A2401", "A2405"]
+    assert plan["trade_date"].to_list() == [
+        pd.Timestamp("2024-01-03").date(),
+        pd.Timestamp("2024-01-04").date(),
+    ]
+    assert plan["adjustment"].to_list() == pytest.approx([1.0, 102.0 / 120.0])
 
 
 def test_daily_settlement_uses_the_same_causal_contract_and_adjustment(tmp_path):
@@ -209,7 +266,7 @@ def test_contract_curve_uses_exact_roots_without_prefix_collisions(tmp_path):
     assert curve["symbol"].tolist() == ["A2405", "P2405"]
 
 
-def test_dominant_selection_requires_positive_open_interest(tmp_path):
+def test_dominant_selection_requires_positive_open_interest(tmp_path, monkeypatch):
     source = ParquetFuturesSource({
         "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
     })
@@ -218,9 +275,16 @@ def test_dominant_selection_requires_positive_open_interest(tmp_path):
         {**_row("A2405", "2024-01-03", 101.0, 10, 1), "position": np.nan},
     ])
 
-    selected = source._infer_vendor_main(frame, ("A",))
+    monkeypatch.setattr(
+        source,
+        "_read_partitions_polars",
+        lambda *args, **kwargs: pl.from_pandas(frame),
+    )
+    selected = source._continuous_plan_polars(
+        ("A",), "2024-01-03", "2024-01-03"
+    )
 
-    assert selected.empty
+    assert selected.is_empty()
 
 
 def test_contract_pairs_use_the_first_two_observable_maturities(tmp_path):
@@ -255,11 +319,11 @@ def test_czce_three_digit_alias_is_canonicalized_and_identical_rows_deduplicate(
     )
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
 
-    actual = source._read_partitions(
+    actual = source._read_partitions_polars(
         "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
     )
 
-    assert actual["symbol"].tolist() == ["FG2609"]
+    assert actual["symbol"].to_list() == ["FG2609"]
 
 
 def test_czce_alias_market_conflict_fails_even_when_requested_field_matches(tmp_path):
@@ -276,7 +340,7 @@ def test_czce_alias_market_conflict_fails_even_when_requested_field_matches(tmp_
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
 
     with np.testing.assert_raises(ContractAliasConflictError):
-        source._read_partitions(
+        source._read_partitions_polars(
             "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
         )
 
@@ -295,7 +359,7 @@ def test_already_canonical_duplicate_market_conflict_fails_closed(tmp_path):
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
 
     with np.testing.assert_raises(ContractAliasConflictError):
-        source._read_partitions(
+        source._read_partitions_polars(
             "1min", "2026-08-03", "2026-08-03", ["symbol", "trade_date", "close"]
         )
 
@@ -309,16 +373,16 @@ def test_partition_read_failure_does_not_return_partial_market_data(
     failing = directory / "zz-failing.parquet"
     failing.write_bytes(healthy.read_bytes())
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
-    original = pd.read_parquet
+    original = pl.read_parquet
 
     def fail_one_partition(path, *args, **kwargs):
         if Path(path).name == failing.name:
             raise OSError("simulated shard failure")
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(pd, "read_parquet", fail_one_partition)
+    monkeypatch.setattr(pl, "read_parquet", fail_one_partition)
     with pytest.raises(RuntimeError, match="failed to read market partition"):
-        source._read_partitions(
+        source._read_partitions_polars(
             "daily", "2024-01-02", "2024-01-04",
             ["symbol", "trade_date", "close"],
         )
@@ -334,7 +398,7 @@ def test_partition_schema_drift_fails_instead_of_dropping_requested_field(tmp_pa
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})
 
     with pytest.raises(RuntimeError, match="inconsistent daily parquet schema"):
-        source._read_partitions(
+        source._read_partitions_polars(
             "daily", "2024-01-02", "2024-01-05",
             ["symbol", "trade_date", "position"],
         )
@@ -400,7 +464,7 @@ def test_intraday_curve_cache_reuses_validated_month_across_instances(
     second = ParquetFuturesSource(config)
     monkeypatch.setattr(
         second,
-        "_aggregate_intraday_states",
+        "_aggregate_intraday_states_polars",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("valid persistent cache was not reused")
         ),
@@ -444,14 +508,14 @@ def test_intraday_curve_cache_isolated_by_frequency_and_invalidated_by_source(
     stat = source_file.stat()
     os.utime(source_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     second = ParquetFuturesSource(config)
-    original = second._aggregate_intraday_states
+    original = second._aggregate_intraday_states_polars
     calls = []
 
     def counted(*args, **kwargs):
         calls.append(1)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(second, "_aggregate_intraday_states", counted)
+    monkeypatch.setattr(second, "_aggregate_intraday_states_polars", counted)
     second.fetch_price_at_frequency(
         ["A"], "2024-01-03", "2024-01-03 23:59",
         ["curve_total_oi"], "15min",
@@ -479,7 +543,7 @@ def test_selected_contract_cache_reuses_validated_request_across_instances(
     second = ParquetFuturesSource(config)
     monkeypatch.setattr(
         second,
-        "_read_partitions",
+        "_read_selected_partitions_polars",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("valid selected-contract cache was not reused")
         ),
@@ -515,7 +579,7 @@ def test_selected_contract_cache_rejects_duplicate_long_keys(tmp_path):
     )
     metadata = pd.read_json(metadata_path, typ="series")
 
-    actual = source._read_selected_cache(
+    actual = source._read_selected_cache_polars(
         "5min",
         pd.Timestamp(metadata["start"]),
         pd.Timestamp(metadata["end"]),
@@ -541,7 +605,7 @@ def test_panel_cache_adds_curve_fields_without_rebuilding_selected_panel(
     )
     monkeypatch.setattr(
         source,
-        "_selected_long",
+        "_selected_long_polars",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("existing OHLCV panel was rebuilt")
         ),
@@ -620,13 +684,83 @@ def test_intraday_night_bar_uses_next_exchange_trading_day(tmp_path, monkeypatch
         ]),
     })
 
-    actual = source._assign_intraday_trade_dates(frame)
+    actual = source._assign_intraday_trade_dates_polars(pl.from_pandas(frame))
 
-    assert actual["trade_date"].tolist() == [
-        pd.Timestamp("2024-01-05"),
-        pd.Timestamp("2024-01-05"),
-        pd.Timestamp("2024-01-08"),
+    assert actual["trade_date"].to_list() == [
+        pd.Timestamp("2024-01-05").date(),
+        pd.Timestamp("2024-01-05").date(),
+        pd.Timestamp("2024-01-08").date(),
     ]
+
+
+def test_polars_symbol_annotation_applies_active_epoch(tmp_path):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)),
+        "eager_fields": False,
+        "root_active_from": {"A": "2024-01-03"},
+    })
+    frame = pd.DataFrame([
+        _row(" a2401 ", "2024-01-02", 100.0, 10, 20),
+        _row("A2405", "2024-01-03", 101.0, 11, 21),
+        _row("bad", "2024-01-03", 102.0, 12, 22),
+    ])
+
+    actual_polars = source._annotate_symbols_polars(pl.from_pandas(frame))
+    assert actual_polars.schema["trade_date"] == pl.Date
+    assert actual_polars.schema["delivery_year"] == pl.Int32
+    assert actual_polars.schema["delivery_month"] == pl.Int32
+    assert actual_polars["symbol"].to_list() == ["A2405"]
+    assert actual_polars["root"].to_list() == ["A"]
+    assert actual_polars["is_concrete"].to_list() == [True]
+
+
+def test_polars_intraday_trade_date_assignment(
+    tmp_path, monkeypatch
+):
+    source = ParquetFuturesSource({
+        "root_path": str(_fixture_root(tmp_path)), "eager_fields": False
+    })
+    monkeypatch.setattr(
+        source,
+        "fetch_calendar",
+        lambda start, end: pd.DatetimeIndex(["2024-01-05", "2024-01-08"]),
+    )
+    frame = pd.DataFrame({
+        "trade_datetime": pd.to_datetime([
+            "2024-01-04 21:00", "2024-01-05 09:00", "2024-01-07 21:00"
+        ]),
+        "trade_date": pd.to_datetime([
+            "2024-01-04", "2024-01-05", "2024-01-07"
+        ]),
+    })
+
+    actual_polars = source._assign_intraday_trade_dates_polars(
+        pl.from_pandas(frame)
+    )
+    assert actual_polars.schema["trade_date"] == pl.Date
+    assert actual_polars["trade_date"].to_list() == [
+        pd.Timestamp("2024-01-05").date(),
+        pd.Timestamp("2024-01-05").date(),
+        pd.Timestamp("2024-01-08").date(),
+    ]
+
+
+def test_polars_deduplication_uses_sequence_priority():
+    frame = pd.DataFrame({
+        "trade_datetime": pd.to_datetime([
+            "2024-01-03 09:01", "2024-01-03 09:00", "2024-01-03 09:00"
+        ]),
+        "root": ["A", "A", "A"],
+        "sequence": [0, 2, 1],
+        "close": [102.0, 101.0, 100.0],
+    })
+    keys = ["trade_datetime", "root"]
+
+    actual = ParquetFuturesSource._deduplicate_polars(
+        pl.from_pandas(frame), keys
+    )
+
+    assert actual["close"].to_list() == [101.0, 102.0]
 
 
 def test_session_index_groups_night_and_day_bars_on_the_exchange_day(
@@ -668,7 +802,7 @@ def test_intraday_trade_date_assignment_fails_when_daily_calendar_is_empty(
     })
 
     with pytest.raises(ValueError, match="daily parquet calendar is empty"):
-        source._assign_intraday_trade_dates(frame)
+        source._assign_intraday_trade_dates_polars(pl.from_pandas(frame))
 
 
 def test_calendar_uses_concrete_contracts_without_vendor_9999_rows(tmp_path):
