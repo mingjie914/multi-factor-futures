@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import runpy
 import shutil
 import time
@@ -101,6 +102,47 @@ COMMON_H5_MATCHED_COMPARISON_RUN_ID: str | None = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _peak_working_set_mib() -> float | None:
+    """Return this process's peak RSS on Windows without an extra dependency."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("page_fault_count", wintypes.DWORD),
+            ("peak_working_set_size", ctypes.c_size_t),
+            ("working_set_size", ctypes.c_size_t),
+            *(  # Remaining fields are required by the Windows structure.
+                (name, ctypes.c_size_t)
+                for name in (
+                    "quota_peak_paged_pool_usage", "quota_paged_pool_usage",
+                    "quota_peak_non_paged_pool_usage", "quota_non_paged_pool_usage",
+                    "pagefile_usage", "peak_pagefile_usage",
+                )
+            ),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    query = kernel.K32GetProcessMemoryInfo
+    query.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    ]
+    query.restype = wintypes.BOOL
+    counters = ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    if not query(
+        kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    ):
+        return None
+    return counters.peak_working_set_size / (1024.0 * 1024.0)
 
 STRATEGY_LABELS = {
     "current_single_baseline": "旧10因子观察策略",
@@ -1098,6 +1140,7 @@ def run_and_compare() -> Path:
             encoding="utf-8",
         )
     performance["total_seconds"] = time.perf_counter() - run_started
+    performance["process_peak_working_set_mib"] = _peak_working_set_mib()
     (output / "performance.json").write_text(
         json.dumps(performance, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

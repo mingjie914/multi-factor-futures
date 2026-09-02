@@ -411,6 +411,8 @@ class FactorPanelRunner:
         comp, checkpoint_manifest = self._load_factor_checkpoint(
             checkpoint_path, all_factors
         )
+        from factors.library.intraday import clear_transient_data_caches
+
         self.checkpoint_loaded_factor_count = len(comp)
         for offset in range(0, len(all_factors), 10):
             batch_names = [
@@ -421,18 +423,23 @@ class FactorPanelRunner:
                 continue
             batch: dict[str, pd.DataFrame] = {}
             for target_dates, request_dates in self._iter_factor_chunks(self.cal):
-                part = self._compute_part(
-                    self.env.engine,
-                    batch_names,
-                    request_dates,
-                    self.u,
-                    {**comp, **batch},
-                )
-                for name, values in part.items():
-                    if name not in batch:
-                        batch[name] = values.reindex(self.cal)
-                    else:
-                        batch[name].loc[target_dates] = values.reindex(target_dates)
+                try:
+                    part = self._compute_part(
+                        self.env.engine,
+                        batch_names,
+                        request_dates,
+                        self.u,
+                        {**comp, **batch},
+                    )
+                    for name, values in part.items():
+                        if name not in batch:
+                            batch[name] = values.reindex(self.cal)
+                        else:
+                            batch[name].loc[target_dates] = values.reindex(target_dates)
+                finally:
+                    # A later chunk never reuses an earlier chunk's minute
+                    # panels. Release them here while retaining batch outputs.
+                    clear_transient_data_caches()
             comp.update(batch)
             self._save_factor_checkpoint(
                 checkpoint_path, checkpoint_manifest, batch
@@ -459,8 +466,6 @@ class FactorPanelRunner:
         )
         # Full minute panels are no longer needed once daily factor/IC matrices
         # have been materialized. Keep only the persistent v4 source cache.
-        from factors.library.intraday import clear_transient_data_caches
-
         clear_transient_data_caches()
 
     def _oriented_ranks(

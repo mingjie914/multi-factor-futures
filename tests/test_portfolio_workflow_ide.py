@@ -179,6 +179,10 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert contract["status"] == "complete"
     assert contract["strategy_library"]["snapshot"]["strategies"][0]["status"] == "preferred"
     assert contract["artifacts"]["performance.json"]["sha256"]
+    performance = json.loads(
+        (output / "performance.json").read_text(encoding="utf-8")
+    )
+    assert "process_peak_working_set_mib" in performance
 
 
 def test_all_strategy_branch_selects_current_and_archived_peers(monkeypatch):
