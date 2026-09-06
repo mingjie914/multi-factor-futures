@@ -17,7 +17,10 @@ def test_default_validation_policy_is_hashable_and_scorecard_cannot_self_calibra
     )
 
     policy = load_config("config/default.yaml").validation_policy
-    assert validate_policy(policy)["discovery_q"] == pytest.approx(0.10)
+    validated = validate_policy(policy)
+    assert validated["version"] == "factor_admission_ic_hac_v1"
+    assert validated["admission_statistic"] == "daily_cross_sectional_ic_hac"
+    assert validated["discovery_q"] == pytest.approx(0.10)
     assert "macro_trend" in policy.dual_track_families
     assert len(validation_policy_sha256(policy)) == 64
 

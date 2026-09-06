@@ -399,7 +399,8 @@ class ValidationScorecardConfig(StrictConfigModel):
 class ValidationPolicyConfig(StrictConfigModel):
     """Versioned discovery, validation and observation-channel policy."""
 
-    version: str = "factor_validation_v2"
+    version: str = "factor_admission_ic_hac_v1"
+    admission_statistic: str = "daily_cross_sectional_ic_hac"
     discovery_method: str = "hierarchical_fdr"
     discovery_q: float = 0.10
     fwer_report_alpha: float = 0.05

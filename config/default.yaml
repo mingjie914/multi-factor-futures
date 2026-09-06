@@ -322,7 +322,10 @@ factor_governance:
 # Formal discovery policy. Horizons and preprocessing variants are hypotheses
 # within an economic factor; Bonferroni/FWER is retained as a report label.
 validation_policy:
-  version: factor_validation_v2
+  # Canonical sweet-spot admission contract recovered from the 6f/8f/10f/13f era.
+  # Changing any field below changes the research-contract hash and requires a new run.
+  version: factor_admission_ic_hac_v1
+  admission_statistic: daily_cross_sectional_ic_hac
   discovery_method: hierarchical_fdr
   discovery_q: 0.10
   fwer_report_alpha: 0.05

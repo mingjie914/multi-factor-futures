@@ -92,6 +92,11 @@ def policy_dict(policy: Any) -> dict:
 
 def validate_policy(policy: Any) -> dict:
     value = policy_dict(policy)
+    if value.get("admission_statistic") != "daily_cross_sectional_ic_hac":
+        raise ValueError(
+            "validation_policy.admission_statistic must be "
+            "daily_cross_sectional_ic_hac"
+        )
     if value.get("discovery_method") != "hierarchical_fdr":
         raise ValueError("validation_policy.discovery_method must be hierarchical_fdr")
     for key in (

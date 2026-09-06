@@ -1035,6 +1035,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         policy.expected_directions = effective_directions
     validate_policy(policy)
     policy_hash = validation_policy_sha256(policy)
+    inference_model = str(policy.admission_statistic)
     _freq_lookup = frequency  # preserve "daily_intraday" before normalization
     minimum_test_bars = int(
         dict(policy.minimum_test_bars_by_frequency).get(
@@ -1390,7 +1391,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                             "ols_p_value": 1.0,
                             "ols_n": 0,
                             "ols_days": 0,
-                            "inference_model": "daily_cross_sectional_ic_hac",
+                            "inference_model": inference_model,
                             "ir_nw": 0.0,
                             "ic_pos_ratio": 0.0,
                             "n": 0,
@@ -1494,7 +1495,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         "ols_p_value": float(ols_p),
                         "ols_n": int(ols_n),
                         "ols_days": int(ols_days),
-                        "inference_model": "daily_cross_sectional_ic_hac",
+                        "inference_model": inference_model,
                         "ir_nw": float(ir_nw),
                         "ic_pos_ratio": float(ic_pos_ratio),
                         "n": int(ic_n),
@@ -2057,7 +2058,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "validation_policy_sha256": policy_hash,
             "taxonomy_version": TAXONOMY_VERSION,
             "taxonomy_sha256": taxonomy_sha256(),
-            "inference_model": "daily_cross_sectional_ic_hac",
+            "inference_model": inference_model,
             "factor_preprocessing": factor_preprocessing,
             "factor_preprocessing_variants": preprocessing_variants,
             "selection_order": [
