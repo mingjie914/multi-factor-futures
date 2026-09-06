@@ -16,6 +16,7 @@ from workflows.research import (
     _load_research_checkpoint,
     _passes_post_bonferroni_quality,
     _parse_requested_factors,
+    _process_factor_batch_for_research,
     _select_registered_factors,
     _summarize_research_performance,
     _validate_requested_factors,
@@ -120,6 +121,32 @@ def test_performance_summary_ranks_factor_hotspots_without_selection_fields():
     assert summary["measurement_role"] == "diagnostic_only_not_a_selection_input"
     assert summary["measured_batch_wall_seconds"] == 4.0
     assert summary["factor_hotspots_top20"][0]["factor"] == "slow"
+
+
+def test_research_processing_records_one_unavailable_factor_and_continues():
+    class Processor:
+        def process(self, matrix, context):
+            if matrix == "bad_after_processing":
+                raise ValueError("winsorize returned no finite values")
+            return f"processed:{matrix}"
+
+        def process_excluding(self, matrix, context, excluded):
+            return f"raw:{matrix}"
+
+    processed, raw, failures = _process_factor_batch_for_research(
+        Processor(),
+        {"good": "matrix", "computed_empty": "unused", "bad": "bad_after_processing"},
+        context=None,
+        factor_names=["good", "computed_empty", "bad"],
+        unavailable=["computed_empty"],
+        has_neutralize=True,
+        dual_track_families={"dual"},
+        family_resolver=lambda name: "dual" if name == "good" else "single",
+    )
+
+    assert processed == {"good": "processed:matrix"}
+    assert raw == {"good": "raw:matrix"}
+    assert set(failures) == {"computed_empty", "bad"}
 
 
 def test_explicit_adaptivity_file_fails_closed(tmp_path):

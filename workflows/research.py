@@ -421,6 +421,34 @@ def _compute_factor_date_chunks(
     return matrices, sorted(invalid | hard_failures)
 
 
+def _process_factor_batch_for_research(
+    processor, computed: dict, context, factor_names: list[str],
+    unavailable: list[str], *, has_neutralize: bool,
+    dual_track_families: set[str], family_resolver,
+) -> tuple[dict, dict, dict[str, str]]:
+    """Keep one unavailable factor from aborting an otherwise valid census."""
+    failures = {
+        name: "factor computation returned no finite values"
+        for name in unavailable
+    }
+    processed = {}
+    raw_variants = {}
+    for name in factor_names:
+        if name in failures or name not in computed:
+            continue
+        try:
+            processed[name] = processor.process(computed[name], context)
+            if has_neutralize and family_resolver(name) in dual_track_families:
+                raw_variants[name] = processor.process_excluding(
+                    computed[name], context, {"neutralize"}
+                )
+        except Exception as exc:
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            processed.pop(name, None)
+            raw_variants.pop(name, None)
+    return processed, raw_variants, failures
+
+
 def _apply_global_bonferroni(
     results: list[dict], family_alpha: float = 0.05
 ) -> tuple[int, float]:
@@ -1325,27 +1353,79 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
         compute_seconds = time.perf_counter() - compute_started
         processing_started = time.perf_counter()
-        factor_batch = runner.processor.process_batch(
-            computed_batch, processing_context
+        factor_batch, raw_variant_batch, processing_failures = (
+            _process_factor_batch_for_research(
+                runner.processor,
+                computed_batch,
+                processing_context,
+                batch_names,
+                invalid,
+                has_neutralize=has_neutralize,
+                dual_track_families=dual_track_families,
+                family_resolver=_factor_family,
+            )
         )
+        invalid = sorted(processing_failures)
         if invalid:
-            print(f"  本批不可计算因子/依赖: {len(invalid)}（已记入结果）")
-        raw_variant_batch = (
-            {
-                name: runner.processor.process_excluding(
-                    computed_batch[name], processing_context, {"neutralize"}
-                )
-                for name in batch_names
-                if name in computed_batch
-                and _factor_family(name) in dual_track_families
-            }
-            if has_neutralize else {}
-        )
+            print(f"  本批不可计算/不可预处理因子: {len(invalid)}（已记入结果）")
         processing_seconds = time.perf_counter() - processing_started
 
         def _evaluate_factor(fname):
             if fname not in factor_batch:
-                return None
+                variants = ["neutralized" if has_neutralize else "raw"]
+                if has_neutralize and _factor_family(fname) in dual_track_families:
+                    variants.append("raw")
+                failed_periods = {}
+                for variant in variants:
+                    for p in factor_horizons[fname]:
+                        failed_periods[f"{variant}_period_{p}"] = {
+                            "period": int(p),
+                            "preprocessing_variant": variant,
+                            "ic": 0.0,
+                            "ic_hac_t": 0.0,
+                            "t": 0.0,
+                            "ols_beta": 0.0,
+                            "ols_hac_t": 0.0,
+                            "ols_p_value": 1.0,
+                            "ols_n": 0,
+                            "ols_days": 0,
+                            "inference_model": (
+                                "unpenalized_univariate_fama_macbeth_ols_hac"
+                            ),
+                            "ir_nw": 0.0,
+                            "ic_pos_ratio": 0.0,
+                            "n": 0,
+                            "estimation_failure": {
+                                "error_type": "FactorUnavailable",
+                                "message": processing_failures.get(
+                                    fname, "factor output is unavailable"
+                                ),
+                            },
+                        }
+                return {
+                    "name": fname,
+                    "window": _infer_window(fname),
+                    "best_period": 0,
+                    "best_t": 0.0,
+                    "best_ic_t": 0.0,
+                    "best_p_value": 1.0,
+                    "best_ic": 0.0,
+                    "best_ir": 0.0,
+                    "best_ic_pos_ratio": 0.0,
+                    "all_periods": failed_periods,
+                    "n_periods_tested": len(factor_horizons[fname]),
+                    "training_bars": factor_training_bars[fname],
+                    "training_days": factor_training_days[fname],
+                    "requires_training_sample_contract": (
+                        factor_requires_training_contract[fname]
+                    ),
+                    "adaptivity_best_sector": "",
+                    "adaptivity_valid_sectors": "",
+                    "adaptivity_n_valid_sectors": 0,
+                    "adaptivity_recommended_period": 0,
+                    "adaptivity_decay_type": "",
+                    "factor_failure": processing_failures.get(fname, "unavailable"),
+                }
             window = _infer_window(fname)
             periods = list(factor_horizons[fname])
             all_period_results = {}
