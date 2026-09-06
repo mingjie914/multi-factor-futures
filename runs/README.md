@@ -7,13 +7,13 @@
 
 - `factor_research/holdout_ledger.jsonl`：只追加的已消费 holdout 记录，禁止删除、
   修改或把其中日期重新称为未见样本。
-- `factor_validation/20260824_intraday588_is126_oos42_cutoff_20260515/`：本次588个
-  日内因子的标准准入证据。保存588行全量明细、75行通过明细、IS筛选产物、OOS统计、
-  摘要和文件哈希合同；研究窗口固定截至2026-05-15。
+- `factor_validation/20260824_intraday588_is126_oos42_cutoff_20260515/`：历史单切分
+  观察证据。保存588行明细、75行当时的通过结果和哈希合同，但不再具有正式入库资格。
 
-以后同类检验统一写入`factor_validation/<run_id>/`，至少包含
+以后正式准入统一写入`factor_validation/<run_id>/`，至少包含
 `factor_validation_full.csv`、`passed_factors.csv`、`validation_summary.json`、
-`oos_factor_ic.json`和`run_contract.json`，逐假设IS证据统一放入`artifacts/`。不得为单次
+`run_contract.json`，逐假设证据统一放入`artifacts/`。共同周期观察可以额外保存OOS文件，
+但合同必须标记为不可入库。不得为单次
 需求在项目根目录新增一次性脚本或散落结果。
 
 有效库之后的周期匹配、相关性去重和并行子集筛选统一由

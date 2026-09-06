@@ -310,13 +310,14 @@ native/mf_factor_kernels/Cargo.toml`，Cargo target固定在`E:\rust\target\mult
   全池为588/588无错误、约326秒，相对本轮早期约1,344秒为4.13倍，完整回归通过。
 
 `config/default.yaml`现已收口为38品种、10f观察基线和统一处理契约；旧的四个重复或
-继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段，当前固定
-`duckdb_futures + required_release_id`，不能覆盖品种、因子、处理或回测语义。
+继承配置已删除。被Git忽略的`config/local.yaml`只能覆盖本机数据运行时字段；
+日常`duckdb_futures`留空`required_release_id`以跟随唯一的当前认证release，冻结复现时才显式指定ID。
+本机配置不能覆盖品种、因子、处理或回测语义。
 当前主框架处理链是MAD＋Z-score且未声明中性化；research现在按实际步骤记录`raw`，不再
 把未中性化结果误标为`neutralized`。正式mining/screen和主框架入口均校验同一有序品种
 契约；只有经完整38品种screen写出的绑定快照可挂载到主框架，普通池快照或旧未绑定快照
 继续可作审计读取，但不能注册为正式因子。
-夜间发布新DuckDB release后，必须先通过发布验证，再更新该ID并重启；回退只需切回
+夜间发布新DuckDB release后，必须先通过发布验证并成为唯一`current + certified`；日常运行无需改ID，回退只需切回
 `parquet_futures`。D1b不阻塞当前研究；现有认证release、统一配置、DuckDB/Polars读取和
 计算热点均已通过门禁，可直接开始正式research、screen、selection与backtest。最终目标
 仍是真实research端到端收益，不以使用某项技术作为完成标准。

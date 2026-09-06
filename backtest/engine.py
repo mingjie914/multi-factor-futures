@@ -40,6 +40,14 @@ from core.logger import get_logger
 logger = get_logger("multi_factor")
 
 
+def _json_default(value):
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return str(pd.Timestamp(value))
+    raise TypeError(f"not JSON serializable: {type(value).__name__}")
+
+
 def _executed_turnover_intervals(result) -> pd.Series:
     """Return exchange-timed turnover when an audited ledger is available."""
     ledger = getattr(result, "research_ledger", None)
@@ -105,13 +113,6 @@ class BacktestResult:
         """Persist a complete single-portfolio research result."""
         root = Path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
-
-        def _json_default(value):
-            if isinstance(value, (np.integer, np.floating)):
-                return value.item()
-            if isinstance(value, (pd.Timestamp, np.datetime64)):
-                return str(pd.Timestamp(value))
-            raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
         payload = {
             "metadata": metadata or {},
@@ -551,13 +552,6 @@ class MultiPortfolioResult:
             "sub_portfolios": self.sub_configs,
             "failure_count": len(combined.failure_ledger),
         }
-
-        def _json_default(value):
-            if isinstance(value, (np.integer, np.floating)):
-                return value.item()
-            if isinstance(value, (pd.Timestamp, np.datetime64)):
-                return str(pd.Timestamp(value))
-            raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
         (root / "metrics.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)

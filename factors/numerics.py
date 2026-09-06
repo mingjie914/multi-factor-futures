@@ -608,6 +608,85 @@ def daily_volume_shock_statistics(close, volume, amount, day_offsets):
     }
 
 
+def daily_liquidity_event_statistics(close, amount, day_offsets):
+    """Daily liquidity-recovery and jump-follow-through features."""
+    close, amount = (
+        np.asarray(value, dtype=np.float64, order="C")
+        for value in (close, amount)
+    )
+    if close.shape != amount.shape:
+        raise ValueError("close and amount must have the same shape")
+    offsets = np.asarray(day_offsets, dtype=np.int64)
+    mode = factor_kernel_mode()
+    reference = None
+    if mode != "native":
+        reference = np.full((len(offsets) - 1, close.shape[1], 2), np.nan)
+        global_returns = close / np.vstack((
+            np.full((1, close.shape[1]), np.nan), close[:-1]
+        )) - 1.0
+        for day, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+            for column in range(close.shape[1]):
+                resilience = np.column_stack((
+                    np.abs(global_returns[start:end, column]),
+                    amount[start:end, column],
+                ))
+                resilience = resilience[~np.isnan(resilience).any(axis=1)]
+                if len(resilience) >= 60:
+                    returns = resilience[:, 0]
+                    amihud = returns / (resilience[:, 1] + 1e-12)
+                    sigma = returns.std(ddof=0)
+                    if sigma != 0 and not np.isnan(sigma):
+                        median = np.median(amihud)
+                        recovery_lags = []
+                        for index in np.flatnonzero(
+                            returns > returns.mean() + 2.0 * sigma
+                        ):
+                            below = np.flatnonzero(amihud[index + 1:] < median)
+                            if len(below):
+                                recovery_lags.append(below[0] + 1)
+                        if recovery_lags:
+                            reference[day, column, 0] = -float(np.mean(recovery_lags))
+
+                common = np.column_stack((
+                    close[start:end, column], amount[start:end, column]
+                ))
+                common = common[~np.isnan(common).any(axis=1)]
+                if len(common) < 30:
+                    continue
+                returns = np.r_[np.nan, common[1:, 0] / common[:-1, 0] - 1.0]
+                amplitude = np.abs(returns)
+                threshold = np.nanstd(amplitude, ddof=0)
+                if threshold < 1e-12:
+                    reference[day, column, 1] = 0.0
+                    continue
+                jumps = amplitude > threshold
+                if jumps.sum() < 3:
+                    reference[day, column, 1] = 0.0
+                    continue
+                jump_amount = common[:, 1][jumps]
+                next_amount = common[1:, 1][jumps[:-1]]
+                paired_jump = jump_amount[:len(next_amount)]
+                if (
+                    len(next_amount) < 3
+                    or paired_jump.std(ddof=0) < 1e-12
+                    or next_amount.std(ddof=0) < 1e-12
+                ):
+                    reference[day, column, 1] = 0.0
+                    continue
+                correlation = float(np.corrcoef(paired_jump, next_amount)[0, 1])
+                reference[day, column, 1] = 0.0 if np.isnan(correlation) else correlation
+    native = native_array_kernel(
+        "daily_liquidity_event_features", close, amount, offsets
+    ) if mode != "reference" else None
+    if mode == "shadow":
+        assert_native_equal(reference, native, "daily_liquidity_event_features")
+    output = native if mode == "native" else reference
+    return {
+        "liquidity_resilience": output[:, :, 0],
+        "jump_amount_lagcorr": output[:, :, 1],
+    }
+
+
 def daily_candle_path_statistics(open_, high, low, close, day_offsets):
     arrays = [
         np.asarray(value, dtype=np.float64, order="C")

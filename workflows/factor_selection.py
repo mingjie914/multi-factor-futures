@@ -11,10 +11,10 @@ future library version is handled without changing this workflow.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -28,10 +28,12 @@ from core.date_policy import factor_validation_window, research_cutoff
 from core.registry import list_registered
 from factors.processor import build_processing_context
 from pipeline.runner import PipelineRunner
+from research.artifacts import sha256_file
+from research.effective_factor_library import load_library
+from research.governance import factor_family
 
 
-SELECTION_SCHEMA_VERSION = 1
-HORIZONS = (5, 10, 20)
+SELECTION_SCHEMA_VERSION = 2
 CLUSTER_CORRELATION_THRESHOLD = 0.50
 MIN_CROSS_SECTION = 10
 N_IS_SEGMENTS = 3
@@ -53,31 +55,6 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _factor_family(name: str) -> str:
-    """Small transparent family taxonomy used for diagnostics, not hard gates."""
-    text = str(name).lower()
-    families = (
-        ("timing_session", ("overnight", "gap", "opening", "seasonality", "early_late", "time_")),
-        ("liquidity_flow", ("volume", "turnover", "amihud", "kyle", "spread", "impact", "flow", "torrent", "signed_volume", "micro_leverage")),
-        ("risk_distribution", ("vol", "variance", "cvar", "skew", "kurt", "tail", "parkinson", "semivariance", "quarticity", "jump", "amplitude", "smile", "dispersion")),
-        ("price_trend_shape", ("momentum", "trend", "slope", "hurst", "run", "breakout", "peak", "ridge", "drip", "stone", "candle", "position", "delay", "reversal")),
-        ("dependence_structure", ("corr", "covariance", "coupling", "elasticity", "entropy", "autocorr", "partial", "herding")),
-        ("market_participation", ("participation", "order", "large_order", "overconfidence", "positioning")),
-    )
-    for family, tokens in families:
-        if any(token in text for token in tokens):
-            return family
-    return "intraday_other"
 
 
 def _rank_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -170,31 +147,16 @@ def _representative_key(row: dict) -> tuple:
 
 
 def _compact_representatives(rows: list[dict], max_count: int) -> list[str]:
-    if len(rows) <= max_count:
-        return [str(row["factor"]) for row in rows]
+    """Keep the strongest distinct-cluster representatives up to one limit."""
     ranked = sorted(rows, key=_representative_key, reverse=True)
-    selected: list[dict] = []
-    family_counts: dict[str, int] = {}
-    # Preserve family breadth first; then fill by the same transparent score.
-    for row in ranked:
-        family = str(row.get("family", "intraday_other"))
-        if family_counts.get(family, 0) >= 2:
-            continue
-        selected.append(row)
-        family_counts[family] = family_counts.get(family, 0) + 1
-        if len(selected) >= max_count:
-            break
-    if len(selected) < max_count:
-        chosen = {row["factor"] for row in selected}
-        selected.extend(row for row in ranked if row["factor"] not in chosen)
-    return [str(row["factor"]) for row in selected[:max_count]]
+    return [str(row["factor"]) for row in ranked[:max_count]]
 
 
 def _load_library(
     config,
     *,
     source_run_dir: str | None = None,
-    allowed_horizons: tuple[int, ...] = HORIZONS,
+    allowed_horizons: tuple[int, ...] | None = None,
 ) -> tuple[Path, list[dict]]:
     if source_run_dir is not None:
         root = Path(source_run_dir)
@@ -213,7 +175,11 @@ def _load_library(
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         horizon_mode = str(summary.get("horizon_mode", ""))
         horizon = int(summary.get("common_horizon", 0) or 0)
-        if horizon_mode != "common_horizon" or horizon not in allowed_horizons:
+        if (
+            horizon_mode != "common_horizon"
+            or horizon < 1
+            or (allowed_horizons is not None and horizon not in allowed_horizons)
+        ):
             raise ValueError(
                 "selection source is not the requested common-horizon run: "
                 f"mode={horizon_mode!r}, horizon={horizon}"
@@ -233,7 +199,8 @@ def _load_library(
             rows.append({
                 "factor": name,
                 "status": "validation_passed",
-                "frequency": "daily_intraday",
+                "frequency": "daily",
+                "family": str(record.get("family", "") or factor_family(name)),
                 "registered_horizons": str(record.get("registered_horizons", "")),
                 "selected_period": horizon,
                 "approved_periods": [horizon],
@@ -249,7 +216,7 @@ def _load_library(
     path = Path(config.factor_library.path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = load_library(path)
     factors = [
         row for row in payload.get("factors", [])
         if isinstance(row, dict) and row.get("status") == "effective"
@@ -261,13 +228,17 @@ def _load_library(
         raise ValueError("effective factor library contains duplicate names")
     for row in factors:
         periods = tuple(int(value) for value in row.get("approved_periods", []))
-        if len(periods) != 1 or periods[0] not in allowed_horizons:
+        if (
+            len(periods) != 1
+            or periods[0] < 1
+            or (allowed_horizons is not None and periods[0] not in allowed_horizons)
+        ):
             raise ValueError(
                 f"factor {row.get('factor')!r} has ambiguous approved periods {periods}"
             )
-        if str(row.get("frequency")) != "daily_intraday":
+        if str(row.get("frequency")) != "daily":
             raise ValueError(
-                f"factor {row.get('factor')!r} is not daily_intraday: {row.get('frequency')!r}"
+                f"factor {row.get('factor')!r} is not daily: {row.get('frequency')!r}"
             )
     return path.resolve(), factors
 
@@ -292,18 +263,21 @@ def run_effective_factor_selection(
             )
         selection_horizons = (int(common_horizon),)
     else:
-        selection_horizons = HORIZONS
+        selection_horizons = None
 
     project = Path(__file__).resolve().parents[1]
     output = project / "runs" / "factor_selection" / str(run_id)
-    output.mkdir(parents=True, exist_ok=False)
-
     config = load_config(config_path)
     library_path, library_rows = _load_library(
         config,
         source_run_dir=source_run_dir,
         allowed_horizons=selection_horizons,
     )
+    if selection_horizons is None:
+        selection_horizons = tuple(sorted({
+            int(row["approved_periods"][0]) for row in library_rows
+        }))
+    output.mkdir(parents=True, exist_ok=False)
     runner = PipelineRunner(config=config)
     window = factor_validation_window(
         config, runner.data_manager, frequency="daily_intraday"
@@ -327,9 +301,12 @@ def run_effective_factor_selection(
         universe,
         config.universe_selection,
     )
+    factor_compute_started = time.perf_counter()
     raw = runner.factor_engine.compute_factors(
         names, requested_dates, universe, parallel=False, chunk_size=64
     )
+    factor_compute_seconds = time.perf_counter() - factor_compute_started
+    factor_timings = list(runner.factor_engine.computation_timings)
     if set(raw) != set(names):
         raise ValueError("factor engine did not return all admitted factor names")
     processed = runner.processor.process_batch(raw, context)
@@ -371,7 +348,7 @@ def run_effective_factor_selection(
             "horizon": horizon,
             "frequency": row["frequency"],
             "direction": direction,
-            "family": _factor_family(name),
+            "family": str(row.get("family", "") or factor_family(name)),
             "coverage": float(ic.notna().mean()) if len(is_dates) else 0.0,
             "mean_ic": float(ic.mean()) if not ic.empty else float("nan"),
             "ic_std": float(ic.std(ddof=1)) if len(ic) > 1 else float("nan"),
@@ -380,10 +357,18 @@ def run_effective_factor_selection(
             "worst_segment_mean_ic": float(np.min(means)) if means else float("nan"),
             "median_segment_mean_ic": float(np.median(means)) if means else float("nan"),
             "rank_churn": float(prior.mean()) if not prior.empty else float("nan"),
-            "oos_ic": row.get("oos_ic"),
-            "oos_same_direction": bool(row.get("oos_ic", 0.0) * direction > 0.0),
-            "oos_gate_only": True,
         }
+        if source_run_dir is not None:
+            observed_oos_ic = row.get("oos_ic")
+            row_out.update({
+                "observed_oos_ic": observed_oos_ic,
+                "observed_oos_same_direction": (
+                    bool(float(observed_oos_ic) * direction > 0.0)
+                    if observed_oos_ic is not None and pd.notna(observed_oos_ic)
+                    else None
+                ),
+                "observed_oos_used_for_selection": False,
+            })
         for idx, (mean, positive_ratio, ir) in enumerate(segment_values, 1):
             row_out[f"segment_{idx}_mean_ic"] = mean
             row_out[f"segment_{idx}_positive_ratio"] = positive_ratio
@@ -404,13 +389,13 @@ def run_effective_factor_selection(
         rows_h = [row for row in all_diagnostics if int(row["horizon"]) == horizon]
         rows_by_name = {str(row["factor"]): row for row in rows_h}
         for row in rows_h:
-            row["cluster"] = int(clusters[str(row["factor"])])
+            row["cluster_id"] = int(clusters[str(row["factor"])])
         diagnostics_by_horizon[horizon] = rows_h
         for name in names_h:
             cluster_rows.append({
                 "horizon": horizon,
                 "factor": name,
-                "cluster": int(clusters[name]),
+                "cluster_id": int(clusters[name]),
                 "cluster_size": int(sum(value == clusters[name] for value in clusters.values())),
                 "is_representative": False,
                 "family": rows_by_name[name]["family"],
@@ -424,7 +409,7 @@ def run_effective_factor_selection(
             chosen = max(members, key=_representative_key)
             representatives.append(str(chosen["factor"]))
             for row in cluster_rows:
-                if row["horizon"] == horizon and row["cluster"] == cluster_id and row["factor"] == chosen["factor"]:
+                if row["horizon"] == horizon and row["cluster_id"] == cluster_id and row["factor"] == chosen["factor"]:
                     row["is_representative"] = True
         representatives = sorted(representatives, key=lambda name: _representative_key(rows_by_name[name]), reverse=True)
         compact = _compact_representatives(
@@ -437,7 +422,7 @@ def run_effective_factor_selection(
         }
         factor_sets[f"compact_core_h{horizon}"] = {
             "horizon": horizon,
-            "purpose": "bounded family-diverse representative subset",
+            "purpose": "bounded strongest distinct-cluster representatives",
             "factors": compact,
         }
 
@@ -469,8 +454,16 @@ def run_effective_factor_selection(
         "data_source": config.data.source,
         "research_cutoff": cutoff.date().isoformat(),
         "warmup": [window.factor_start.date().isoformat(), (window.is_start - pd.Timedelta(days=1)).date().isoformat()],
-        "is": [window.is_start.date().isoformat(), window.is_end.date().isoformat(), window.is_bars],
-        "oos": [window.oos_start.date().isoformat(), window.oos_end.date().isoformat(), window.oos_bars],
+        "selection_sample": [
+            window.is_start.date().isoformat(),
+            window.is_end.date().isoformat(),
+            window.is_bars,
+        ],
+        "excluded_post_selection_observation": [
+            window.oos_start.date().isoformat(),
+            window.oos_end.date().isoformat(),
+            window.oos_bars,
+        ],
         "factor_frequency": "daily_intraday (1min-derived daily output)",
         "horizon_unit": "daily bars / trading days",
         "horizon_counts": {
@@ -479,6 +472,19 @@ def run_effective_factor_selection(
         },
         "cluster_correlation": {"metric": "direction-adjusted daily cross-sectional rank exposure", "method": "complete_linkage", "threshold_abs_corr": CLUSTER_CORRELATION_THRESHOLD},
         "oos_used_for_selection": False,
+        "performance": {
+            "factor_compute_seconds": factor_compute_seconds,
+            "factor_seconds": sum(float(row["seconds"]) for row in factor_timings),
+            "shared_overhead_seconds": max(
+                0.0,
+                factor_compute_seconds
+                - sum(float(row["seconds"]) for row in factor_timings),
+            ),
+            "factor_timings": sorted(
+                factor_timings,
+                key=lambda row: (-float(row["seconds"]), str(row["factor"])),
+            ),
+        },
         "factor_sets": {key: value for key, value in factor_sets.items() if key in {"balanced_core", "compact_core"}},
         "correlation_files": correlation_files,
     }
@@ -492,7 +498,7 @@ def run_effective_factor_selection(
         "run_id": str(run_id),
         "workflow": "effective-factor-subset-selection",
         "selection_contract": summary,
-        "files": {name: {"sha256": _sha256(output / name)} for name in files},
+        "files": {name: {"sha256": sha256_file(output / name)} for name in files},
     }
     _write_json(output / "run_contract.json", contract)
     runner.factor_engine.clear_cache()

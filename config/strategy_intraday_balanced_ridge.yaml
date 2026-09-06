@@ -1,6 +1,5 @@
-# Reusable balanced candidate built from the effective-library selection run.
-# Horizon assignment in sub_portfolios is authoritative; the top-level union
-# is retained for config readability and audit snapshots.
+# Historical balanced candidate derived from the retired 75-row single-split run.
+# Audit only; horizon assignments are retained to reproduce that snapshot.
 market: futures
 seed: 42
 
@@ -170,7 +169,7 @@ backtest:
   training_window: 750
   retrain_freq: 10
   holding_period: 5
-  # Fixed effective-library subset comparison; the framework default remains enabled.
+  # Historical fixed-subset comparison; the framework default remains enabled.
   ic_monitor:
     enabled: false
 

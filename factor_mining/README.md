@@ -51,7 +51,8 @@
 
 默认 `screen` 预筛与正式滚动训练折发现都使用主框架唯一的`FRAMEWORK_UNIVERSE`，结果会明确写入
 `diagnostic_universe_policy=static_declared_universe`。预筛曲线只能定位horizon，不能
-替代`main.py research`的正式IC与点时可用性检验。
+替代`main.py research`对挖掘`1min`候选的冻结IC与点时可用性检验；
+该入口不直接写入内置日频有效因子库。
 
 ## 特征和算子
 

@@ -16,8 +16,8 @@ plot: true
 #     selection_context: {purpose: metals, max_instruments: 8, leverage: low}
 factor_sets:
   - id: intraday_balanced_core
-    status: active
-    description: 75个有效日内因子按批准周期分组、相关簇代表的平衡候选集；不代表优先级。
+    status: archived
+    description: 历史75条单切分观察结果派生的平衡子集；仅供审计，不属于当前有效库。
     factors:
       - intraday_amihud_sector_relative_20d
       - intraday_amihud_vol_corr_20d
@@ -53,14 +53,14 @@ factor_sets:
       - vol_clustering_20d
     selection_context:
       run_id: 20260825_intraday_effective_library_is126_oos42_cutoff_20260515
-      source: effective_library
+      source: legacy_single_split_observation
       research_cutoff: '2026-05-15'
       method: complete_linkage_abs_rank_exposure_corr_0.50
       horizon_counts: {5: 5, 10: 8, 20: 19}
-      role: peer_candidate
+      role: historical_audit
   - id: intraday_compact_core
-    status: active
-    description: 平衡候选集的有界、家族多样化版本；不代表优先级。
+    status: archived
+    description: 历史75条单切分观察结果派生的紧凑子集；仅供审计，不属于当前有效库。
     factors:
       - intraday_amihud_vol_corr_20d
       - intraday_close_drift_20d
@@ -89,11 +89,11 @@ factor_sets:
       - vol_clustering_20d
     selection_context:
       run_id: 20260825_intraday_effective_library_is126_oos42_cutoff_20260515
-      source: effective_library
+      source: legacy_single_split_observation
       research_cutoff: '2026-05-15'
       method: complete_linkage_abs_rank_exposure_corr_0.50_family_cap_2
       horizon_counts: {5: 5, 10: 8, 20: 12}
-      role: peer_candidate
+      role: historical_audit
 
 strategies:
   # The two effective-library IDs and YAML filenames retain their historical
@@ -113,19 +113,19 @@ strategies:
     mode: single
     description: Fixed 10f observation baseline using the default production recipe; not production approved.
   - id: intraday_balanced_ridge
-    status: observing
-    source: effective_library
-    factor_set_id: intraday_balanced_core
+    status: archived
+    source: legacy_observation
+    factor_set_id: ''
     config_path: config/strategy_intraday_balanced_ridge.yaml
     mode: multi
-    description: 平衡有效因子子集；默认生产方法基线，周期匹配固定为5/10/20。
+    description: 历史75条单切分结果派生的平衡组合；仅供审计。
   - id: intraday_compact_ridge
-    status: observing
-    source: effective_library
-    factor_set_id: intraday_compact_core
+    status: archived
+    source: legacy_observation
+    factor_set_id: ''
     config_path: config/strategy_intraday_compact_ridge.yaml
     mode: multi
-    description: 紧凑有效因子子集；默认生产方法基线，周期匹配固定为5/10/20。
+    description: 历史75条单切分结果派生的紧凑组合；仅供审计。
   # Archived snapshot definitions are excluded from ordinary comparisons.
   # Select them only through RUN_AND_COMPARE_SNAPSHOT_AUDIT; the current
   # default recipe is then applied to the frozen factor set.

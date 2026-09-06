@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from collections.abc import Mapping
 
@@ -398,6 +399,7 @@ class FactorPanelRunner:
         self.close_tradable = self.env.close_tradable
         self._contract_schedule: pd.DataFrame | None = None
         self._contract_schedule_loaded = False
+        self.factor_chunk_timings: list[dict] = []
         all_factors = list(
             dict.fromkeys(
                 factor_names
@@ -423,6 +425,11 @@ class FactorPanelRunner:
                 continue
             batch: dict[str, pd.DataFrame] = {}
             for target_dates, request_dates in self._iter_factor_chunks(self.cal):
+                chunk_started = time.perf_counter()
+                engine_timings = getattr(
+                    self.env.engine, "computation_timings", ()
+                )
+                timing_start = len(engine_timings)
                 try:
                     part = self._compute_part(
                         self.env.engine,
@@ -437,6 +444,18 @@ class FactorPanelRunner:
                         else:
                             batch[name].loc[target_dates] = values.reindex(target_dates)
                 finally:
+                    factor_timings = getattr(
+                        self.env.engine, "computation_timings", ()
+                    )[timing_start:]
+                    self.factor_chunk_timings.append({
+                        "factor_batch": list(batch_names),
+                        "target_start": str(pd.Timestamp(target_dates[0]).date()),
+                        "target_end": str(pd.Timestamp(target_dates[-1]).date()),
+                        "request_start": str(pd.Timestamp(request_dates[0]).date()),
+                        "request_end": str(pd.Timestamp(request_dates[-1]).date()),
+                        "seconds": time.perf_counter() - chunk_started,
+                        "factor_timings": list(factor_timings),
+                    })
                     # A later chunk never reuses an earlier chunk's minute
                     # panels. Release them here while retaining batch outputs.
                     clear_transient_data_caches()
@@ -467,6 +486,41 @@ class FactorPanelRunner:
         # Full minute panels are no longer needed once daily factor/IC matrices
         # have been materialized. Keep only the persistent v4 source cache.
         clear_transient_data_caches()
+
+    def performance_profile(self) -> dict:
+        """Summarize measured factor and date-chunk wall times."""
+        factor_totals: dict[str, float] = {}
+        factor_calls: dict[str, int] = {}
+        for chunk in self.factor_chunk_timings:
+            for row in chunk["factor_timings"]:
+                name = str(row["factor"])
+                factor_totals[name] = factor_totals.get(name, 0.0) + float(
+                    row["seconds"]
+                )
+                factor_calls[name] = factor_calls.get(name, 0) + 1
+        ranked = sorted(
+            (
+                {
+                    "factor": name,
+                    "seconds": seconds,
+                    "calls": factor_calls[name],
+                }
+                for name, seconds in factor_totals.items()
+            ),
+            key=lambda row: (-row["seconds"], row["factor"]),
+        )
+        chunk_seconds = sum(
+            float(chunk["seconds"]) for chunk in self.factor_chunk_timings
+        )
+        factor_seconds = sum(float(row["seconds"]) for row in ranked)
+        return {
+            "factor_totals": ranked,
+            "chunk_count": len(self.factor_chunk_timings),
+            "chunk_seconds": chunk_seconds,
+            "factor_seconds": factor_seconds,
+            "shared_overhead_seconds": max(0.0, chunk_seconds - factor_seconds),
+            "chunks": self.factor_chunk_timings,
+        }
 
     def _oriented_ranks(
         self,

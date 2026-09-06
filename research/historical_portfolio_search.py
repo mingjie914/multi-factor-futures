@@ -354,13 +354,16 @@ def beam_factor_sets(
     maximum_size: int = 12,
     beam_width: int = 20,
     output_limit: int = 12,
+    segments: Sequence[tuple[pd.Timestamp, pd.Timestamp]] | None = None,
 ) -> list[dict]:
     """Return stable cluster-constrained factor sets without exponential search."""
 
     eligible = diagnostics.loc[diagnostics["eligible"], "factor"].astype(str).tolist()
     if len(eligible) < minimum_size:
         return []
-    segments = calendar_segments(start, end, years=2)
+    segments = list(segments) if segments is not None else calendar_segments(
+        start, end, years=2
+    )
     rank = {name: index for index, name in enumerate(eligible)}
     seeds = [(name,) for name in eligible[: min(len(eligible), beam_width)]]
     beam = seeds

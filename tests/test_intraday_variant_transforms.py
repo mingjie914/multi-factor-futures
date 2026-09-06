@@ -10,6 +10,7 @@ from factors.numerics import (
     daily_breakout_statistics,
     daily_candle_path_statistics,
     daily_lagged_pair_statistics,
+    daily_liquidity_event_statistics,
     daily_oi_statistics,
     daily_pair_statistics,
     daily_price_volume_statistics,
@@ -29,6 +30,7 @@ from factors.numerics import (
 from factors.library.intraday import (
     _daily_feature_frames,
     _daily_hlc_features,
+    _daily_path_impact_features,
     _daily_range_volume_ratio,
     _daily_volume_distribution_stability,
     _post_extreme_amount_persistence,
@@ -43,6 +45,70 @@ from factors.library.intraday import (
     OpenCloseVolRank20d,
     PeakCountZscore20d,
 )
+
+
+def test_daily_path_impact_features_are_complete_cached_and_numerically_aligned():
+    index = pd.DatetimeIndex(
+        list(pd.date_range("2026-01-05 09:00", periods=30, freq="min"))
+        + list(pd.date_range("2026-01-06 09:00", periods=30, freq="min"))
+    )
+    step = np.arange(len(index), dtype=float)
+    returns = np.column_stack([
+        np.where(step % 4 == 0, -0.002, 0.001),
+        np.where(step % 5 == 0, -0.001, 0.0015),
+        np.where(step % 3 == 0, 0.001, -0.0005),
+    ])
+    close = pd.DataFrame(
+        100.0 * np.cumprod(1.0 + returns, axis=0), index=index, columns=["A", "B", "C"]
+    )
+    spread = pd.DataFrame(
+        1.0 + (step[:, None] % 5) * np.array([0.1, 0.15, 0.2]),
+        index=index,
+        columns=close.columns,
+    )
+    panel = {
+        "close": close,
+        "high": close + spread,
+        "low": close - 1.0,
+        "open": close.shift(1).fillna(close.iloc[0]),
+        "amount": pd.DataFrame(
+            1_000.0 + step[:, None] * np.array([2.0, 3.0, 4.0]),
+            index=index,
+            columns=close.columns,
+        ),
+    }
+
+    actual = _daily_path_impact_features(panel)
+    assert _daily_path_impact_features(panel) is actual
+    assert set(actual) == {
+        "close_location_dispersion", "close_location_weighted_dispersion",
+        "close_location_tail_spread", "downside_path_share",
+        "downside_path_fraction", "downside_path_concentration",
+        "down_up_impact_ratio", "robust_impact_asymmetry",
+        "scaled_impact_asymmetry", "impact_repair_efficiency",
+        "impact_repair_consistency", "impact_repair_stability",
+        "negative_reversal_ratio", "negative_reversal_speed",
+        "negative_reversal_confirmation", "market_path_similarity",
+        "market_path_shape_similarity", "market_path_residual_stability",
+    }
+    day = pd.Timestamp("2026-01-05")
+    first_day = close.loc[close.index.normalize() == day, "A"]
+    first_returns = first_day.pct_change(fill_method=None).dropna()
+    expected_downside_fraction = float(
+        (-first_returns.clip(upper=0.0)).sum() / first_returns.abs().sum()
+    )
+    assert actual["downside_path_fraction"].loc[day, "A"] == pytest.approx(
+        expected_downside_fraction
+    )
+    location = (
+        2.0
+        * (close.loc[first_day.index, "A"] - panel["low"].loc[first_day.index, "A"])
+        / (panel["high"].loc[first_day.index, "A"] - panel["low"].loc[first_day.index, "A"])
+        - 1.0
+    ).clip(-1.0, 1.0)
+    assert actual["close_location_dispersion"].loc[day, "A"] == pytest.approx(
+        float(location.std(ddof=0))
+    )
 
 
 def test_factor_kernel_mode_auto_selects_installed_native(monkeypatch):
@@ -397,7 +463,78 @@ def test_native_daily_unary_and_pair_statistics_match_pandas(monkeypatch):
             if len(series) >= 3:
                 assert tail["means"][day, column, 1] == pytest.approx(
                     series.iloc[-3:-1].mean()
-                )
+            )
+
+
+@pytest.mark.parametrize("mode", ["reference", "shadow"])
+def test_daily_liquidity_event_statistics_matches_established_loops(monkeypatch, mode):
+    if mode == "shadow":
+        pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", mode)
+    rng = np.random.default_rng(20260903)
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, (140, 3)), axis=0))
+    amount = rng.lognormal(8.0, 0.7, (140, 3))
+    close[9:12, 1] = np.nan
+    amount[75:79, 2] = np.nan
+    close[70:, 0] = 100.0
+    offsets = np.array([0, 70, 140], dtype=np.int64)
+
+    actual = daily_liquidity_event_statistics(close, amount, offsets)
+    expected_resilience = np.full((2, 3), np.nan)
+    expected_lagcorr = np.full((2, 3), np.nan)
+    global_returns = pd.DataFrame(close).pct_change(fill_method=None).abs()
+    amihud = global_returns / (pd.DataFrame(amount) + 1e-12)
+    for day, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        for column in range(close.shape[1]):
+            r = global_returns.iloc[start:end, column].dropna()
+            a = amihud.iloc[start:end, column].dropna()
+            common_index = r.index.intersection(a.index)
+            if len(common_index) >= 60:
+                r, a = r.loc[common_index], a.loc[common_index]
+                sigma = r.std(ddof=0)
+                if sigma != 0 and not pd.isna(sigma):
+                    recoveries = []
+                    for index in np.flatnonzero(r.to_numpy() > r.mean() + 2 * sigma):
+                        below = np.flatnonzero(a.iloc[index + 1:].to_numpy() < a.median())
+                        if len(below):
+                            recoveries.append(below[0] + 1)
+                    if recoveries:
+                        expected_resilience[day, column] = -np.mean(recoveries)
+
+            frame = pd.DataFrame({
+                "close": close[start:end, column],
+                "amount": amount[start:end, column],
+            }).dropna()
+            if len(frame) < 30:
+                continue
+            amplitude = frame["close"].pct_change(fill_method=None).abs()
+            threshold = amplitude.std(ddof=0)
+            jumps = (amplitude > threshold).to_numpy()
+            if threshold < 1e-12 or jumps.sum() < 3:
+                expected_lagcorr[day, column] = 0.0
+                continue
+            jump_amount = frame["amount"].to_numpy()[jumps]
+            next_amount = frame["amount"].to_numpy()[1:][jumps[:-1]]
+            paired_jump = jump_amount[:len(next_amount)]
+            if (
+                len(next_amount) < 3
+                or paired_jump.std(ddof=0) < 1e-12
+                or next_amount.std(ddof=0) < 1e-12
+            ):
+                expected_lagcorr[day, column] = 0.0
+            else:
+                expected_lagcorr[day, column] = np.corrcoef(
+                    paired_jump, next_amount
+                )[0, 1]
+
+    np.testing.assert_allclose(
+        actual["liquidity_resilience"], expected_resilience,
+        atol=1e-12, rtol=1e-12, equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        actual["jump_amount_lagcorr"], expected_lagcorr,
+        atol=1e-12, rtol=1e-12, equal_nan=True,
+    )
 
 
 def test_native_hlc_family_matches_established_daily_formulas(monkeypatch):

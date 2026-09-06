@@ -21,7 +21,9 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
+import time
 from types import SimpleNamespace
 from typing import Mapping, Sequence
 
@@ -37,6 +39,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtest.metrics import TRADING_DAYS_PER_YEAR  # noqa: E402
+from core.config import load_config  # noqa: E402
+from core.date_policy import factor_validation_window, research_cutoff  # noqa: E402
+from pipeline.runner import PipelineRunner  # noqa: E402
 from research.historical_portfolio_search import (  # noqa: E402
     CausalEligibilityEnvironment,
     PortfolioEvaluator,
@@ -60,6 +65,7 @@ from research.portfolio_experiment_support import (  # noqa: E402
     FactorPanelRunner as Runner,
     configured_futures_cost_model,
 )
+from workflows.factor_selection import _load_library  # noqa: E402
 from research.validation import (  # noqa: E402
     HISTORICAL_START,
     OOS_END,
@@ -94,6 +100,314 @@ KNOWN_FACTOR_SETS = {
     "14f": F14,
     "8f": FACTORS_8F,
 }
+
+
+def _split_trading_dates(
+    dates: pd.DatetimeIndex, count: int
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    chunks = np.array_split(np.asarray(dates), int(count))
+    return [
+        (pd.Timestamp(chunk[0]), pd.Timestamp(chunk[-1]))
+        for chunk in chunks if len(chunk)
+    ]
+
+
+def _rank_fixed_recipe_candidates(
+    evaluator: PortfolioEvaluator,
+    candidates: Sequence[dict],
+    segments: Sequence[tuple[pd.Timestamp, pd.Timestamp]],
+) -> list[dict]:
+    rows = []
+    for candidate in _deduplicate_factor_candidates(candidates):
+        factors = list(candidate["factors"])
+        ledger = evaluator.ledger(factors, BASE_RECIPE)
+        summary = robust_summary(ledger, segments, initial_anchor=True)
+        rows.append({
+            "candidate": candidate["candidate"],
+            "factor_count": len(factors),
+            "factors": factors,
+            **summary,
+            "annual_turnover": float(
+                ledger["executed_traded_notional"].iloc[1:].mean()
+                * TRADING_DAYS_PER_YEAR
+            ),
+        })
+    return sorted(
+        rows,
+        key=lambda row: (
+            *robustness_key(row),
+            -float(row["annual_turnover"]),
+            -int(row["factor_count"]),
+        ),
+        reverse=True,
+    )
+
+
+def run_combination_aware_factor_search(
+    *,
+    run_id: str,
+    config_path: str,
+    source_validation_dir: str,
+    source_selection_dir: str | None = None,
+    common_horizon: int = 5,
+) -> Path:
+    """Select common-horizon factors by exact fixed-recipe portfolio evidence.
+
+    Candidate generation and ranking use only the locked IS window.  The locked
+    OOS is evaluated once after the IS winner is frozen and never changes the
+    chosen membership.  A factor checkpoint survives interruption and is
+    removed after a successful run.
+    """
+    output = ROOT / "runs" / "portfolio_factor_search" / str(run_id)
+    output.mkdir(parents=True, exist_ok=False)
+    config = load_config(config_path)
+    policy_runner = PipelineRunner(config=config)
+    window = factor_validation_window(
+        config, policy_runner.data_manager, frequency="daily_intraday"
+    )
+    cutoff = research_cutoff(config)
+    if window.oos_end != cutoff:
+        raise ValueError("portfolio factor search must end at the research cutoff")
+    source_path, library_rows = _load_library(
+        config,
+        source_run_dir=source_validation_dir,
+        allowed_horizons=(int(common_horizon),),
+    )
+    factors = sorted(str(row["factor"]) for row in library_rows)
+    directions = {str(row["factor"]): int(row["direction"]) for row in library_rows}
+    checkpoint = output / "_factor_checkpoints"
+    started = time.perf_counter()
+    runner = Runner(
+        factors,
+        start=window.factor_start,
+        end=cutoff,
+        factor_directions=directions,
+        ic_horizon=int(common_horizon),
+        checkpoint_dir=checkpoint,
+    )
+    factor_seconds = time.perf_counter() - started
+    runner.get_contract_schedule()
+    is_dates = runner.cal[(runner.cal >= window.is_start) & (runner.cal <= window.is_end)]
+    oos_dates = runner.cal[(runner.cal >= window.oos_start) & (runner.cal <= window.oos_end)]
+    if len(is_dates) != window.is_bars or len(oos_dates) != window.oos_bars:
+        raise ValueError("resolved factor-search calendar differs from the locked window")
+
+    candidates_by_prefix: dict[str, list[dict]] = {}
+    prefix_specs = (("is84", is_dates[:84], 2), ("is126", is_dates, 3))
+    for label, dates, segment_count in prefix_specs:
+        diagnostics = training_factor_diagnostics(
+            runner.ic[factors], dates[0], dates[-1]
+        )
+        eligible = diagnostics.loc[diagnostics["eligible"], "factor"].astype(str).tolist()
+        clusters = cluster_factors(
+            runner.ic.loc[dates[0]:dates[-1]], eligible,
+            correlation_threshold=0.85,
+        )
+        beams = beam_factor_sets(
+            runner.ic,
+            diagnostics,
+            clusters,
+            start=dates[0],
+            end=dates[-1],
+            minimum_size=4,
+            maximum_size=14,
+            beam_width=32,
+            output_limit=24,
+            segments=_split_trading_dates(dates, segment_count),
+        )
+        candidates_by_prefix[label] = [
+            {"candidate": f"{label}_beam_{row['rank']}", "factors": row["factors"]}
+            for row in beams
+        ]
+
+    if source_selection_dir:
+        sets_path = Path(source_selection_dir)
+        if not sets_path.is_absolute():
+            sets_path = ROOT / sets_path
+        sets = json.loads((sets_path / "factor_sets.json").read_text(encoding="utf-8"))
+        for name in ("balanced_core", "compact_core"):
+            values = list(sets.get(name, {}).get("factors", []))
+            if values and set(values).issubset(factors):
+                candidates_by_prefix["is126"].append({
+                    "candidate": f"existing_{name}", "factors": values
+                })
+
+    prefix_evaluator = PortfolioEvaluator(
+        runner, start=is_dates[0], end=is_dates[83], cost_model=COST_MODEL
+    )
+    prefix_ranked = _rank_fixed_recipe_candidates(
+        prefix_evaluator,
+        candidates_by_prefix["is84"],
+        _split_trading_dates(is_dates[:84], 2),
+    )
+    prefix_evaluator.clear_transient_caches()
+    candidates = _deduplicate_factor_candidates(
+        candidates_by_prefix["is84"] + candidates_by_prefix["is126"]
+    )
+    is_evaluator = PortfolioEvaluator(
+        runner, start=is_dates[0], end=is_dates[-1], cost_model=COST_MODEL
+    )
+    exact_started = time.perf_counter()
+    initial_is_ranked = _rank_fixed_recipe_candidates(
+        is_evaluator, candidates, _split_trading_dates(is_dates, 3)
+    )
+    full_diagnostics = training_factor_diagnostics(
+        runner.ic[factors], is_dates[0], is_dates[-1]
+    )
+    replacement_pool = full_diagnostics.loc[
+        full_diagnostics["eligible"], "factor"
+    ].astype(str).head(8).tolist()
+    refinements = []
+    for seed_index, seed in enumerate(initial_is_ranked[:2], 1):
+        seed_factors = list(seed["factors"])
+        if len(seed_factors) > 4:
+            refinements.extend({
+                "candidate": f"refine_{seed_index}_drop_{removed}",
+                "factors": [name for name in seed_factors if name != removed],
+            } for removed in seed_factors)
+        refinements.extend({
+            "candidate": f"refine_{seed_index}_add_{added}",
+            "factors": [*seed_factors, added],
+        } for added in replacement_pool if added not in seed_factors)
+        for removed in seed_factors:
+            refinements.extend({
+                "candidate": f"refine_{seed_index}_swap_{removed}_for_{added}",
+                "factors": [
+                    *(name for name in seed_factors if name != removed), added
+                ],
+            } for added in replacement_pool if added not in seed_factors)
+    candidates = _deduplicate_factor_candidates([*candidates, *refinements])
+    is_ranked = _rank_fixed_recipe_candidates(
+        is_evaluator, candidates, _split_trading_dates(is_dates, 3)
+    )
+    exact_seconds = time.perf_counter() - exact_started
+    winner = is_ranked[0]
+
+    leave_one_out = []
+    winner_ledger = is_evaluator.ledger(winner["factors"], BASE_RECIPE)
+    winner_metrics = performance_metrics(
+        winner_ledger["net_return"], initial_anchor=True
+    )
+    for removed in winner["factors"]:
+        factors_without = [name for name in winner["factors"] if name != removed]
+        ledger = is_evaluator.ledger(factors_without, BASE_RECIPE)
+        metrics = performance_metrics(ledger["net_return"], initial_anchor=True)
+        leave_one_out.append({
+            "removed_factor": removed,
+            "sharpe": metrics["sharpe"],
+            "sharpe_delta_vs_winner": metrics["sharpe"] - winner_metrics["sharpe"],
+            "annual_return": metrics["annual_return"],
+            "max_drawdown": metrics["max_drawdown"],
+        })
+    is_evaluator.clear_transient_caches()
+
+    oos_evaluator = PortfolioEvaluator(
+        runner, start=oos_dates[0], end=oos_dates[-1], cost_model=COST_MODEL
+    )
+    finalist_names = {row["candidate"] for row in is_ranked[:5]}
+    oos_rows = []
+    navs = {}
+    for row in is_ranked:
+        if row["candidate"] not in finalist_names:
+            continue
+        ledger = oos_evaluator.ledger(row["factors"], BASE_RECIPE)
+        metrics = performance_metrics(ledger["net_return"], initial_anchor=True)
+        oos_rows.append({
+            "candidate": row["candidate"],
+            "is_rank": is_ranked.index(row) + 1,
+            "factor_count": row["factor_count"],
+            "factors": row["factors"],
+            **metrics,
+        })
+        navs[row["candidate"]] = ledger["nav"]
+    winner_weights = oos_evaluator.weights(winner["factors"], BASE_RECIPE)
+    stressed = oos_evaluator.ledger_from_weights(winner_weights, cost_multiplier=2.0)
+    stress_metrics = performance_metrics(stressed["net_return"], initial_anchor=True)
+    oos_evaluator.clear_transient_caches()
+
+    pd.DataFrame(is_ranked).assign(
+        factors=lambda frame: frame["factors"].map("|".join)
+    ).to_csv(output / "is_candidate_ranking.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(oos_rows).assign(
+        factors=lambda frame: frame["factors"].map("|".join)
+    ).to_csv(output / "locked_oos_diagnostics.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(leave_one_out).to_csv(
+        output / "leave_one_out_is.csv", index=False, encoding="utf-8-sig"
+    )
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for name, nav in navs.items():
+        normalized = nav / nav.iloc[0] * 1000.0
+        metric = next(row for row in oos_rows if row["candidate"] == name)
+        ax.plot(
+            normalized.index,
+            normalized.values,
+            linewidth=2.0 if name == winner["candidate"] else 1.2,
+            label=(f"{name} | 年化{metric['annual_return']:.1%} "
+                   f"夏普{metric['sharpe']:.2f} 回撤{metric['max_drawdown']:.1%}"),
+        )
+    ax.set_title("共同H5因子组合搜索：冻结样本外净值（总敞口2，扣费后）")
+    ax.set_ylabel("净值（起点=1000）")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output / "locked_oos_nav.png", dpi=160)
+    plt.close(fig)
+
+    profile = runner.performance_profile()
+    result = {
+        "workflow": "combination_aware_factor_search",
+        "source_validation": str(source_path),
+        "candidate_factor_count": len(factors),
+        "common_horizon": int(common_horizon),
+        "recipe": BASE_RECIPE.to_dict(),
+        "research_cutoff": cutoff.date().isoformat(),
+        "warmup": [window.factor_start.date().isoformat(), (window.is_start - pd.Timedelta(days=1)).date().isoformat()],
+        "is": [window.is_start.date().isoformat(), window.is_end.date().isoformat(), window.is_bars],
+        "oos": [window.oos_start.date().isoformat(), window.oos_end.date().isoformat(), window.oos_bars],
+        "oos_used_for_selection": False,
+        "search": {
+            "prefixes": ["first_84_is_bars", "all_126_is_bars"],
+            "candidate_generation": "IC beam, max one member per abs-IC-correlation cluster at 0.85",
+            "candidate_factor_count_range": [4, 14],
+            "exact_ranking": "fixed production recipe; 3 IS segments; robustness then turnover",
+            "refinement": "top-2 exact candidates; one bounded add/drop/swap pass using top-8 IS diagnostics",
+            "initial_candidate_count": len(initial_is_ranked),
+            "refinement_candidate_count": len(candidates) - len(initial_is_ranked),
+            "candidate_count": len(candidates),
+        },
+        "winner": {
+            **winner,
+            "full_is_metrics": winner_metrics,
+            "locked_oos_metrics": next(
+                row for row in oos_rows if row["candidate"] == winner["candidate"]
+            ),
+            "locked_oos_cost_2x_metrics": stress_metrics,
+        },
+        "membership_stability": {
+            "is84_winner": prefix_ranked[0]["factors"],
+            "is126_winner": winner["factors"],
+            "jaccard": factor_set_jaccard(
+                prefix_ranked[0]["factors"], winner["factors"]
+            ),
+        },
+        "performance": {
+            "factor_panel_seconds": factor_seconds,
+            "exact_candidate_search_seconds": exact_seconds,
+            "factor_panel_profile": profile,
+        },
+    }
+    _json_dump(output / "search_summary.json", result)
+    shutil.rmtree(checkpoint)
+    print(json.dumps({
+        "output": str(output),
+        "winner": winner["candidate"],
+        "factors": winner["factors"],
+        "is_metrics": winner_metrics,
+        "oos_metrics": result["winner"]["locked_oos_metrics"],
+    }, ensure_ascii=False, indent=2), flush=True)
+    return output
 
 
 def _json_dump(path: Path, value) -> None:

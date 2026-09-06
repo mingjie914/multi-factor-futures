@@ -1,24 +1,32 @@
-from pathlib import Path
 from inspect import signature
+from pathlib import Path
+
+import pytest
 
 import run_factor_workflow as ide
 from workflows.factor_validation import run_default_factor_validation
 
 
-def test_ide_workflow_has_no_full_history_branch():
+def test_ide_workflow_names_have_one_default_and_no_one_off_horizon_branches():
     assert {item.value for item in ide.FactorWorkflow} == {
+        "validate_factor_batch",
         "validate_all_intraday",
-        "validate_all_intraday_common_h1",
-        "validate_all_intraday_common_h5",
+        "observe_common_horizon",
         "admit_completed_run",
         "select_effective_subsets",
-        "select_common_h5_subsets",
     }
-    assert ide.WORKFLOW is ide.FactorWorkflow.VALIDATE_ALL_INTRADAY
+    assert ide.WORKFLOW is ide.FactorWorkflow.VALIDATE_FACTOR_BATCH
     assert "admit" not in signature(run_default_factor_validation).parameters
 
 
-def test_ide_default_routes_to_standard_validation(monkeypatch):
+def test_ide_batch_validation_fails_closed_without_factor_names(monkeypatch):
+    monkeypatch.setattr(ide, "WORKFLOW", ide.FactorWorkflow.VALIDATE_FACTOR_BATCH)
+    monkeypatch.setattr(ide, "FACTOR_NAMES", ())
+    with pytest.raises(ValueError, match="FACTOR_NAMES"):
+        ide.main()
+
+
+def test_ide_batch_routes_to_standard_admission_validation(monkeypatch):
     called = {}
 
     def fake_validation(**kwargs):
@@ -27,16 +35,37 @@ def test_ide_default_routes_to_standard_validation(monkeypatch):
 
     monkeypatch.setattr(ide, "run_default_factor_validation", fake_validation)
     monkeypatch.setattr(ide, "VALIDATION_RUN_ID", "ide_test")
-    monkeypatch.setattr(ide, "WORKFLOW", ide.FactorWorkflow.VALIDATE_ALL_INTRADAY)
+    monkeypatch.setattr(ide, "FACTOR_NAMES", ("factor_b", "factor_a"))
+    monkeypatch.setattr(ide, "WORKFLOW", ide.FactorWorkflow.VALIDATE_FACTOR_BATCH)
     ide.main()
 
     assert called == {
         "run_id": "ide_test",
         "config_path": "config/default.yaml",
+        "factor_names": ("factor_b", "factor_a"),
     }
 
 
-def test_ide_common_horizon_routes_to_explicit_comparison(monkeypatch):
+def test_ide_full_pool_route_is_explicit(monkeypatch):
+    called = {}
+
+    def fake_validation(**kwargs):
+        called.update(kwargs)
+        return Path("unused")
+
+    monkeypatch.setattr(ide, "run_default_factor_validation", fake_validation)
+    monkeypatch.setattr(ide, "VALIDATION_RUN_ID", "full_test")
+    monkeypatch.setattr(ide, "WORKFLOW", ide.FactorWorkflow.VALIDATE_ALL_INTRADAY)
+    ide.main()
+
+    assert called == {
+        "run_id": "full_test",
+        "config_path": "config/default.yaml",
+        "all_registered": True,
+    }
+
+
+def test_ide_common_horizon_is_one_explicit_observation_route(monkeypatch):
     called = {}
 
     def fake_validation(**kwargs):
@@ -45,14 +74,13 @@ def test_ide_common_horizon_routes_to_explicit_comparison(monkeypatch):
 
     monkeypatch.setattr(ide, "run_common_horizon_factor_validation", fake_validation)
     monkeypatch.setattr(ide, "VALIDATION_RUN_ID", "common_probe")
-    monkeypatch.setattr(
-        ide, "WORKFLOW", ide.FactorWorkflow.VALIDATE_ALL_INTRADAY_COMMON_H1
-    )
+    monkeypatch.setattr(ide, "COMMON_HORIZON", 5)
+    monkeypatch.setattr(ide, "WORKFLOW", ide.FactorWorkflow.OBSERVE_COMMON_HORIZON)
     ide.main()
 
     assert called == {
         "run_id": "common_probe",
-        "common_horizon": 1,
+        "common_horizon": 5,
         "config_path": "config/default.yaml",
     }
 
@@ -62,12 +90,8 @@ def test_ide_admission_requires_explicit_evidence(monkeypatch):
     monkeypatch.setattr(ide, "ADMISSION_RUN_DIR", None)
     monkeypatch.setattr(ide, "ADMITTED_AT", None)
 
-    try:
+    with pytest.raises(ValueError, match="ADMISSION_RUN_DIR and ADMITTED_AT"):
         ide.main()
-    except ValueError as exc:
-        assert "ADMISSION_RUN_DIR and ADMITTED_AT" in str(exc)
-    else:
-        raise AssertionError("admission must fail closed without explicit evidence")
 
 
 def test_ide_admission_routes_only_to_library_update(monkeypatch, tmp_path):
@@ -112,27 +136,4 @@ def test_ide_selection_routes_to_effective_library_workflow(monkeypatch):
     assert called == {
         "run_id": "selection_probe",
         "config_path": "config/default.yaml",
-    }
-
-
-def test_ide_common_h5_selection_routes_to_frozen_validation_run(monkeypatch):
-    called = {}
-
-    def fake_selection(**kwargs):
-        called.update(kwargs)
-        return Path("runs/factor_selection/common_h5_probe")
-
-    monkeypatch.setattr(
-        ide, "WORKFLOW", ide.FactorWorkflow.SELECT_COMMON_H5_SUBSETS
-    )
-    monkeypatch.setattr(ide, "COMMON_H5_SELECTION_RUN_ID", "common_h5_probe")
-    monkeypatch.setattr(ide, "run_effective_factor_selection", fake_selection)
-
-    ide.main()
-
-    assert called == {
-        "run_id": "common_h5_probe",
-        "config_path": "config/default.yaml",
-        "source_run_dir": ide.COMMON_H5_VALIDATION_RUN_DIR,
-        "common_horizon": 5,
     }

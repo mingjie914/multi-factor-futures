@@ -245,6 +245,14 @@ def test_factor_panel_runner_resumes_after_completed_batch(tmp_path, monkeypatch
     assert calls == [("factor_10",)]
     assert resumed.checkpoint_loaded_factor_count == 10
     assert resumed.computed_factor_count == 1
+    assert resumed.performance_profile() == {
+        "factor_totals": [],
+        "chunk_count": 1,
+        "chunk_seconds": resumed.factor_chunk_timings[0]["seconds"],
+        "factor_seconds": 0,
+        "shared_overhead_seconds": resumed.factor_chunk_timings[0]["seconds"],
+        "chunks": resumed.factor_chunk_timings,
+    }
 
 
 def test_return_metrics_include_drawdown_from_initial_capital():
@@ -481,6 +489,7 @@ def test_training_clustering_and_beam_search_use_training_slice_only():
         maximum_size=4,
         beam_width=10,
         output_limit=5,
+        segments=[(dates[0], dates[249]), (dates[250], dates[-1])],
     )
     assert candidates
     for candidate in candidates:

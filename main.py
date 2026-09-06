@@ -13,9 +13,9 @@ if PROJECT_ROOT not in sys.path:
 
 
 WORKFLOW_COMMANDS = {
-    "research": ("workflows.research", "factor tests and census studies"),
+    "research": ("workflows.research", "exploratory, migration, or mined-factor studies"),
     "factor-validation": (
-        "workflows.factor_validation", "default 126 IS + 42 OOS factor validation"
+        "workflows.factor_validation", "formal daily-intraday factor admission or observation"
     ),
     "factor-library": (
         "workflows.factor_library", "effective-factor library management"

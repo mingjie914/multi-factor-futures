@@ -15,7 +15,7 @@ from core.sectors import FRAMEWORK_UNIVERSE
 def _write_config(tmp_path, *, approved_period=5, holding_period=5):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "factors": [{
             "factor": "factor_a",
             "status": "effective",
@@ -244,3 +244,26 @@ def test_common_h5_branch_routes_without_catalog_admission(monkeypatch):
     ide.main()
 
     assert called == {"ic_horizon": 5}
+
+
+def test_common_h5_combination_compare_is_explicit_and_horizon_matched(monkeypatch):
+    called = {}
+
+    def fake_compare(**kwargs):
+        called.update(kwargs)
+        return Path("runs/portfolio_backtest/common_h5_combination_probe")
+
+    monkeypatch.setattr(
+        ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_COMMON_H5_SEARCH
+    )
+    monkeypatch.setattr(ide, "run_common_h5_compare", fake_compare)
+    monkeypatch.setattr(ide, "COMMON_H5_SEARCH_COMPARISON_RUN_ID", "probe")
+    monkeypatch.setattr(ide, "COMMON_H5_SEARCH_IC_HORIZON", 5)
+
+    ide.main()
+
+    assert called == {
+        "ic_horizon": 5,
+        "run_id_override": "probe",
+        "factor_search_run_dir": ide.COMMON_H5_FACTOR_SEARCH_RUN_DIR,
+    }

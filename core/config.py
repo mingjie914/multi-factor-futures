@@ -677,11 +677,6 @@ def load_strategy_library(path: str) -> StrategyLibraryConfig:
         else:
             if entry.factor_set_id:
                 raise ValueError(f"legacy strategy {entry.id!r} cannot claim an effective factor set")
-            if not entry.factor_definition_path and entry.status == "archived":
-                raise ValueError(
-                    f"archived legacy strategy {entry.id!r} must declare a "
-                    "factor definition path"
-                )
     return catalog
 
 

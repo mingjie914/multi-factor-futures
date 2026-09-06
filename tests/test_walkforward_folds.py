@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from core.config import load_config
+from core.registry import list_registered
 from workflows.walkforward import (
     _build_fold_bundle,
     _build_rolling_folds,
@@ -16,10 +17,16 @@ from workflows.walkforward import (
 from workflows.research import _research_period_protocol
 
 
-def test_intraday_walkforward_pool_is_the_registered_588_contract():
+def test_intraday_walkforward_pool_tracks_the_registered_intraday_contract():
     names = _candidate_factor_names("factors.library.intraday")
+    registry = list_registered("factor").get("factor", {})
+    expected = sorted(
+        name for name, factor_class in registry.items()
+        if factor_class.__module__.startswith("factors.library.intraday")
+        and str(getattr(factor_class, "frequency", "daily")).lower() == "daily"
+    )
 
-    assert len(names) == 588
+    assert names == expected
 
 
 def test_intraday_walkforward_uses_configured_90_day_warmup():

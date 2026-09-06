@@ -1156,7 +1156,8 @@ def test_parallel_factor_engine_preserves_alignment_and_values(monkeypatch):
         lambda kind, name: factors[name],
     )
 
-    sequential = engine_module.FactorEngine(Data()).compute_factors(
+    sequential_engine = engine_module.FactorEngine(Data())
+    sequential = sequential_engine.compute_factors(
         list(factors), dates, universe, parallel=False
     )
     parallel = engine_module.FactorEngine(Data()).compute_factors(
@@ -1167,6 +1168,10 @@ def test_parallel_factor_engine_preserves_alignment_and_values(monkeypatch):
         assert parallel[name].index.equals(dates)
         assert parallel[name].columns.equals(universe)
         pd.testing.assert_frame_equal(parallel[name], sequential[name])
+    timings = sequential_engine.computation_timings
+    assert [row["factor"] for row in timings] == list(factors)
+    assert all(row["status"] == "complete" for row in timings)
+    assert all(row["seconds"] >= 0.0 for row in timings)
 
 
 def test_factor_engine_is_strict_by_default_and_tolerant_only_when_explicit(
@@ -1224,6 +1229,44 @@ def test_factor_engine_is_strict_by_default_and_tolerant_only_when_explicit(
         engine_module.FactorEngine(Data()).compute_factors(
             ["missing_factor"], dates, universe
         )
+
+
+def test_factor_engine_empty_request_preserves_validation_error_and_timing():
+    import factors.engine as engine_module
+
+    class Data:
+        pass
+
+    factor = SimpleNamespace(name="empty_request_probe")
+    engine = engine_module.FactorEngine(Data())
+
+    with pytest.raises(ValueError, match="dates and universe must be non-empty"):
+        engine.compute_factor(factor, pd.DatetimeIndex([]), pd.Index(["RB"]))
+
+    assert engine.computation_timings[-1] == {
+        "factor": "empty_request_probe",
+        "request_start": "",
+        "request_end": "",
+        "request_dates": 0,
+        "seconds": engine.computation_timings[-1]["seconds"],
+        "status": "failed",
+    }
+
+
+def test_research_fingerprint_uses_only_the_frozen_date_slice():
+    from workflows.research import _research_data_fingerprint
+
+    calls = []
+
+    class Source:
+        def checkpoint_source_fingerprint(self, start, end):
+            calls.append((start, end))
+            return "frozen-slice-hash"
+
+    start = pd.Timestamp("2025-01-01")
+    end = pd.Timestamp("2026-05-15")
+    assert _research_data_fingerprint(Source(), start, end) == "frozen-slice-hash"
+    assert calls == [(start, end)]
 
 
 def test_factor_engine_validates_optimized_spec_batch_outputs(monkeypatch):

@@ -81,7 +81,11 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 `MF_MINED_CANDIDATE_SNAPSHOT` 在导入前传递已校验路径，不应由普通研究命令手工设置。
 主框架不会读取 SQLite，也不会访问远程行情源。
 
-### 4. 用现有研究流程正式筛选
+### 4. 用现有分钟研究流程生成冻结证据
+
+> 本节专用于挖掘得到的`1min`候选，不直接写入当前只接受内置
+> `daily intraday`因子的正式有效库。内置日频因子准入的唯一入口是
+> `run_factor_workflow.py`；二者的频率和准入语义不可混用。
 
 注册名来自 `pool-list` 的 `framework_name`，例如：
 
@@ -100,15 +104,15 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 仅用于显式复述同一有序全集，传入不同集合或顺序会失败关闭。`factor-start` 仍需覆盖
 因子自身的技术指标预热。
 
-正式执行时应先冻结候选快照、因子名、bar 周期、日期和检验边界，并为每次研究指定
+执行时应先冻结候选快照、因子名、bar 周期、日期和检验边界，并为每次研究指定
 新的 `--output-dir` 与 `--refuse-existing-output`。`main.py research` 输出的
 `ic_by_window_period.json` 会记录精确配置、验证策略与 taxonomy 哈希、完整假设数、
 因子级 Simes/BH、selection-adjusted 因子内 BH、报告用 FWER 标签和逐因子结果；
-`validation_funnel.json` 另存完整漏斗及阈值 ±20% 敏感性。正式查看真实历史的 IC、
+`validation_funnel.json` 另存完整漏斗及阈值 ±20% 敏感性。查看该分钟候选真实历史的 IC、
 HAC t 值、收益或最优周期必须走该流程；合成数据调试、表达式编码和单元测试不需要
 机械执行完整协议。
 
-当前正式发现门槛读取 `validation_policy`：层级 FDR `q=0.10`、`|IC|>=0.01`、
+该冻结分钟研究门槛读取 `validation_policy`：层级 FDR `q=0.10`、`|IC|>=0.01`、
 `|t|>=2.0`。Bonferroni/FWER 只作证据标签，不再是硬闸门。三分组、分钟换手按交易日
 聚合、自然年稳定性和成本检查均在同一输出中记录。筛选期仅扣年化 0.02% 固定成本，
 换手仅作诊断且不是准入门槛；筛选成功后的研究回测再加入年化 0.105% 移仓成本。

@@ -44,11 +44,17 @@ class FactorEngine:
         )
         self._factor_cache: Dict[str, FactorMatrix] = {}
         self._failure_ledger: list[dict[str, str]] = []
+        self._computation_timings: list[dict[str, object]] = []
 
     @property
     def failures(self) -> tuple[dict[str, str], ...]:
         """Failures observed in explicit discovery-only tolerant mode."""
         return tuple(dict(item) for item in self._failure_ledger)
+
+    @property
+    def computation_timings(self) -> tuple[dict[str, object], ...]:
+        """Per-factor wall times for lightweight, result-neutral profiling."""
+        return tuple(dict(item) for item in self._computation_timings)
 
     @staticmethod
     def _nan_matrix(dates: DateIndex, universe: Universe) -> FactorMatrix:
@@ -124,7 +130,30 @@ class FactorEngine:
     def compute_factor(
         self, factor: Factor, dates: DateIndex, universe: Universe
     ) -> FactorMatrix:
-        """计算单个因子矩阵."""
+        """计算单个因子矩阵并记录不改变执行路径的墙钟耗时."""
+        started = time.perf_counter()
+        status = "complete"
+        request_start = str(pd.Timestamp(dates[0]).date()) if len(dates) else ""
+        request_end = str(pd.Timestamp(dates[-1]).date()) if len(dates) else ""
+        try:
+            return self._compute_factor(factor, dates, universe)
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            self._computation_timings.append({
+                "factor": str(factor.name),
+                "request_start": request_start,
+                "request_end": request_end,
+                "request_dates": int(len(dates)),
+                "seconds": time.perf_counter() - started,
+                "status": status,
+            })
+
+    def _compute_factor(
+        self, factor: Factor, dates: DateIndex, universe: Universe
+    ) -> FactorMatrix:
+        """Unprofiled factor implementation used by the public wrapper."""
         if len(dates) == 0 or len(universe) == 0:
             raise ValueError("factor request dates and universe must be non-empty")
         try:

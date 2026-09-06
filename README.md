@@ -1,7 +1,7 @@
 # 期货多因子研究框架
 
 这是一个以本地数据研究为优先、默认不交易的期货因子研究与组合框架。当前状态
-（2026-08-23）仍为 `NO_TARGETS`：`config/default.yaml` 的10f只是固定观察基线，
+（2026-09-06）仍为 `NO_TARGETS`：`config/default.yaml` 的10f只是固定观察基线，
 `config/target_publication.yaml` 保持关闭且没有获批部署包。挖掘结果只会进入候选池，
 不会自动进入组合或发布目标权重。
 当前固定观察基线为10f＋60日ICIR＋Top10/Bottom10＋cap3＋分侧ERC；它只用于
@@ -10,14 +10,14 @@
 > **2026-08-24状态**：Parquet权威数据与认证DuckDB镜像均通过严格健康检查；框架默认运行
 > 源已切换为认证DuckDB；行情长表读取、选约、连续合约、重采样与期限曲线使用Polars，
 > 仅在现有DataProvider日期×品种矩阵接口处转换为Pandas。Parquet保留为发布与回退层。
-> 统一38品种、76交易日、588因子的最新单线程快速画像为588/588无错误、约326秒；同口径
+> 统一38品种、76交易日、588因子的迁移期单线程快速画像为588/588无错误、约326秒；同口径
 > 本轮早期约1,344秒。Python因子/策略接口不变，已准入共享数组族自动使用本地Rust核心；
 > 本轮只改执行方式和重复日内整理，不改策略公式、日期语义、选约或席位匹配。
 > 2016-03-31至2026-08-20的长历史迁移对照提交599个历史注册类，其中11个不可估计定义已确认
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
 > `|corr|>=0.5`去重为13簇。本次588因子迁移重放得到相同H20；它只证明数据/实现语义
-> 一致，不是正式因子准入。2026-08-24已按90日历日预热 + 126交易日IS + 42交易日OOS
-> 完成588因子的统一检验，75个通过并进入结构化有效因子库；生产批准数仍为0。
+> 一致，不是正式因子准入。2026-08-24的90日历日预热＋126交易日IS＋42交易日OOS及其
+> 75条结果现仅作历史单切分观察；正式有效因子库从0开始按恢复后的全历史准入流程重建。
 
 ## 架构
 
@@ -62,7 +62,7 @@ python -m pip install -r requirements.txt
 - **[框架工作流程与使用方法.md](框架工作流程与使用方法.md)** — 标准工作流程（因子层可变/组合层固化）+ 快速上手（主入口）
 - **[docs/多因子框架研究手册.md](docs/多因子框架研究手册.md)** — 总体研究方法与四层架构
 - **docs/因子检验与准入流程.md** — 因子检验与准入流程（v2 策略）
-- **docs/有效因子库.md** — 当前75个有效因子的结构化库、证据与日常入库流程
+- **docs/有效因子库.md** — 当前结构化有效库、证据边界与日常入库流程
 - **run_factor_workflow.py** — IDE日常因子检验/入库的唯一显式分支入口
 - **workflows/factor_selection.py** — 从当前有效库派生周期匹配、去冗后的平行因子子集并保存选择证据
 - **config/strategy_library.yaml** — 平行因子子集与策略库的唯一人类可读目录
@@ -78,9 +78,9 @@ python -m pip install -r requirements.txt
 
 ## 常用入口
 
-因子检验日常入口优先使用IDE直接运行`run_factor_workflow.py`。顶部代码枚举明确区分
-“检验全部日内因子”和“将已审阅run入库”，且没有全历史分支。以下`main.py`命令用于
-自动化和其他兼容工作流：
+因子检验日常入口优先使用IDE直接运行`run_factor_workflow.py`。默认送检明确新增批次；
+第一次建库/正式重建、观察、入库和下游子集选择均为互斥的显式分支。以下`main.py`命令
+用于自动化和其他兼容工作流：
 
 组合回测优先在IDE运行`run_portfolio_workflow.py`。因子子集、策略状态和完整策略YAML路径
 统一登记在`config/strategy_library.yaml`；入口代码不再保存策略名单。默认分支只校验目录、
@@ -97,12 +97,11 @@ YAML中模型/风险/优化器的显式挑战方案时才切换`RUN_AND_COMPARE_
 需要将旧10、平衡、紧凑与 6f/8f/13f 六个策略放在同一张净值图时，切换
 `RUN_AND_COMPARE_ALL`；该分支只改变因子集合，仍使用同一默认生产方法。
 
-周期对照也必须使用显式 IDE 分支，不能把六策略统一图误认为多周期子组合：
+周期对照也必须使用显式分支，不能把六策略统一图误认为多周期子组合：
 `RUN_AND_COMPARE_CONFIGURED` 才会按各 YAML 的 `sub_portfolios` 实际运行 5/10/20
 子组合，但它同时采用 YAML 中声明的模型、风险和 meta-optimizer，属于完整配置挑战；
-它不能单独证明“周期匹配”带来的增益。共同 H5 因子筛选证据可用
-`run_factor_workflow.py` 的 `SELECT_COMMON_H5_SUBSETS`，随后用
-`RUN_AND_COMPARE_COMMON_H5`（默认日度 IC）与
+它不能单独证明“周期匹配”带来的增益。已有共同H5研究证据仍可由下游选择API显式读取，
+随后用`RUN_AND_COMPARE_COMMON_H5`（默认日度 IC）与
 `RUN_AND_COMPARE_COMMON_H5_MATCHED`（统一 H5 IC 敏感性）逐条比较。后两条只读取独立
 研究run，不会把共同 H5 因子自动写入有效因子库。
 
@@ -116,7 +115,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 # 自动化兼容入口；IDE日常操作仍运行run_factor_workflow.py
 & $PY -X utf8 -B main.py factor-validation `
-  --config config/default.yaml --run-id <study_id>
+  --config config/default.yaml --run-id <study_id> `
+  --factors factor_a,factor_b
 
 # 因子挖掘（合成冒烟不会写候选库）
 & $PY -X utf8 -B main.py mining dev-smoke `
@@ -157,7 +157,7 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 
 - `config/default.yaml`：全框架默认契约及旧10f观察基线，包含38品种和统一处理语义；默认
   读取认证DuckDB，Parquet保留为权威发布与回退层。确定的新策略使用各自完整YAML。
-- `config/local.yaml`：只保存本机数据路径、认证release与数据运行时选择，已被Git忽略；
+- `config/local.yaml`：只保存本机数据路径、可选的冻结release与数据运行时选择，已被Git忽略；
   加载器禁止它覆盖品种、因子、处理或回测语义。
 - `config/target_publication.yaml`：独立目标权重发布门，不能传给 `load_config()`当作研究配置。
 - 除成本模型的自定义参数外，未知配置键会直接报错，避免拼写错误被静默忽略。
@@ -165,9 +165,10 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   `config/strategy_library.yaml`，不在入口代码重复维护模块参数。
 
 本地 Parquet 根目录通过 `MF_PARQUET_ROOT` 提供；认证运行库通过
-`MF_DUCKDB_PATH`和当前`MF_DATA_RELEASE_ID`绑定。DuckDB读取固定使用Polars生产路径，
-不再存在容易误路由的结果后端开关。夜间DuckDB发布新release后，必须先验证成功，再更新
-绑定的release ID并重启；旧ID会失败关闭，不能自动漂移到未经确认的数据。
+`MF_DUCKDB_PATH`提供。日常运行的`required_release_id`/`MF_DATA_RELEASE_ID`留空，自动读取唯一
+`current + certified`的每日release；复现冻结研究时才显式填入ID，不匹配将失败关闭。
+DuckDB读取固定使用Polars生产路径，不再存在容易误路由的结果后端开关。
+研究合同哈希仅覆盖冻结日期范围内的分区；截止日之后的日常增量不会使旧研究断点失效。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 
 时间采用两条互不混用的轴：`date_policy.research_cutoff`是所有因子发现、挖掘、适配性、
@@ -190,10 +191,10 @@ Rayon，不能以增加计算线程换取速度。
 
 ## 研究治理
 
-正式查看真实历史上的 IC、HAC t 值、收益或最优周期时，必须冻结公式、频率、日期、
-目标和假设数，并为每次研究使用新的只写一次输出目录。仓库内的 `main.py research`
-会记录检验配置、完整假设数和逐因子结果；编写表达式、合成数据调试和单元测试不要求
-执行完整流程。
+查看真实历史上的 IC、HAC t 值、收益或周期时，必须冻结公式、频率、日期、
+目标和假设数，并为每次研究使用新的只写一次输出目录。内置日频因子的正式准入只走
+`run_factor_workflow.py`；`main.py research`仅保留为探索/迁移及挖掘分钟候选的冻结研究入口。
+编写表达式、合成数据调试和单元测试不需执行完整流程。
 
 GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手仅作诊断，二者都不是正式
 入围证据。SQLite 只管理候选与血缘；主框架只接收带哈希的 JSON 快照。候选即使通过
@@ -211,12 +212,13 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 长历史迁移对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
 提交规模。其研究契约、代码/配置/数据哈希用于更新后同区间重放比较，不代表当前数据
 更新后的正式结论。
-正式因子检验窗口由`config/default.yaml::validation_policy`单一维护。日内因子日度输出当前
-使用90个日历日预热、126个交易日IS和紧邻的42个交易日OOS，按认证交易日历从统一
-`research_cutoff`向前解析。默认工作流只生成这一组窗口，不滚动扩展也不使用全历史。
-`research/validation.py`中的固定扩展窗口只服务
-`workflows/experiments/`旧版隔离实验。最终locked OOS只能从研究方案完全冻结后的新数据
-开始；`holdout_ledger.jsonl`记录样本消费事实，不能把已查看历史重新标成未见样本。
+正式因子准入窗口固定为`config/default.yaml::date_range.start`至
+`date_policy.research_cutoff`，预热与统计门槛由`validation_policy`维护；默认只检验IDE中
+显式列出的新增批次，首次建库或正式全量重建必须显式选择全池分支。126/42单切分、滚动
+Walk-forward、相关聚类和locked OOS均属于准入后的观察或组合验证，不能写回单因子准入结论。
+`research/validation.py`中的固定扩展窗口只服务`workflows/experiments/`旧版隔离实验。最终
+locked OOS只能从研究方案完全冻结后的新数据开始；`holdout_ledger.jsonl`记录样本消费事实，
+不能把已查看历史重新标成未见样本。
 
 ## 验证与保留
 

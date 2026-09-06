@@ -1994,6 +1994,167 @@ fn daily_histogram_stability<'py>(
     Ok(output.into_pyarray(py))
 }
 
+#[pyfunction]
+fn daily_liquidity_event_features<'py>(
+    py: Python<'py>,
+    close: PyReadonlyArray2<'py, f64>,
+    amount: PyReadonlyArray2<'py, f64>,
+    day_offsets: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let close = close.as_array();
+    let amount = amount.as_array();
+    let offsets = day_offsets.as_slice()?;
+    if close.raw_dim() != amount.raw_dim() {
+        return Err(PyValueError::new_err(
+            "close and amount must have the same shape",
+        ));
+    }
+    if offsets.len() < 2
+        || offsets[0] != 0
+        || offsets[offsets.len() - 1] != close.nrows() as i64
+        || offsets.windows(2).any(|pair| pair[0] > pair[1])
+    {
+        return Err(PyValueError::new_err("invalid day_offsets"));
+    }
+    let mut output = Array3::from_elem((offsets.len() - 1, close.ncols(), 2), f64::NAN);
+    for day in 0..offsets.len() - 1 {
+        let start = offsets[day] as usize;
+        let end = offsets[day + 1] as usize;
+        for symbol in 0..close.ncols() {
+            let mut returns = Vec::with_capacity(end - start);
+            let mut amihud = Vec::with_capacity(end - start);
+            for row in start..end {
+                let previous = if row > 0 {
+                    close[[row - 1, symbol]]
+                } else {
+                    f64::NAN
+                };
+                let value = close[[row, symbol]];
+                let traded = amount[[row, symbol]];
+                if value.is_nan() || previous.is_nan() || traded.is_nan() {
+                    continue;
+                }
+                let absolute_return = (value / previous - 1.0).abs();
+                let illiquidity = absolute_return / (traded + 1e-12);
+                if !absolute_return.is_nan() && !illiquidity.is_nan() {
+                    returns.push(absolute_return);
+                    amihud.push(illiquidity);
+                }
+            }
+            if returns.len() >= 60 {
+                let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+                let sigma = (returns
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / returns.len() as f64)
+                    .sqrt();
+                if sigma != 0.0 && !sigma.is_nan() {
+                    let mut ordered = amihud.clone();
+                    ordered.sort_by(f64::total_cmp);
+                    let middle = ordered.len() / 2;
+                    let median = if ordered.len() % 2 == 0 {
+                        (ordered[middle - 1] + ordered[middle]) / 2.0
+                    } else {
+                        ordered[middle]
+                    };
+                    let threshold = mean + 2.0 * sigma;
+                    let mut recovery_sum = 0usize;
+                    let mut recovery_count = 0usize;
+                    for index in 0..returns.len() {
+                        if returns[index] <= threshold {
+                            continue;
+                        }
+                        if let Some(offset) =
+                            amihud[index + 1..].iter().position(|value| *value < median)
+                        {
+                            recovery_sum += offset + 1;
+                            recovery_count += 1;
+                        }
+                    }
+                    if recovery_count > 0 {
+                        output[[day, symbol, 0]] = -(recovery_sum as f64 / recovery_count as f64);
+                    }
+                }
+            }
+
+            let common: Vec<(f64, f64)> = (start..end)
+                .filter_map(|row| {
+                    let price = close[[row, symbol]];
+                    let traded = amount[[row, symbol]];
+                    (!price.is_nan() && !traded.is_nan()).then_some((price, traded))
+                })
+                .collect();
+            if common.len() < 30 {
+                continue;
+            }
+            let amplitudes: Vec<f64> = common
+                .windows(2)
+                .map(|pair| (pair[1].0 / pair[0].0 - 1.0).abs())
+                .collect();
+            let amplitude_mean = amplitudes.iter().sum::<f64>() / amplitudes.len() as f64;
+            let threshold = (amplitudes
+                .iter()
+                .map(|value| (value - amplitude_mean).powi(2))
+                .sum::<f64>()
+                / amplitudes.len() as f64)
+                .sqrt();
+            if threshold < 1e-12 || threshold.is_nan() {
+                output[[day, symbol, 1]] = 0.0;
+                continue;
+            }
+            let mut jump_count = 0usize;
+            let mut paired = Vec::new();
+            for (index, amplitude) in amplitudes.iter().enumerate() {
+                if *amplitude > threshold {
+                    jump_count += 1;
+                    paired.push((common[index + 1].1, common.get(index + 2).map(|row| row.1)));
+                }
+            }
+            if jump_count < 3 {
+                output[[day, symbol, 1]] = 0.0;
+                continue;
+            }
+            let pairs: Vec<(f64, f64)> = paired
+                .into_iter()
+                .filter_map(|(current, next)| next.map(|value| (current, value)))
+                .collect();
+            if pairs.len() < 3 {
+                output[[day, symbol, 1]] = 0.0;
+                continue;
+            }
+            let left_mean = pairs.iter().map(|pair| pair.0).sum::<f64>() / pairs.len() as f64;
+            let right_mean = pairs.iter().map(|pair| pair.1).sum::<f64>() / pairs.len() as f64;
+            let left_variance = pairs
+                .iter()
+                .map(|pair| (pair.0 - left_mean).powi(2))
+                .sum::<f64>()
+                / pairs.len() as f64;
+            let right_variance = pairs
+                .iter()
+                .map(|pair| (pair.1 - right_mean).powi(2))
+                .sum::<f64>()
+                / pairs.len() as f64;
+            if left_variance.sqrt() < 1e-12 || right_variance.sqrt() < 1e-12 {
+                output[[day, symbol, 1]] = 0.0;
+                continue;
+            }
+            let covariance = pairs
+                .iter()
+                .map(|pair| (pair.0 - left_mean) * (pair.1 - right_mean))
+                .sum::<f64>()
+                / pairs.len() as f64;
+            let correlation = covariance / (left_variance * right_variance).sqrt();
+            output[[day, symbol, 1]] = if correlation.is_nan() {
+                0.0
+            } else {
+                correlation
+            };
+        }
+    }
+    Ok(output.into_pyarray(py))
+}
+
 #[pymodule]
 fn _mf_factor_kernels(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(daily_return_stats, module)?)?;
@@ -2011,5 +2172,6 @@ fn _mf_factor_kernels(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(daily_price_path_features, module)?)?;
     module.add_function(wrap_pyfunction!(daily_mfdfa_width, module)?)?;
     module.add_function(wrap_pyfunction!(daily_histogram_stability, module)?)?;
+    module.add_function(wrap_pyfunction!(daily_liquidity_event_features, module)?)?;
     Ok(())
 }

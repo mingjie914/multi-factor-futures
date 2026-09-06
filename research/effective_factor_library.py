@@ -1,23 +1,16 @@
-"""Small, version-controlled effective-factor library backed by run evidence."""
+"""Version-controlled effective-factor library backed by formal run evidence."""
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+from research.artifacts import sha256_file
 
-SCHEMA_VERSION = 1
 
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+SCHEMA_VERSION = 2
 
 
 def load_library(path: str | Path) -> dict[str, Any]:
@@ -59,11 +52,9 @@ def export_current_csv(library_path: str | Path) -> Path:
     payload = load_library(path)
     output = path.with_name("current.csv")
     fields = [
-        "factor", "status", "frequency", "registered_horizons",
+        "factor", "family", "status", "frequency", "registered_horizons",
         "selected_period", "approved_periods", "direction", "admitted_at", "source_run",
-        "research_cutoff",
-        "is_ic", "is_t", "is_q", "oos_ic", "oos_ic_hac_t",
-        "oos_ols_hac_t", "oos_days", "evidence_sha256",
+        "research_start", "research_cutoff", "ic", "t", "q", "evidence_sha256",
     ]
     temporary = output.with_name(f"{output.name}.{os.getpid()}.tmp")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +73,7 @@ def admit_validation_run(
     *,
     admitted_at: str,
 ) -> dict[str, Any]:
-    """Merge one completed factor-validation run into the current library."""
+    """Apply one formal run: merge a batch or replace from a full-pool rebuild."""
     run = Path(run_dir).expanduser().resolve()
     passed_path = run / "passed_factors.csv"
     full_path = run / "factor_validation_full.csv"
@@ -90,41 +81,77 @@ def admit_validation_run(
     contract_path = run / "run_contract.json"
     if not all(path.is_file() for path in (passed_path, summary_path, contract_path)):
         raise FileNotFoundError(
-            "validation run is missing passed_factors.csv, summary, or contract"
+            "validation run is missing passed results, summary, or contract"
         )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     if contract.get("run_id") != run.name:
         raise ValueError("validation contract run_id does not match directory")
+    if (
+        int(contract.get("schema_version", 0)) != 2
+        or int(summary.get("schema_version", 0)) != 2
+        or contract.get("workflow") != "factor-admission-validation"
+        or contract.get("admission_eligible") is not True
+        or summary.get("workflow") != "factor_admission"
+        or summary.get("admission_policy") != "hierarchical_fdr_post_gates"
+        or summary.get("horizon_mode") != "registered_contract"
+    ):
+        raise ValueError("validation run is not eligible for effective-factor admission")
+    manifest_path = run / "artifacts" / "manifest.json"
+    if not full_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(
+            "formal validation run is missing full results or artifact manifest"
+        )
+    scope = str(summary.get("scope", ""))
+    if scope not in {"explicit_batch", "all_registered_intraday"}:
+        raise ValueError("validation summary has an invalid admission scope")
+    if str(contract.get("scope", "")) != scope:
+        raise ValueError("validation contract and summary admission scopes disagree")
     contract_files = contract.get("files", {})
+    required_files = {
+        "factor_validation_full.csv",
+        "passed_factors.csv",
+        "validation_summary.json",
+        "artifacts/manifest.json",
+    }
+    if not required_files.issubset(contract_files):
+        raise ValueError("validation contract does not bind every required artifact")
     summary_hash = contract.get("validation_summary_sha256") or (
         contract_files.get("validation_summary.json", {}).get("sha256")
     )
     passed_hash = contract.get("passed_results_sha256") or (
         contract_files.get("passed_factors.csv", {}).get("sha256")
     )
-    if summary_hash != _sha256(summary_path):
+    if summary_hash != sha256_file(summary_path):
         raise ValueError("validation summary hash does not match run contract")
-    if passed_hash != _sha256(passed_path):
+    if passed_hash != sha256_file(passed_path):
         raise ValueError("passed factor hash does not match run contract")
     for filename, metadata in contract_files.items():
         artifact = run / filename
         expected_hash = metadata.get("sha256") if isinstance(metadata, dict) else None
         if not artifact.is_file() or not expected_hash:
             raise ValueError(f"validation contract artifact is missing: {filename}")
-        if _sha256(artifact) != expected_hash:
+        if sha256_file(artifact) != expected_hash:
             raise ValueError(f"validation artifact hash does not match: {filename}")
-    if len(summary.get("is", [])) != 3 or len(summary.get("oos", [])) != 3:
-        raise ValueError("validation summary is missing the fixed IS/OOS contract")
+    research_window = summary.get("research_window", [])
+    if len(research_window) != 2:
+        raise ValueError("validation summary is missing the formal research window")
     with passed_path.open(encoding="utf-8-sig", newline="") as handle:
         passed = list(csv.DictReader(handle))
     if len(passed) != int(summary.get("final_pass_count", -1)):
         raise ValueError("validation summary and passed factor rows disagree")
-    if full_path.is_file():
-        with full_path.open(encoding="utf-8-sig", newline="") as handle:
-            full_count = sum(1 for _ in csv.DictReader(handle))
-        if full_count != int(summary.get("factor_count", -1)):
-            raise ValueError("validation summary and full factor rows disagree")
+    with full_path.open(encoding="utf-8-sig", newline="") as handle:
+        full = list(csv.DictReader(handle))
+    if len(full) != int(summary.get("factor_count", -1)):
+        raise ValueError("validation summary and full factor rows disagree")
+    full_names = [row.get("factor") for row in full]
+    submitted_names = contract.get("factors")
+    if (
+        not isinstance(submitted_names, list)
+        or len(set(full_names)) != len(full_names)
+        or full_names != submitted_names
+    ):
+        raise ValueError("validation contract and submitted factor rows disagree")
     if any(str(row.get("final_pass", "")).lower() != "true" for row in passed):
         raise ValueError("passed factor file contains a non-passing row")
     if len({row.get("factor") for row in passed}) != len(passed):
@@ -134,28 +161,36 @@ def admit_validation_run(
         row["factor"] for row in passed
     }:
         raise ValueError("validation summary and passed factor names disagree")
+    full_passed = {
+        str(row["factor"])
+        for row in full
+        if str(row.get("final_pass", "")).lower() == "true"
+    }
+    if full_passed != {row["factor"] for row in passed}:
+        raise ValueError("full validation decisions and passed factor rows disagree")
 
     path = Path(library_path).expanduser().resolve()
     current = load_library(path)
-    by_name = {row["factor"]: row for row in current["factors"]}
+    by_name = (
+        {}
+        if scope == "all_registered_intraday"
+        else {row["factor"]: row for row in current["factors"]}
+    )
     source_run = run.name
-    evidence_hash = _sha256(passed_path)
+    evidence_hash = sha256_file(passed_path)
     try:
         evidence_file = passed_path.relative_to(path.parent.parent).as_posix()
     except ValueError:
         evidence_file = str(passed_path)
     for row in passed:
         factor = row["factor"]
-        is_ic = float(row["is_official_best_ic"])
-        selected_period = int(float(row["oos_period"]))
+        ic = float(row["ic"])
+        selected_period = int(float(row["selected_period"]))
         registered_periods = {
             int(value) for value in str(row["registered_horizons"]).split("|")
             if value
         }
-        approved_text = str(row.get("approved_periods", "") or "")
-        approved_periods = sorted({
-            int(value) for value in approved_text.split("|") if value
-        }) or [selected_period]
+        approved_periods = [selected_period]
         if (
             selected_period not in approved_periods
             or not set(approved_periods).issubset(registered_periods)
@@ -163,24 +198,20 @@ def admit_validation_run(
             raise ValueError(f"invalid approved periods for factor {factor!r}")
         by_name[factor] = {
             "factor": factor,
+            "family": str(row.get("family", "") or ""),
             "status": "effective",
-            "frequency": "daily_intraday",
+            "frequency": "daily",
             "registered_horizons": row["registered_horizons"],
             "selected_period": selected_period,
-            # The standard run emits no multi-period field and therefore
-            # approves only its IS-selected/OOS-tested horizon.
             "approved_periods": approved_periods,
-            "direction": 1 if is_ic >= 0.0 else -1,
+            "direction": 1 if ic >= 0.0 else -1,
             "admitted_at": admitted_at,
             "source_run": source_run,
+            "research_start": research_window[0],
             "research_cutoff": summary.get("research_cutoff"),
-            "is_ic": is_ic,
-            "is_t": float(row["is_official_best_t"]),
-            "is_q": float(row["is_official_best_q"]),
-            "oos_ic": float(row["oos_ic"]),
-            "oos_ic_hac_t": float(row["oos_ic_hac_t"]),
-            "oos_ols_hac_t": float(row["oos_ols_hac_t"]),
-            "oos_days": int(float(row["oos_days"])),
+            "ic": ic,
+            "t": float(row["ols_hac_t"]),
+            "q": float(row["local_q_value"]),
             "evidence_file": evidence_file,
             "evidence_sha256": evidence_hash,
         }

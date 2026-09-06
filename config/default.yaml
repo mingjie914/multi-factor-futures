@@ -37,7 +37,8 @@ data:
     curve_cache_path: './cache/curve_aggregates'
     selected_cache_enabled: true
     selected_cache_path: './cache/selected_contracts'
-  # The machine-local path and certified release remain explicit and fail closed.
+  # Path is machine-local. Leave the release blank for current+certified daily
+  # data; set it explicitly only for a frozen reproduction that must fail closed.
   duckdb:
     path: '${MF_DUCKDB_PATH:}'
     required_release_id: '${MF_DATA_RELEASE_ID:}'
@@ -366,7 +367,7 @@ validation_policy:
     30min: 20
     hourly: 20
   minimum_train_test_ratio: 3.0
-  # Walk-forward rolling parameters (bars per frequency).
+  # Downstream Walk-forward / split-observation parameters (not factor admission).
   # daily_intraday = intraday factors aggregated to daily output.
   wf_train_bars_by_frequency:
     daily: 500

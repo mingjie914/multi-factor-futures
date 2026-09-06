@@ -1,4 +1,4 @@
-"""Default one-split factor validation: warmup + 126 IS + 42 OOS."""
+"""Formal factor admission plus explicit, non-admissible split observations."""
 from __future__ import annotations
 
 import argparse
@@ -13,23 +13,113 @@ from pathlib import Path
 import pandas as pd
 
 from core.config import load_config
-from core.date_policy import factor_validation_window
+from core.date_policy import factor_validation_window, research_cutoff
 from core.registry import list_registered
 from factors.processor import build_processing_context
 from pipeline.runner import PipelineRunner
+from research.artifacts import sha256_file
 from workflows.research import (
     _joint_ic_ols_statistics,
     _run_multi_period_screening,
 )
-from workflows.walkforward import _candidate_factor_names
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _resolve_candidate_names(
+    factor_names,
+    *,
+    all_registered: bool,
+    module_prefix: str,
+) -> tuple[list[str], str]:
+    """Resolve one explicit hypothesis family; never guess batch versus full pool."""
+    if bool(factor_names) == bool(all_registered):
+        raise ValueError(
+            "select exactly one validation scope: factor_names or all_registered"
+        )
+    registry = list_registered("factor").get("factor", {})
+    eligible = {
+        name for name, factor_class in registry.items()
+        if factor_class.__module__.startswith(module_prefix)
+        and str(getattr(factor_class, "frequency", "daily")).lower() == "daily"
+    }
+    if all_registered:
+        return sorted(eligible), "all_registered_intraday"
+    names = list(dict.fromkeys(str(name).strip() for name in factor_names if str(name).strip()))
+    invalid = sorted(set(names) - eligible)
+    if invalid:
+        raise ValueError(f"not registered intraday factors: {invalid}")
+    if not names:
+        raise ValueError("factor_names must contain at least one factor")
+    return names, "explicit_batch"
+
+
+def _admission_result_rows(screening: dict) -> list[dict]:
+    """Flatten the old formal discovery/post-gate decision without OOS or clusters."""
+    registry = list_registered("factor").get("factor", {})
+    significant = {
+        row["name"]: row for row in screening.get("significant_factors", [])
+    }
+    final = set(screening.get("final_factors", []))
+    rows: list[dict] = []
+    for result in screening.get("all_results", []):
+        name = result["name"]
+        selected_period = int(result.get("best_period", 0) or 0)
+        selected_variant = str(result.get("best_variant", "") or "")
+        local = [
+            values for values in result.get("all_periods", {}).values()
+            if values.get("estimable")
+        ]
+        selected = next((
+            values for values in local
+            if int(values.get("period", 0) or 0) == selected_period
+            and str(values.get("preprocessing_variant", "") or "") == selected_variant
+        ), {})
+        if not selected and selected_period:
+            selected = next((
+                values for values in local
+                if int(values.get("period", 0) or 0) == selected_period
+            ), {})
+        metadata = significant.get(name, {})
+        passed = name in final
+        if passed:
+            reason = "passed_formal_admission"
+        elif name in significant:
+            reason = "robustness_sample_or_cost_gate_not_passed"
+        elif result.get("hierarchical_fdr_significant", False):
+            reason = "ic_t_or_direction_gate_not_passed"
+        elif not local:
+            reason = "not_estimable"
+        else:
+            reason = "hierarchical_fdr_not_passed"
+        factor_class = registry.get(name)
+        registered_horizons = getattr(factor_class, "validation_horizons", ())
+        rows.append({
+            "factor": name,
+            "family": str(getattr(factor_class, "category", "") or ""),
+            "registered_horizons": "|".join(map(str, registered_horizons)),
+            "selected_period": selected_period or "",
+            "selected_variant": selected_variant,
+            "ic": selected.get("ic", result.get("best_ic")),
+            "ic_hac_t": selected.get("ic_hac_t"),
+            "ols_hac_t": selected.get("ols_hac_t", result.get("best_t")),
+            "p_value": selected.get("ols_p_value", result.get("best_p_value")),
+            "factor_q_value": selected.get("factor_q_value"),
+            "local_q_value": selected.get("local_q_value", result.get("best_q_value")),
+            "factor_fdr_pass": bool(selected.get("factor_fdr_significant", False)),
+            "hierarchical_fdr_pass": bool(
+                selected.get("hierarchical_fdr_significant", False)
+            ),
+            "fwer_pass": bool(selected.get("fwer_significant", False)),
+            "evidence_level": selected.get("evidence_level", ""),
+            "passes_robustness": metadata.get("passes_robustness"),
+            "sample_sufficient": metadata.get("sample_sufficient"),
+            "observation_channel": metadata.get("observation_channel"),
+            "observation_reasons": "|".join(
+                map(str, metadata.get("observation_reasons", []))
+            ),
+            "final_pass": passed,
+            "decision_reason": reason,
+        })
+    return rows
 
 
 def _write_csv(
@@ -47,6 +137,41 @@ def _write_csv(
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temporary, path)
+
+
+def _validate_admission_screening_contract(
+    screening: dict,
+    *,
+    names: list[str],
+    factor_start: pd.Timestamp,
+    ic_start: pd.Timestamp,
+    ic_end: pd.Timestamp,
+) -> None:
+    """Fail closed before finalizing an already-computed formal screening."""
+    contract = dict(screening.get("research_contract", {}))
+    names_hash = hashlib.sha256(json.dumps(
+        names, ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    expected = {
+        "factor_count": len(names),
+        "factor_names_sha256": names_hash,
+        "factor_start": factor_start.isoformat(),
+        "ic_start": ic_start.isoformat(),
+        "ic_end": ic_end.isoformat(),
+        "frequency": "daily",
+        "horizon_mode": "registered_contract",
+        "research_role": "factor_admission",
+    }
+    mismatches = {
+        key: (contract.get(key), value)
+        for key, value in expected.items()
+        if contract.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "existing screening artifact does not match formal admission contract: "
+            f"{mismatches}"
+        )
 
 
 def _evaluate_oos(config, screening: dict, window, *, frequency: str) -> dict:
@@ -218,14 +343,14 @@ def _result_rows(screening: dict, oos: dict) -> list[dict]:
     return rows
 
 
-def run_default_factor_validation(
+def run_single_split_factor_observation(
     *,
     run_id: str,
     config_path: str = "config/default.yaml",
     module_prefix: str = "factors.library.intraday",
     common_horizon: int | None = None,
 ) -> Path:
-    """Run the standard validation or an explicit common-horizon comparison."""
+    """Run the later 126/42 split as observation evidence, never admission."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
         raise ValueError("run_id 仅允许字母、数字、点、下划线和连字符")
     project = Path(__file__).resolve().parents[1]
@@ -253,7 +378,9 @@ def run_default_factor_validation(
     window = factor_validation_window(
         config, runner.data_manager, frequency="daily_intraday"
     )
-    names = _candidate_factor_names(module_prefix)
+    names, _ = _resolve_candidate_names(
+        None, all_registered=True, module_prefix=module_prefix
+    )
     screening_path = artifacts / "ic_by_window_period.json"
     if screening_path.exists():
         screening = json.loads(screening_path.read_text(encoding="utf-8"))
@@ -365,7 +492,7 @@ def run_default_factor_validation(
                 "validation_funnel.json": artifacts / "validation_funnel.json",
             },
             metadata={
-                "workflow": "factor-validation",
+                "workflow": "single-split-factor-observation",
                 "horizon_mode": summary["horizon_mode"],
                 "common_horizon": common_horizon,
             },
@@ -373,7 +500,8 @@ def run_default_factor_validation(
     contract = {
         "schema_version": 1,
         "run_id": run_id,
-        "workflow": "factor-validation",
+        "workflow": "single-split-factor-observation",
+        "admission_eligible": False,
         "window_policy": "default_warmup_plus_126_is_plus_42_oos",
         "horizon_policy": {
             "mode": (
@@ -386,7 +514,7 @@ def run_default_factor_validation(
         "oos_start": window.oos_start.date().isoformat(),
         "oos_end": window.oos_end.date().isoformat(),
         "files": {
-            name: {"sha256": _sha256(run_dir / name)}
+            name: {"sha256": sha256_file(run_dir / name)}
             for name in (
                 "factor_validation_full.csv",
                 "passed_factors.csv",
@@ -401,7 +529,162 @@ def run_default_factor_validation(
         encoding="utf-8",
     )
     print(f"全量明细: {run_dir / 'factor_validation_full.csv'}")
-    print(f"通过因子: {len(passed)}/{len(rows)}")
+    print(f"观察期同方向因子: {len(passed)}/{len(rows)}")
+    return run_dir
+
+
+def run_default_factor_validation(
+    *,
+    run_id: str,
+    config_path: str = "config/default.yaml",
+    factor_names=None,
+    all_registered: bool = False,
+    module_prefix: str = "factors.library.intraday",
+) -> Path:
+    """Run the restored formal admission policy through the frozen cutoff."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
+        raise ValueError("run_id 仅允许字母、数字、点、下划线和连字符")
+    names, scope = _resolve_candidate_names(
+        factor_names,
+        all_registered=all_registered,
+        module_prefix=module_prefix,
+    )
+    project = Path(__file__).resolve().parents[1]
+    run_dir = project / "runs" / "factor_validation" / run_id
+    if run_dir.exists():
+        if (run_dir / "run_contract.json").exists():
+            raise FileExistsError(f"validation run already finalized: {run_dir}")
+        checkpoint = run_dir / "artifacts" / ".multi_period_checkpoint.json"
+        screening_artifact = run_dir / "artifacts" / "ic_by_window_period.json"
+        if not checkpoint.exists() and not screening_artifact.exists():
+            raise FileExistsError(
+                f"validation run exists without a resumable research artifact: {run_dir}"
+            )
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+
+    config = load_config(config_path)
+    runner = PipelineRunner(config=config)
+    ic_start = pd.Timestamp(config.date_range.start).normalize()
+    ic_end = research_cutoff(config)
+    warmup_days = int(config.validation_policy.warmup_days_by_frequency["daily"])
+    factor_start = ic_start - pd.Timedelta(days=warmup_days)
+    runner.config.date_range.start = ic_start.date().isoformat()
+    runner.config.date_range.end = ic_end.date().isoformat()
+    screening_path = artifacts / "ic_by_window_period.json"
+    if screening_path.exists():
+        screening = json.loads(screening_path.read_text(encoding="utf-8"))
+        _validate_admission_screening_contract(
+            screening,
+            names=names,
+            factor_start=factor_start,
+            ic_start=ic_start,
+            ic_end=ic_end,
+        )
+    else:
+        screening = _run_multi_period_screening(
+            runner,
+            names,
+            config_path,
+            1.96,
+            factor_start,
+            ic_start,
+            ic_end,
+            periods_override=None,
+            frequency="daily",
+            output_dir=str(artifacts),
+            adaptivity_file=None,
+            research_role="factor_admission",
+            common_horizon=None,
+        )
+    rows = _admission_result_rows(screening)
+    passed = sorted(
+        (row for row in rows if row["final_pass"]),
+        key=lambda row: (-abs(float(row.get("ols_hac_t") or 0.0)), row["factor"]),
+    )
+    _write_csv(run_dir / "factor_validation_full.csv", rows)
+    _write_csv(
+        run_dir / "passed_factors.csv",
+        passed,
+        fieldnames=list(rows[0]) if rows else ["factor", "final_pass"],
+    )
+    summary = {
+        "schema_version": 2,
+        "workflow": "factor_admission",
+        "admission_policy": "hierarchical_fdr_post_gates",
+        "scope": scope,
+        "data_source": config.data.source,
+        "research_window": [ic_start.date().isoformat(), ic_end.date().isoformat()],
+        "research_cutoff": ic_end.date().isoformat(),
+        "warmup_start": factor_start.date().isoformat(),
+        "factor_count": len(rows),
+        "hypothesis_count": int(
+            screening.get("discovery_audit", {}).get("total_hypotheses", 0)
+        ),
+        "hierarchical_fdr_discoveries": len(
+            screening.get("significant_factors", [])
+        ),
+        "final_pass_count": len(passed),
+        "final_gate": "hierarchical FDR + IC/t/direction/robustness/sample/cost",
+        "horizon_mode": "registered_contract",
+        "passed_factors": [row["factor"] for row in passed],
+    }
+    (run_dir / "validation_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    from research.artifacts import ResearchArtifactBundle
+
+    research_contract = dict(screening.get("research_contract", {}))
+    if not (artifacts / "manifest.json").exists():
+        ResearchArtifactBundle.create(
+            artifacts,
+            artifact_id=f"{run_id}:screening",
+            train_start=ic_start,
+            train_end=ic_end,
+            data_sha256=str(research_contract["data_sha256"]),
+            config_sha256=str(research_contract["config_sha256"]),
+            code_sha256=str(research_contract["code_sha256"]),
+            files={
+                "ic_by_window_period.json": artifacts / "ic_by_window_period.json",
+                "validation_funnel.json": artifacts / "validation_funnel.json",
+            },
+            metadata={
+                "workflow": "factor-admission-validation",
+                "scope": scope,
+                "horizon_mode": "registered_contract",
+            },
+        )
+    contract = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "workflow": "factor-admission-validation",
+        "admission_eligible": True,
+        "window_policy": "full_history_through_research_cutoff",
+        "scope": scope,
+        "factors": names,
+        "horizon_policy": {"mode": "registered_contract"},
+        "research_contract": research_contract,
+        "files": {
+            name: {"sha256": sha256_file(run_dir / name)}
+            for name in (
+                "factor_validation_full.csv",
+                "passed_factors.csv",
+                "validation_summary.json",
+                "artifacts/manifest.json",
+            )
+        },
+    }
+    (run_dir / "run_contract.json").write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    runner.factor_engine.clear_cache()
+    print(f"正式准入明细: {run_dir / 'factor_validation_full.csv'}")
+    print(f"统计通过因子: {len(passed)}/{len(rows)}")
     return run_dir
 
 
@@ -421,7 +704,7 @@ def run_common_horizon_factor_validation(
     horizon = int(common_horizon)
     if horizon < 1:
         raise ValueError("common_horizon must be positive")
-    return run_default_factor_validation(
+    return run_single_split_factor_observation(
         run_id=run_id,
         config_path=config_path,
         module_prefix=module_prefix,
@@ -431,19 +714,39 @@ def run_common_horizon_factor_validation(
 
 def main() -> None:
     """Compatibility CLI; the IDE entrypoint is ``run_factor_workflow.py``."""
-    parser = argparse.ArgumentParser(description="单次126 IS + 42 OOS因子有效性检验")
+    parser = argparse.ArgumentParser(description="正式因子准入或显式共同周期观察")
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--run-id", required=True)
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--factors", help="本次冻结批次，使用逗号分隔的因子注册名")
+    scope.add_argument("--all", action="store_true", help="显式重建全部日内因子")
+    scope.add_argument(
+        "--common-horizon", type=int,
+        help="非准入共同周期观察；结果不能写入有效因子库",
+    )
     parser.add_argument(
         "--module-prefix", default="factors.library.intraday",
         help="注册因子模块前缀",
     )
     args = parser.parse_args()
     try:
-        run_default_factor_validation(
-            run_id=args.run_id,
-            config_path=args.config,
-            module_prefix=args.module_prefix,
-        )
+        if args.common_horizon is not None:
+            run_common_horizon_factor_validation(
+                run_id=args.run_id,
+                common_horizon=args.common_horizon,
+                config_path=args.config,
+                module_prefix=args.module_prefix,
+            )
+        else:
+            run_default_factor_validation(
+                run_id=args.run_id,
+                config_path=args.config,
+                factor_names=(
+                    tuple(name.strip() for name in args.factors.split(","))
+                    if args.factors else None
+                ),
+                all_registered=args.all,
+                module_prefix=args.module_prefix,
+            )
     except ValueError as exc:
         parser.error(str(exc))

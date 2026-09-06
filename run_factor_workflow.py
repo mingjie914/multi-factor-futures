@@ -1,7 +1,7 @@
-"""IDE entrypoint for factor validation and explicit library admission.
+"""Single IDE entrypoint for factor admission, observation, and subset selection.
 
-Edit only the constants in ``IDE SETTINGS`` and press Run.  Full-history
-research is intentionally not a branch in this file.
+Edit only ``IDE SETTINGS`` and press Run.  The default validates one explicit
+development batch.  Full-pool rebuilding is a separate, explicit choice.
 """
 from __future__ import annotations
 
@@ -11,53 +11,40 @@ from pathlib import Path
 
 from core.config import load_config
 from research.effective_factor_library import admit_validation_run
+from workflows.factor_selection import run_effective_factor_selection
 from workflows.factor_validation import (
     run_common_horizon_factor_validation,
     run_default_factor_validation,
 )
-from workflows.factor_selection import run_effective_factor_selection
 
 
 class FactorWorkflow(Enum):
+    VALIDATE_FACTOR_BATCH = "validate_factor_batch"
     VALIDATE_ALL_INTRADAY = "validate_all_intraday"
-    # Explicit legacy-parity comparison: all registered factors use one
-    # next-bar daily return label; it never replaces the standard library.
-    VALIDATE_ALL_INTRADAY_COMMON_H1 = "validate_all_intraday_common_h1"
-    # Explicit common five-bar sensitivity comparison; independent evidence.
-    VALIDATE_ALL_INTRADAY_COMMON_H5 = "validate_all_intraday_common_h5"
+    OBSERVE_COMMON_HORIZON = "observe_common_horizon"
     ADMIT_COMPLETED_RUN = "admit_completed_run"
     SELECT_EFFECTIVE_SUBSETS = "select_effective_subsets"
-    # Explicit common-H5 subset comparison source.  This consumes a finalized
-    # common-horizon validation run and never mutates the effective library.
-    SELECT_COMMON_H5_SUBSETS = "select_common_h5_subsets"
 
 
 # ============================== IDE SETTINGS ==============================
-WORKFLOW = FactorWorkflow.VALIDATE_ALL_INTRADAY
+WORKFLOW = FactorWorkflow.VALIDATE_FACTOR_BATCH
 CONFIG_PATH = "config/default.yaml"
 
-# VALIDATE_ALL_INTRADAY: validates the complete registered intraday discovery
-# set (not the effective library). The count is discovered from the registry;
-# e.g. a future 688-factor discovery set produces a 688-row full-detail run.
+# Daily default: list every factor created in one predeclared development batch.
+# Leave empty only when another WORKFLOW is selected.  Duplicates are removed
+# without changing first-seen order; unknown/non-intraday names fail closed.
+FACTOR_NAMES: tuple[str, ...] = ()
 VALIDATION_RUN_ID: str | None = None
 
-# ADMIT_COMPLETED_RUN: set both values after reviewing a completed run.
+# OBSERVE_COMMON_HORIZON is non-admissible sensitivity evidence.
+COMMON_HORIZON = 5
+
+# ADMIT_COMPLETED_RUN: set both after reviewing a formal admission run.
 ADMISSION_RUN_DIR: str | None = None
 ADMITTED_AT: str | None = None
 
-# SELECT_EFFECTIVE_SUBSETS: derive parallel subsets from the current effective
-# library (not the complete discovery set) using the locked warmup + 126 IS +
-# 42 OOS contract. The library size is discovered from factor_library.path;
-# e.g. after 25 new admissions it consumes 100 effective factors, not 688
-# unadmitted candidates.
+# SELECT_EFFECTIVE_SUBSETS consumes only the current admitted library.
 SELECTION_RUN_ID: str | None = None
-# SELECT_COMMON_H5_SUBSETS: derive parallel candidates from the finalized
-# common-H5 validation evidence.  Keep this path explicit so an IDE Run never
-# silently switches the ordinary effective-library selection input.
-COMMON_H5_VALIDATION_RUN_DIR = (
-    "runs/factor_validation/20260826_intraday588_common_h5_is126_oos42_cutoff_20260515"
-)
-COMMON_H5_SELECTION_RUN_ID: str | None = None
 # ========================================================================
 
 
@@ -73,29 +60,39 @@ def _library_path(config_path: str) -> Path:
 
 
 def main() -> None:
-    if WORKFLOW is FactorWorkflow.VALIDATE_ALL_INTRADAY:
+    if WORKFLOW is FactorWorkflow.VALIDATE_FACTOR_BATCH:
+        if not FACTOR_NAMES:
+            raise ValueError(
+                "VALIDATE_FACTOR_BATCH requires an explicit non-empty FACTOR_NAMES"
+            )
         run_id = VALIDATION_RUN_ID or datetime.now().strftime(
-            "%Y%m%d_%H%M%S_intraday_default_window"
+            "%Y%m%d_%H%M%S_factor_batch_admission"
         )
-        run_default_factor_validation(run_id=run_id, config_path=CONFIG_PATH)
+        run_default_factor_validation(
+            run_id=run_id,
+            config_path=CONFIG_PATH,
+            factor_names=FACTOR_NAMES,
+        )
         return
 
-    if WORKFLOW in {
-        FactorWorkflow.VALIDATE_ALL_INTRADAY_COMMON_H1,
-        FactorWorkflow.VALIDATE_ALL_INTRADAY_COMMON_H5,
-    }:
-        horizon = (
-            1
-            if WORKFLOW is FactorWorkflow.VALIDATE_ALL_INTRADAY_COMMON_H1
-            else 5
-        )
-        suffix = f"common_h{horizon}"
+    if WORKFLOW is FactorWorkflow.VALIDATE_ALL_INTRADAY:
         run_id = VALIDATION_RUN_ID or datetime.now().strftime(
-            f"%Y%m%d_%H%M%S_intraday_{suffix}"
+            "%Y%m%d_%H%M%S_full_intraday_admission"
+        )
+        run_default_factor_validation(
+            run_id=run_id,
+            config_path=CONFIG_PATH,
+            all_registered=True,
+        )
+        return
+
+    if WORKFLOW is FactorWorkflow.OBSERVE_COMMON_HORIZON:
+        run_id = VALIDATION_RUN_ID or datetime.now().strftime(
+            f"%Y%m%d_%H%M%S_common_h{int(COMMON_HORIZON)}_observation"
         )
         run_common_horizon_factor_validation(
             run_id=run_id,
-            common_horizon=horizon,
+            common_horizon=COMMON_HORIZON,
             config_path=CONFIG_PATH,
         )
         return
@@ -122,19 +119,6 @@ def main() -> None:
             config_path=CONFIG_PATH,
         )
         print(f"因子子集筛选产物: {output}")
-        return
-
-    if WORKFLOW is FactorWorkflow.SELECT_COMMON_H5_SUBSETS:
-        run_id = COMMON_H5_SELECTION_RUN_ID or datetime.now().strftime(
-            "%Y%m%d_%H%M%S_common_h5_factor_selection"
-        )
-        output = run_effective_factor_selection(
-            run_id=run_id,
-            config_path=CONFIG_PATH,
-            source_run_dir=COMMON_H5_VALIDATION_RUN_DIR,
-            common_horizon=5,
-        )
-        print(f"共同H5因子子集筛选产物: {output}")
         return
 
     raise ValueError(f"unsupported factor workflow: {WORKFLOW!r}")

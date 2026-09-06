@@ -13,7 +13,7 @@ from core.date_policy import (
 )
 
 
-def test_default_factor_validation_window_is_126_is_plus_42_oos_and_warmup():
+def test_split_observation_window_is_126_is_plus_42_oos_and_warmup():
     config = load_config("config/default.yaml")
     calendar = pd.bdate_range("2025-01-01", "2026-05-15")
     manager = SimpleNamespace(

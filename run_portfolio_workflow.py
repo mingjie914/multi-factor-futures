@@ -26,6 +26,7 @@ from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics
 from core.config import ProcessingStepConfig, load_config, load_strategy_library
 from core.date_policy import research_cutoff
 from pipeline.runner import PipelineRunner
+from research.artifacts import sha256_file
 from research.effective_factor_library import (
     effective_factor_names,
     validate_effective_factor_periods,
@@ -54,6 +55,10 @@ class PortfolioWorkflow(Enum):
     # Same five-bar evidence with a five-bar IC used by the production
     # weighting history.  This is a sensitivity comparison, not the default.
     RUN_AND_COMPARE_COMMON_H5_MATCHED = "run_and_compare_common_h5_matched"
+    # Training-only factor-membership search under the fixed production recipe;
+    # the locked OOS is diagnostic and never changes the chosen set.
+    SEARCH_COMMON_H5_FACTOR_SET = "search_common_h5_factor_set"
+    RUN_AND_COMPARE_COMMON_H5_SEARCH = "run_and_compare_common_h5_search"
 
 
 # ============================== IDE SETTINGS ==============================
@@ -98,6 +103,22 @@ COMMON_H5_SELECTION_RUN_DIR = (
 )
 COMMON_H5_COMPARISON_RUN_ID: str | None = None
 COMMON_H5_MATCHED_COMPARISON_RUN_ID: str | None = None
+# SEARCH_COMMON_H5_FACTOR_SET consumes the finalized 50-factor H5 validation
+# evidence and the existing cluster baselines.  It never mutates either library.
+COMMON_H5_SEARCH_RUN_ID: str | None = None
+COMMON_H5_VALIDATION_RUN_DIR = (
+    "runs/factor_validation/20260826_intraday588_common_h5_is126_oos42_cutoff_20260515"
+)
+COMMON_H5_SEARCH_BASELINE_DIR = (
+    "runs/factor_selection/20260903_common_h5_subset_selection_native_liq_events"
+)
+COMMON_H5_FACTOR_SEARCH_RUN_DIR = (
+    "runs/portfolio_factor_search/20260903_common_h5_combination_search_v2"
+)
+COMMON_H5_SEARCH_COMPARISON_RUN_ID: str | None = None
+# Keep 5 for selection/deployment horizon consistency; set 1 only for the
+# explicit default-IC sensitivity control.  The factor set remains frozen.
+COMMON_H5_SEARCH_IC_HORIZON = 5
 # ========================================================================
 
 
@@ -153,20 +174,13 @@ STRATEGY_LABELS = {
     "snapshot_13f_icir": "历史 13f 因子集",
     "common_h5_balanced": "共同H5平衡因子集",
     "common_h5_compact": "共同H5紧凑因子集",
+    "common_h5_combination": "共同H5组合互补因子集",
 }
 
 
 def _resolve(path: str) -> Path:
     candidate = Path(path)
     return (candidate if candidate.is_absolute() else PROJECT_ROOT / candidate).resolve()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _load_factor_definition(path: Path) -> dict:
@@ -366,7 +380,9 @@ def _write_comparison_plot(
     fig, (ax, metrics_ax) = plt.subplots(
         2, 1, figsize=(15, 10), gridspec_kw={"height_ratios": [5.0, 1.35]}
     )
-    colors = ["#1a73e8", "#e8710a", "#1e8e3e", "#d93025", "#9334e6"]
+    colors = [
+        "#1a73e8", "#e8710a", "#1e8e3e", "#d93025", "#9334e6", "#00897b"
+    ]
     for idx, name in enumerate(nav_table.columns):
         series = nav_table[name].dropna()
         if series.empty:
@@ -908,6 +924,7 @@ def run_and_compare() -> Path:
                 "computed_factor_count": int(
                     shared_panel_runner.computed_factor_count
                 ),
+                "profile": shared_panel_runner.performance_profile(),
             }
             if shared_panel_runner is not None else None
         ),
@@ -1225,8 +1242,8 @@ def _load_common_h5_selection() -> tuple[dict, dict[str, list[str]], dict[str, i
     if not selected.issubset(directions):
         raise ValueError("common-H5 factor set contains a factor without frozen direction")
     summary["selection_run_dir"] = str(root)
-    summary["selection_run_sha256"] = _sha256(summary_path)
-    summary["validation_detail_sha256"] = _sha256(passed_path)
+    summary["selection_run_sha256"] = sha256_file(summary_path)
+    summary["validation_detail_sha256"] = sha256_file(passed_path)
     return summary, sets, directions
 
 
@@ -1234,6 +1251,7 @@ def run_common_h5_compare(
     *,
     ic_horizon: int = 1,
     run_id_override: str | None = None,
+    factor_search_run_dir: str | None = None,
 ) -> Path:
     """Compare H5-selected peers and current peers under one production recipe.
 
@@ -1241,6 +1259,7 @@ def run_common_h5_compare(
     library.  The shared panel is only a performance optimization; each row
     retains its own factor directions and source hashes in the run contract.
     """
+    run_started = time.perf_counter()
     ic_horizon = int(ic_horizon)
     if ic_horizon < 1:
         raise ValueError("ic_horizon must be positive")
@@ -1303,6 +1322,40 @@ def run_common_h5_compare(
             },
             "direction_source": validation_source,
         })
+    factor_search_source = None
+    if factor_search_run_dir:
+        search_root = _resolve(factor_search_run_dir)
+        search_path = search_root / "search_summary.json"
+        if not search_path.is_file():
+            raise FileNotFoundError(
+                f"combination-aware factor search is incomplete: {search_root}"
+            )
+        search = json.loads(search_path.read_text(encoding="utf-8"))
+        if (
+            search.get("workflow") != "combination_aware_factor_search"
+            or bool(search.get("oos_used_for_selection", True))
+            or int(search.get("common_horizon", 0)) != 5
+            or str(search.get("research_cutoff")) != str(research_cutoff(default_config).date())
+        ):
+            raise ValueError("combination-aware factor search contract is invalid")
+        search_factors = [str(name) for name in search["winner"]["factors"]]
+        if not search_factors or not set(search_factors).issubset(h5_directions):
+            raise ValueError("factor-search winner is outside the common-H5 pool")
+        factor_search_source = {
+            "path": str(search_root),
+            "sha256": sha256_file(search_path),
+            "oos_used_for_selection": False,
+        }
+        candidates.append({
+            "id": "common_h5_combination",
+            "label": STRATEGY_LABELS["common_h5_combination"],
+            "config": load_config(_resolve("config/default.yaml")),
+            "factor_source_config": str(search_root),
+            "factors": search_factors,
+            "factor_set_id": "common_h5_combination",
+            "directions": {name: h5_directions[name] for name in search_factors},
+            "direction_source": factor_search_source,
+        })
 
     direction_union: dict[str, int] = {}
     for candidate in candidates:
@@ -1315,6 +1368,7 @@ def run_common_h5_compare(
     from research.portfolio_experiment_support import FactorPanelRunner, latest_local_date
 
     latest = pd.Timestamp(latest_local_date()).normalize()
+    panel_started = time.perf_counter()
     panel_runner = FactorPanelRunner(
         all_factors,
         start=pd.Timestamp(COMPARISON_START) - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS),
@@ -1322,6 +1376,7 @@ def run_common_h5_compare(
         factor_directions=direction_union,
         ic_horizon=ic_horizon,
     )
+    panel_seconds = time.perf_counter() - panel_started
 
     run_id = run_id_override or (
         COMMON_H5_COMPARISON_RUN_ID if ic_horizon == 1
@@ -1336,8 +1391,10 @@ def run_common_h5_compare(
     navs: dict[str, pd.Series] = {}
     configs: dict[str, dict] = {}
     strategy_results: list[tuple[object, object, object]] = []
+    strategy_timings: list[dict] = []
     cutoff = research_cutoff(default_config)
     for candidate in candidates:
+        strategy_started = time.perf_counter()
         strategy_id = candidate["id"]
         config = candidate["config"]
         config.factors = list(candidate["factors"])
@@ -1388,6 +1445,10 @@ def run_common_h5_compare(
             result,
             config,
         ))
+        strategy_timings.append({
+            "strategy": strategy_id,
+            "seconds": time.perf_counter() - strategy_started,
+        })
     comparison = pd.DataFrame(rows).set_index("strategy")
     comparison.to_csv(output / "comparison.csv", encoding="utf-8-sig")
     nav_table = pd.DataFrame(navs)
@@ -1408,6 +1469,7 @@ def run_common_h5_compare(
             "ic_horizon": ic_horizon,
         },
         "selection_source": selection_summary,
+        "factor_search_source": factor_search_source,
         "strategies": configs,
     }
     (output / "run_contract.json").write_text(
@@ -1423,10 +1485,20 @@ def run_common_h5_compare(
         production_method_compare=True,
         ic_horizon=ic_horizon,
     )
+    (output / "performance.json").write_text(
+        json.dumps({
+            "factor_panel_seconds": panel_seconds,
+            "factor_panel_profile": panel_runner.performance_profile(),
+            "strategy_seconds": strategy_timings,
+            "total_seconds": time.perf_counter() - run_started,
+            "process_peak_working_set_mib": _peak_working_set_mib(),
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     contract = json.loads((output / "run_contract.json").read_text(encoding="utf-8"))
     artifact_names = (
         "comparison.csv", "nav_comparison.csv", "segment_comparison.csv",
-        "portfolio_report.md", "nav_comparison.png",
+        "portfolio_report.md", "nav_comparison.png", "performance.json",
     )
     contract["artifacts"] = {
         name: {"sha256": hashlib.sha256((output / name).read_bytes()).hexdigest()}
@@ -1440,6 +1512,24 @@ def run_common_h5_compare(
 
 
 def main() -> None:
+    if WORKFLOW is PortfolioWorkflow.SEARCH_COMMON_H5_FACTOR_SET:
+        from workflows.experiments.historical_portfolio_search import (
+            run_combination_aware_factor_search,
+        )
+
+        run_id = COMMON_H5_SEARCH_RUN_ID or datetime.now().strftime(
+            "%Y%m%d_%H%M%S_common_h5_combination_search"
+        )
+        output = run_combination_aware_factor_search(
+            run_id=run_id,
+            config_path="config/default.yaml",
+            source_validation_dir=COMMON_H5_VALIDATION_RUN_DIR,
+            source_selection_dir=COMMON_H5_SEARCH_BASELINE_DIR,
+            common_horizon=5,
+        )
+        print(f"组合互补性因子搜索产物: {output}")
+        return
+
     if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE_COMMON_H5:
         print(f"共同H5因子集默认方法比较结果: {run_common_h5_compare()}")
         return
@@ -1447,6 +1537,13 @@ def main() -> None:
         print(
             "共同H5因子集H5-IC敏感性比较结果: "
             f"{run_common_h5_compare(ic_horizon=5)}"
+        )
+        return
+
+    if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE_COMMON_H5_SEARCH:
+        print(
+            "共同H5组合搜索候选对比结果: "
+            f"{run_common_h5_compare(ic_horizon=COMMON_H5_SEARCH_IC_HORIZON, run_id_override=COMMON_H5_SEARCH_COMPARISON_RUN_ID, factor_search_run_dir=COMMON_H5_FACTOR_SEARCH_RUN_DIR)}"
         )
         return
     catalog_path, _, specs = _validated_specs()

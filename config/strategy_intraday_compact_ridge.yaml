@@ -1,6 +1,5 @@
-# Reusable compact candidate built from the effective-library selection run.
-# It keeps the same risk/model contract as the balanced peer; only the
-# effective-library factor subset differs.
+# Historical compact candidate derived from the retired 75-row single-split run.
+# Audit only: this file is not part of the current schema-v2 effective library.
 market: futures
 seed: 42
 
@@ -162,7 +161,7 @@ backtest:
   training_window: 750
   retrain_freq: 10
   holding_period: 5
-  # Fixed effective-library subset comparison; the framework default remains enabled.
+  # Historical fixed-subset comparison; the framework default remains enabled.
   ic_monitor:
     enabled: false
 

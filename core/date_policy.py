@@ -12,7 +12,7 @@ LATEST_AVAILABLE = "latest_available"
 
 @dataclass(frozen=True)
 class FactorValidationWindow:
-    """One default factor-validation split resolved from the exchange calendar."""
+    """Frozen 126/42 split for observations and downstream selection."""
 
     factor_start: pd.Timestamp
     is_start: pd.Timestamp
@@ -82,7 +82,7 @@ def factor_validation_window(
     frequency: str = "daily_intraday",
     requested_end: Any = None,
 ) -> FactorValidationWindow:
-    """Resolve the framework's default warmup + IS + OOS factor-test window."""
+    """Resolve the non-admission warmup + IS + OOS observation window."""
     end = require_research_end(config, requested_end)
     policy = config.validation_policy
     try:

@@ -66,6 +66,7 @@ from core.factor_contract import normalise_frequency
 
 _RESEARCH_CHECKPOINT_NAME = ".multi_period_checkpoint.json"
 _SELECTION_ELIGIBLE_RESEARCH_ROLES = {
+    "factor_admission",
     "factor_validation_is",
     "rolling_walkforward_train",
 }
@@ -82,6 +83,22 @@ def _write_json_atomic(path: str, payload: dict) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def _research_data_fingerprint(source, start, end) -> str:
+    """Fingerprint only partitions that can affect the frozen research range."""
+    selected = getattr(source, "checkpoint_source_fingerprint", None)
+    if callable(selected):
+        return str(selected(start, end))
+    source_root = getattr(source, "root_path", None)
+    fingerprint_builder = getattr(source, "_files_fingerprint", None)
+    if source_root is None or not callable(fingerprint_builder):
+        raise RuntimeError("research source does not expose a data fingerprint")
+    from pathlib import Path
+
+    return str(fingerprint_builder(
+        source_root, Path(source_root).rglob("*.parquet")
+    ))
 
 
 def _load_research_checkpoint(path: str, contract: dict) -> list[dict]:
@@ -1137,17 +1154,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from research.artifacts import canonical_config_hash, source_tree_hash
 
     source = base_data_mgr.source
-    source_root = getattr(source, "root_path", None)
-    fingerprint_builder = getattr(source, "_files_fingerprint", None)
-    if source_root is None or not callable(fingerprint_builder):
-        raise RuntimeError("formal research source does not expose a data fingerprint")
     checkpoint_contract = {
         "version": 1,
         "config_sha256": canonical_config_hash(runner.config),
         "code_sha256": source_tree_hash(Path(_PROJECT_ROOT)),
-        "data_sha256": fingerprint_builder(
-            source_root, Path(source_root).rglob("*.parquet")
-        ),
+        "data_sha256": _research_data_fingerprint(source, factor_start, ic_end),
         "factors": list(all_factors),
         "factor_start": factor_start.isoformat(),
         "ic_start": ic_start.isoformat(),
@@ -1973,13 +1984,7 @@ def _run_correlation_analysis(
     if not isinstance(screening_contract, dict):
         raise RuntimeError("screening result has no research contract")
     source = runner.data_manager.source
-    source_root = getattr(source, "root_path", None)
-    fingerprint_builder = getattr(source, "_files_fingerprint", None)
-    if source_root is None or not callable(fingerprint_builder):
-        raise RuntimeError("correlation source does not expose a data fingerprint")
-    current_data_hash = fingerprint_builder(
-        source_root, Path(source_root).rglob("*.parquet")
-    )
+    current_data_hash = _research_data_fingerprint(source, factor_start, ic_end)
     if current_data_hash != screening_contract.get("data_sha256"):
         raise RuntimeError("screening and correlation data fingerprints differ")
     for key, expected in {
@@ -2091,7 +2096,9 @@ def main():
         print(f"   请安装依赖: python -m pip install -r requirements.txt")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="多因子研究 — 因子 IC/分层/回归检验")
+    parser = argparse.ArgumentParser(
+        description="探索/迁移研究入口；正式因子准入使用 factor-validation"
+    )
     parser.add_argument(
         "--config", default="config/default.yaml",
         help="配置文件路径 (默认: config/default.yaml)")
@@ -2133,7 +2140,8 @@ def main():
         help="因子计算起始日（默认按配置的频率预热天数向前推）")
     parser.add_argument(
         "--full-history", action="store_true",
-        help="显式启用截至统一研究截止日的全历史检验；未指定时默认使用预热+126 IS+42 OOS中的IS段")
+        help="显式启用截至统一研究截止日的全历史探索/迁移重放；"
+             "未指定时使用126/42观察窗口中的训练段，二者均不直接具备入库资格")
     parser.add_argument(
         "--correlation", action="store_true",
         help="对显著因子做相关性分析 + 聚类, 生成 factor_correlation.json "

@@ -46,6 +46,7 @@ from factors.numerics import (
     daily_candle_path_statistics,
     daily_breakout_statistics,
     daily_lagged_pair_statistics,
+    daily_liquidity_event_statistics,
     daily_oi_statistics,
     daily_pair_statistics,
     daily_price_volume_statistics,
@@ -596,6 +597,22 @@ def _daily_volume_shock_features(panel: dict) -> dict[str, pd.DataFrame]:
             volume.to_numpy(dtype=float),
             amount.to_numpy(dtype=float),
             offsets,
+        )
+        result = _daily_feature_frames(values, index, close.columns)
+        panel[cache_key] = result
+        return result
+
+
+def _daily_liquidity_event_features(panel: dict) -> dict[str, pd.DataFrame]:
+    cache_key = "_daily_liquidity_event_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+        close, amount = panel["close"], panel["amount"]
+        index, offsets = _day_offsets(close.index)
+        values = daily_liquidity_event_statistics(
+            close.to_numpy(dtype=float), amount.to_numpy(dtype=float), offsets
         )
         result = _daily_feature_frames(values, index, close.columns)
         panel[cache_key] = result
@@ -4545,7 +4562,7 @@ class IntradayVPIN20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_order_flow_imbalance_20d", category="intraday_advanced")
-class IntradayOrderFlowImbalance20d(Factor):
+class IntradayOrderFlowImbalance20d(IntradaySignedVolumeRatio20d):
     """订单流不平衡因子.
 
     (Σbuy - Σsell)/Σvol, 用分钟收益方向近似买卖方向.
@@ -4558,15 +4575,6 @@ class IntradayOrderFlowImbalance20d(Factor):
     description = "订单流不平衡 ((买量-卖量)/总量, 净方向)"
     validation_horizons = (5, 10, 20)
 
-    def dependencies(self) -> list:
-        return []
-
-    def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if not {"close", "volume"}.issubset(panel.keys()):
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = _daily_price_volume_features(panel)["signed_volume_ratio"]
-        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -18657,45 +18665,8 @@ class IntradayLiqResilience20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not {"close", "amount"}.issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        ret_abs = close.pct_change(fill_method=None).abs()
-        amihud = ret_abs / (amount + 1e-12)
-        day = ret_abs.index.normalize()
-        interactions: dict = {}
-        for dt in sorted(set(day)):
-            grp_r = ret_abs.loc[day == dt]
-            grp_a = amihud.loc[day == dt]
-            if len(grp_r) < 60:
-                continue
-            vals = {}
-            for col in grp_r.columns:
-                r = grp_r[col].dropna()
-                a = grp_a[col].dropna()
-                common = r.index.intersection(a.index)
-                if len(common) < 60:
-                    continue
-                r_c, a_c = r.loc[common], a.loc[common]
-                mu, sigma = r_c.mean(), r_c.std(ddof=0)
-                if sigma == 0 or pd.isna(sigma):
-                    continue
-                amed = a_c.median()
-                surge_idx = np.where(r_c.values > mu + 2 * sigma)[0]
-                half_lives = []
-                for idx in surge_idx:
-                    if idx + 1 >= len(a_c):
-                        continue
-                    tail = a_c.iloc[idx + 1:]
-                    below = np.where(tail.values < amed)[0]
-                    if len(below) > 0:
-                        half_lives.append(below[0] + 1)
-                vals[col] = -float(np.mean(half_lives)) if half_lives else np.nan
-            if vals:
-                interactions[dt] = pd.Series(vals)
-        if not interactions:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(interactions).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        daily = _daily_liquidity_event_features(panel)["liquidity_resilience"]
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # 361. intraday_buy_aggression — 主动买入强度
@@ -24337,47 +24308,8 @@ class IntradayJumpAmountLagcorr20d(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if "close" not in panel or "amount" not in panel:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        day = close.index.normalize()
-        corrs: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_a = amount.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                a = grp_a[col].dropna()
-                common = c.index.intersection(a.index)
-                if len(common) < 30:
-                    continue
-                c_c = c.loc[common]
-                a_c = a.loc[common]
-                ret = c_c.pct_change(fill_method=None)
-                amp = ret.abs()
-                thr = amp.std(ddof=0)
-                if thr < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                jump = (amp > thr).values
-                if jump.sum() < 3:
-                    vals[col] = 0.0
-                    continue
-                jump_amt = a_c.values[jump]
-                next_amt = a_c.values[1:][jump[:-1]] if len(a_c) > 1 else np.array([])
-                if len(next_amt) < 3 or np.std(jump_amt[:len(next_amt)]) < 1e-12 or np.std(next_amt) < 1e-12:
-                    vals[col] = 0.0
-                    continue
-                corr_val = float(np.corrcoef(jump_amt[:len(next_amt)], next_amt)[0, 1])
-                vals[col] = corr_val if not np.isnan(corr_val) else 0.0
-            if vals:
-                corrs[dt] = pd.Series(vals)
-        if not corrs:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = pd.DataFrame(corrs).T
-        daily.index = pd.DatetimeIndex(daily.index)
-        return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
+        daily = _daily_liquidity_event_features(panel)["jump_amount_lagcorr"]
+        return _roll_mean(daily, 20, 5).reindex(dates).shift(1).reindex(columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29417,6 +29349,20 @@ class IntradayVolZExtremeFreq20d(Factor):
 # 558. intraday_sentiment_beta — 情绪 Beta
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _rolling_market_beta(ret, market, universe):
+    beta = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
+    for col in ret.columns:
+        def estimate(window_y):
+            window_x = market.reindex(window_y.index)
+            valid = ~(window_y.isna() | window_x.isna())
+            if valid.sum() < 20:
+                return np.nan
+            xx = np.column_stack([np.ones(valid.sum()), window_x[valid].values])
+            return np.linalg.lstsq(xx, window_y[valid].values, rcond=None)[0][1]
+        beta[col] = ret[col].rolling(60, min_periods=20).apply(estimate, raw=False)
+    return beta
+
+
 @register_factor("intraday_sentiment_beta_20d", category="intraday_advanced")
 class IntradaySentimentBeta20d(Factor):
     """情绪 Beta 因子 (情绪敏感度, 日频).
@@ -29447,20 +29393,7 @@ class IntradaySentimentBeta20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret = p["close"].pct_change(fill_method=None)
         market = ret.mean(axis=1)
-        beta = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
-        for col in ret.columns:
-            y = ret[col]
-            x = market
-            def _roll_beta(window_y):
-                window_x = market.reindex(window_y.index)
-                valid = ~(window_y.isna() | window_x.isna())
-                if valid.sum() < 20:
-                    return np.nan
-                yy = window_y[valid].values
-                xx = np.column_stack([np.ones(valid.sum()), window_x[valid].values])
-                b = np.linalg.lstsq(xx, yy, rcond=None)[0]
-                return b[1] if len(b) > 1 else np.nan
-            beta[col] = y.rolling(60, min_periods=20).apply(_roll_beta, raw=False)
+        beta = _rolling_market_beta(ret, market, universe)
         return beta.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
@@ -29497,19 +29430,7 @@ class IntradaySentimentBetaVolatility20d(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         ret = p["close"].pct_change(fill_method=None)
         market = ret.mean(axis=1)
-        beta = pd.DataFrame(index=ret.index, columns=universe, dtype=float)
-        for col in ret.columns:
-            y = ret[col]
-            def _roll_beta(window_y):
-                window_x = market.reindex(window_y.index)
-                valid = ~(window_y.isna() | window_x.isna())
-                if valid.sum() < 20:
-                    return np.nan
-                yy = window_y[valid].values
-                xx = np.column_stack([np.ones(valid.sum()), window_x[valid].values])
-                b = np.linalg.lstsq(xx, yy, rcond=None)[0]
-                return b[1] if len(b) > 1 else np.nan
-            beta[col] = y.rolling(60, min_periods=20).apply(_roll_beta, raw=False)
+        beta = _rolling_market_beta(ret, market, universe)
         vol = beta.rolling(20, min_periods=5).std()
         return (-vol).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
@@ -29735,3 +29656,579 @@ class IntradayRelVolumePercentile20d(Factor):
         pct = vol.rolling(20, min_periods=5).apply(
             lambda x: float((x <= x[-1]).mean()) if len(x) >= 5 else np.nan, raw=True)
         return (-pct).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+
+
+def _daily_path_impact_features(panel: dict) -> dict[str, pd.DataFrame]:
+    """按交易日集中计算价格位置、路径、冲击与修复特征."""
+    cache_key = "_daily_path_impact_features"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+
+        feature_names = (
+            "close_location_dispersion",
+            "close_location_weighted_dispersion",
+            "close_location_tail_spread",
+            "downside_path_share",
+            "downside_path_fraction",
+            "downside_path_concentration",
+            "down_up_impact_ratio",
+            "robust_impact_asymmetry",
+            "scaled_impact_asymmetry",
+            "impact_repair_efficiency",
+            "impact_repair_consistency",
+            "impact_repair_stability",
+            "negative_reversal_ratio",
+            "negative_reversal_speed",
+            "negative_reversal_confirmation",
+            "market_path_similarity",
+            "market_path_shape_similarity",
+            "market_path_residual_stability",
+        )
+        records: dict[str, dict] = {name: {} for name in feature_names}
+        close = panel.get("close")
+        if close is None or close.empty:
+            result = {name: pd.DataFrame() for name in feature_names}
+            panel[cache_key] = result
+            return result
+
+        day = close.index.normalize()
+        for dt in sorted(set(day)):
+            mask = day == dt
+            close_day = close.loc[mask]
+            if len(close_day) < 21:
+                continue
+            ret_day = close_day.pct_change(fill_method=None)
+            market_ret = ret_day.mean(axis=1)
+            market_sum = ret_day.sum(axis=1, min_count=1)
+            market_count = ret_day.count(axis=1)
+            high_day = panel.get("high")
+            low_day = panel.get("low")
+            open_day = panel.get("open")
+            amount_day = panel.get("amount")
+            if high_day is not None:
+                high_day = high_day.loc[mask]
+            if low_day is not None:
+                low_day = low_day.loc[mask]
+            if open_day is not None:
+                open_day = open_day.loc[mask]
+            if amount_day is not None:
+                amount_day = amount_day.loc[mask]
+
+            daily_values = {name: {} for name in feature_names}
+            for col in close_day.columns:
+                prices = close_day[col].replace([np.inf, -np.inf], np.nan)
+                returns = ret_day[col].replace([np.inf, -np.inf], np.nan).dropna()
+                if len(returns) < 20:
+                    continue
+
+                if high_day is not None and low_day is not None:
+                    loc = pd.concat(
+                        [prices, high_day[col], low_day[col]], axis=1,
+                        keys=["close", "high", "low"],
+                    ).dropna()
+                    loc = loc[(loc > 0).all(axis=1)]
+                    minute_range = loc["high"] - loc["low"]
+                    loc = loc.loc[minute_range > 1e-12]
+                    if len(loc) >= 20:
+                        minute_range = loc["high"] - loc["low"]
+                        close_location = (
+                            2.0 * (loc["close"] - loc["low"]) / minute_range - 1.0
+                        ).clip(-1.0, 1.0)
+                        daily_values["close_location_dispersion"][col] = float(
+                            close_location.std(ddof=0)
+                        )
+                        daily_values["close_location_tail_spread"][col] = float(
+                            close_location.quantile(0.9) - close_location.quantile(0.1)
+                        )
+                        if amount_day is not None:
+                            weights = amount_day[col].reindex(close_location.index)
+                            valid = close_location.notna() & weights.gt(0) & np.isfinite(weights)
+                            if valid.sum() >= 20 and weights[valid].sum() > 1e-12:
+                                values = close_location[valid]
+                                weights = weights[valid]
+                                mean = float(np.average(values, weights=weights))
+                                daily_values["close_location_weighted_dispersion"][col] = float(
+                                    np.sqrt(np.average((values - mean) ** 2, weights=weights))
+                                )
+
+                down = (-returns.clip(upper=0.0))
+                down_path = float(down.sum())
+                total_path = float(returns.abs().sum())
+                if total_path > 1e-12:
+                    daily_values["downside_path_fraction"][col] = down_path / total_path
+                if down_path > 1e-12:
+                    daily_values["downside_path_concentration"][col] = float(
+                        np.sqrt(np.square(down).sum()) / down_path
+                    )
+                if high_day is not None and low_day is not None and open_day is not None:
+                    highs = high_day[col].replace([np.inf, -np.inf], np.nan).dropna()
+                    lows = low_day[col].replace([np.inf, -np.inf], np.nan).dropna()
+                    opens = open_day[col].replace([np.inf, -np.inf], np.nan).dropna()
+                    if not highs.empty and not lows.empty and not opens.empty and opens.iloc[0] > 0:
+                        amplitude = float((highs.max() - lows.min()) / opens.iloc[0])
+                        if amplitude > 1e-12:
+                            daily_values["downside_path_share"][col] = down_path / amplitude
+
+                cumulative = returns.cumsum()
+                running_peak = cumulative.cummax()
+                max_drawdown = float((running_peak - cumulative).max())
+                trough_pos = int(np.argmin(cumulative.to_numpy()))
+                rebound = float(cumulative.iloc[-1] - cumulative.iloc[trough_pos])
+                post_returns = returns.iloc[trough_pos + 1:]
+                positive_share = float((post_returns > 0).mean()) if len(post_returns) else 0.0
+                if max_drawdown > 1e-12:
+                    reversal = rebound / max_drawdown
+                    remaining_fraction = max(1, len(returns) - 1 - trough_pos) / max(1, len(returns) - 1)
+                    daily_values["negative_reversal_ratio"][col] = reversal
+                    daily_values["negative_reversal_speed"][col] = reversal / remaining_fraction
+                    daily_values["negative_reversal_confirmation"][col] = reversal * positive_share
+
+                if amount_day is not None:
+                    amounts = amount_day[col].reindex(returns.index)
+                    valid = amounts.gt(0) & np.isfinite(amounts)
+                    impact = (returns[valid].abs() / amounts[valid]).replace(
+                        [np.inf, -np.inf], np.nan
+                    ).dropna()
+                    up = returns[valid & returns.gt(0)]
+                    down_ret = returns[valid & returns.lt(0)]
+                    up_amount = amounts.reindex(up.index)
+                    down_amount = amounts.reindex(down_ret.index)
+                    if len(up) >= 3 and len(down_ret) >= 3:
+                        impact_up = float(up.sum() / up_amount.sum())
+                        impact_down = float((-down_ret).sum() / down_amount.sum())
+                        if impact_up > 1e-18:
+                            daily_values["down_up_impact_ratio"][col] = impact_down / impact_up
+                        impact_total = impact_down + impact_up
+                        if impact_total > 1e-18:
+                            daily_values["scaled_impact_asymmetry"][col] = (
+                                impact_down - impact_up
+                            ) / impact_total
+                        minute_up = (up / up_amount).replace([np.inf, -np.inf], np.nan).dropna()
+                        minute_down = ((-down_ret) / down_amount).replace(
+                            [np.inf, -np.inf], np.nan
+                        ).dropna()
+                        robust_up = float(minute_up.median())
+                        if robust_up > 1e-18 and not minute_down.empty:
+                            daily_values["robust_impact_asymmetry"][col] = (
+                                float(minute_down.median()) / robust_up
+                            )
+                    if len(impact) >= 10 and impact.mean() > 1e-18:
+                        repair = rebound / float(impact.mean())
+                        daily_values["impact_repair_efficiency"][col] = repair
+                        daily_values["impact_repair_consistency"][col] = repair * positive_share
+                        impact_cv = float(impact.std(ddof=0) / impact.mean())
+                        daily_values["impact_repair_stability"][col] = repair / (1.0 + impact_cv)
+
+                reference = market_ret.reindex(returns.index)
+                common = returns.index[reference.notna()]
+                if len(common) >= 20:
+                    own = returns.loc[common]
+                    ref = reference.loc[common]
+                    corr = own.corr(ref)
+                    own_cum = own.cumsum()
+                    ref_cum = ref.cumsum()
+                    distance = float((own_cum - ref_cum).abs().mean())
+                    if pd.notna(corr):
+                        daily_values["market_path_similarity"][col] = float(corr - distance)
+
+                loo_count = market_count.reindex(returns.index) - returns.notna().astype(int)
+                loo_ref = (
+                    market_sum.reindex(returns.index) - returns.fillna(0.0)
+                ) / loo_count.where(loo_count > 0)
+                common = returns.index[loo_ref.notna()]
+                if len(common) >= 20:
+                    own = returns.loc[common]
+                    ref = loo_ref.loc[common]
+                    corr = own.corr(ref)
+                    if pd.notna(corr):
+                        own_cum = own.cumsum()
+                        ref_cum = ref.cumsum()
+                        scale = float(own_cum.abs().mean() + ref_cum.abs().mean())
+                        distance = float((own_cum - ref_cum).abs().mean())
+                        daily_values["market_path_shape_similarity"][col] = float(
+                            corr - distance / (scale + 1e-12)
+                        )
+                        residual = own - ref
+                        own_std = float(own.std(ddof=0))
+                        daily_values["market_path_residual_stability"][col] = float(
+                            corr / (1.0 + residual.std(ddof=0) / (own_std + 1e-12))
+                        )
+
+            for name, values in daily_values.items():
+                if values:
+                    records[name][dt] = pd.Series(values)
+
+        result = {}
+        for name, values in records.items():
+            frame = pd.DataFrame(values).T if values else pd.DataFrame()
+            if not frame.empty:
+                frame.index = pd.DatetimeIndex(frame.index)
+            result[name] = frame
+        panel[cache_key] = result
+        return result
+
+
+class _MinutePathImpactFactorBase(Factor):
+    """分钟路径与价格冲击因子的统一日频输出封装."""
+
+    category = "intraday_advanced"
+    frequency = "daily"
+    validation_horizons = (5, 10, 20)
+    FEATURE = ""
+    REQUIRED_FIELDS = ("close",)
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not set(self.REQUIRED_FIELDS).issubset(panel.keys()):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = _daily_path_impact_features(panel).get(self.FEATURE)
+        if daily is None or daily.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        return _roll_mean(daily, 20, 5).reindex(
+            index=pd.DatetimeIndex(dates), columns=universe
+        ).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 566. intraday_close_location_dispersion — 分钟收盘位置离散度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_close_location_dispersion_20d", category="intraday_advanced")
+class IntradayCloseLocationDispersion20d(_MinutePathImpactFactorBase):
+    """分钟收盘位置离散度因子.
+
+    【用法说明】
+    - 输入: 1 分钟 high/low/close
+    - 公式: pos=2*(close-low)/(high-low)-1; factor=Std(pos)
+    - 输出: 日频, 20 日滚动均值, shift(1) 防未来
+
+    【含义】
+    高值表示分钟收盘位置在高低区间内切换充分，价格发现更活跃。
+    方向: 正向.
+    """
+    name = "intraday_close_location_dispersion_20d"
+    description = "分钟收盘位置离散度 (区间位置标准差, 活跃=正向)"
+    FEATURE = "close_location_dispersion"
+    REQUIRED_FIELDS = ("high", "low", "close")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 567. intraday_close_location_weighted_dispersion — 成交额加权位置离散度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_close_location_weighted_dispersion_20d", category="intraday_advanced")
+class IntradayCloseLocationWeightedDispersion20d(_MinutePathImpactFactorBase):
+    """成交额加权的分钟收盘位置离散度.
+
+    【用法说明】以分钟成交额为权重计算区间位置的加权标准差，降低微量成交
+    对位置切换的放大；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示有真实成交参与的价格位置切换更充分。方向: 正向.
+    """
+    name = "intraday_close_location_weighted_dispersion_20d"
+    description = "成交额加权位置离散度 (有效博弈活跃=正向)"
+    FEATURE = "close_location_weighted_dispersion"
+    REQUIRED_FIELDS = ("high", "low", "close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 568. intraday_close_location_tail_spread — 收盘位置尾差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_close_location_tail_spread_20d", category="intraday_advanced")
+class IntradayCloseLocationTailSpread20d(_MinutePathImpactFactorBase):
+    """分钟收盘位置尾差因子.
+
+    【用法说明】factor=Q90(pos)-Q10(pos)，用分位差替代标准差以削弱少量极端
+    分钟的影响；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示日内收盘位置覆盖范围广且切换显著。方向: 正向.
+    """
+    name = "intraday_close_location_tail_spread_20d"
+    description = "收盘位置尾差 (Q90-Q10, 稳健离散度)"
+    FEATURE = "close_location_tail_spread"
+    REQUIRED_FIELDS = ("high", "low", "close")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 569. intraday_downside_path_share — 下行路径振幅占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downside_path_share_20d", category="intraday_advanced")
+class IntradayDownsidePathShare20d(_MinutePathImpactFactorBase):
+    """下行路径相对全天振幅因子.
+
+    【用法说明】factor=Sum(|min(ret,0)|)/((max(high)-min(low))/首分钟open)，
+    日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示下行路径被反复消化而非一次扩大区间，承接和风险补偿更强。
+    方向: 正向.
+    """
+    name = "intraday_downside_path_share_20d"
+    description = "下行路径振幅占比 (下跌路径/全天振幅, 承接=正向)"
+    FEATURE = "downside_path_share"
+    REQUIRED_FIELDS = ("open", "high", "low", "close")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 570. intraday_downside_path_fraction — 下行路径总路程占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downside_path_fraction_20d", category="intraday_advanced")
+class IntradayDownsidePathFraction20d(_MinutePathImpactFactorBase):
+    """下行路径占总价格路程的比例.
+
+    【用法说明】factor=Sum(|negative ret|)/Sum(|ret|)，以实际价格路程替代日内
+    高低振幅；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示全天价格路程由下行释放主导。方向: 正向.
+    """
+    name = "intraday_downside_path_fraction_20d"
+    description = "下行路径总路程占比 (卖压释放份额)"
+    FEATURE = "downside_path_fraction"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 571. intraday_downside_path_concentration — 下行路径集中度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downside_path_concentration_20d", category="intraday_advanced")
+class IntradayDownsidePathConcentration20d(_MinutePathImpactFactorBase):
+    """下行路径集中度因子.
+
+    【用法说明】factor=Sqrt(Sum(down_ret^2))/Sum(down_ret)，区分连续缓跌与少数
+    急跌分钟；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示下行冲击集中，低值表示卖压分散。方向: 正向.
+    """
+    name = "intraday_downside_path_concentration_20d"
+    description = "下行路径集中度 (急跌集中程度)"
+    FEATURE = "downside_path_concentration"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 572. intraday_down_up_impact_ratio — 下行相对上行冲击成本
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_down_up_impact_ratio_20d", category="intraday_advanced")
+class IntradayDownUpImpactRatio20d(_MinutePathImpactFactorBase):
+    """下行相对上行价格冲击成本因子.
+
+    【用法说明】分别计算上涨和下跌分钟的 Sum(|ret|)/Sum(amount)，factor 为
+    下行冲击/上行冲击；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示卖出时单位成交额更易压低价格，下行流动性风险更高。
+    方向: 正向.
+    """
+    name = "intraday_down_up_impact_ratio_20d"
+    description = "下行相对上行冲击成本 (流动性风险补偿=正向)"
+    FEATURE = "down_up_impact_ratio"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 573. intraday_robust_impact_asymmetry — 稳健冲击不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_robust_impact_asymmetry_20d", category="intraday_advanced")
+class IntradayRobustImpactAsymmetry20d(_MinutePathImpactFactorBase):
+    """稳健冲击不对称因子.
+
+    【用法说明】factor=Median(|ret|/amount | ret<0) / Median(ret/amount | ret>0)，
+    用中位数降低极端分钟影响；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示典型下跌分钟的流动性弱于典型上涨分钟。方向: 正向.
+    """
+    name = "intraday_robust_impact_asymmetry_20d"
+    description = "稳健冲击不对称 (分钟冲击中位数比)"
+    FEATURE = "robust_impact_asymmetry"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 574. intraday_scaled_impact_asymmetry — 有界冲击不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_scaled_impact_asymmetry_20d", category="intraday_advanced")
+class IntradayScaledImpactAsymmetry20d(_MinutePathImpactFactorBase):
+    """有界冲击不对称因子.
+
+    【用法说明】factor=(impact_down-impact_up)/(impact_down+impact_up)，将量纲和
+    极端比值压缩到 [-1,1]；日频值取 20 日均值并滞后一期。
+
+    【含义】正值表示下行冲击占优，负值表示上行冲击占优。方向: 正向.
+    """
+    name = "intraday_scaled_impact_asymmetry_20d"
+    description = "有界冲击不对称 (下行-上行)/(下行+上行)"
+    FEATURE = "scaled_impact_asymmetry"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 575. intraday_impact_repair_efficiency — 冲击后价格修复效率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_impact_repair_efficiency_20d", category="intraday_advanced")
+class IntradayImpactRepairEfficiency20d(_MinutePathImpactFactorBase):
+    """冲击后价格修复效率因子.
+
+    【用法说明】improve=收盘累计收益-日内最低累计收益，factor=improve /
+    Mean(|ret|/amount)；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示价格在承受单位成交冲击后仍能充分修复。方向: 正向.
+    """
+    name = "intraday_impact_repair_efficiency_20d"
+    description = "冲击后价格修复效率 (回升/平均价格冲击)"
+    FEATURE = "impact_repair_efficiency"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 576. intraday_impact_repair_consistency — 冲击修复一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_impact_repair_consistency_20d", category="intraday_advanced")
+class IntradayImpactRepairConsistency20d(_MinutePathImpactFactorBase):
+    """冲击修复一致性因子.
+
+    【用法说明】factor=修复效率*最低点后正收益分钟占比，要求最终回升同时具有
+    连续确认；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示修复不是由少数跳涨分钟偶然完成。方向: 正向.
+    """
+    name = "intraday_impact_repair_consistency_20d"
+    description = "冲击修复一致性 (修复效率×正收益分钟占比)"
+    FEATURE = "impact_repair_consistency"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 577. intraday_impact_repair_stability — 稳定冲击修复效率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_impact_repair_stability_20d", category="intraday_advanced")
+class IntradayImpactRepairStability20d(_MinutePathImpactFactorBase):
+    """稳定冲击修复效率因子.
+
+    【用法说明】factor=修复效率/(1+CV(|ret|/amount))，惩罚依赖少数异常冲击的
+    修复；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示修复能力强且分钟冲击分布稳定。方向: 正向.
+    """
+    name = "intraday_impact_repair_stability_20d"
+    description = "稳定冲击修复效率 (冲击离散惩罚)"
+    FEATURE = "impact_repair_stability"
+    REQUIRED_FIELDS = ("close", "amount")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 578. intraday_negative_reversal_ratio — 负向冲击反转比例
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_negative_reversal_ratio_20d", category="intraday_advanced")
+class IntradayNegativeReversalRatio20d(_MinutePathImpactFactorBase):
+    """负向冲击后的反转比例因子.
+
+    【用法说明】factor=(收盘累计收益-最低累计收益)/最大日内回撤，衡量负向冲击
+    后的收复程度；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示超跌后修复充分、承接力量更强。方向: 正向.
+    """
+    name = "intraday_negative_reversal_ratio_20d"
+    description = "负向冲击反转比例 (谷底后回升/最大回撤)"
+    FEATURE = "negative_reversal_ratio"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 579. intraday_negative_reversal_speed — 负向反转相对速度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_negative_reversal_speed_20d", category="intraday_advanced")
+class IntradayNegativeReversalSpeed20d(_MinutePathImpactFactorBase):
+    """负向反转相对速度因子.
+
+    【用法说明】factor=反转比例/谷底后剩余交易时长占比，使相同收复程度下更快
+    完成修复者得分更高；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示卖压释放后资金快速承接。方向: 正向.
+    """
+    name = "intraday_negative_reversal_speed_20d"
+    description = "负向反转相对速度 (收复比例/剩余时长占比)"
+    FEATURE = "negative_reversal_speed"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 580. intraday_negative_reversal_confirmation — 负向反转路径确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_negative_reversal_confirmation_20d", category="intraday_advanced")
+class IntradayNegativeReversalConfirmation20d(_MinutePathImpactFactorBase):
+    """负向反转路径确认因子.
+
+    【用法说明】factor=反转比例*谷底后正收益分钟占比，将最终收复程度与恢复过程
+    的方向一致性结合；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示反转幅度大且恢复路径连续。方向: 正向.
+    """
+    name = "intraday_negative_reversal_confirmation_20d"
+    description = "负向反转路径确认 (收复比例×正收益分钟占比)"
+    FEATURE = "negative_reversal_confirmation"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 581. intraday_market_path_similarity — 市场路径相似度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_path_similarity_20d", category="intraday_advanced")
+class IntradayMarketPathSimilarity20d(_MinutePathImpactFactorBase):
+    """品种与全市场分钟路径相似度因子.
+
+    【用法说明】对品种与全市场等权分钟收益去均值，计算相关系数，并减去两者
+    累计收益路径的平均绝对距离；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示价格形成过程更受连续共性信息驱动。方向: 正向.
+    """
+    name = "intraday_market_path_similarity_20d"
+    description = "市场路径相似度 (去均值相关-累计路径距离)"
+    FEATURE = "market_path_similarity"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 582. intraday_market_path_shape_similarity — 剔除自身的路径形状相似度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_path_shape_similarity_20d", category="intraday_advanced")
+class IntradayMarketPathShapeSimilarity20d(_MinutePathImpactFactorBase):
+    """剔除自身后的市场路径形状相似度.
+
+    【用法说明】参考路径使用其余品种等权分钟收益，factor=相关系数-累计路径距离/
+    双方累计路径尺度；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示排除机械自相关后仍与市场路径同步。方向: 正向.
+    """
+    name = "intraday_market_path_shape_similarity_20d"
+    description = "剔除自身的路径形状相似度 (尺度归一化)"
+    FEATURE = "market_path_shape_similarity"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 583. intraday_market_path_residual_stability — 市场路径残差稳定度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_path_residual_stability_20d", category="intraday_advanced")
+class IntradayMarketPathResidualStability20d(_MinutePathImpactFactorBase):
+    """市场路径残差稳定度因子.
+
+    【用法说明】剔除自身构造市场路径，factor=相关系数/(1+残差波动/自身波动)，
+    同时要求同步和低偏离噪声；日频值取 20 日均值并滞后一期。
+
+    【含义】高值表示共性路径解释力强且特异噪声较少。方向: 正向.
+    """
+    name = "intraday_market_path_residual_stability_20d"
+    description = "市场路径残差稳定度 (同步性与低噪声结合)"
+    FEATURE = "market_path_residual_stability"
