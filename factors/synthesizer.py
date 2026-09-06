@@ -355,11 +355,13 @@ class FactorSynthesizer:
 def build_cluster_map_from_json(
     corr_json_path: str,
     min_cluster_size: int = 2,
+    *,
+    split_by_best_period: bool = False,
 ) -> Tuple[Dict[str, List[str]], List[str], Dict[str, int]]:
     """从相关性分析 JSON 构建聚类映射.
 
-    重要: 只合成同一 best_period 的因子, 避免跨持有期信号混淆.
-    聚类内若包含不同 best_period 的因子, 按 best_period 拆分为子簇.
+    默认按日频混合合成；best_period 只是准入证据，不代表持仓期。
+    ``split_by_best_period=True`` 仅供显式的分周期研究对照。
 
     支持新版 JSON (含 flip_signs 和 factors[].flip 字段) 和旧版 JSON (无方向修正).
 
@@ -386,10 +388,9 @@ def build_cluster_map_from_json(
     synth_counter = 0
 
     for cluster in data.get("clusters", []):
-        # 按 best_period 分组 (避免跨持有期合成)
         period_groups: Dict[int, List[Tuple[str, int]]] = {}
         for f in cluster["factors"]:
-            p = f.get("period", 0)
+            p = int(f.get("period", 0)) if split_by_best_period else 0
             name = f["name"]
             # 优先从 factors[].flip 读取, 其次从顶层 flip_signs 读取
             flip = f.get("flip", flip_signs.get(name, 1))
@@ -399,7 +400,8 @@ def build_cluster_map_from_json(
             factors = [name for name, _ in factors_with_flip]
             if len(factors) >= min_cluster_size:
                 synth_counter += 1
-                synth_name = f"synth_c{cluster['cluster_id']}_p{period}"
+                suffix = f"_p{period}" if split_by_best_period else ""
+                synth_name = f"synth_c{cluster['cluster_id']}{suffix}"
                 cluster_map[synth_name] = factors
                 # 更新 flip_signs (确保合成时方向修正生效)
                 for name, flip in factors_with_flip:

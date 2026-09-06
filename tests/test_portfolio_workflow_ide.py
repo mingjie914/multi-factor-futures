@@ -15,12 +15,12 @@ from core.sectors import FRAMEWORK_UNIVERSE
 def _write_config(tmp_path, *, approved_period=5, holding_period=5):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": 3,
         "factors": [{
             "factor": "factor_a",
             "status": "effective",
-            "selected_period": approved_period,
-            "approved_periods": [approved_period],
+            "best_period": approved_period,
+            "signal_frequency": "daily",
         }],
     }), encoding="utf-8")
     config = tmp_path / "strategy.yaml"
@@ -31,7 +31,7 @@ def _write_config(tmp_path, *, approved_period=5, holding_period=5):
         f"universe: {json.dumps(list(FRAMEWORK_UNIVERSE))}\n"
         "factors: [factor_a]\n"
         f"factor_library:\n  path: '{library.as_posix()}'\n"
-        "  enforce_portfolio_periods: true\n"
+        "  enforce_effective_membership: true\n"
         f"backtest:\n  holding_period: {holding_period}\n",
         encoding="utf-8",
     )
@@ -63,17 +63,13 @@ def _write_catalog(tmp_path, config, *, plot=False):
     return catalog
 
 
-def test_ide_strategy_validation_enforces_library_periods(tmp_path, monkeypatch):
+def test_ide_strategy_best_period_does_not_constrain_portfolio_holding(tmp_path, monkeypatch):
     config = _write_config(tmp_path, approved_period=5, holding_period=10)
     catalog = _write_catalog(tmp_path, config)
     monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
 
-    try:
-        ide._validated_specs()
-    except ValueError as exc:
-        assert "period 10 not approved" in str(exc)
-    else:
-        raise AssertionError("IDE workflow accepted an unapproved factor period")
+    specs = ide._validated_specs()
+    assert len(specs[2]) == 1
 
 
 def test_catalog_rejects_unknown_factor_even_before_strategy_use(tmp_path, monkeypatch):

@@ -384,10 +384,10 @@ def test_threshold_sensitivity_reports_factor_names_and_jaccard():
     results = [{
         "name": "signal",
         "all_periods": {"1": {
-            "ols_p_value": 0.001,
+            "ic_p_value": 0.001,
             "estimable": True,
             "ic": 0.02,
-            "ols_hac_t": 3.0,
+            "ic_hac_t": 3.0,
             "period": 1,
             "preprocessing_variant": "neutralized",
         }},
@@ -399,6 +399,39 @@ def test_threshold_sensitivity_reports_factor_names_and_jaccard():
         assert scenario["economic_factor_names"] == ["signal"]
         assert scenario["local_fdr_jaccard_vs_baseline"] == pytest.approx(1.0)
         assert scenario["economic_jaccard_vs_baseline"] == pytest.approx(1.0)
+
+
+def test_factor_discovery_uses_ic_hac_p_value_not_ols_p_value():
+    from types import SimpleNamespace
+
+    from workflows.research import _apply_hierarchical_discovery
+
+    results = [{
+        "name": "signal",
+        "all_periods": {"period_5": {
+            "period": 5,
+            "preprocessing_variant": "neutralized",
+            "ic": 0.03,
+            "ic_hac_t": 3.5,
+            "ic_p_value": 0.001,
+            "n": 100,
+            "ols_hac_t": 0.1,
+            "ols_p_value": 0.92,
+            "ols_n": 100,
+            "ols_days": 100,
+            "ir_nw": 0.5,
+            "ic_pos_ratio": 0.6,
+        }},
+    }]
+    _apply_hierarchical_discovery(
+        results,
+        SimpleNamespace(discovery_q=0.10, fwer_report_alpha=0.05),
+    )
+
+    assert results[0]["hierarchical_fdr_significant"] is True
+    assert results[0]["best_period"] == 5
+    assert results[0]["best_t"] == pytest.approx(3.5)
+    assert results[0]["best_p_value"] == pytest.approx(0.001)
 
 
 def test_deployment_adaptivity_loads_only_frozen_discovery_contract(tmp_path):

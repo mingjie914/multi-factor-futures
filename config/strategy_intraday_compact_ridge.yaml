@@ -19,7 +19,8 @@ date_range:
 
 factor_library:
   path: './factor_library/library.json'
-  enforce_portfolio_periods: true
+  # Historical audit configuration; it is not a current effective-library strategy.
+  enforce_effective_membership: false
 
 universe:
   - A

@@ -170,6 +170,19 @@ def test_registered_factor_contract_rejects_formal_horizon_override():
         )
 
 
+def test_intraday_admission_horizons_are_uniform_h5_h10_h20():
+    from core.registry import list_registered
+    import factors.library.intraday  # noqa: F401
+
+    factors = list_registered("factor")["factor"]
+    intraday = [
+        factor for factor in factors.values()
+        if factor.__module__.startswith("factors.library.intraday")
+    ]
+    assert intraday
+    assert {factor.validation_horizons for factor in intraday} == {(5, 10, 20)}
+
+
 def test_requested_factor_validation_rejects_unknown_names():
     assert _validate_requested_factors(["known"], {"known"}) == ["known"]
     with pytest.raises(ValueError, match="missing"):

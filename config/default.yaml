@@ -60,8 +60,8 @@ date_range:
 factor_library:
   path: './factor_library/library.json'
   # Legacy baseline below is not an effective-library portfolio. New confirmed
-  # strategy configs should set this true to reject unapproved factor periods.
-  enforce_portfolio_periods: false
+  # strategy configs should set this true to reject factors outside the library.
+  enforce_effective_membership: false
 
 universe:
   - A
@@ -133,7 +133,8 @@ testing:
 # Ridge is the enabled post-screening estimator. sector_grouped_lasso is a
 # registered parallel alternative, but is never selected unless a strategy
 # configuration explicitly sets alpha.type to it. Neither model changes the
-# effective-factor library. Raw OLS/HAC and multiplicity control happen first.
+# effective-factor library. Raw IC/HAC p-values and multiplicity control happen first;
+# unpenalized OLS/HAC remains a diagnostic channel.
 alpha:
   type: sector_grouped_ridge
   params:

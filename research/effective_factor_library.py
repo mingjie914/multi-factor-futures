@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+from core.registry import get as registry_get
 from research.artifacts import sha256_file
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def load_library(path: str | Path) -> dict[str, Any]:
@@ -18,7 +20,8 @@ def load_library(path: str | Path) -> dict[str, Any]:
     if not library_path.is_file():
         return {"schema_version": SCHEMA_VERSION, "factors": []}
     payload = json.loads(library_path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    schema_version = int(payload.get("schema_version", 0))
+    if schema_version not in {2, SCHEMA_VERSION}:
         raise ValueError("unsupported effective factor library schema")
     factors = payload.get("factors")
     if not isinstance(factors, list):
@@ -26,6 +29,17 @@ def load_library(path: str | Path) -> dict[str, Any]:
     names = [str(row.get("factor", "")) for row in factors]
     if any(not name for name in names) or len(names) != len(set(names)):
         raise ValueError("effective factor library contains empty or duplicate names")
+    if schema_version == 2:
+        migrated = []
+        for row in factors:
+            record = dict(row)
+            record["best_period"] = int(record.pop("selected_period"))
+            record.pop("approved_periods", None)
+            record.pop("registered_horizons", None)
+            record["signal_frequency"] = record.pop("frequency", "daily")
+            record.setdefault("input_bar_frequency", "1min")
+            migrated.append(record)
+        payload = {**payload, "schema_version": SCHEMA_VERSION, "factors": migrated}
     return payload
 
 
@@ -52,8 +66,8 @@ def export_current_csv(library_path: str | Path) -> Path:
     payload = load_library(path)
     output = path.with_name("current.csv")
     fields = [
-        "factor", "family", "status", "frequency", "registered_horizons",
-        "selected_period", "approved_periods", "direction", "admitted_at", "source_run",
+        "factor", "family", "status", "input_bar_frequency", "signal_frequency",
+        "best_period", "direction", "admitted_at", "source_run",
         "research_start", "research_cutoff", "ic", "t", "q", "evidence_sha256",
     ]
     temporary = output.with_name(f"{output.name}.{os.getpid()}.tmp")
@@ -65,6 +79,15 @@ def export_current_csv(library_path: str | Path) -> Path:
             writer.writerow({key: row.get(key, "") for key in fields})
     os.replace(temporary, output)
     return output
+
+
+def _input_bar_frequency(factor: str) -> str:
+    """Read the minimal raw-bar contract from the registered implementation."""
+    try:
+        cls = registry_get("factor", factor)
+    except KeyError:
+        return "1min"
+    return str(getattr(cls, "input_bar_frequency", "1min"))
 
 
 def admit_validation_run(
@@ -107,6 +130,12 @@ def admit_validation_run(
         raise ValueError("validation summary has an invalid admission scope")
     if str(contract.get("scope", "")) != scope:
         raise ValueError("validation contract and summary admission scopes disagree")
+    if scope == "all_registered_intraday":
+        # The library command is intentionally lightweight and does not load the
+        # factor module through the research runner.  Load it here so raw-bar
+        # metadata comes from the same registered implementations that were
+        # validated, rather than from a hard-coded library default.
+        importlib.import_module("factors.library.intraday")
     contract_files = contract.get("files", {})
     required_files = {
         "factor_validation_full.csv",
@@ -185,32 +214,27 @@ def admit_validation_run(
     for row in passed:
         factor = row["factor"]
         ic = float(row["ic"])
-        selected_period = int(float(row["selected_period"]))
+        best_period = int(float(row["best_period"]))
         registered_periods = {
             int(value) for value in str(row["registered_horizons"]).split("|")
             if value
         }
-        approved_periods = [selected_period]
-        if (
-            selected_period not in approved_periods
-            or not set(approved_periods).issubset(registered_periods)
-        ):
-            raise ValueError(f"invalid approved periods for factor {factor!r}")
+        if best_period not in registered_periods:
+            raise ValueError(f"invalid best period for factor {factor!r}")
         by_name[factor] = {
             "factor": factor,
             "family": str(row.get("family", "") or ""),
             "status": "effective",
-            "frequency": "daily",
-            "registered_horizons": row["registered_horizons"],
-            "selected_period": selected_period,
-            "approved_periods": approved_periods,
+            "input_bar_frequency": _input_bar_frequency(factor),
+            "signal_frequency": "daily",
+            "best_period": best_period,
             "direction": 1 if ic >= 0.0 else -1,
             "admitted_at": admitted_at,
             "source_run": source_run,
             "research_start": research_window[0],
             "research_cutoff": summary.get("research_cutoff"),
             "ic": ic,
-            "t": float(row["ols_hac_t"]),
+            "t": float(row["ic_hac_t"]),
             "q": float(row["local_q_value"]),
             "evidence_file": evidence_file,
             "evidence_sha256": evidence_hash,
@@ -226,29 +250,26 @@ def admit_validation_run(
     return payload
 
 
-def validate_effective_factor_periods(
+def validate_effective_factor_membership(
     library_path: str | Path,
     assignments: dict[int, list[str]],
 ) -> None:
-    """Fail when a portfolio uses a non-effective or unapproved factor horizon."""
+    """Fail when a portfolio uses a factor outside the effective library.
+
+    Assignment keys are portfolio holding periods, not factor-admission horizons.
+    ``best_period`` remains evidence metadata and never constrains rebalancing.
+    """
     factors = {
         row["factor"]: row
         for row in load_library(library_path)["factors"]
         if row.get("status") == "effective"
     }
     errors: list[str] = []
-    for period, names in assignments.items():
+    for names in assignments.values():
         for name in names:
             record = factors.get(name)
             if record is None:
                 errors.append(f"{name}: not in effective library")
                 continue
-            approved = record.get("approved_periods")
-            if approved is None:  # schema-v1 libraries written before this field
-                approved = [record.get("selected_period")]
-            if int(period) not in {int(value) for value in approved}:
-                errors.append(
-                    f"{name}: period {period} not approved; approved={approved}"
-                )
     if errors:
-        raise ValueError("effective factor period validation failed: " + "; ".join(errors))
+        raise ValueError("effective factor membership validation failed: " + "; ".join(errors))

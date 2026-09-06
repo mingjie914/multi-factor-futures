@@ -478,9 +478,9 @@ def _apply_global_bonferroni(
         approved_rows = []
         for label, values in factor_result.get("all_periods", {}).items():
             period = int(label.replace("period_", ""))
-            raw_p = float(values.get("ols_p_value", 1.0))
+            raw_p = float(values.get("ic_p_value", 1.0))
             valid_p = bool(
-                math.isfinite(raw_p) and int(values.get("ols_n", 0)) >= 2
+                math.isfinite(raw_p) and int(values.get("n", 0)) >= 2
             )
             is_approved = bool(valid_p and raw_p <= cutoff)
             values["bonferroni_adjusted_p"] = float(
@@ -495,16 +495,16 @@ def _apply_global_bonferroni(
             best_period, best_values = min(
                 approved_rows,
                 key=lambda item: (
-                    float(item[1].get("ols_p_value", 1.0)),
-                    -abs(float(item[1].get("ols_hac_t", 0.0))),
+                    float(item[1].get("ic_p_value", 1.0)),
+                    -abs(float(item[1].get("ic_hac_t", 0.0))),
                     item[0],
                 ),
             )
             factor_result.update({
                 "best_period": int(best_period),
-                "best_t": float(best_values.get("ols_hac_t", 0.0)),
+                "best_t": float(best_values.get("ic_hac_t", 0.0)),
                 "best_ic_t": float(best_values.get("ic_hac_t", 0.0)),
-                "best_p_value": float(best_values.get("ols_p_value", 1.0)),
+                "best_p_value": float(best_values.get("ic_p_value", 1.0)),
                 "best_ic": float(best_values.get("ic", 0.0)),
                 "best_ir": float(best_values.get("ir_nw", 0.0)),
                 "best_ic_pos_ratio": float(
@@ -526,14 +526,14 @@ def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
     for result in results:
         entries = list(result.get("all_periods", {}).values())
         for entry in entries:
-            entry["estimable"] = int(entry.get("ols_n", 0) or 0) >= 2
+            entry["estimable"] = int(entry.get("n", 0) or 0) >= 2
         entries_by_factor[str(result["name"])] = entries
 
     audit = apply_hierarchical_fdr(
         entries_by_factor,
         q=float(policy.discovery_q),
         fwer_alpha=float(policy.fwer_report_alpha),
-        p_key="ols_p_value",
+        p_key="ic_p_value",
         estimable_key="estimable",
     )
     for result in results:
@@ -568,8 +568,8 @@ def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
             approved,
             key=lambda entry: (
                 float(entry.get("local_q_value", 1.0)),
-                float(entry.get("ols_p_value", 1.0)),
-                -abs(float(entry.get("ols_hac_t", 0.0))),
+                float(entry.get("ic_p_value", 1.0)),
+                -abs(float(entry.get("ic_hac_t", 0.0))),
                 int(entry.get("period", 0)),
                 str(entry.get("preprocessing_variant", "neutralized")),
             ),
@@ -577,9 +577,9 @@ def _apply_hierarchical_discovery(results: list[dict], policy) -> dict:
         result.update({
             "best_period": int(best.get("period", 0)),
             "best_variant": str(best.get("preprocessing_variant", "neutralized")),
-            "best_t": float(best.get("ols_hac_t", 0.0)),
+            "best_t": float(best.get("ic_hac_t", 0.0)),
             "best_ic_t": float(best.get("ic_hac_t", 0.0)),
-            "best_p_value": float(best.get("ols_p_value", 1.0)),
+            "best_p_value": float(best.get("ic_p_value", 1.0)),
             "best_q_value": max(
                 float(best.get("factor_q_value", 1.0)),
                 float(best.get("local_q_value", 1.0)),
@@ -603,7 +603,7 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
         factor_entries = {
             str(result["name"]): [
                 {
-                    "p_value": float(entry.get("ols_p_value", 1.0)),
+                    "p_value": float(entry.get("ic_p_value", 1.0)),
                     "estimable": bool(entry.get("estimable", False)),
                 }
                 for entry in result.get("all_periods", {}).values()
@@ -644,14 +644,14 @@ def _build_threshold_sensitivity(results: list[dict], policy) -> dict:
                 approved,
                 key=lambda pair: (
                     float(pair[1].get("local_q_value", 1.0)),
-                    float(pair[0].get("ols_p_value", 1.0)),
-                    -abs(float(pair[0].get("ols_hac_t", 0.0))),
+                    float(pair[0].get("ic_p_value", 1.0)),
+                    -abs(float(pair[0].get("ic_hac_t", 0.0))),
                     int(pair[0].get("period", 0)),
                     str(pair[0].get("preprocessing_variant", "neutralized")),
                 ),
             )
             ic_value = float(best.get("ic", 0.0))
-            t_value = float(best.get("ols_hac_t", 0.0))
+            t_value = float(best.get("ic_hac_t", 0.0))
             expected = expected_directions.get(name)
             observed = 1 if ic_value >= 0.0 else -1
             direction_ok = expected not in {-1, 1} or int(expected) == observed
@@ -1383,15 +1383,14 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                             "preprocessing_variant": variant,
                             "ic": 0.0,
                             "ic_hac_t": 0.0,
+                            "ic_p_value": 1.0,
                             "t": 0.0,
                             "ols_beta": 0.0,
                             "ols_hac_t": 0.0,
                             "ols_p_value": 1.0,
                             "ols_n": 0,
                             "ols_days": 0,
-                            "inference_model": (
-                                "unpenalized_univariate_fama_macbeth_ols_hac"
-                            ),
+                            "inference_model": "daily_cross_sectional_ic_hac",
                             "ir_nw": 0.0,
                             "ic_pos_ratio": 0.0,
                             "n": 0,
@@ -1460,6 +1459,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         ols_n = stats["ols_n"]
                         ols_days = stats["ols_days"]
                         ic_n = stats["ic_n"]
+                        ic_p = float(
+                            2.0 * _scipy_stats.t.sf(
+                                abs(t_stat), df=max(ic_n - 1, 1)
+                            )
+                        )
                     except Exception as exc:
                         estimation_failure = {
                             "error_type": type(exc).__name__,
@@ -1475,6 +1479,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         ols_n = 0
                         ols_days = 0
                         ic_n = 0
+                        ic_p = 1.0
 
                     label = f"{variant}_period_{p}"
                     all_period_results[label] = {
@@ -1482,13 +1487,14 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                         "preprocessing_variant": variant,
                         "ic": float(ic_mean),
                         "ic_hac_t": float(t_stat),
-                        "t": float(ols_t),
+                        "ic_p_value": float(ic_p),
+                        "t": float(t_stat),
                         "ols_beta": float(ols_beta),
                         "ols_hac_t": float(ols_t),
                         "ols_p_value": float(ols_p),
                         "ols_n": int(ols_n),
                         "ols_days": int(ols_days),
-                        "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
+                        "inference_model": "daily_cross_sectional_ic_hac",
                         "ir_nw": float(ir_nw),
                         "ic_pos_ratio": float(ic_pos_ratio),
                         "n": int(ic_n),
@@ -1571,7 +1577,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     # 正式门槛由层级 FDR、|IC|/|t|、预声明方向和后置交易属性共同治理。
 
     # 第一阶段: 对每个预声明因子×持有期×预处理版本的原始单因子
-    # OLS/HAC p 值执行层级 FDR。Ridge 尚未参与，也不产生筛选 p 值。
+    # 逐日截面 IC 序列的 HAC p 值执行层级 FDR。OLS/HAC 只保留为诊断；
+    # Ridge 尚未参与，也不产生筛选 p 值。
     discovery_audit = _apply_hierarchical_discovery(results, policy)
     total_hypotheses = int(discovery_audit["total_hypotheses"])
     bonferroni_alpha = float(discovery_audit["fwer_cutoff"])
@@ -2050,12 +2057,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "validation_policy_sha256": policy_hash,
             "taxonomy_version": TAXONOMY_VERSION,
             "taxonomy_sha256": taxonomy_sha256(),
-            "inference_model": "unpenalized_univariate_fama_macbeth_ols_hac",
+            "inference_model": "daily_cross_sectional_ic_hac",
             "factor_preprocessing": factor_preprocessing,
             "factor_preprocessing_variants": preprocessing_variants,
             "selection_order": [
                 "predeclared_exposure_preprocessing",
-                "raw_ols_hac_p_values",
+                "raw_ic_hac_p_values",
                 "factor_simes_bh",
                 "selection_adjusted_local_bh",
                 "economic_and_robustness_gates",

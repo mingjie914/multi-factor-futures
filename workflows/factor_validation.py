@@ -100,12 +100,12 @@ def _admission_result_rows(screening: dict) -> list[dict]:
             "factor": name,
             "family": str(getattr(factor_class, "category", "") or ""),
             "registered_horizons": "|".join(map(str, registered_horizons)),
-            "selected_period": selected_period or "",
+            "best_period": selected_period or "",
             "selected_variant": selected_variant,
             "ic": selected.get("ic", result.get("best_ic")),
             "ic_hac_t": selected.get("ic_hac_t"),
             "ols_hac_t": selected.get("ols_hac_t", result.get("best_t")),
-            "p_value": selected.get("ols_p_value", result.get("best_p_value")),
+            "p_value": selected.get("ic_p_value", result.get("best_p_value")),
             "factor_q_value": selected.get("factor_q_value"),
             "local_q_value": selected.get("local_q_value", result.get("best_q_value")),
             "factor_fdr_pass": bool(selected.get("factor_fdr_significant", False)),
@@ -275,7 +275,7 @@ def _result_rows(screening: dict, oos: dict) -> list[dict]:
         report = max(
             local,
             key=lambda values: (
-                abs(float(values.get("ols_hac_t", 0.0))),
+                abs(float(values.get("ic_hac_t", 0.0))),
                 -int(values.get("period", 0)),
                 str(values.get("preprocessing_variant", "")),
             ),
@@ -305,7 +305,7 @@ def _result_rows(screening: dict, oos: dict) -> list[dict]:
             "is_ic_hac_t": report.get("ic_hac_t"),
             "is_ols_beta": report.get("ols_beta"),
             "is_ols_hac_t": report.get("ols_hac_t"),
-            "is_p_value": report.get("ols_p_value"),
+            "is_p_value": report.get("ic_p_value"),
             "is_ir_nw": report.get("ir_nw"),
             "is_ic_pos_ratio": report.get("ic_pos_ratio"),
             "is_n": report.get("n"),
@@ -607,7 +607,7 @@ def run_default_factor_validation(
     rows = _admission_result_rows(screening)
     passed = sorted(
         (row for row in rows if row["final_pass"]),
-        key=lambda row: (-abs(float(row.get("ols_hac_t") or 0.0)), row["factor"]),
+        key=lambda row: (-abs(float(row.get("ic_hac_t") or 0.0)), row["factor"]),
     )
     _write_csv(run_dir / "factor_validation_full.csv", rows)
     _write_csv(

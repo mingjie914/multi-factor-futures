@@ -11,14 +11,14 @@ from workflows.factor_selection import _compact_representatives, _load_library
 def test_effective_library_selection_accepts_registered_daily_horizon_three(tmp_path):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": 3,
         "factors": [{
             "factor": "intraday_probe",
             "family": "intraday",
             "status": "effective",
-            "frequency": "daily",
-            "selected_period": 3,
-            "approved_periods": [3],
+            "signal_frequency": "daily",
+            "input_bar_frequency": "1min",
+            "best_period": 3,
             "direction": 1,
         }],
     }), encoding="utf-8")
@@ -26,7 +26,7 @@ def test_effective_library_selection_accepts_registered_daily_horizon_three(tmp_
 
     _, rows = _load_library(config, allowed_horizons=None)
 
-    assert rows[0]["approved_periods"] == [3]
+    assert rows[0]["best_period"] == 3
     assert rows[0]["family"] == "intraday"
 
 

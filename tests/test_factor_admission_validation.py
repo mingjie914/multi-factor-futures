@@ -106,6 +106,7 @@ def test_admission_rows_use_old_final_factors_without_oos_or_correlation(monkeyp
                         "estimable": True,
                         "ic": -0.04,
                         "ic_hac_t": -2.3,
+                        "ic_p_value": 0.01,
                         "ols_hac_t": -2.8,
                         "ols_p_value": 0.01,
                         "factor_q_value": 0.03,
@@ -139,7 +140,7 @@ def test_admission_rows_use_old_final_factors_without_oos_or_correlation(monkeyp
     rows = {row["factor"]: row for row in _admission_result_rows(screening)}
     assert rows["passed"]["final_pass"] is True
     assert rows["passed"]["decision_reason"] == "passed_formal_admission"
-    assert rows["passed"]["selected_period"] == 10
+    assert rows["passed"]["best_period"] == 10
     assert rows["passed"]["family"] == "microstructure"
     assert "oos_ic" not in rows["passed"]
     assert "cluster_id" not in rows["passed"]

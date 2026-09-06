@@ -1356,9 +1356,10 @@ def test_global_bonferroni_selects_horizon_only_from_approved_tests():
 
     def period(p_value, t_stat):
         return {
-            "ols_p_value": p_value,
+            "ic_p_value": p_value,
             "ols_hac_t": t_stat,
             "ols_n": 100,
+            "n": 100,
             "ols_beta": 0.001,
             "ic_hac_t": t_stat,
             "ic": 0.03,

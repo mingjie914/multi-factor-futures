@@ -28,6 +28,7 @@ from factors.numerics import (
 )
 
 from factors.library.intraday import (
+    _daily_close_location_features,
     _daily_feature_frames,
     _daily_hlc_features,
     _daily_path_impact_features,
@@ -109,6 +110,17 @@ def test_daily_path_impact_features_are_complete_cached_and_numerically_aligned(
     assert actual["close_location_dispersion"].loc[day, "A"] == pytest.approx(
         float(location.std(ddof=0))
     )
+
+    optimized = _daily_close_location_features(panel)
+    assert _daily_close_location_features(panel) is optimized
+    for feature in (
+        "close_location_dispersion",
+        "close_location_weighted_dispersion",
+        "close_location_tail_spread",
+    ):
+        pd.testing.assert_frame_equal(
+            optimized[feature], actual[feature], check_exact=False, rtol=1e-13, atol=1e-13
+        )
 
 
 def test_factor_kernel_mode_auto_selects_installed_native(monkeypatch):
@@ -275,20 +287,22 @@ def test_zscore_variant_is_cross_sectional_and_handles_constant_rows():
     assert result.iloc[1].isna().all()
 
 
-def test_df_manual_fallback_produces_a_finite_statistic(monkeypatch):
-    import statsmodels.tsa.stattools as stattools
+@pytest.mark.parametrize("length", [30, 80, 240, 480])
+def test_df_numpy_adf_matches_statsmodels_adfuller(length):
+    from statsmodels.tsa.stattools import adfuller
 
-    monkeypatch.setattr(
-        stattools,
-        "adfuller",
-        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("fallback")),
-    )
-    series = np.cumsum(np.sin(np.arange(80, dtype=float)))
+    rng = np.random.default_rng(1200 + length)
+    series = np.cumsum(rng.normal(size=length))
 
-    result = IntradayDfTest20d._df_tstat(series)
+    expected = abs(adfuller(series, autolag="AIC", regresults=False)[0])
+    actual = IntradayDfTest20d._df_tstat(series)
 
-    assert np.isfinite(result)
-    assert result >= 0.0
+    assert actual == pytest.approx(expected, rel=1e-8, abs=1e-8)
+
+
+def test_df_numpy_adf_returns_zero_for_short_or_degenerate_series():
+    assert IntradayDfTest20d._df_tstat(np.arange(20, dtype=float)) == 0.0
+    assert IntradayDfTest20d._df_tstat(np.ones(80, dtype=float)) == 0.0
 
 
 def test_oi_surge_relations_do_not_use_closes_on_or_after_signal_date(monkeypatch):

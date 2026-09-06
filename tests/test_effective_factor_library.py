@@ -9,7 +9,7 @@ from research.effective_factor_library import (
     admit_validation_run,
     effective_factor_names,
     load_library,
-    validate_effective_factor_periods,
+    validate_effective_factor_membership,
 )
 from pipeline.runner import PipelineRunner
 
@@ -21,10 +21,11 @@ def test_validation_run_admission_creates_structured_library(tmp_path):
         "factor": "intraday_probe",
         "family": "microstructure",
         "registered_horizons": "5|10|20",
-        "selected_period": "10",
+        "best_period": "10",
         "selected_variant": "raw",
         "ic": "0.03",
-        "ols_hac_t": "2.5",
+        "ic_hac_t": "2.5",
+        "ols_hac_t": "2.1",
         "local_q_value": "0.04",
         "final_pass": "True",
     }
@@ -87,8 +88,9 @@ def test_validation_run_admission_creates_structured_library(tmp_path):
     )
 
     assert payload["factors"][0]["factor"] == "intraday_probe"
-    assert payload["factors"][0]["selected_period"] == 10
-    assert payload["factors"][0]["approved_periods"] == [10]
+    assert payload["factors"][0]["best_period"] == 10
+    assert "selected_period" not in payload["factors"][0]
+    assert "approved_periods" not in payload["factors"][0]
     assert payload["factors"][0]["family"] == "microstructure"
     assert payload["factors"][0]["direction"] == 1
     assert payload["factors"][0]["research_cutoff"] == "2026-05-15"
@@ -96,30 +98,28 @@ def test_validation_run_admission_creates_structured_library(tmp_path):
     assert load_library(library)["source_run"] == "run-1"
     assert library.with_name("current.csv").is_file()
 
-    validate_effective_factor_periods(library, {10: ["intraday_probe"]})
+    validate_effective_factor_membership(library, {10: ["intraday_probe"]})
 
 
-def test_period_validation_rejects_unapproved_and_unknown_factors(tmp_path):
+def test_membership_validation_does_not_treat_best_period_as_holding_period(tmp_path):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": 3,
         "factors": [{
             "factor": "approved_factor",
             "status": "effective",
-            "selected_period": 5,
-            "approved_periods": [5, 10],
+            "best_period": 5,
         }],
     }), encoding="utf-8")
 
-    validate_effective_factor_periods(library, {5: ["approved_factor"]})
-    validate_effective_factor_periods(library, {10: ["approved_factor"]})
+    validate_effective_factor_membership(library, {5: ["approved_factor"]})
+    validate_effective_factor_membership(library, {20: ["approved_factor"]})
     try:
-        validate_effective_factor_periods(
+        validate_effective_factor_membership(
             library, {20: ["approved_factor"], 5: ["unknown_factor"]}
         )
     except ValueError as exc:
         message = str(exc)
-        assert "period 20 not approved" in message
         assert "unknown_factor: not in effective library" in message
     else:
         raise AssertionError("invalid effective-factor assignments were accepted")
@@ -157,26 +157,19 @@ def test_admission_rejects_single_split_observation_run(tmp_path):
 def test_pipeline_period_gate_is_explicit_and_reuses_library_validator(tmp_path):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": 3,
         "factors": [{
             "factor": "approved_factor",
             "status": "effective",
-            "selected_period": 5,
-            "approved_periods": [5],
+            "best_period": 5,
         }],
     }), encoding="utf-8")
     runner = PipelineRunner.__new__(PipelineRunner)
     runner.config = SimpleNamespace(factor_library=SimpleNamespace(
-        path=str(library), enforce_portfolio_periods=True
+        path=str(library), enforce_effective_membership=True
     ))
 
-    runner._validate_effective_factor_periods({5: ["approved_factor"]})
-    try:
-        runner._validate_effective_factor_periods({10: ["approved_factor"]})
-    except ValueError as exc:
-        assert "period 10 not approved" in str(exc)
-    else:
-        raise AssertionError("pipeline accepted an unapproved factor period")
+    runner._validate_effective_factor_membership({10: ["approved_factor"]})
 
 
 def test_admission_merges_new_passes_without_retiring_existing_factors(tmp_path):
@@ -185,11 +178,10 @@ def test_admission_merges_new_passes_without_retiring_existing_factors(tmp_path)
     existing = [{
         "factor": f"old_{index:03d}",
         "status": "effective",
-        "selected_period": 5,
-        "approved_periods": [5],
+        "best_period": 5,
     } for index in range(75)]
     library.write_text(json.dumps({
-        "schema_version": 2, "factors": existing
+        "schema_version": 3, "factors": existing
     }), encoding="utf-8")
 
     run = tmp_path / "run-688"
@@ -208,10 +200,11 @@ def test_admission_merges_new_passes_without_retiring_existing_factors(tmp_path)
         "factor": f"new_{index:03d}",
         "family": "test",
         "registered_horizons": "5|10|20",
-        "selected_period": "10",
+        "best_period": "10",
         "selected_variant": "raw",
         "ic": "0.03",
-        "ols_hac_t": "2.5",
+        "ic_hac_t": "2.5",
+        "ols_hac_t": "2.1",
         "local_q_value": "0.04",
         "final_pass": "True",
     } for index in range(25)]
@@ -271,12 +264,11 @@ def test_full_pool_admission_replaces_instead_of_merging_old_effective_rows(tmp_
     library = tmp_path / "factor_library" / "library.json"
     library.parent.mkdir()
     library.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": 3,
         "factors": [{
             "factor": "stale_factor",
             "status": "effective",
-            "selected_period": 5,
-            "approved_periods": [5],
+            "best_period": 5,
         }],
     }), encoding="utf-8")
 
@@ -286,10 +278,11 @@ def test_full_pool_admission_replaces_instead_of_merging_old_effective_rows(tmp_
         "factor": "fresh_factor",
         "family": "intraday",
         "registered_horizons": "3|5|10",
-        "selected_period": "3",
+        "best_period": "3",
         "selected_variant": "raw",
         "ic": "0.03",
-        "ols_hac_t": "2.5",
+        "ic_hac_t": "2.5",
+        "ols_hac_t": "2.1",
         "local_q_value": "0.04",
         "final_pass": "True",
     }
@@ -339,4 +332,12 @@ def test_full_pool_admission_replaces_instead_of_merging_old_effective_rows(tmp_
     payload = admit_validation_run(run, library, admitted_at="2026-09-06")
 
     assert [record["factor"] for record in payload["factors"]] == ["fresh_factor"]
-    assert payload["factors"][0]["frequency"] == "daily"
+    assert payload["factors"][0]["signal_frequency"] == "daily"
+
+
+def test_input_bar_frequency_comes_from_registered_factor_contract():
+    import factors.library.intraday  # noqa: F401
+    from research.effective_factor_library import _input_bar_frequency
+
+    assert _input_bar_frequency("intraday_multiperiod_trend_vote_20d") == "5min"
+    assert _input_bar_frequency("intraday_df_test_20d") == "1min"

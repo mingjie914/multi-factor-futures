@@ -128,7 +128,7 @@ class FactorLibraryConfig(StrictConfigModel):
 
     path: str = "./factor_library/library.json"
     # Enable only for strategies whose factors must all come from the library.
-    enforce_portfolio_periods: bool = False
+    enforce_effective_membership: bool = False
 
 
 class ProcessingStepConfig(StrictConfigModel):

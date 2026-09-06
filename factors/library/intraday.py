@@ -126,6 +126,8 @@ class IntradayFactorBase(Factor):
 
     category = "intraday"
     frequency = "daily"
+    input_bar_frequency = "1min"
+    validation_horizons = (5, 10, 20)
     WINDOW = 5
 
     def prefetch_dependencies(self) -> list:
@@ -142,6 +144,13 @@ class IntradayFactorBase(Factor):
     def _transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """子类实现: 对原始日内字段做变换."""
         raise NotImplementedError
+
+
+class _FiveMinuteDailyFactor(Factor):
+    """日频输出、但必须由真实 5 分钟 bar 计算的因子标识。"""
+
+    frequency = "daily"
+    input_bar_frequency = "5min"
 
 
 # ======================================================================
@@ -375,6 +384,7 @@ _MINUTE_FIELDS = ["open", "high", "low", "close", "volume", "amount", "oi"]
 
 _PANEL_CACHE: dict = {}
 _PANEL_CACHE_LOCK = threading.Lock()
+_CLOSE_LOCATION_FEATURE_LOCK = threading.Lock()
 _PEAK_RIDGE_CACHE: dict = {}
 _PEAK_RIDGE_CACHE_LOCK = threading.Lock()
 _BREAKOUT_CACHE: dict = {}
@@ -15616,36 +15626,65 @@ class IntradayDfTest20d(Factor):
 
     @staticmethod
     def _df_tstat(series):
-        """Dickey-Fuller 检验 t 统计量绝对值.
-
-        优先使用当前环境中的 statsmodels.adfuller；
-        缺失时回退手动 OLS 实现 (Python312 兼容).
-        """
-        try:
-            from statsmodels.tsa.stattools import adfuller
-            res = adfuller(series, autolag="AIC", regresults=False)
-            return float(abs(res[0]))
-        except (ImportError, ValueError, np.linalg.LinAlgError):
-            pass
-        # 手动 OLS Dickey-Fuller: Δy_t = a + b·y_{t-1} + e
+        """Dickey-Fuller ADF+AIC t 统计量绝对值（NumPy 等价实现）."""
         y = np.asarray(series, dtype=float)
         y = y[np.isfinite(y)]
         if len(y) < 30:
             return 0.0
+
+        # 与 statsmodels.adfuller(regression="c", autolag="AIC") 的默认
+        # Schwert 最大滞后及固定样本 AIC 选阶保持一致。
+        maxlag = int(np.ceil(12.0 * (len(y) / 100.0) ** 0.25))
+        maxlag = min(maxlag, len(y) // 2 - 2)
+        if maxlag < 0:
+            return 0.0
         dy = np.diff(y)
-        y_lag = y[:-1]
-        X = np.column_stack([np.ones(len(y_lag)), y_lag])
+        dependent = dy[maxlag:]
+        nobs = len(dependent)
+        if nobs <= maxlag + 2:
+            return 0.0
+        lagged = np.empty((nobs, maxlag), dtype=float)
+        for lag in range(1, maxlag + 1):
+            lagged[:, lag - 1] = dy[maxlag - lag:-lag]
+        full = np.column_stack((np.ones(nobs), y[maxlag:-1], lagged))
+
         try:
-            beta, res, rank, sv = np.linalg.lstsq(X, dy, rcond=None)
+            best_lag = 0
+            best_aic = np.inf
+            for lag in range(maxlag + 1):
+                design = full[:, :2 + lag]
+                beta = np.linalg.lstsq(design, dependent, rcond=None)[0]
+                resid = dependent - design @ beta
+                ssr = float(resid @ resid)
+                if ssr <= 0.0:
+                    aic = -np.inf
+                else:
+                    aic = nobs * (np.log(2.0 * np.pi) + 1.0 + np.log(ssr / nobs))
+                    aic += 2.0 * design.shape[1]
+                if aic < best_aic:
+                    best_aic = aic
+                    best_lag = lag
+
+            dependent = dy[best_lag:]
+            final_lags = [dy[best_lag - lag:-lag] for lag in range(1, best_lag + 1)]
+            design = np.column_stack(
+                (np.ones(len(dependent)), y[best_lag:-1], *final_lags)
+            )
+            beta = np.linalg.lstsq(design, dependent, rcond=None)[0]
         except np.linalg.LinAlgError:
             return 0.0
-        resid = dy - X @ beta
-        n, k = X.shape
-        s2 = resid @ resid / (n - k)
+        resid = dependent - design @ beta
+        n, k = design.shape
+        if n <= k:
+            return 0.0
+        s2 = float(resid @ resid) / (n - k)
         if s2 < 1e-16:
             return 0.0
-        xtx_inv = np.linalg.inv(X.T @ X)
-        se_b = np.sqrt(s2 * xtx_inv[1, 1])
+        try:
+            covariance = np.linalg.pinv(design.T @ design)
+        except np.linalg.LinAlgError:
+            return 0.0
+        se_b = np.sqrt(s2 * covariance[1, 1])
         if se_b < 1e-16:
             return 0.0
         return float(abs(beta[1] / se_b))
@@ -20311,7 +20350,7 @@ class IntradayAmihudRankMa20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_multiperiod_trend_vote_20d", category="intraday_advanced")
-class IntradayMultiperiodTrendVote20d(Factor):
+class IntradayMultiperiodTrendVote20d(_FiveMinuteDailyFactor):
     """多周期趋势投票因子 (基于5min).
 
     分别计算 5/15/30/60 根5min K线的均线斜率方向, 多头票数/总票数.
@@ -20363,7 +20402,7 @@ class IntradayMultiperiodTrendVote20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_multiperiod_vote_confirm_20d", category="intraday_advanced")
-class IntradayMultiperiodVoteConfirm20d(Factor):
+class IntradayMultiperiodVoteConfirm20d(_FiveMinuteDailyFactor):
     """多周期投票动量确认因子 (原创: A1 改进).
 
     在 A1 投票基础上, 用投票结果与价格位移方向一致性加权:
@@ -20425,7 +20464,7 @@ class IntradayMultiperiodVoteConfirm20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_price_corr_div_20d", category="intraday_advanced")
-class IntradayVolumePriceCorrDiv20d(Factor):
+class IntradayVolumePriceCorrDiv20d(_FiveMinuteDailyFactor):
     """量价相关快慢窗背离因子 (基于5min).
 
     Corr(ret, volume, 20根) − Corr(ret, volume, 60根) (快慢窗口相关之差).
@@ -20486,7 +20525,7 @@ class IntradayVolumePriceCorrDiv20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_vp_corr_div_slope_20d", category="intraday_advanced")
-class IntradayVpCorrDivSlope20d(Factor):
+class IntradayVpCorrDivSlope20d(_FiveMinuteDailyFactor):
     """量价相关背离趋势因子 (原创: A2 改进).
 
     快慢窗相关背离的边际变化 (今日背离 − 昨日背离):
@@ -20578,7 +20617,7 @@ def _daily_range_volume_ratio(panel, lookback=20):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_price_range_volume_ratio_20d", category="intraday_advanced")
-class IntradayPriceRangeVolumeRatio20d(Factor):
+class IntradayPriceRangeVolumeRatio20d(_FiveMinuteDailyFactor):
     """价格区间量能偏斜因子 (变体, 基于5min).
 
     落在近20日价格区间上半部的成交量占比: Σvol[price > mid(N日)] / Σvol.
@@ -20608,7 +20647,7 @@ class IntradayPriceRangeVolumeRatio20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_range_vol_skew_delta_20d", category="intraday_advanced")
-class IntradayRangeVolSkewDelta20d(Factor):
+class IntradayRangeVolSkewDelta20d(_FiveMinuteDailyFactor):
     """区间量能偏斜边际因子 (原创: A3 改进).
 
     A3 水平值的跨日变化 (偏斜的边际方向):
@@ -20679,7 +20718,7 @@ def _rolling_breakout_feature(data, dates, universe, field):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_false_breakout_retrace_20d", category="intraday_advanced")
-class IntradayFalseBreakoutRetrace20d(Factor):
+class IntradayFalseBreakoutRetrace20d(_FiveMinuteDailyFactor):
     """假突破回撤因子 (基于5min).
 
     价格触及近20根5min高低点后, 5根内回撤幅度 (突破失败度量):
@@ -20708,7 +20747,7 @@ class IntradayFalseBreakoutRetrace20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_breakout_quality_20d", category="intraday_advanced")
-class IntradayBreakoutQuality20d(Factor):
+class IntradayBreakoutQuality20d(_FiveMinuteDailyFactor):
     """突破质量因子 (原创: A5 改进).
 
     真实突破占比 = 突破后5根内站稳(未回撤超0.5×ATR)的次数 / 总突破次数.
@@ -20736,7 +20775,7 @@ class IntradayBreakoutQuality20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_session_effect_z_20d", category="intraday_advanced")
-class IntradaySessionEffectZ20d(Factor):
+class IntradaySessionEffectZ20d(_FiveMinuteDailyFactor):
     """时段效应 z-score 因子 (基于5min).
 
     将当日分为4个时段 (开盘30min/午前/午后/收盘30min),
@@ -20800,7 +20839,7 @@ class IntradaySessionEffectZ20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_session_vol_state_20d", category="intraday_advanced")
-class IntradaySessionVolState20d(Factor):
+class IntradaySessionVolState20d(_FiveMinuteDailyFactor):
     """时段效应×波动状态因子 (原创: A6 改进).
 
     时段 z-score 与时段波动状态交互: z × sign(当前时段波动 vs 20日同段波动).
@@ -20875,7 +20914,7 @@ class IntradaySessionVolState20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_volume_crowding_20d", category="intraday_advanced")
-class IntradayOiVolumeCrowding20d(Factor):
+class IntradayOiVolumeCrowding20d(_FiveMinuteDailyFactor):
     """OI-量能拥挤度因子 (基于5min+OI).
 
     拥挤度 = OI增速20根z-score × 0.5 + (vol/OI)分位 × 0.5 合成.
@@ -20940,7 +20979,7 @@ class IntradayOiVolumeCrowding20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_crowding_extreme_reversal_20d", category="intraday_advanced")
-class IntradayCrowdingExtremeReversal20d(Factor):
+class IntradayCrowdingExtremeReversal20d(_FiveMinuteDailyFactor):
     """拥挤度极值反转因子 (原创: A7 改进).
 
     A7 拥挤度取 20 日时序分位, 极高分位(>80%) 触发反转信号:
@@ -21007,7 +21046,7 @@ class IntradayCrowdingExtremeReversal20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_oi_divergence_20d", category="intraday_advanced")
-class IntradayVolumeOiDivergence20d(Factor):
+class IntradayVolumeOiDivergence20d(_FiveMinuteDailyFactor):
     """量仓四象限因子 (基于5min+OI).
 
     四象限: sign(Δvol) × sign(ΔOI) 组合 — 放量增仓/放量减仓/缩量增仓/缩量减仓.
@@ -21038,7 +21077,7 @@ class IntradayVolumeOiDivergence20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_oi_price_confirm_20d", category="intraday_advanced")
-class IntradayVolumeOiPriceConfirm20d(Factor):
+class IntradayVolumeOiPriceConfirm20d(_FiveMinuteDailyFactor):
     """量仓×价格交叉验证因子 (原创: A8 改进).
 
     四象限与价格方向交叉验证: 放量增仓+价格上涨 = 新多进场 (强多);
@@ -21069,7 +21108,7 @@ class IntradayVolumeOiPriceConfirm20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_fast_slow_divergence_20d", category="intraday_advanced")
-class IntradayRvFastSlowDivergence20d(Factor):
+class IntradayRvFastSlowDivergence20d(_FiveMinuteDailyFactor):
     """RV 快慢窗背离因子 (基于5min).
 
     RV5 (5根已实现波动) − RV20 (20根滚动) 的 z-score 背离 (类 IV-HV 背离).
@@ -21127,7 +21166,7 @@ class IntradayRvFastSlowDivergence20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_divergence_persistence_20d", category="intraday_advanced")
-class IntradayRvDivergencePersistence20d(Factor):
+class IntradayRvDivergencePersistence20d(_FiveMinuteDailyFactor):
     """RV 背离持续性因子 (原创: A9 改进).
 
     A9 看单日快慢背离, 本因子统计背离(rv5>rv20 或 <)连续持续的根数占比:
@@ -21193,7 +21232,7 @@ class IntradayRvDivergencePersistence20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_compression_20d", category="intraday_advanced")
-class IntradayRvCompression20d(Factor):
+class IntradayRvCompression20d(_FiveMinuteDailyFactor):
     """RV 波动压缩度因子 (改名避免与 #142 冲突).
 
     当前 RV 的 20 日历史分位 (压缩度): 分位越低 → 波动越压缩.
@@ -21245,7 +21284,7 @@ class IntradayRvCompression20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rv_compression_breakout_20d", category="intraday_advanced")
-class IntradayRvCompressionBreakout20d(Factor):
+class IntradayRvCompressionBreakout20d(_FiveMinuteDailyFactor):
     """压缩后扩张强度因子 (原创: A10 改进).
 
     A10 只识别压缩状态, 本因子捕捉压缩后的扩张幅度:
@@ -21296,7 +21335,7 @@ class IntradayRvCompressionBreakout20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_ma_count_bullish_20d", category="intraday_advanced")
-class IntradayMaCountBullish20d(Factor):
+class IntradayMaCountBullish20d(_FiveMinuteDailyFactor):
     """均线簇多空强度因子 (基于5min).
 
     收盘价位于 5/10/20/30/60/120 根5min均线上方的数量 (0-6).
@@ -21355,7 +21394,7 @@ class IntradayMaCountBullish20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_ma_count_weighted_20d", category="intraday_advanced")
-class IntradayMaCountWeighted20d(Factor):
+class IntradayMaCountWeighted20d(_FiveMinuteDailyFactor):
     """加权均线簇强度因子 (原创: A11 改进).
 
     在 A11 基础上按均线周期加权: 长周期均线权重更高 (趋势更可靠).
@@ -21414,7 +21453,7 @@ class IntradayMaCountWeighted20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_overnight_gap_reaction_20d", category="intraday_advanced")
-class IntradayOvernightGapReaction20d(Factor):
+class IntradayOvernightGapReaction20d(_FiveMinuteDailyFactor):
     """跳空后反应模式因子 (基于5min).
 
     开盘跳空 (open−prev_close) 后, 30分钟内的回补/延续方向.
@@ -21477,7 +21516,7 @@ class IntradayOvernightGapReaction20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_gap_fill_speed_20d", category="intraday_advanced")
-class IntradayGapFillSpeed20d(Factor):
+class IntradayGapFillSpeed20d(_FiveMinuteDailyFactor):
     """缺口回补速度因子 (原创: A13 改进).
 
     A13 只判断回补与否, 本因子度量回补的深度与速度:
@@ -21555,7 +21594,7 @@ class IntradayGapFillSpeed20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_implied_sector_beta_20d", category="intraday_advanced")
-class IntradayImpliedSectorBeta20d(Factor):
+class IntradayImpliedSectorBeta20d(_FiveMinuteDailyFactor):
     """板块隐含 β 因子 (基于5min).
 
     品种5min收益对板块内其他品种平均收益回归的滚动 β (60根).
@@ -21619,7 +21658,7 @@ class IntradayImpliedSectorBeta20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_beta_change_signal_20d", category="intraday_advanced")
-class IntradayBetaChangeSignal20d(Factor):
+class IntradayBetaChangeSignal20d(_FiveMinuteDailyFactor):
     """板块 β 突变因子 (原创: A14 改进).
 
     A14 看 β 水平, 本因子捕捉 β 的跨日突变:
@@ -21683,7 +21722,7 @@ class IntradayBetaChangeSignal20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_money_flow_margin_20d", category="intraday_advanced")
-class IntradayMoneyFlowMargin20d(Factor):
+class IntradayMoneyFlowMargin20d(_FiveMinuteDailyFactor):
     """资金流边际因子 (基于5min).
 
     主动买卖差 (tick test: 涨=主动买, 跌=主动卖) 的近5根变化率 (边际而非水平).
@@ -21745,7 +21784,7 @@ class IntradayMoneyFlowMargin20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_money_price_divergence_20d", category="intraday_advanced")
-class IntradayMoneyPriceDivergence20d(Factor):
+class IntradayMoneyPriceDivergence20d(_FiveMinuteDailyFactor):
     """资金-价格背离因子 (原创: A15 改进).
 
     标准化资金流 (净主动买卖/总量) − 标准化价格涨幅 (各自 z-score) 之差:
@@ -21813,7 +21852,7 @@ class IntradayMoneyPriceDivergence20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_annualized_basis_z_20d", category="intraday_advanced")
-class IntradayAnnualizedBasisZ20d(Factor):
+class IntradayAnnualizedBasisZ20d(_FiveMinuteDailyFactor):
     """基差分位极值反转因子 (基于5min term).
 
     近远月基差率 (far−near)/near 的 20 日时序分位, 中间区线性、极值区(>80%/<20%)反转:
@@ -21852,7 +21891,7 @@ class IntradayAnnualizedBasisZ20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_basis_reversion_conviction_20d", category="intraday_advanced")
-class IntradayBasisReversionConviction20d(Factor):
+class IntradayBasisReversionConviction20d(_FiveMinuteDailyFactor):
     """基差反转信念因子（基于基差分位极值反转改进）。
 
     在基差分位极值反转基础上，用基差自身波动率加权信念：
@@ -21916,7 +21955,7 @@ class IntradayBasisReversionConviction20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_roll_yield_dualscore_20d", category="intraday_advanced")
-class IntradayRollYieldDualscore20d(Factor):
+class IntradayRollYieldDualscore20d(_FiveMinuteDailyFactor):
     """展期收益双打分因子 (基于5min term).
 
     展期收益 (far−near)/near (正=近月贴水=多头展期正收益) 双打分:
@@ -21977,7 +22016,7 @@ class IntradayRollYieldDualscore20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_roll_dualscore_consistency_20d", category="intraday_advanced")
-class IntradayRollDualscoreConsistency20d(Factor):
+class IntradayRollDualscoreConsistency20d(_FiveMinuteDailyFactor):
     """双打分一致性因子（基于展期收益双打分改进）。
 
     基础因子平均两个打分，本因子强调两分同向时的信念：
@@ -22038,7 +22077,7 @@ class IntradayRollDualscoreConsistency20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_cross_contract_spread_z_20d", category="intraday_advanced")
-class IntradayCrossContractSpreadZ20d(Factor):
+class IntradayCrossContractSpreadZ20d(_FiveMinuteDailyFactor):
     """板块内价比时序 z 因子 (变体, 基于5min).
 
     品种价格 / 板块其他品种平均价的比值, 取 20 日时序 z (配对价差的自身历史偏离).
@@ -22099,7 +22138,7 @@ class IntradayCrossContractSpreadZ20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_cross_ratio_reversion_speed_20d", category="intraday_advanced")
-class IntradayCrossRatioReversionSpeed20d(Factor):
+class IntradayCrossRatioReversionSpeed20d(_FiveMinuteDailyFactor):
     """价比回归速度因子 (原创: B5 改进).
 
     B5 只识别偏离, 本因子度量板块价比偏离后的回归速度:
@@ -22163,7 +22202,7 @@ class IntradayCrossRatioReversionSpeed20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_sector_rotation_momentum_20d", category="intraday_advanced")
-class IntradaySectorRotationMomentum20d(Factor):
+class IntradaySectorRotationMomentum20d(_FiveMinuteDailyFactor):
     """板块轮动方向动量因子 (原创: B6 改进).
 
     B6 度量轮动强度, 本因子度量轮动方向的持续性:
@@ -22450,7 +22489,7 @@ class IntradayFlowPriceCatchup20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_annualized_basis_20d", category="intraday_advanced")
-class IntradayAnnualizedBasis20d(Factor):
+class IntradayAnnualizedBasis20d(_FiveMinuteDailyFactor):
     """真年化基差率因子 (基于修复后的期限结构面板, ).
 
     年化基差率 = (far - near) / near * 365 / remaining_days, 其中 near/far 为
@@ -22511,7 +22550,7 @@ class IntradayAnnualizedBasis20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_basis_momentum_20d", category="intraday_advanced")
-class IntradayBasisMomentum20d(Factor):
+class IntradayBasisMomentum20d(_FiveMinuteDailyFactor):
     """年化基差率动量因子.
 
     年化基差率的 20 日滚动均值 (与 #225 slope_change 的一阶差区分: 本因子用
@@ -22559,7 +22598,7 @@ class IntradayBasisMomentum20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rollover_frequency_20d", category="intraday_advanced")
-class IntradayRolloverFrequency20d(Factor):
+class IntradayRolloverFrequency20d(_FiveMinuteDailyFactor):
     """换月频率因子 (基于修复后面板的 rollover_flag).
 
     rollover_flag 标记换月点及其±1根K线. 本因子统计 20 日窗口内换月标记的比例:
@@ -22731,7 +22770,7 @@ class IntradayRolloverSettleGap20d(Factor):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_rollover_basis_gap_20d", category="intraday_advanced")
-class IntradayRolloverBasisGap20d(Factor):
+class IntradayRolloverBasisGap20d(_FiveMinuteDailyFactor):
     """换月基差结构跳变强度因子.
 
     annualized_basis 日度均值在换月窗口(±1交易日)内的 |Δ| 缺口, 20 日求和:
@@ -23808,64 +23847,7 @@ class IntradayCloseFlowResid20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 458. intraday_scene_amp_flow — 情景×振幅双切割资金流 (原创改进)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-@register_factor("intraday_scene_amp_flow_20d", category="intraday_advanced")
-class IntradaySceneAmpFlow20d(Factor):
-    """情景×振幅双切割资金流因子 (原创: #453/#455 组合改进).
-
-    将 #453(振幅切割) 与 #455(情景切割) 组合: 上涨情景 ∩ 高振幅 分钟资金流.
-    双条件切割 → 信息冲击 + 顺势确认 同时满足 → 更纯的信号.
-    与单一切割相比, 过滤掉"高振幅但下跌"(恐慌)与"上涨但低振幅"(无资金)噪声.
-    方向: 正向.
-    """
-    name = "intraday_scene_amp_flow_20d"
-    category = "intraday_advanced"
-    frequency = "daily"
-    description = "情景×振幅双切割资金流 (上涨∩高振幅符号成交额)"
-    validation_horizons = (5, 10, 20)
-
-    def dependencies(self) -> list:
-        return []
-
-    def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel or "amount" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        day = close.index.normalize()
-        flows: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_a = amount.loc[day == dt]
-            if len(grp_c) < 30:
-                continue
-            vals = {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                a = grp_a[col].dropna()
-                common = c.index.intersection(a.index)
-                if len(common) < 30:
-                    continue
-                c_c = c.loc[common]
-                a_c = a.loc[common]
-                ret = c_c.pct_change(fill_method=None).fillna(0)
-                amp = ret.abs()
-                ret5 = ret.rolling(5, min_periods=1).sum()
-                sel = (ret5 > 0) & (amp >= amp.median())
-                if sel.sum() < 5:
-                    continue
-                vals[col] = float((np.sign(ret[sel]) * a_c[sel]).sum())
-            if vals:
-                flows[dt] = pd.Series(vals)
-        if not flows:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        df = pd.DataFrame(flows).T
-        df.index = pd.DatetimeIndex(df.index)
-        resid = _fund_flow_resid(df, dates, universe)
-        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 459. intraday_same_state_traction — 同状态收益率牵引
@@ -29876,6 +29858,90 @@ def _daily_path_impact_features(panel: dict) -> dict[str, pd.DataFrame]:
         return result
 
 
+def _daily_close_location_features(panel: dict) -> dict[str, pd.DataFrame]:
+    """向量化计算三个分钟收盘位置特征，与原逐列实现数值等价."""
+    cache_key = "_daily_close_location_features"
+    with _CLOSE_LOCATION_FEATURE_LOCK:
+        cached = panel.get(cache_key)
+        if cached is not None:
+            return cached
+
+        names = (
+            "close_location_dispersion",
+            "close_location_weighted_dispersion",
+            "close_location_tail_spread",
+        )
+        records: dict[str, dict] = {name: {} for name in names}
+        close, high, low = (panel.get(field) for field in ("close", "high", "low"))
+        if close is None or high is None or low is None or close.empty:
+            result = {name: pd.DataFrame() for name in names}
+            panel[cache_key] = result
+            return result
+
+        amount = panel.get("amount")
+        normalized_days = close.index.normalize()
+        for dt in sorted(set(normalized_days)):
+            mask = normalized_days == dt
+            close_day = close.loc[mask].replace([np.inf, -np.inf], np.nan)
+            if len(close_day) < 21:
+                continue
+            high_day, low_day = high.loc[mask], low.loc[mask]
+            minute_range = high_day - low_day
+            valid = (
+                close_day.notna()
+                & high_day.notna()
+                & low_day.notna()
+                & close_day.gt(0)
+                & high_day.gt(0)
+                & low_day.gt(0)
+                & minute_range.gt(1e-12)
+            )
+            location = (
+                2.0 * (close_day - low_day) / minute_range - 1.0
+            ).clip(-1.0, 1.0).where(valid)
+            enough_returns = close_day.pct_change(fill_method=None).replace(
+                [np.inf, -np.inf], np.nan
+            ).count().ge(20)
+            enough_location = location.count().ge(20) & enough_returns
+
+            dispersion = location.std(axis=0, ddof=0).where(enough_location).dropna()
+            tail = (
+                location.quantile(0.9) - location.quantile(0.1)
+            ).where(enough_location).dropna()
+            if not dispersion.empty:
+                records["close_location_dispersion"][dt] = dispersion
+            if not tail.empty:
+                records["close_location_tail_spread"][dt] = tail
+
+            if amount is not None:
+                weights = amount.loc[mask]
+                weighted_valid = valid & weights.gt(0) & np.isfinite(weights)
+                weights = weights.where(weighted_valid)
+                weighted_location = location.where(weighted_valid)
+                weight_sum = weights.sum(axis=0)
+                weighted_mean = (weighted_location * weights).sum(axis=0) / weight_sum
+                weighted_var = (
+                    weights.mul(weighted_location.sub(weighted_mean, axis=1).pow(2)).sum(axis=0)
+                    / weight_sum
+                )
+                weighted = np.sqrt(weighted_var).where(
+                    weighted_valid.sum(axis=0).ge(20)
+                    & weight_sum.gt(1e-12)
+                    & enough_returns
+                ).dropna()
+                if not weighted.empty:
+                    records["close_location_weighted_dispersion"][dt] = weighted
+
+        result = {}
+        for name, values in records.items():
+            frame = pd.DataFrame(values).T if values else pd.DataFrame()
+            if not frame.empty:
+                frame.index = pd.DatetimeIndex(frame.index)
+            result[name] = frame
+        panel[cache_key] = result
+        return result
+
+
 class _MinutePathImpactFactorBase(Factor):
     """分钟路径与价格冲击因子的统一日频输出封装."""
 
@@ -29892,7 +29958,10 @@ class _MinutePathImpactFactorBase(Factor):
         panel = _get_minute_panel(data, dates, universe, freq="1min")
         if not set(self.REQUIRED_FIELDS).issubset(panel.keys()):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
-        daily = _daily_path_impact_features(panel).get(self.FEATURE)
+        if self.FEATURE.startswith("close_location_"):
+            daily = _daily_close_location_features(panel).get(self.FEATURE)
+        else:
+            daily = _daily_path_impact_features(panel).get(self.FEATURE)
         if daily is None or daily.empty:
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         return _roll_mean(daily, 20, 5).reindex(

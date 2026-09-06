@@ -98,20 +98,20 @@ class PipelineRunner:
         from core.logger import setup_logger
         setup_logger("multi_factor", logging.INFO)
 
-    def _validate_effective_factor_periods(
+    def _validate_effective_factor_membership(
         self, assignments: dict[int, list[str]]
     ) -> None:
         library_config = self.config.factor_library
-        if not library_config.enforce_portfolio_periods:
+        if not library_config.enforce_effective_membership:
             return
         from research.effective_factor_library import (
-            validate_effective_factor_periods,
+            validate_effective_factor_membership,
         )
 
         library_path = Path(library_config.path)
         if not library_path.is_absolute():
             library_path = Path(__file__).resolve().parents[1] / library_path
-        validate_effective_factor_periods(library_path, assignments)
+        validate_effective_factor_membership(library_path, assignments)
 
     def _load_research_artifacts(self):
         """Load and validate one immutable point-in-time artifact bundle."""
@@ -615,7 +615,7 @@ class PipelineRunner:
     def run_full_pipeline(self, dates: DateIndex = None,
                           universe: Universe = None):
         """端到端全流程."""
-        self._validate_effective_factor_periods({
+        self._validate_effective_factor_membership({
             int(self.config.backtest.holding_period): list(self.config.factors)
         })
         dr = self.config.date_range
@@ -702,7 +702,7 @@ class PipelineRunner:
             assignments.setdefault(int(sub_config.holding_period), []).extend(
                 sub_config.factors
             )
-        self._validate_effective_factor_periods(assignments)
+        self._validate_effective_factor_membership(assignments)
         names = [str(config.name).strip() for config in sub_configs]
         if any(not name for name in names) or len(names) != len(set(names)):
             raise ValueError("sub-portfolio names must be non-empty and unique")

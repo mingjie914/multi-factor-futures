@@ -2,7 +2,7 @@
 
 This workflow consumes the current admitted effective-factor library (not a
 fixed-size candidate pool), computes only the locked IS window (with its
-required warm-up), clusters factors within their approved forward horizon, and
+required warm-up), clusters all daily signals together by default, and
 writes durable diagnostics plus parallel factor sets. It never mutates the
 effective library and never uses post-cutoff data for selection. The input
 count is always discovered from the configured effective library path, so a
@@ -37,7 +37,7 @@ SELECTION_SCHEMA_VERSION = 2
 CLUSTER_CORRELATION_THRESHOLD = 0.50
 MIN_CROSS_SECTION = 10
 N_IS_SEGMENTS = 3
-COMPACT_MAX_PER_HORIZON = 12
+COMPACT_MAX_FACTORS = 12
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -199,11 +199,11 @@ def _load_library(
             rows.append({
                 "factor": name,
                 "status": "validation_passed",
-                "frequency": "daily",
+                "signal_frequency": "daily",
+                "input_bar_frequency": "",
                 "family": str(record.get("family", "") or factor_family(name)),
                 "registered_horizons": str(record.get("registered_horizons", "")),
-                "selected_period": horizon,
-                "approved_periods": [horizon],
+                "best_period": horizon,
                 "direction": 1 if ic >= 0.0 else -1,
                 "source_run": root.name,
                 "oos_ic": record.get("oos_ic"),
@@ -227,18 +227,17 @@ def _load_library(
     if len(names) != len(factors):
         raise ValueError("effective factor library contains duplicate names")
     for row in factors:
-        periods = tuple(int(value) for value in row.get("approved_periods", []))
-        if (
-            len(periods) != 1
-            or periods[0] < 1
-            or (allowed_horizons is not None and periods[0] not in allowed_horizons)
+        period = int(row.get("best_period", 0) or 0)
+        if period < 1 or (
+            allowed_horizons is not None and period not in allowed_horizons
         ):
             raise ValueError(
-                f"factor {row.get('factor')!r} has ambiguous approved periods {periods}"
+                f"factor {row.get('factor')!r} has invalid best period {period}"
             )
-        if str(row.get("frequency")) != "daily":
+        if str(row.get("signal_frequency")) != "daily":
             raise ValueError(
-                f"factor {row.get('factor')!r} is not daily: {row.get('frequency')!r}"
+                f"factor {row.get('factor')!r} is not daily: "
+                f"{row.get('signal_frequency')!r}"
             )
     return path.resolve(), factors
 
@@ -247,15 +246,16 @@ def run_effective_factor_selection(
     *,
     run_id: str,
     config_path: str = "config/default.yaml",
-    max_compact_per_horizon: int = COMPACT_MAX_PER_HORIZON,
+    max_compact_factors: int = COMPACT_MAX_FACTORS,
     source_run_dir: str | None = None,
     common_horizon: int | None = None,
+    group_by_best_period: bool = False,
 ) -> Path:
     """Run governed effective-library subset selection and write one immutable run."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(run_id)):
         raise ValueError("run_id only allows letters, numbers, dot, underscore and hyphen")
-    if int(max_compact_per_horizon) < 1:
-        raise ValueError("max_compact_per_horizon must be positive")
+    if int(max_compact_factors) < 1:
+        raise ValueError("max_compact_factors must be positive")
     if source_run_dir is not None:
         if common_horizon is None or int(common_horizon) < 1:
             raise ValueError(
@@ -275,7 +275,7 @@ def run_effective_factor_selection(
     )
     if selection_horizons is None:
         selection_horizons = tuple(sorted({
-            int(row["approved_periods"][0]) for row in library_rows
+            int(row["best_period"]) for row in library_rows
         }))
     output.mkdir(parents=True, exist_ok=False)
     runner = PipelineRunner(config=config)
@@ -314,8 +314,20 @@ def run_effective_factor_selection(
     missing_registry = sorted(set(names) - set(registry))
     if missing_registry:
         raise ValueError("effective factors are not registered: " + ", ".join(missing_registry))
+    for row in library_rows:
+        name = str(row["factor"])
+        declared_input = str(
+            getattr(registry[name], "input_bar_frequency", "1min")
+        )
+        stored_input = str(row.get("input_bar_frequency", "") or "")
+        if stored_input and stored_input != declared_input:
+            raise ValueError(
+                f"factor {name!r} input bar metadata {stored_input!r} does not "
+                f"match registered implementation {declared_input!r}"
+            )
+        row["input_bar_frequency"] = declared_input
     directions = {str(row["factor"]): int(row["direction"]) for row in library_rows}
-    periods = {str(row["factor"]): int(row["approved_periods"][0]) for row in library_rows}
+    periods = {str(row["factor"]): int(row["best_period"]) for row in library_rows}
 
     returns = {
         horizon: runner.data_manager.get_forward_returns(
@@ -346,7 +358,7 @@ def run_effective_factor_selection(
         row_out = {
             "factor": name,
             "horizon": horizon,
-            "frequency": row["frequency"],
+            "signal_frequency": row["signal_frequency"],
             "direction": direction,
             "family": str(row.get("family", "") or factor_family(name)),
             "coverage": float(ic.notna().mean()) if len(is_dates) else 0.0,
@@ -375,26 +387,33 @@ def run_effective_factor_selection(
             row_out[f"segment_{idx}_ic_ratio"] = ir
         all_diagnostics.append(row_out)
 
-    diagnostics_by_horizon: dict[int, list[dict]] = {}
     cluster_rows: list[dict] = []
     factor_sets: dict[str, dict] = {}
     correlation_files: dict[str, str] = {}
-    for horizon in selection_horizons:
-        names_h = sorted(name for name in names if periods[name] == horizon)
-        corr = _exposure_correlation(ranks, names_h)
-        corr_path = output / f"exposure_correlation_h{horizon}.csv"
+    if group_by_best_period or source_run_dir is not None:
+        groups = [
+            (f"h{horizon}", sorted(name for name in names if periods[name] == horizon))
+            for horizon in selection_horizons
+        ]
+    else:
+        groups = [("mixed", names)]
+    for group, group_names in groups:
+        corr = _exposure_correlation(ranks, group_names)
+        corr_path = output / f"exposure_correlation_{group}.csv"
         corr.to_csv(corr_path, encoding="utf-8-sig")
-        correlation_files[str(horizon)] = corr_path.name
-        clusters = _cluster(corr, names_h)
-        rows_h = [row for row in all_diagnostics if int(row["horizon"]) == horizon]
-        rows_by_name = {str(row["factor"]): row for row in rows_h}
-        for row in rows_h:
+        correlation_files[group] = corr_path.name
+        clusters = _cluster(corr, group_names)
+        rows_in_group = [
+            row for row in all_diagnostics if str(row["factor"]) in set(group_names)
+        ]
+        rows_by_name = {str(row["factor"]): row for row in rows_in_group}
+        for row in rows_in_group:
             row["cluster_id"] = int(clusters[str(row["factor"])])
-        diagnostics_by_horizon[horizon] = rows_h
-        for name in names_h:
+        for name in group_names:
             cluster_rows.append({
-                "horizon": horizon,
+                "group": group,
                 "factor": name,
+                "best_period": periods[name],
                 "cluster_id": int(clusters[name]),
                 "cluster_size": int(sum(value == clusters[name] for value in clusters.values())),
                 "is_representative": False,
@@ -405,39 +424,42 @@ def run_effective_factor_selection(
             })
         representatives: list[str] = []
         for cluster_id in sorted(set(clusters.values())):
-            members = [rows_by_name[name] for name in names_h if clusters[name] == cluster_id]
+            members = [
+                rows_by_name[name] for name in group_names
+                if clusters[name] == cluster_id
+            ]
             chosen = max(members, key=_representative_key)
             representatives.append(str(chosen["factor"]))
             for row in cluster_rows:
-                if row["horizon"] == horizon and row["cluster_id"] == cluster_id and row["factor"] == chosen["factor"]:
+                if row["group"] == group and row["cluster_id"] == cluster_id and row["factor"] == chosen["factor"]:
                     row["is_representative"] = True
         representatives = sorted(representatives, key=lambda name: _representative_key(rows_by_name[name]), reverse=True)
         compact = _compact_representatives(
-            [rows_by_name[name] for name in representatives], int(max_compact_per_horizon)
+            [rows_by_name[name] for name in representatives], int(max_compact_factors)
         )
-        factor_sets[f"balanced_core_h{horizon}"] = {
-            "horizon": horizon,
-            "purpose": "all same-horizon cluster representatives; no OOS ranking",
+        factor_sets[f"balanced_core_{group}"] = {
+            "group": group,
+            "purpose": "all cluster representatives; no OOS ranking",
             "factors": representatives,
         }
-        factor_sets[f"compact_core_h{horizon}"] = {
-            "horizon": horizon,
+        factor_sets[f"compact_core_{group}"] = {
+            "group": group,
             "purpose": "bounded strongest distinct-cluster representatives",
             "factors": compact,
         }
 
-    for name, spec in ("balanced_core", "balanced_core_h"), ("compact_core", "compact_core_h"):
-        by_horizon = [
-            factor_sets[f"{name}_h{horizon}"]["factors"]
-            for horizon in selection_horizons
+    for name in ("balanced_core", "compact_core"):
+        by_group = [
+            factor_sets[f"{name}_{group}"]["factors"]
+            for group, _ in groups
         ]
         factor_sets[name] = {
-            "horizons": {
-                str(horizon): values
-                for horizon, values in zip(selection_horizons, by_horizon)
+            "groups": {
+                group: values
+                for (group, _), values in zip(groups, by_group)
             },
-            "factors": sorted(set().union(*map(set, by_horizon))),
-            "purpose": "parallel factor set; horizon assignment remains authoritative",
+            "factors": sorted(set().union(*map(set, by_group))),
+            "purpose": "mixed daily factor set; best_period is evidence only",
         }
 
     _write_csv(output / "factor_diagnostics.csv", all_diagnostics)
@@ -448,7 +470,11 @@ def run_effective_factor_selection(
         "workflow": "effective_factor_subset_selection",
         "library_path": str(library_path),
         "source_run_dir": str(Path(source_run_dir).resolve()) if source_run_dir else None,
-        "selection_mode": "common_horizon" if source_run_dir else "effective_library",
+        "selection_mode": (
+            "common_horizon" if source_run_dir else
+            "best_period_sleeves" if group_by_best_period else
+            "mixed_daily"
+        ),
         "common_horizon": int(common_horizon) if common_horizon is not None else None,
         "library_count": len(names),
         "data_source": config.data.source,
@@ -464,12 +490,22 @@ def run_effective_factor_selection(
             window.oos_end.date().isoformat(),
             window.oos_bars,
         ],
-        "factor_frequency": "daily_intraday (1min-derived daily output)",
+        "input_bar_frequencies": {
+            frequency: sum(
+                str(row["input_bar_frequency"]) == frequency
+                for row in library_rows
+            )
+            for frequency in sorted({
+                str(row["input_bar_frequency"]) for row in library_rows
+            })
+        },
+        "signal_frequency": "daily",
         "horizon_unit": "daily bars / trading days",
         "horizon_counts": {
             str(horizon): sum(periods[name] == horizon for name in names)
             for horizon in selection_horizons
         },
+        "best_period_role": "admission_evidence_only",
         "cluster_correlation": {"metric": "direction-adjusted daily cross-sectional rank exposure", "method": "complete_linkage", "threshold_abs_corr": CLUSTER_CORRELATION_THRESHOLD},
         "oos_used_for_selection": False,
         "performance": {

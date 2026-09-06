@@ -29,7 +29,7 @@ from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
 from research.effective_factor_library import (
     effective_factor_names,
-    validate_effective_factor_periods,
+    validate_effective_factor_membership,
 )
 
 
@@ -273,7 +273,7 @@ def _validated_specs():
                 _resolve(strategy.factor_definition_path)
             )
             config.factors = list(snapshot_definition["factors"])
-            config.factor_library.enforce_portfolio_periods = False
+            config.factor_library.enforce_effective_membership = False
         configured_start = str(config.date_range.start)
         if configured_start != COMPARISON_START:
             if strategy.source == "legacy_observation":
@@ -304,10 +304,10 @@ def _validated_specs():
         assignments = _assignments(config, strategy.mode)
         configured_factors = set().union(*map(set, assignments.values()))
         if strategy.source == "effective_library":
-            if not config.factor_library.enforce_portfolio_periods:
+            if not config.factor_library.enforce_effective_membership:
                 raise ValueError(
                     f"effective-library strategy {strategy.id!r} must enable "
-                    "factor_library.enforce_portfolio_periods"
+                    "factor_library.enforce_effective_membership"
                 )
             if _resolve(config.factor_library.path) != library_path:
                 raise ValueError(
@@ -320,7 +320,7 @@ def _validated_specs():
                     f"strategy {strategy.id!r} factors do not match factor set "
                     f"{strategy.factor_set_id!r}"
                 )
-            validate_effective_factor_periods(
+            validate_effective_factor_membership(
                 library_path, assignments
             )
         validated.append((strategy, path, config))
@@ -542,7 +542,7 @@ def _default_production_config():
 
 def _effective_factor_directions(config, factors: list[str]) -> dict[str, int]:
     """Load frozen directions when a strategy explicitly uses the effective library."""
-    if not bool(config.factor_library.enforce_portfolio_periods):
+    if not bool(config.factor_library.enforce_effective_membership):
         return {}
     path = _resolve(config.factor_library.path)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1550,13 +1550,13 @@ def main() -> None:
     if WORKFLOW is PortfolioWorkflow.VALIDATE_CONFIGURATIONS:
         print(f"strategy_library={catalog_path}")
         for strategy, path, config in specs:
-            gate = config.factor_library.enforce_portfolio_periods
+            gate = config.factor_library.enforce_effective_membership
             print(
                 f"{strategy.id}: status={strategy.status}, mode={strategy.mode}, "
                 f"factor_set={strategy.factor_set_id or '-'}, config={path}, "
                 f"data_source={config.data.source}, "
                 f"dates={config.date_range.start}~{config.date_range.end}, "
-                f"effective_period_gate={gate}"
+                f"effective_membership_gate={gate}"
             )
         return
     if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE:
