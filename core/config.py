@@ -119,6 +119,7 @@ class DateRangeConfig(StrictConfigModel):
 class DatePolicyConfig(StrictConfigModel):
     """Global separation between research evidence and forward observation."""
 
+    factor_admission_start: str = "2025-01-01"
     research_cutoff: str = "2026-05-15"
 
 
@@ -562,6 +563,9 @@ _ENV_MAP = {
     "MF_DUCKDB_PATH": (("data", "duckdb", "path"), str),
     "MF_DATA_RELEASE_ID": (("data", "duckdb", "required_release_id"), str),
     "MF_RESEARCH_CUTOFF": (("date_policy", "research_cutoff"), str),
+    "MF_FACTOR_ADMISSION_START": (
+        ("date_policy", "factor_admission_start"), str
+    ),
     "MF_BT_FREQ": (("backtest", "rebalance_freq"), str),
     "MF_DATE_START": (("date_range", "start"), str),
     "MF_DATE_END": (("date_range", "end"), str),

@@ -44,6 +44,22 @@ def research_cutoff(config) -> pd.Timestamp:
     )
 
 
+def factor_admission_start(config) -> pd.Timestamp:
+    """Return the frozen statistical-admission start, independent of backtests."""
+    policy = getattr(config, "date_policy", None)
+    start = _normalised_date(
+        getattr(policy, "factor_admission_start", None),
+        label="date_policy.factor_admission_start",
+    )
+    cutoff = research_cutoff(config)
+    if start > cutoff:
+        raise ValueError(
+            f"factor admission start {start.date()} is after research cutoff "
+            f"{cutoff.date()}"
+        )
+    return start
+
+
 def forward_observation_start(config) -> pd.Timestamp:
     """First calendar date strictly after the inclusive research cutoff."""
     return research_cutoff(config) + pd.Timedelta(days=1)

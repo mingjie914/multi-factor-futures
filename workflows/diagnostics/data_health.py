@@ -688,7 +688,9 @@ def check_health(config_path: str, *, strict: bool = False) -> dict:
         "config": str(Path(config_path).resolve()),
         "selected_source": selected_source,
         "date_policy": {
+            "factor_admission_start": config.date_policy.factor_admission_start,
             "research_cutoff": config.date_policy.research_cutoff,
+            "backtest_start": config.date_range.start,
             "observation_end": config.date_range.end,
         },
         "parquet": {"status": "not_selected"},

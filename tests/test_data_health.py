@@ -154,7 +154,10 @@ def test_parquet_health_checks_only_published_local_source(tmp_path, monkeypatch
         cache={"path": str(tmp_path / "cache")},
         audited_nontrading_closes={},
     ),
-        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
+        date_policy=SimpleNamespace(
+            factor_admission_start="2025-01-01",
+            research_cutoff="2026-05-15",
+        ),
         date_range=SimpleNamespace(start="2026-05-01", end="latest_available"),
     )
     monkeypatch.setattr(data_health, "load_config", lambda path: config)
@@ -294,7 +297,10 @@ def test_strict_health_runs_full_history_gate(tmp_path, monkeypatch):
             audited_nontrading_closes={},
         ),
         universe=["A"],
-        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
+        date_policy=SimpleNamespace(
+            factor_admission_start="2025-01-01",
+            research_cutoff="2026-05-15",
+        ),
         date_range=SimpleNamespace(start="2026-08-03", end="2026-08-06"),
     )
     monkeypatch.setattr(data_health, "load_config", lambda path: config)

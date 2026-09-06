@@ -683,8 +683,14 @@ def _daily_candle_features(panel: dict) -> dict[str, pd.DataFrame]:
                 pattern.astype(float).where(common).to_numpy(dtype=float), offsets
             )["sum"]
             valid = (rows >= 20) & (common_count >= 20) & (valid_count >= 10)
+            ratio = np.divide(
+                pattern_count,
+                valid_count,
+                out=np.full_like(pattern_count, np.nan, dtype=float),
+                where=valid,
+            )
             result[name] = pd.DataFrame(
-                np.where(valid, pattern_count / valid_count, np.nan),
+                ratio,
                 index=index,
                 columns=close.columns,
             ).dropna(how="all")

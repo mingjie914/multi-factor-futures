@@ -13,7 +13,11 @@ from pathlib import Path
 import pandas as pd
 
 from core.config import load_config
-from core.date_policy import factor_validation_window, research_cutoff
+from core.date_policy import (
+    factor_admission_start,
+    factor_validation_window,
+    research_cutoff,
+)
 from core.registry import list_registered
 from factors.processor import build_processing_context
 from pipeline.runner import PipelineRunner
@@ -566,8 +570,9 @@ def run_default_factor_validation(
     artifacts.mkdir(exist_ok=True)
 
     config = load_config(config_path)
+    configured_backtest_start = str(config.date_range.start)
     runner = PipelineRunner(config=config)
-    ic_start = pd.Timestamp(config.date_range.start).normalize()
+    ic_start = factor_admission_start(config)
     ic_end = research_cutoff(config)
     warmup_days = int(config.validation_policy.warmup_days_by_frequency["daily"])
     factor_start = ic_start - pd.Timedelta(days=warmup_days)
@@ -610,6 +615,13 @@ def run_default_factor_validation(
         passed,
         fieldnames=list(rows[0]) if rows else ["factor", "final_pass"],
     )
+    performance = dict(screening.get("performance", {}))
+    performance_path = artifacts / "performance.json"
+    if not performance_path.exists():
+        performance_path.write_text(
+            json.dumps(performance, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     summary = {
         "schema_version": 2,
         "workflow": "factor_admission",
@@ -618,6 +630,7 @@ def run_default_factor_validation(
         "data_source": config.data.source,
         "research_window": [ic_start.date().isoformat(), ic_end.date().isoformat()],
         "research_cutoff": ic_end.date().isoformat(),
+        "backtest_start": configured_backtest_start,
         "warmup_start": factor_start.date().isoformat(),
         "factor_count": len(rows),
         "hypothesis_count": int(
@@ -630,6 +643,7 @@ def run_default_factor_validation(
         "final_gate": "hierarchical FDR + IC/t/direction/robustness/sample/cost",
         "horizon_mode": "registered_contract",
         "passed_factors": [row["factor"] for row in passed],
+        "performance_artifact": "artifacts/performance.json",
     }
     (run_dir / "validation_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -651,6 +665,7 @@ def run_default_factor_validation(
             files={
                 "ic_by_window_period.json": artifacts / "ic_by_window_period.json",
                 "validation_funnel.json": artifacts / "validation_funnel.json",
+                "performance.json": artifacts / "performance.json",
             },
             metadata={
                 "workflow": "factor-admission-validation",
@@ -663,7 +678,7 @@ def run_default_factor_validation(
         "run_id": run_id,
         "workflow": "factor-admission-validation",
         "admission_eligible": True,
-        "window_policy": "full_history_through_research_cutoff",
+        "window_policy": "frozen_factor_admission_window",
         "scope": scope,
         "factors": names,
         "horizon_policy": {"mode": "registered_contract"},
@@ -675,6 +690,7 @@ def run_default_factor_validation(
                 "passed_factors.csv",
                 "validation_summary.json",
                 "artifacts/manifest.json",
+                "artifacts/performance.json",
             )
         },
     }

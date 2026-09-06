@@ -120,6 +120,65 @@ def _load_research_checkpoint(path: str, contract: dict) -> list[dict]:
     return results
 
 
+def _load_checkpoint_performance(path: str, contract: dict) -> list[dict]:
+    """Restore completed batch timings without making them part of inference."""
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("contract") != contract:
+        raise RuntimeError("research checkpoint contract does not match this run")
+    batches = payload.get("performance_batches", [])
+    if not isinstance(batches, list):
+        raise RuntimeError("research checkpoint contains invalid performance data")
+    return batches
+
+
+def _summarize_research_performance(
+    batches: list[dict], *, workflow_wall_seconds: float,
+    resumed_factor_count: int, factor_chunk_size: int, analysis_workers: int,
+) -> dict:
+    """Build a durable timing report; values never participate in selection."""
+    factor_totals: dict[str, dict] = {}
+    date_chunks: list[dict] = []
+    for batch in batches:
+        date_chunks.extend(batch.get("date_chunks", []))
+        for timing in batch.get("factor_timings", []):
+            name = str(timing.get("factor", ""))
+            if not name:
+                continue
+            row = factor_totals.setdefault(name, {
+                "factor": name,
+                "wall_seconds_sum": 0.0,
+                "calls": 0,
+                "failed_calls": 0,
+            })
+            row["wall_seconds_sum"] += float(timing.get("seconds", 0.0))
+            row["calls"] += 1
+            row["failed_calls"] += int(timing.get("status") == "failed")
+    ranked = sorted(
+        factor_totals.values(),
+        key=lambda row: (-row["wall_seconds_sum"], row["factor"]),
+    )
+    return {
+        "schema_version": 1,
+        "measurement_role": "diagnostic_only_not_a_selection_input",
+        "clock": "time.perf_counter_wall_seconds",
+        "current_process_wall_seconds": float(workflow_wall_seconds),
+        "measured_batch_wall_seconds": float(sum(
+            float(batch.get("batch_wall_seconds", 0.0)) for batch in batches
+        )),
+        "resumed_factor_count": int(resumed_factor_count),
+        "factor_chunk_size": int(factor_chunk_size),
+        "analysis_workers": int(analysis_workers),
+        "batch_count": len(batches),
+        "date_chunk_execution_count": len(date_chunks),
+        "batches": batches,
+        "factor_totals": ranked,
+        "factor_hotspots_top20": ranked[:20],
+    }
+
+
 def _infer_window(factor_name: str) -> str:
     """从因子名推断窗口标签 (5d/10d/20d/other).
 
@@ -289,6 +348,7 @@ def _select_registered_factors(
 def _compute_factor_date_chunks(
     data_mgr, factor_names, date_chunks, universe, chunk_size,
     *, tolerate_failures: bool, clear_intraday_caches: bool,
+    performance: dict | None = None, phase: str = "screening",
 ):
     """Compute exact-date factor panels while bounding raw-data memory."""
     import numpy as np
@@ -297,7 +357,8 @@ def _compute_factor_date_chunks(
 
     parts = {name: [] for name in factor_names}
     hard_failures: set[str] = set()
-    for target_dates, request_dates in date_chunks:
+    for chunk_index, (target_dates, request_dates) in enumerate(date_chunks):
+        chunk_started = time.perf_counter()
         engine = FactorEngine(data_mgr, tolerant=True, log_failures=False)
         computed = engine.compute_factors(
             factor_names, request_dates, universe, parallel=True,
@@ -312,6 +373,27 @@ def _compute_factor_date_chunks(
             )
         for name in factor_names:
             parts[name].append(computed[name].reindex(target_dates).copy())
+        if performance is not None:
+            performance.setdefault("factor_timings", []).extend(
+                {
+                    **timing,
+                    "phase": phase,
+                    "date_chunk_index": int(chunk_index),
+                }
+                for timing in engine.computation_timings
+            )
+            performance.setdefault("date_chunks", []).append({
+                "phase": phase,
+                "date_chunk_index": int(chunk_index),
+                "target_start": str(pd.Timestamp(target_dates[0]).date()),
+                "target_end": str(pd.Timestamp(target_dates[-1]).date()),
+                "target_dates": int(len(target_dates)),
+                "request_start": str(pd.Timestamp(request_dates[0]).date()),
+                "request_end": str(pd.Timestamp(request_dates[-1]).date()),
+                "request_dates": int(len(request_dates)),
+                "factor_count": int(len(factor_names)),
+                "wall_seconds": time.perf_counter() - chunk_started,
+            })
         engine.clear_cache()
         if clear_intraday_caches:
             from factors.library.intraday import clear_transient_data_caches
@@ -903,6 +985,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     from core.sectors import TAXONOMY_VERSION, taxonomy_sha256
     from scipy import stats as _scipy_stats
 
+    workflow_started = time.perf_counter()
     policy = runner.config.validation_policy
     from factor_mining.bridge import registered_expected_directions
 
@@ -1191,6 +1274,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     })
     checkpoint_path = os.path.join(output_dir, _RESEARCH_CHECKPOINT_NAME)
     results = _load_research_checkpoint(checkpoint_path, checkpoint_contract)
+    performance_batches = _load_checkpoint_performance(
+        checkpoint_path, checkpoint_contract
+    )
     completed_names = {item["name"] for item in results}
     pending_factors = [name for name in all_factors if name not in completed_names]
     if completed_names:
@@ -1222,16 +1308,23 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         date_chunks = [(calendar, calendar)]
 
     for batch_start in range(0, len(pending_factors), research_chunk_size):
+        batch_started = time.perf_counter()
         batch_names = pending_factors[
             batch_start:batch_start + research_chunk_size
         ]
         # Discovery scans the entire registered library, including optional
         # factors.  Failures are recorded instead of aborting unrelated tests.
+        batch_profile: dict = {"date_chunks": [], "factor_timings": []}
+        compute_started = time.perf_counter()
         computed_batch, invalid = _compute_factor_date_chunks(
             data_mgr, batch_names, date_chunks, universe, research_chunk_size,
             tolerate_failures=True,
             clear_intraday_caches=intraday_daily_scan,
+            performance=batch_profile,
+            phase="discovery_compute",
         )
+        compute_seconds = time.perf_counter() - compute_started
+        processing_started = time.perf_counter()
         factor_batch = runner.processor.process_batch(
             computed_batch, processing_context
         )
@@ -1248,6 +1341,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             }
             if has_neutralize else {}
         )
+        processing_seconds = time.perf_counter() - processing_started
 
         def _evaluate_factor(fname):
             if fname not in factor_batch:
@@ -1346,6 +1440,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 "adaptivity_decay_type": _safe_str(adaptivity_data.get(fname, {}).get("decay_type", "")),
             }
 
+        analysis_started = time.perf_counter()
         if analysis_workers == 1 or len(batch_names) <= 1:
             evaluated = map(_evaluate_factor, batch_names)
             pool = None
@@ -1361,12 +1456,29 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
+        analysis_seconds = time.perf_counter() - analysis_started
 
         del computed_batch, raw_variant_batch
         del factor_batch
+        performance_batches.append({
+            "phase": "discovery_batch",
+            "batch_index": len(performance_batches),
+            "factor_count": len(batch_names),
+            "factors": list(batch_names),
+            "compute_wall_seconds": compute_seconds,
+            "processing_wall_seconds": processing_seconds,
+            "analysis_wall_seconds": analysis_seconds,
+            "batch_wall_seconds": time.perf_counter() - batch_started,
+            "date_chunks": batch_profile["date_chunks"],
+            "factor_timings": batch_profile["factor_timings"],
+        })
         _write_json_atomic(
             checkpoint_path,
-            {"contract": checkpoint_contract, "results": results},
+            {
+                "contract": checkpoint_contract,
+                "results": results,
+                "performance_batches": performance_batches,
+            },
         )
         done = len(completed_names) + min(
             batch_start + research_chunk_size, len(pending_factors)
@@ -1489,14 +1601,22 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
         print("\n=== 后置检验: 分层单调性 / 换手率 / 稳健性 ===")
         post_names = [row["name"] for row in significant]
+        post_started = time.perf_counter()
+        post_profile: dict = {"date_chunks": [], "factor_timings": []}
         computed_post_matrices, _ = _compute_factor_date_chunks(
             data_mgr, post_names, date_chunks, universe,
             max(len(post_names), 1), tolerate_failures=False,
             clear_intraday_caches=intraday_daily_scan,
+            performance=post_profile,
+            phase="post_gate_compute",
         )
+        post_compute_seconds = time.perf_counter() - post_started
+        post_processing_started = time.perf_counter()
         factor_matrices = runner.processor.process_batch(
             computed_post_matrices, processing_context
         )
+        post_processing_seconds = time.perf_counter() - post_processing_started
+        post_analysis_started = time.perf_counter()
         layered_test = LayeredBacktest(n_groups=policy.n_return_groups)
         turnover_test = TurnoverTest(
             monthly_threshold=policy.monthly_turnover_reference
@@ -1777,6 +1897,18 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             f"{len(observations)} 个，硬门槛淘汰 "
             f"{len(rejected_final)} 个)"
         )
+        performance_batches.append({
+            "phase": "post_gate_batch",
+            "batch_index": len(performance_batches),
+            "factor_count": len(post_names),
+            "factors": list(post_names),
+            "compute_wall_seconds": post_compute_seconds,
+            "processing_wall_seconds": post_processing_seconds,
+            "analysis_wall_seconds": time.perf_counter() - post_analysis_started,
+            "batch_wall_seconds": time.perf_counter() - post_started,
+            "date_chunks": post_profile["date_chunks"],
+            "factor_timings": post_profile["factor_timings"],
+        })
 
     # 保存 JSON 结果
     final_factor_names = (
@@ -1817,6 +1949,13 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             "zscore_standardize_by_date",
         ]
         factor_preprocessing = preprocessing_variants["neutralized"]
+    performance = _summarize_research_performance(
+        performance_batches,
+        workflow_wall_seconds=time.perf_counter() - workflow_started,
+        resumed_factor_count=len(completed_names),
+        factor_chunk_size=research_chunk_size,
+        analysis_workers=analysis_workers,
+    )
     out = {
         "research_contract": research_contract,
         "config": {
@@ -1880,6 +2019,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "funnel_audit": funnel_audit,
         "threshold_sensitivity": threshold_sensitivity,
         "family_governance": family_governance_audit,
+        "performance": performance,
         "summary": {
             "by_window": {k: len(v) for k, v in window_groups.items()},
             "by_best_period": {str(k): len(v) for k, v in by_period.items()},
@@ -1892,6 +2032,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     out_path = os.path.join(output_dir, "ic_by_window_period.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     _write_json_atomic(out_path, out)
+    performance_path = os.path.join(output_dir, "performance.json")
+    _write_json_atomic(performance_path, performance)
     funnel_path = os.path.join(output_dir, "validation_funnel.json")
     _write_json_atomic(funnel_path, {
         "research_contract": research_contract,

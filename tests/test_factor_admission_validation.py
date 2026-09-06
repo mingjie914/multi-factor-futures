@@ -167,8 +167,11 @@ def test_formal_run_writes_admissible_full_history_contract(tmp_path, monkeypatc
         lambda kind: {"factor": {"probe": factor_class}},
     )
     config = SimpleNamespace(
-        date_range=SimpleNamespace(start="2025-01-01", end="2026-05-15"),
-        date_policy=SimpleNamespace(research_cutoff="2026-05-15"),
+        date_range=SimpleNamespace(start="2017-01-01", end="2026-05-15"),
+        date_policy=SimpleNamespace(
+            factor_admission_start="2025-01-01",
+            research_cutoff="2026-05-15",
+        ),
         validation_policy=SimpleNamespace(
             warmup_days_by_frequency={"daily": 252}
         ),
@@ -187,6 +190,7 @@ def test_formal_run_writes_admissible_full_history_contract(tmp_path, monkeypatc
         artifacts = module.Path(output_dir)
         (artifacts / "ic_by_window_period.json").write_text("{}", encoding="utf-8")
         (artifacts / "validation_funnel.json").write_text("{}", encoding="utf-8")
+        (artifacts / "performance.json").write_text("{}", encoding="utf-8")
         result = {
             "name": "probe",
             "best_period": 10,
@@ -222,6 +226,7 @@ def test_formal_run_writes_admissible_full_history_contract(tmp_path, monkeypatc
                 "config_sha256": "b" * 64,
                 "code_sha256": "c" * 64,
             },
+            "performance": {},
         }
 
     monkeypatch.setattr(module, "_run_multi_period_screening", fake_screening)
@@ -233,8 +238,11 @@ def test_formal_run_writes_admissible_full_history_contract(tmp_path, monkeypatc
     summary = json.loads((run / "validation_summary.json").read_text(encoding="utf-8"))
     contract = json.loads((run / "run_contract.json").read_text(encoding="utf-8"))
     assert summary["research_window"] == ["2025-01-01", "2026-05-15"]
+    assert summary["backtest_start"] == "2017-01-01"
     assert summary["final_pass_count"] == 1
     assert contract["admission_eligible"] is True
+    assert contract["window_policy"] == "frozen_factor_admission_window"
+    assert "artifacts/performance.json" in contract["files"]
     assert contract["scope"] == "explicit_batch"
     assert not (run / "oos_factor_ic.json").exists()
     assert cleared == [True]

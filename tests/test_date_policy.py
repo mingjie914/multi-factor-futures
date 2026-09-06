@@ -6,6 +6,7 @@ import pytest
 from core.config import load_config
 from core.date_policy import (
     apply_research_end,
+    factor_admission_start,
     factor_validation_window,
     forward_observation_start,
     require_research_end,
@@ -42,6 +43,16 @@ def test_research_end_defaults_to_one_global_cutoff_and_rejects_later_dates():
     assert require_research_end(config, "2026-05-14") == pd.Timestamp("2026-05-14")
     with pytest.raises(ValueError, match="exceeds the inclusive framework cutoff"):
         require_research_end(config, "2026-05-18")
+
+
+def test_factor_admission_start_is_independent_of_backtest_start():
+    config = load_config("config/default.yaml")
+
+    assert config.date_range.start == "2017-01-01"
+    assert factor_admission_start(config) == pd.Timestamp("2025-01-01")
+
+    config.date_range.start = "2010-01-01"
+    assert factor_admission_start(config) == pd.Timestamp("2025-01-01")
 
 
 def test_research_and_observation_ends_resolve_independently():

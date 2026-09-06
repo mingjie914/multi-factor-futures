@@ -17,7 +17,7 @@
 > 为退化/市场标量并从源码清理，剩余588个均可估计。层级FDR得到20个观察发现，按
 > `|corr|>=0.5`去重为13簇。本次588因子迁移重放得到相同H20；它只证明数据/实现语义
 > 一致，不是正式因子准入。2026-08-24的90日历日预热＋126交易日IS＋42交易日OOS及其
-> 75条结果现仅作历史单切分观察；正式有效因子库从0开始按恢复后的全历史准入流程重建。
+> 75条结果现仅作历史单切分观察；正式有效因子库从0开始按恢复后的冻结区间准入流程重建。
 
 ## 架构
 
@@ -171,11 +171,11 @@ DuckDB读取固定使用Polars生产路径，不再存在容易误路由的结�
 研究合同哈希仅覆盖冻结日期范围内的分区；截止日之后的日常增量不会使旧研究断点失效。
 框架不包含远程行情查询、核对或回填旁路；数据修复与发布属于独立数据工程。
 
-时间采用两条互不混用的轴：`date_policy.research_cutoff`是所有因子发现、挖掘、适配性、
+时间采用两条互不混用的轴：研究轴由`date_policy`治理，其中`research_cutoff`是所有因子发现、挖掘、适配性、
 策略比较和滚动WF的统一含端点截止日；`date_range.end: latest_available`仅供冻结组合回测、
 净值、监控和报告解析认证数据源的最新完整交易日。截止日后的数据不得反向参与选择或调参。
-需要调整研究边界时只修改`date_policy.research_cutoff`（或显式环境覆盖
-`MF_RESEARCH_CUTOFF`）；研究命令传入更晚日期会失败关闭。
+正式单因子准入另从`date_policy.factor_admission_start`开始；它与
+`date_range.start`所表示的普通回测起点相互独立。研究命令传入截止日之后会失败关闭。
 
 ## 计算内核
 
@@ -212,10 +212,12 @@ GP 搜索期的 IC/IR、分层和成本后收益只是优化适应度；换手�
 长历史迁移对照位于`runs/factor_research/20260820_intraday599_rebuild/`；目录名保留最初
 提交规模。其研究契约、代码/配置/数据哈希用于更新后同区间重放比较，不代表当前数据
 更新后的正式结论。
-正式因子准入窗口固定为`config/default.yaml::date_range.start`至
+正式因子准入窗口固定为`date_policy.factor_admission_start`至
 `date_policy.research_cutoff`，预热与统计门槛由`validation_policy`维护；默认只检验IDE中
 显式列出的新增批次，首次建库或正式全量重建必须显式选择全池分支。126/42单切分、滚动
 Walk-forward、相关聚类和locked OOS均属于准入后的观察或组合验证，不能写回单因子准入结论。
+每次正式run同时保存`artifacts/performance.json`，记录分批计算、处理、统计分析墙钟耗时和
+逐因子热点；这些诊断不参与筛选。
 `research/validation.py`中的固定扩展窗口只服务`workflows/experiments/`旧版隔离实验。最终
 locked OOS只能从研究方案完全冻结后的新数据开始；`holdout_ledger.jsonl`记录样本消费事实，
 不能把已查看历史重新标成未见样本。

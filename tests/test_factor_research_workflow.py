@@ -11,11 +11,13 @@ from core.period import iter_overlapping_chunks
 from core.registry import _REGISTRIES
 from workflows.research import (
     _compute_factor_date_chunks,
+    _load_checkpoint_performance,
     _load_adaptivity_data,
     _load_research_checkpoint,
     _passes_post_bonferroni_quality,
     _parse_requested_factors,
     _select_registered_factors,
+    _summarize_research_performance,
     _validate_requested_factors,
     _write_json_atomic,
 )
@@ -32,9 +34,15 @@ def test_research_checkpoint_roundtrip_and_contract_guard(tmp_path):
     contract = {"version": 1, "factors": ["alpha"]}
     results = [{"name": "alpha", "best_ic": 0.01}]
 
-    _write_json_atomic(str(path), {"contract": contract, "results": results})
+    performance = [{"phase": "discovery_batch", "factor_count": 1}]
+    _write_json_atomic(str(path), {
+        "contract": contract,
+        "results": results,
+        "performance_batches": performance,
+    })
 
     assert _load_research_checkpoint(str(path), contract) == results
+    assert _load_checkpoint_performance(str(path), contract) == performance
     with pytest.raises(RuntimeError, match="contract"):
         _load_research_checkpoint(
             str(path), {"version": 1, "factors": ["beta"]}
@@ -75,15 +83,43 @@ def test_date_chunk_compute_preserves_sparse_early_history(monkeypatch):
     expected = engine_module.FactorEngine(Data()).compute_factors(
         ["sparse_factor"], dates, universe
     )["sparse_factor"]
+    performance = {}
     actual, invalid = _compute_factor_date_chunks(
         Data(), ["sparse_factor"], list(iter_overlapping_chunks(dates, 3, 0)),
         universe, 1, tolerate_failures=False, clear_intraday_caches=False,
+        performance=performance,
     )
 
     assert invalid == []
     pd.testing.assert_frame_equal(
         actual["sparse_factor"], expected, check_freq=False
     )
+    assert len(performance["date_chunks"]) == 2
+    assert all(row["wall_seconds"] >= 0 for row in performance["date_chunks"])
+    assert {row["factor"] for row in performance["factor_timings"]} == {
+        "sparse_factor"
+    }
+
+
+def test_performance_summary_ranks_factor_hotspots_without_selection_fields():
+    summary = _summarize_research_performance(
+        [{
+            "batch_wall_seconds": 4.0,
+            "date_chunks": [{"wall_seconds": 3.0}],
+            "factor_timings": [
+                {"factor": "fast", "seconds": 1.0, "status": "complete"},
+                {"factor": "slow", "seconds": 3.0, "status": "complete"},
+            ],
+        }],
+        workflow_wall_seconds=5.0,
+        resumed_factor_count=0,
+        factor_chunk_size=64,
+        analysis_workers=8,
+    )
+
+    assert summary["measurement_role"] == "diagnostic_only_not_a_selection_input"
+    assert summary["measured_batch_wall_seconds"] == 4.0
+    assert summary["factor_hotspots_top20"][0]["factor"] == "slow"
 
 
 def test_explicit_adaptivity_file_fails_closed(tmp_path):
