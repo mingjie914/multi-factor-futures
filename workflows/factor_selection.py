@@ -1,21 +1,22 @@
 """Frozen effective-factor subset selection for the intraday daily contract.
 
 This workflow consumes the current admitted effective-factor library (not a
-fixed-size candidate pool), computes only the locked IS window (with its
-required warm-up), clusters all daily signals together by default, and
-writes durable diagnostics plus parallel factor sets. It never mutates the
-effective library and never uses post-cutoff data for selection. The input
-count is always discovered from the configured effective library path, so a
-future library version is handled without changing this workflow.
+fixed-size candidate pool), computes the frozen admission interval with its
+required warm-up, clusters all daily signals together by default, and builds
+an exact nested portfolio path under the production construction recipe. It
+never mutates the effective library and never uses post-cutoff data for
+selection. The input count is always discovered from the configured effective
+library path, so a future library version needs no workflow change.
 """
 from __future__ import annotations
 
 import csv
+from itertools import combinations
 import json
-import math
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable
 
 import numpy as np
@@ -24,20 +25,36 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from core.config import load_config
-from core.date_policy import factor_validation_window, research_cutoff
+from core.date_policy import factor_admission_start, research_cutoff
 from core.registry import list_registered
-from factors.processor import build_processing_context
+from core.sectors import SECTOR_MAP
+from optimization.costs import SimpleFuturesCost
+from optimization.factor_weighting import (
+    prepare_complete_history,
+    rank_information_coefficients,
+)
 from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
 from research.effective_factor_library import load_library
 from research.governance import factor_family
+from research.historical_portfolio_search import (
+    PortfolioEvaluator,
+    PortfolioRecipe,
+    performance_metrics,
+    robust_summary,
+    robustness_key,
+)
 
 
-SELECTION_SCHEMA_VERSION = 2
+SELECTION_SCHEMA_VERSION = 3
 CLUSTER_CORRELATION_THRESHOLD = 0.50
 MIN_CROSS_SECTION = 10
-N_IS_SEGMENTS = 3
+N_IS_SEGMENTS = 4
 COMPACT_MAX_FACTORS = 12
+PORTFOLIO_SEARCH_MAX_FACTORS = 24
+PORTFOLIO_SEARCH_EXACT_WIDTH = 16
+PORTFOLIO_SEARCH_PATIENCE = 3
+PORTFOLIO_SEARCH_SHARPE_TOLERANCE = 0.10
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -150,6 +167,266 @@ def _compact_representatives(rows: list[dict], max_count: int) -> list[str]:
     """Keep the strongest distinct-cluster representatives up to one limit."""
     ranked = sorted(rows, key=_representative_key, reverse=True)
     return [str(row["factor"]) for row in ranked[:max_count]]
+
+
+def _segment_bounds(dates: pd.DatetimeIndex, count: int = 4) -> list[tuple]:
+    chunks = np.array_split(np.asarray(dates), int(count))
+    return [
+        (pd.Timestamp(chunk[0]), pd.Timestamp(chunk[-1]))
+        for chunk in chunks if len(chunk)
+    ]
+
+
+def _combined_ic_key(
+    ic: pd.DataFrame,
+    factors: Iterable[str],
+    segments: list[tuple],
+) -> tuple[float, float, float]:
+    combined = ic[list(factors)].mean(axis=1, skipna=True)
+    means: list[float] = []
+    sharpes: list[float] = []
+    for start, end in segments:
+        values = combined.loc[start:end].dropna()
+        if len(values) < 20:
+            continue
+        mean = float(values.mean())
+        std = float(values.std(ddof=1))
+        means.append(mean)
+        sharpes.append(
+            mean / std * np.sqrt(252.0) if std > 0.0 else -10.0
+        )
+    if not sharpes:
+        return (0.0, -10.0, -10.0)
+    return (
+        float(np.mean(np.asarray(means) > 0.0)),
+        float(np.min(sharpes)),
+        float(np.median(sharpes)),
+    )
+
+
+def _recommended_nested_candidate(
+    path: list[dict],
+    *,
+    sharpe_tolerance: float = PORTFOLIO_SEARCH_SHARPE_TOLERANCE,
+) -> dict:
+    """Choose the smallest near-best robust member of one nested path."""
+    if not path:
+        raise ValueError("nested portfolio path is empty")
+    best_positive = max(float(row["positive_segment_ratio"]) for row in path)
+    stable = [
+        row for row in path
+        if float(row["positive_segment_ratio"]) == best_positive
+    ]
+    best_worst = max(float(row["worst_sharpe"]) for row in stable)
+    stable = [
+        row for row in stable
+        if float(row["worst_sharpe"]) >= best_worst - float(sharpe_tolerance)
+    ]
+    best_median = max(float(row["median_sharpe"]) for row in stable)
+    stable = [
+        row for row in stable
+        if float(row["median_sharpe"]) >= best_median - float(sharpe_tolerance)
+    ]
+    return min(
+        stable,
+        key=lambda row: (
+            int(row["factor_count"]),
+            float(row["annual_turnover"]),
+            tuple(-value for value in robustness_key(row)),
+        ),
+    )
+
+
+def _production_recipe(config) -> PortfolioRecipe:
+    policy = config.production_portfolio
+    return PortfolioRecipe(
+        factor_weight=str(policy.factor_weight_method),
+        top_n=int(policy.top_n_per_side),
+        sector_cap=int(policy.sector_count_cap),
+        asset_weight=str(policy.asset_weight_method),
+        asset_min_fraction=float(policy.asset_min_fraction),
+        asset_max_fraction=float(policy.asset_max_fraction),
+        gross_exposure=float(policy.gross_exposure),
+        asset_max_overrides=tuple(sorted(policy.asset_max_overrides.items())),
+        sector_weight_caps=tuple(sorted(policy.sector_weight_caps.items())),
+    )
+
+
+def _configured_cost_model(config) -> SimpleFuturesCost:
+    policy = config.costs
+    return SimpleFuturesCost(
+        turnover_cost_rate=float(policy.turnover_cost_rate),
+        annual_fee=float(policy.annual_fee),
+        annual_roll_cost=float(policy.annual_roll_cost),
+        periods_per_year=float(policy.periods_per_year),
+        cost_stage=str(policy.cost_stage),
+    )
+
+
+def _run_nested_portfolio_search(
+    *,
+    evaluator: PortfolioEvaluator,
+    portfolio_ic: pd.DataFrame,
+    representatives: list[str],
+    recipe: PortfolioRecipe,
+    segments: list[tuple[pd.Timestamp, pd.Timestamp]],
+    max_factors: int = PORTFOLIO_SEARCH_MAX_FACTORS,
+    exact_width: int = PORTFOLIO_SEARCH_EXACT_WIDTH,
+    patience: int = PORTFOLIO_SEARCH_PATIENCE,
+) -> tuple[list[dict], list[dict], str]:
+    """Build one exact, nested path without fixing the final factor count."""
+    pool = list(dict.fromkeys(map(str, representatives)))
+    if len(pool) < 2:
+        raise ValueError("nested portfolio search requires at least two factors")
+    if int(exact_width) < 1 or int(patience) < 1 or int(max_factors) < 2:
+        raise ValueError("nested portfolio search limits must be positive")
+
+    selection_dates = portfolio_ic.loc[segments[0][0]:segments[-1][1]].index
+
+    def icir_history_available(factors: tuple[str, ...]) -> bool:
+        values = portfolio_ic[list(factors)]
+        started = False
+        for date in selection_dates:
+            history = prepare_complete_history(
+                values.loc[values.index < date].tail(60),
+                minimum_observations=30,
+            )
+            available = history.shape[1] >= 2
+            if started and not available:
+                return False
+            started = started or available
+        return started
+
+    def cheap_candidates(candidates: Iterable[tuple[str, ...]]) -> list[tuple]:
+        rows = [
+            (_combined_ic_key(portfolio_ic, factors, segments), tuple(factors))
+            for factors in candidates
+            if icir_history_available(tuple(factors))
+        ]
+        return sorted(rows, key=lambda row: (row[0], row[1]), reverse=True)
+
+    evaluations: list[dict] = []
+
+    def evaluate(
+        factors: tuple[str, ...],
+        *,
+        step: int,
+        added_factor: str,
+        cheap_key: tuple[float, float, float],
+    ) -> dict | None:
+        row = {
+            "step": int(step),
+            "factor_count": len(factors),
+            "added_factor": str(added_factor),
+            "factors": list(factors),
+            "cheap_positive_segment_ratio": float(cheap_key[0]),
+            "cheap_worst_ic_sharpe": float(cheap_key[1]),
+            "cheap_median_ic_sharpe": float(cheap_key[2]),
+            "status": "rejected_runtime",
+            "error": "",
+            "segment_count": 0,
+            "positive_segment_ratio": 0.0,
+            "worst_sharpe": -10.0,
+            "median_sharpe": -10.0,
+            "median_annual_return": -1.0,
+            "worst_drawdown": -1.0,
+            "annual_turnover": float("nan"),
+            "full_annual_return": float("nan"),
+            "full_sharpe": float("nan"),
+            "full_max_drawdown": float("nan"),
+            "full_total_return": float("nan"),
+        }
+        try:
+            ledger = evaluator.ledger(factors, recipe)
+        except RuntimeError as exc:
+            row["error"] = str(exc)
+            evaluations.append(row)
+            return None
+        robust = robust_summary(ledger, segments, initial_anchor=True)
+        full = performance_metrics(ledger["net_return"], initial_anchor=True)
+        row.update({
+            "status": "evaluated",
+            **robust,
+            "annual_turnover": (
+                float(ledger["executed_traded_notional"].iloc[1:].mean() * 252.0)
+                if len(ledger) > 1 else float("nan")
+            ),
+            "full_annual_return": float(full.get("annual_return", np.nan)),
+            "full_sharpe": float(full.get("sharpe", np.nan)),
+            "full_max_drawdown": float(full.get("max_drawdown", np.nan)),
+            "full_total_return": float(full.get("total_return", np.nan)),
+        })
+        evaluations.append(row)
+        return row
+
+    def exact_candidates(
+        shortlisted: list[tuple], *, step: int
+    ) -> list[dict]:
+        rows: list[dict] = []
+        for cheap_key, factors in shortlisted:
+            row = evaluate(
+                factors,
+                step=step,
+                added_factor=("|".join(factors) if step == 2 else factors[-1]),
+                cheap_key=cheap_key,
+            )
+            if row is not None:
+                rows.append(row)
+            if len(rows) >= int(exact_width):
+                break
+        return rows
+
+    initial_rows = exact_candidates(
+        cheap_candidates(combinations(pool, 2)), step=2
+    )
+    if not initial_rows:
+        raise RuntimeError("no executable two-factor portfolio survived exact evaluation")
+    selected_row = max(
+        initial_rows,
+        key=lambda row: (
+            *robustness_key(row),
+            -float(row["annual_turnover"]),
+            tuple(row["factors"]),
+        ),
+    )
+    path = [dict(selected_row)]
+    selected = tuple(selected_row["factors"])
+    best_key = robustness_key(selected_row)
+    stale_steps = 0
+    stop_reason = "candidate_pool_exhausted"
+    search_limit = min(len(pool), int(max_factors))
+    for size in range(3, search_limit + 1):
+        remaining = [name for name in pool if name not in selected]
+        shortlisted = cheap_candidates(
+            tuple((*selected, candidate)) for candidate in remaining
+        )
+        exact_rows = exact_candidates(shortlisted, step=size)
+        if not exact_rows:
+            stop_reason = f"no_executable_extension_at_size_{size}"
+            break
+        selected_row = max(
+            exact_rows,
+            key=lambda row: (
+                *robustness_key(row),
+                -float(row["annual_turnover"]),
+                str(row["added_factor"]),
+            ),
+        )
+        path.append(dict(selected_row))
+        selected = tuple(selected_row["factors"])
+        current_key = robustness_key(selected_row)
+        if current_key > best_key:
+            best_key = current_key
+            stale_steps = 0
+        else:
+            stale_steps += 1
+        if stale_steps >= int(patience):
+            stop_reason = f"no_robustness_improvement_for_{int(patience)}_sizes"
+            break
+    else:
+        if search_limit < len(pool):
+            stop_reason = f"computational_safety_cap_{search_limit}"
+    return path, evaluations, stop_reason
 
 
 def _load_library(
@@ -279,28 +556,20 @@ def run_effective_factor_selection(
         }))
     output.mkdir(parents=True, exist_ok=False)
     runner = PipelineRunner(config=config)
-    window = factor_validation_window(
-        config, runner.data_manager, frequency="daily_intraday"
-    )
+    selection_start = factor_admission_start(config)
     cutoff = research_cutoff(config)
-    if window.oos_end != cutoff:
-        raise ValueError(
-            f"selection window ends {window.oos_end.date()}, not research cutoff {cutoff.date()}"
-        )
-    is_dates = pd.DatetimeIndex(
-        runner.data_manager.get_calendar(window.is_start, window.is_end)
+    warmup_days = int(config.validation_policy.warmup_days_by_frequency["daily"])
+    factor_start = selection_start - pd.Timedelta(days=warmup_days)
+    selection_dates = pd.DatetimeIndex(
+        runner.data_manager.get_calendar(selection_start, cutoff)
     )
     requested_dates = pd.DatetimeIndex(
-        runner.data_manager.get_calendar(window.factor_start, window.is_end)
+        runner.data_manager.get_calendar(factor_start, cutoff)
     )
+    if len(selection_dates) < 80:
+        raise ValueError("factor-set selection requires at least 80 trading days")
     universe = pd.Index(config.universe)
     names = sorted(str(row["factor"]) for row in library_rows)
-    context = build_processing_context(
-        runner.data_manager,
-        requested_dates,
-        universe,
-        config.universe_selection,
-    )
     factor_compute_started = time.perf_counter()
     raw = runner.factor_engine.compute_factors(
         names, requested_dates, universe, parallel=False, chunk_size=64
@@ -309,7 +578,6 @@ def run_effective_factor_selection(
     factor_timings = list(runner.factor_engine.computation_timings)
     if set(raw) != set(names):
         raise ValueError("factor engine did not return all admitted factor names")
-    processed = runner.processor.process_batch(raw, context)
     registry = list_registered("factor").get("factor", {})
     missing_registry = sorted(set(names) - set(registry))
     if missing_registry:
@@ -335,19 +603,22 @@ def run_effective_factor_selection(
         )
         for horizon in selection_horizons
     }
-    segments = _segments(is_dates)
+    segments = _segments(selection_dates)
     all_diagnostics: list[dict] = []
-    oriented_ic: dict[str, pd.Series] = {}
     ranks: dict[str, pd.DataFrame] = {}
+    full_ranks: dict[str, pd.DataFrame] = {}
     for row in library_rows:
         name = str(row["factor"])
         horizon = periods[name]
-        frame = processed[name].loc[is_dates]
+        raw_rank = _rank_frame(raw[name])
         direction = directions[name]
-        directed = frame * float(direction)
-        ranks[name] = _rank_frame(directed)
-        ic = _daily_spearman_ic(directed, returns[horizon].loc[is_dates], is_dates)
-        oriented_ic[name] = ic
+        full_ranks[name] = raw_rank if direction == 1 else (1.0 - raw_rank)
+        ranks[name] = full_ranks[name].loc[selection_dates]
+        ic = _daily_spearman_ic(
+            ranks[name],
+            returns[horizon].loc[selection_dates],
+            selection_dates,
+        )
         segment_values = []
         for segment in segments:
             mean, positive_ratio, ir = _metric(ic.reindex(segment))
@@ -361,7 +632,7 @@ def run_effective_factor_selection(
             "signal_frequency": row["signal_frequency"],
             "direction": direction,
             "family": str(row.get("family", "") or factor_family(name)),
-            "coverage": float(ic.notna().mean()) if len(is_dates) else 0.0,
+            "coverage": float(ic.notna().mean()) if len(selection_dates) else 0.0,
             "mean_ic": float(ic.mean()) if not ic.empty else float("nan"),
             "ic_std": float(ic.std(ddof=1)) if len(ic) > 1 else float("nan"),
             "ic_pos_ratio": float(ic.gt(0.0).mean()) if not ic.empty else float("nan"),
@@ -434,21 +705,28 @@ def run_effective_factor_selection(
                 if row["group"] == group and row["cluster_id"] == cluster_id and row["factor"] == chosen["factor"]:
                     row["is_representative"] = True
         representatives = sorted(representatives, key=lambda name: _representative_key(rows_by_name[name]), reverse=True)
-        compact = _compact_representatives(
-            [rows_by_name[name] for name in representatives], int(max_compact_factors)
-        )
         factor_sets[f"balanced_core_{group}"] = {
             "group": group,
-            "purpose": "all cluster representatives; no OOS ranking",
+            "purpose": "all cluster representatives; portfolio-search candidate pool",
             "factors": representatives,
         }
-        factor_sets[f"compact_core_{group}"] = {
-            "group": group,
-            "purpose": "bounded strongest distinct-cluster representatives",
-            "factors": compact,
-        }
+        # Retain the old bounded view only for the explicit common-horizon
+        # observation workflow. It is not a current strategy candidate.
+        if source_run_dir is not None:
+            compact = _compact_representatives(
+                [rows_by_name[name] for name in representatives],
+                int(max_compact_factors),
+            )
+            factor_sets[f"compact_core_{group}"] = {
+                "group": group,
+                "purpose": "legacy bounded common-horizon observation",
+                "factors": compact,
+            }
 
-    for name in ("balanced_core", "compact_core"):
+    aggregate_names = ["balanced_core"]
+    if source_run_dir is not None:
+        aggregate_names.append("compact_core")
+    for name in aggregate_names:
         by_group = [
             factor_sets[f"{name}_{group}"]["factors"]
             for group, _ in groups
@@ -459,8 +737,123 @@ def run_effective_factor_selection(
                 for (group, _), values in zip(groups, by_group)
             },
             "factors": sorted(set().union(*map(set, by_group))),
-            "purpose": "mixed daily factor set; best_period is evidence only",
+            "purpose": (
+                "cluster representatives; best_period is evidence only"
+                if name == "balanced_core" else
+                "legacy common-horizon observation only"
+            ),
         }
+
+    nested_path: list[dict] = []
+    candidate_evaluations: list[dict] = []
+    nested_stop_reason: str | None = None
+    portfolio_search_seconds = 0.0
+    extra_files: list[str] = []
+    if source_run_dir is None and not group_by_best_period:
+        portfolio_started = time.perf_counter()
+        close = runner.data_manager.get("close", requested_dates, universe)
+        daily_ret, close_tradable = runner.data_manager.prepare_close_data(close)
+        full_portfolio_ic = rank_information_coefficients(
+            full_ranks,
+            daily_ret,
+            minimum_cross_section=3,
+        )
+        portfolio_ic = full_portfolio_ic
+        schedule = runner.data_manager.get_contract_schedule(
+            requested_dates, universe
+        )
+        adapter = SimpleNamespace(
+            cal=requested_dates,
+            u=list(universe),
+            ranks=full_ranks,
+            ic=full_portfolio_ic,
+            daily_ret=daily_ret,
+            close_tradable=close_tradable,
+            contract_schedule=schedule,
+            env=SimpleNamespace(
+                sector_of={name: SECTOR_MAP.get(name, "other") for name in universe}
+            ),
+        )
+        recipe = _production_recipe(config)
+        if (
+            recipe.constraints.minimum_risk_observations
+            != int(config.production_portfolio.minimum_risk_observations)
+            or not np.isclose(
+                recipe.constraints.covariance_shrinkage,
+                float(config.production_portfolio.covariance_shrinkage),
+            )
+        ):
+            raise ValueError(
+                "PortfolioRecipe risk defaults no longer match production_portfolio"
+            )
+        evaluator = PortfolioEvaluator(
+            adapter,
+            start=selection_dates[0],
+            end=selection_dates[-1],
+            cost_model=_configured_cost_model(config),
+            ic_window=int(config.production_portfolio.ic_window),
+            risk_lookback_calendar_days=int(
+                config.production_portfolio.risk_lookback_calendar_days
+            ),
+        )
+        representatives = factor_sets["balanced_core_mixed"]["factors"]
+        nested_path, candidate_evaluations, nested_stop_reason = (
+            _run_nested_portfolio_search(
+                evaluator=evaluator,
+                portfolio_ic=portfolio_ic,
+                representatives=representatives,
+                recipe=recipe,
+                segments=_segment_bounds(selection_dates),
+            )
+        )
+        recommended = _recommended_nested_candidate(nested_path)
+        factor_sets["recommended_core"] = {
+            "purpose": (
+                "smallest near-best robust member of the nested fixed-recipe path; "
+                "membership still requires independent post-selection validation"
+            ),
+            "factor_count": int(recommended["factor_count"]),
+            "factors": list(recommended["factors"]),
+            "selection_metrics": {
+                key: recommended[key]
+                for key in (
+                    "positive_segment_ratio", "worst_sharpe", "median_sharpe",
+                    "median_annual_return", "worst_drawdown", "annual_turnover",
+                    "full_annual_return", "full_sharpe", "full_max_drawdown",
+                    "full_total_return",
+                )
+            },
+        }
+        factor_sets["nested_candidates"] = {
+            "purpose": "complete nested path retained for independent validation",
+            "stop_reason": nested_stop_reason,
+            "candidates": [
+                {
+                    "factor_count": int(row["factor_count"]),
+                    "factors": list(row["factors"]),
+                    **{
+                        key: row[key]
+                        for key in (
+                            "positive_segment_ratio", "worst_sharpe",
+                            "median_sharpe", "median_annual_return",
+                            "worst_drawdown", "annual_turnover", "full_sharpe",
+                        )
+                    },
+                }
+                for row in nested_path
+            ],
+        }
+        portfolio_search_seconds = time.perf_counter() - portfolio_started
+        for filename, rows_to_write in (
+            ("nested_candidate_path.csv", nested_path),
+            ("portfolio_candidate_evaluations.csv", candidate_evaluations),
+        ):
+            serializable = [
+                {**row, "factors": "|".join(row["factors"])}
+                for row in rows_to_write
+            ]
+            _write_csv(output / filename, serializable)
+            extra_files.append(filename)
 
     _write_csv(output / "factor_diagnostics.csv", all_diagnostics)
     _write_csv(output / "factor_clusters.csv", cluster_rows)
@@ -473,23 +866,22 @@ def run_effective_factor_selection(
         "selection_mode": (
             "common_horizon" if source_run_dir else
             "best_period_sleeves" if group_by_best_period else
-            "mixed_daily"
+            "mixed_daily_nested_portfolio"
         ),
         "common_horizon": int(common_horizon) if common_horizon is not None else None,
         "library_count": len(names),
         "data_source": config.data.source,
         "research_cutoff": cutoff.date().isoformat(),
-        "warmup": [window.factor_start.date().isoformat(), (window.is_start - pd.Timedelta(days=1)).date().isoformat()],
+        "warmup": [
+            factor_start.date().isoformat(),
+            (selection_start - pd.Timedelta(days=1)).date().isoformat(),
+        ],
         "selection_sample": [
-            window.is_start.date().isoformat(),
-            window.is_end.date().isoformat(),
-            window.is_bars,
+            selection_start.date().isoformat(),
+            cutoff.date().isoformat(),
+            len(selection_dates),
         ],
-        "excluded_post_selection_observation": [
-            window.oos_start.date().isoformat(),
-            window.oos_end.date().isoformat(),
-            window.oos_bars,
-        ],
+        "post_cutoff_data_used": False,
         "input_bar_frequencies": {
             frequency: sum(
                 str(row["input_bar_frequency"]) == frequency
@@ -508,8 +900,37 @@ def run_effective_factor_selection(
         "best_period_role": "admission_evidence_only",
         "cluster_correlation": {"metric": "direction-adjusted daily cross-sectional rank exposure", "method": "complete_linkage", "threshold_abs_corr": CLUSTER_CORRELATION_THRESHOLD},
         "oos_used_for_selection": False,
+        "portfolio_search": (
+            {
+                "enabled": True,
+                "recipe": recipe.to_dict(),
+                "ic_horizon": 1,
+                "risk_lookback_calendar_days": int(
+                    config.production_portfolio.risk_lookback_calendar_days
+                ),
+                "minimum_risk_observations": int(
+                    config.production_portfolio.minimum_risk_observations
+                ),
+                "covariance_shrinkage": float(
+                    config.production_portfolio.covariance_shrinkage
+                ),
+                "segments": 4,
+                "initial_factor_count": 2,
+                "final_factor_count_is_fixed": False,
+                "maximum_explored_factor_count": PORTFOLIO_SEARCH_MAX_FACTORS,
+                "exact_shortlist_width": PORTFOLIO_SEARCH_EXACT_WIDTH,
+                "no_improvement_patience": PORTFOLIO_SEARCH_PATIENCE,
+                "near_best_sharpe_tolerance": PORTFOLIO_SEARCH_SHARPE_TOLERANCE,
+                "stop_reason": nested_stop_reason,
+                "recommended_factor_count": int(
+                    factor_sets["recommended_core"]["factor_count"]
+                ),
+            }
+            if nested_path else {"enabled": False}
+        ),
         "performance": {
             "factor_compute_seconds": factor_compute_seconds,
+            "portfolio_search_seconds": portfolio_search_seconds,
             "factor_seconds": sum(float(row["seconds"]) for row in factor_timings),
             "shared_overhead_seconds": max(
                 0.0,
@@ -521,13 +942,16 @@ def run_effective_factor_selection(
                 key=lambda row: (-float(row["seconds"]), str(row["factor"])),
             ),
         },
-        "factor_sets": {key: value for key, value in factor_sets.items() if key in {"balanced_core", "compact_core"}},
+        "factor_sets": {
+            key: value for key, value in factor_sets.items()
+            if key in {"balanced_core", "compact_core", "recommended_core"}
+        },
         "correlation_files": correlation_files,
     }
     _write_json(output / "selection_summary.json", summary)
     files = [
         "factor_diagnostics.csv", "factor_clusters.csv", "factor_sets.json",
-        "selection_summary.json", *correlation_files.values(),
+        "selection_summary.json", *correlation_files.values(), *extra_files,
     ]
     contract = {
         "schema_version": SELECTION_SCHEMA_VERSION,

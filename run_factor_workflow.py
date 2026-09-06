@@ -43,7 +43,8 @@ COMMON_HORIZON = 5
 ADMISSION_RUN_DIR: str | None = None
 ADMITTED_AT: str | None = None
 
-# SELECT_EFFECTIVE_SUBSETS consumes only the current admitted library.
+# SELECT_EFFECTIVE_SUBSETS consumes only the current admitted library and
+# writes a correlation-reduced, dynamically sized nested portfolio path.
 SELECTION_RUN_ID: str | None = None
 # ========================================================================
 
