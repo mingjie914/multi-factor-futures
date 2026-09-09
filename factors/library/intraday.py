@@ -45,6 +45,7 @@ from factors.numerics import (
     count_isolated_peaks,
     daily_candle_path_statistics,
     daily_breakout_statistics,
+    daily_downside_concentration,
     daily_lagged_pair_statistics,
     daily_liquidity_event_statistics,
     daily_oi_statistics,
@@ -29960,6 +29961,17 @@ class _MinutePathImpactFactorBase(Factor):
             return pd.DataFrame(np.nan, index=dates, columns=universe)
         if self.FEATURE.startswith("close_location_"):
             daily = _daily_close_location_features(panel).get(self.FEATURE)
+        elif self.FEATURE == "downside_path_concentration":
+            # This scalar reduction does not need the other path/impact features.
+            # Keep their shared cache and numerical implementations unchanged.
+            close = panel["close"]
+            if close.empty:
+                return pd.DataFrame(np.nan, index=dates, columns=universe)
+            index, offsets = _day_offsets(close.index)
+            daily = pd.DataFrame(
+                daily_downside_concentration(close.to_numpy(dtype=float), offsets),
+                index=index, columns=close.columns,
+            ).dropna(how="all").dropna(axis=1, how="all").rename_axis(index=None, columns=None)
         else:
             daily = _daily_path_impact_features(panel).get(self.FEATURE)
         if daily is None or daily.empty:

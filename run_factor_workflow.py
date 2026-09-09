@@ -44,8 +44,9 @@ ADMISSION_RUN_DIR: str | None = None
 ADMITTED_AT: str | None = None
 
 # SELECT_EFFECTIVE_SUBSETS consumes only the current admitted library and
-# writes a correlation-reduced, dynamically sized nested portfolio path.
+# writes multiple historically evaluated portfolio candidates.
 SELECTION_RUN_ID: str | None = None
+SELECTION_START = "2016-03-31"  # independent of the recent admission window
 # ========================================================================
 
 
@@ -118,6 +119,7 @@ def main() -> None:
         output = run_effective_factor_selection(
             run_id=run_id,
             config_path=CONFIG_PATH,
+            selection_start=SELECTION_START,
         )
         print(f"因子子集筛选产物: {output}")
         return

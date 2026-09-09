@@ -1,8 +1,9 @@
 """IDE entrypoint for durable single/multi-strategy backtests and comparison.
 
 The readable strategy library names parallel factor subsets and strategies;
-each strategy still points to one complete framework YAML. ``RUN_AND_COMPARE``
-is the default portfolio-method route: only the factor set varies and every
+each strategy points to a method YAML; shared-default subsets live in the catalog.
+``RUN_PREFERRED`` runs the unique preferred observation strategy by default.
+``RUN_AND_COMPARE`` compares active peers: only the factor set varies and every
 selected strategy uses the single configured production recipe. The explicit
 ``RUN_AND_COMPARE_CONFIGURED`` branch is reserved for deliberate
 model/optimizer comparisons from each strategy YAML.
@@ -35,6 +36,7 @@ from research.effective_factor_library import (
 
 class PortfolioWorkflow(Enum):
     VALIDATE_CONFIGURATIONS = "validate_configurations"
+    RUN_PREFERRED = "run_preferred"
     # Default comparison route: only the factor subset varies; every selected
     # strategy uses config/default.yaml::production_portfolio.
     RUN_AND_COMPARE = "run_and_compare"
@@ -44,8 +46,7 @@ class PortfolioWorkflow(Enum):
     # Explicitly rerun archived 6f/8f/13f definitions through the current
     # production ledger without adding them to ordinary peer comparisons.
     RUN_AND_COMPARE_SNAPSHOT_AUDIT = "run_and_compare_snapshot_audit"
-    # Explicit all-strategy comparison: current observing strategies plus the
-    # archived 6f/8f/13f definitions, all under the same production recipe.
+    # Compare non-archived catalog peers under the same production recipe.
     RUN_AND_COMPARE_ALL = "run_and_compare_all"
     # Explicit research-pool comparison: common-H5 passed factors are routed
     # through the same default production recipe as the ordinary peers.  This
@@ -62,14 +63,13 @@ class PortfolioWorkflow(Enum):
 
 
 # ============================== IDE SETTINGS ==============================
-WORKFLOW = PortfolioWorkflow.VALIDATE_CONFIGURATIONS
+WORKFLOW = PortfolioWorkflow.RUN_PREFERRED
 
 CATALOG_PATH = "config/strategy_library.yaml"
 RUN_ID: str | None = None
-# Peer comparisons use one observation range.  The legacy 10-factor YAML keeps
-# its broader framework default for standalone research, but is narrowed here
-# in-memory so it is comparable with the effective-library candidates.
-COMPARISON_START = "2024-01-01"
+# Default to the framework observation start; assign an explicit date here
+# only for a deliberately bounded comparison. Admission dates are independent.
+COMPARISON_START = str(load_config("config/default.yaml").date_range.start)
 # The legacy observation route uses the production-style research ledger and
 # its own availability checks.  It must not be silently converted into the
 # generic model pipeline or patched with a comparison-only fill operation.
@@ -87,16 +87,10 @@ SNAPSHOT_AUDIT_IDS: tuple[str, ...] = (
     "snapshot_8f_icir",
     "snapshot_13f_icir",
 )
-# A deliberate six-strategy comparison for the IDE.  Archived snapshots stay
-# excluded from ordinary RUN_AND_COMPARE unless this branch is selected.
-ALL_STRATEGY_IDS: tuple[str, ...] = (
-    "current_single_baseline",
-    "intraday_balanced_ridge",
-    "intraday_compact_ridge",
-    *SNAPSHOT_AUDIT_IDS,
-)
+# Empty selects every non-archived peer. Archived 6f remains audit-only.
+ALL_STRATEGY_IDS: tuple[str, ...] = ()
 # RUN_AND_COMPARE_COMMON_H5: the source selection run is immutable evidence;
-# the comparison starts at 2024-01-01 and observes through the latest source
+# the comparison uses COMPARISON_START and observes through the latest source
 # date, exactly like other confirmed-combination backtests.
 COMMON_H5_SELECTION_RUN_DIR = (
     "runs/factor_selection/20260826_common_h5_subset_selection"
@@ -188,7 +182,11 @@ def _load_factor_definition(path: Path) -> dict:
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"factor definition not found: {path}")
-    payload = runpy.run_path(str(path))
+    payload = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path.suffix.lower() == ".json"
+        else runpy.run_path(str(path))
+    )
     raw_factors = payload.get("FACTORS")
     if not isinstance(raw_factors, dict) or not raw_factors:
         raise ValueError(f"snapshot factor definition must expose FACTORS: {path}")
@@ -233,6 +231,7 @@ def _validated_specs():
         _default_production_config().production_portfolio
         if WORKFLOW in {
             PortfolioWorkflow.VALIDATE_CONFIGURATIONS,
+            PortfolioWorkflow.RUN_PREFERRED,
             PortfolioWorkflow.RUN_AND_COMPARE,
             PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
             PortfolioWorkflow.RUN_AND_COMPARE_ALL,
@@ -256,6 +255,11 @@ def _validated_specs():
         if snapshot_audit
         else {str(value) for value in STRATEGY_IDS}
     )
+    if WORKFLOW is PortfolioWorkflow.RUN_PREFERRED and not requested_ids:
+        requested_ids = {entry.id for entry in catalog.strategies if entry.status == "preferred"}
+        if len(requested_ids) != 1:
+            raise ValueError("default portfolio requires exactly one preferred strategy")
+    STRATEGY_LABELS.update({entry.id: entry.name for entry in catalog.strategies if entry.name})
     seen_ids: set[str] = set()
     for strategy in catalog.strategies:
         seen_ids.add(strategy.id)
@@ -267,6 +271,15 @@ def _validated_specs():
             continue
         path = _resolve(strategy.config_path)
         config = load_config(path)
+        if strategy.source == "effective_library" and path == _resolve("config/default.yaml"):
+            # Shared method config; the catalog owns each reusable factor subset.
+            factor_set = factor_sets[strategy.factor_set_id]
+            config.factors = list(factor_set.factors)
+            config.factor_library.path = str(library_path)
+            config.factor_library.enforce_effective_membership = True
+            frozen = factor_set.selection_context.get("directions")
+            if frozen and frozen != _effective_factor_directions(config, config.factors):
+                raise ValueError(f"strategy {strategy.id!r} frozen directions differ from current library")
         snapshot_definition = None
         if strategy.factor_definition_path:
             snapshot_definition = _load_factor_definition(
@@ -274,15 +287,8 @@ def _validated_specs():
             )
             config.factors = list(snapshot_definition["factors"])
             config.factor_library.enforce_effective_membership = False
-        configured_start = str(config.date_range.start)
-        if configured_start != COMPARISON_START:
-            if strategy.source == "legacy_observation":
-                config.date_range.start = COMPARISON_START
-            else:
-                raise ValueError(
-                    f"strategy {strategy.id!r} must use comparison start "
-                    f"{COMPARISON_START}, found {configured_start}"
-                )
+        # All peers share the comparison range without rewriting their YAMLs.
+        config.date_range.start = COMPARISON_START
         if strategy.source == "legacy_observation" and LEGACY_COMPARISON_FILLNA_ZERO:
             if not any(step.type == "fillna" for step in config.processing):
                 config.processing.append(
@@ -363,6 +369,9 @@ def _write_comparison_plot(
     output: Path,
     nav_table: pd.DataFrame,
     rows: list[dict],
+    *,
+    title: str | None = None,
+    cutoff: pd.Timestamp | None = None,
 ) -> None:
     """Use the framework's Chinese plotting conventions for peer comparison."""
     import matplotlib
@@ -381,7 +390,8 @@ def _write_comparison_plot(
         2, 1, figsize=(15, 10), gridspec_kw={"height_ratios": [5.0, 1.35]}
     )
     colors = [
-        "#1a73e8", "#e8710a", "#1e8e3e", "#d93025", "#9334e6", "#00897b"
+        "#1a73e8", "#e8710a", "#1e8e3e", "#d93025", "#9334e6", "#00897b",
+        "#795548", "#d81b60", "#607d8b",
     ]
     for idx, name in enumerate(nav_table.columns):
         series = nav_table[name].dropna()
@@ -404,13 +414,18 @@ def _write_comparison_plot(
                 [], [], linestyle="--", color="#777777",
                 label=_strategy_label(name) + "（未形成）",
             )
+    if cutoff is not None and nav_table.index.min() <= cutoff < nav_table.index.max():
+        ax.axvline(cutoff, color="#555555", linestyle=":", linewidth=1.3,
+                   label=f"研究截止日 {cutoff:%Y-%m-%d}")
+        ax.axvspan(cutoff, nav_table.index.max(), color="#e8f1fc", alpha=0.45,
+                   label="模拟实盘观察期（截止日之后）")
     ax.set_title(
-        f"平行策略净值对比（{COMPARISON_START}至最新交易日）",
+        title or f"平行策略净值对比（{nav_table.index.min():%Y-%m-%d}至{nav_table.index.max():%Y-%m-%d}）",
         fontsize=14,
     )
     ax.set_ylabel("归一化净值")
     ax.set_xlabel("交易日期")
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left", ncol=3 if len(rows) > 6 else 2)
     ax.grid(True, alpha=0.3)
 
     columns = (
@@ -872,6 +887,7 @@ def run_and_compare() -> Path:
     run_id = RUN_ID or datetime.now().strftime("%Y%m%d_%H%M%S")
     output = _resolve(catalog.output_root) / run_id
     production_method_compare = WORKFLOW in {
+        PortfolioWorkflow.RUN_PREFERRED,
         PortfolioWorkflow.RUN_AND_COMPARE,
         PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT,
         PortfolioWorkflow.RUN_AND_COMPARE_ALL,
@@ -1135,13 +1151,13 @@ def run_and_compare() -> Path:
         "strategies": configs,
         "failures": failures,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    if catalog.plot:
-        _write_comparison_plot(output, nav_table, rows)
     if len(cutoffs) != 1:
         raise ValueError(
             "strategy catalog contains multiple research cutoffs; refusing "
             "to write an ambiguous comparison report"
         )
+    if catalog.plot:
+        _write_comparison_plot(output, nav_table, rows, cutoff=next(iter(cutoffs)))
     _write_segment_report(
         output,
         strategy_results,
@@ -1477,7 +1493,7 @@ def run_common_h5_compare(
         encoding="utf-8",
     )
     if catalog.plot:
-        _write_comparison_plot(output, nav_table, rows)
+        _write_comparison_plot(output, nav_table, rows, cutoff=cutoff)
     _write_segment_report(
         output,
         strategy_results,
@@ -1559,7 +1575,7 @@ def main() -> None:
                 f"effective_membership_gate={gate}"
             )
         return
-    if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE:
+    if WORKFLOW in {PortfolioWorkflow.RUN_PREFERRED, PortfolioWorkflow.RUN_AND_COMPARE}:
         print(f"默认生产方法组合回测结果: {run_and_compare()}")
         return
     if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED:
@@ -1569,7 +1585,7 @@ def main() -> None:
         print(f"历史快照当前口径重评结果: {run_and_compare()}")
         return
     if WORKFLOW is PortfolioWorkflow.RUN_AND_COMPARE_ALL:
-        print(f"六策略统一组合回测结果: {run_and_compare()}")
+        print(f"全部备选策略统一组合回测结果: {run_and_compare()}")
         return
     raise ValueError(f"unsupported portfolio workflow: {WORKFLOW!r}")
 

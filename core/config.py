@@ -490,12 +490,12 @@ class StrategyLibraryEntry(StrictConfigModel):
     """One parallel strategy definition backed by a complete framework YAML."""
 
     id: str
+    name: str = ""
     status: Literal["preferred", "observing", "archived"] = "observing"
     source: Literal["effective_library", "legacy_observation"] = "effective_library"
     factor_set_id: str = ""
-    # Optional immutable factor-definition module for archived snapshot audits.
-    # It is read only by the explicit snapshot-audit IDE branch; normal
-    # strategy runs never import archived definitions.
+    # Optional frozen definition for a historical observation strategy.
+    # Archived entries still require an explicit audit selection.
     factor_definition_path: str = ""
     config_path: str
     mode: Literal["single", "multi"] = "single"

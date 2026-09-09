@@ -1133,6 +1133,32 @@ def _reference_daily_return_stats(values, day_offsets) -> np.ndarray:
     return output
 
 
+def daily_downside_concentration(values, day_offsets) -> np.ndarray:
+    """Within-day adjacent finite returns; no overnight or gap bridging."""
+    array = np.asarray(values, dtype=np.float64, order="C")
+    offsets = np.asarray(day_offsets, dtype=np.int64)
+    mode = factor_kernel_mode()
+    reference = None
+    if mode != "native":
+        reference = np.full((len(offsets) - 1, array.shape[1]), np.nan)
+        for day, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+            if end - start < 21:
+                continue
+            with np.errstate(divide="ignore", invalid="ignore"):
+                returns = array[start + 1:end] / array[start:end - 1] - 1.0
+            finite = np.isfinite(returns)
+            down = np.where(finite, np.maximum(-returns, 0.0), 0.0)
+            total = down.sum(axis=0)
+            valid = (finite.sum(axis=0) >= 20) & (total > 1e-12)
+            np.divide(np.sqrt(np.square(down).sum(axis=0)), total,
+                      out=reference[day], where=valid)
+    native = (native_array_kernel("daily_downside_concentration", array, offsets)
+              if mode != "reference" else None)
+    if mode == "shadow":
+        assert_native_equal(reference, native, "daily_downside_concentration")
+    return native if mode == "native" else reference
+
+
 def daily_return_statistics(values, day_offsets) -> dict[str, np.ndarray]:
     """Daily minute-return primitives with opt-in native/shadow execution."""
 

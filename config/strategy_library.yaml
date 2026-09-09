@@ -1,5 +1,6 @@
 # Parallel factor subsets and strategies. This is the human-readable catalog;
-# complete module parameters remain in each strategy's FrameworkConfig YAML.
+# module parameters remain in FrameworkConfig YAMLs. Effective subsets sharing
+# config/default.yaml bind their members from factor_sets in memory.
 schema_version: 1
 effective_factor_library: ./factor_library/library.json
 output_root: ./runs/portfolio_backtest
@@ -95,6 +96,136 @@ factor_sets:
       horizon_counts: {5: 5, 10: 8, 20: 12}
       role: historical_audit
 
+  - id: multi_source_balanced
+    status: active
+    description: 多源稳衡；冻结成员的生产方法观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_extreme_conc_20d
+      - intraday_path_bandwidth_20d
+      - intraday_permutation_entropy_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: candidate_1_17f
+      comparison_run: 20260909_candidates5_vs_legacy_latest
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_extreme_conc_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_permutation_entropy_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: curve_resonance
+    status: active
+    description: 期限共振；冻结成员的生产方法观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_extreme_conc_20d
+      - intraday_open_state_trend_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_seat_top5_long_conc_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_term_dtws_20d
+      - intraday_term_slope_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: candidate_2_17f
+      comparison_run: 20260909_candidates5_vs_legacy_latest
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_extreme_conc_20d":-1,"intraday_open_state_trend_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_seat_top5_long_conc_20d":1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: shock_enhanced
+    status: active
+    description: 冲击增强；冻结成员的生产方法观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_extreme_conc_20d
+      - intraday_open_state_trend_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_seat_net_strength_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_slope_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: candidate_3_18f
+      comparison_run: 20260909_candidates5_vs_legacy_latest
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_extreme_conc_20d":-1,"intraday_open_state_trend_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_seat_net_strength_20d":1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: position_trend
+    status: active
+    description: 持仓趋势；冻结成员的生产方法观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_extreme_conc_20d
+      - intraday_path_bandwidth_20d
+      - intraday_permutation_entropy_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_seat_net_strength_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_wick_symmetry_20d
+    selection_context:
+      source_candidate: candidate_4_13f
+      comparison_run: 20260909_candidates5_vs_legacy_latest
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_extreme_conc_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_permutation_entropy_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_seat_net_strength_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_wick_symmetry_20d":1}
+      production_approved: false
+
+  - id: compact_diversified
+    status: active
+    description: 精简多源；冻结成员的生产方法观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: candidate_5_10f
+      comparison_run: 20260909_candidates5_vs_legacy_latest
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
 strategies:
   # The two effective-library IDs and YAML filenames retain their historical
   # ``_ridge`` suffix for run/artifact compatibility; display names and
@@ -106,6 +237,8 @@ strategies:
   # (ICIR + Top10/Bottom10 + cap3 + ERC), not the generic model/risk pipeline.
   # It does not claim membership in the effective-factor subset catalog.
   - id: current_single_baseline
+    name: 量价脉冲
+    factor_definition_path: config/factor_sets/legacy_10f.json
     status: observing
     source: legacy_observation
     factor_set_id: ''
@@ -126,30 +259,76 @@ strategies:
     config_path: config/strategy_intraday_compact_ridge.yaml
     mode: multi
     description: 历史75条单切分结果派生的紧凑组合；仅供审计。
-  # Archived snapshot definitions are excluded from ordinary comparisons.
-  # Select them only through RUN_AND_COMPARE_SNAPSHOT_AUDIT; the current
-  # default recipe is then applied to the frozen factor set.
+  # Archived entries require explicit audit selection. Observing historical
+  # entries retain their snapshot directions without claiming current admission.
   - id: snapshot_6f_icir
     status: archived
     source: legacy_observation
     factor_set_id: ''
-    factor_definition_path: snapshot/6f_icir/combined.py
+    factor_definition_path: config/factor_sets/legacy_6f.json
     config_path: config/default.yaml
     mode: single
-    description: 历史6f ICIR因子集；仅允许通过快照审计分支按当前方法重评。
+    description: 旧6因子退出当前候选池：统一口径长期年化-3.67%、回撤49.36%；保留审计，不删除单因子。
   - id: snapshot_8f_icir
-    status: archived
+    name: 量价趋势
+    status: observing
     source: legacy_observation
     factor_set_id: ''
-    factor_definition_path: snapshot/8f_icir/combined.py
+    factor_definition_path: config/factor_sets/legacy_8f.json
     config_path: config/default.yaml
     mode: single
-    description: 历史8f ICIR因子集；仅允许通过快照审计分支按当前方法重评。
+    description: 量价趋势；历史8因子观察备选，保留历史方向，不声称全部成员属于当前有效库。
   - id: snapshot_13f_icir
-    status: archived
+    name: 量价持仓
+    status: observing
     source: legacy_observation
     factor_set_id: ''
-    factor_definition_path: snapshot/13f_icir/combined.py
+    factor_definition_path: config/factor_sets/legacy_13f.json
     config_path: config/default.yaml
     mode: single
-    description: 历史13f ICIR因子集；仅允许通过快照审计分支按当前方法重评。
+    description: 量价持仓；历史13因子观察备选，保留历史方向，不声称全部成员属于当前有效库。
+
+  - id: multi_source_balanced
+    name: 多源稳衡
+    status: preferred
+    source: effective_library
+    factor_set_id: multi_source_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 多源稳衡；17因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
+
+  - id: curve_resonance
+    name: 期限共振
+    status: observing
+    source: effective_library
+    factor_set_id: curve_resonance
+    config_path: config/default.yaml
+    mode: single
+    description: 期限共振；17因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
+
+  - id: shock_enhanced
+    name: 冲击增强
+    status: observing
+    source: effective_library
+    factor_set_id: shock_enhanced
+    config_path: config/default.yaml
+    mode: single
+    description: 冲击增强；18因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
+
+  - id: position_trend
+    name: 持仓趋势
+    status: observing
+    source: effective_library
+    factor_set_id: position_trend
+    config_path: config/default.yaml
+    mode: single
+    description: 持仓趋势；13因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
+
+  - id: compact_diversified
+    name: 精简多源
+    status: observing
+    source: effective_library
+    factor_set_id: compact_diversified
+    config_path: config/default.yaml
+    mode: single
+    description: 精简多源；10因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。

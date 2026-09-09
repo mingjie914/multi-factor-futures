@@ -9,6 +9,47 @@ const N_PAIR_STATS: usize = 10;
 const N_LAGGED_PAIR_STATS: usize = 4;
 
 #[pyfunction]
+fn daily_downside_concentration<'py>(
+    py: Python<'py>,
+    close: PyReadonlyArray2<'py, f64>,
+    day_offsets: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let close = close.as_array();
+    let offsets = day_offsets.as_slice()?;
+    if offsets.len() < 2
+        || offsets[0] != 0
+        || offsets[offsets.len() - 1] != close.nrows() as i64
+        || offsets.windows(2).any(|p| p[0] > p[1])
+    {
+        return Err(PyValueError::new_err("invalid day_offsets"));
+    }
+    let mut out = Array2::from_elem((offsets.len() - 1, close.ncols()), f64::NAN);
+    for day in 0..offsets.len() - 1 {
+        let start = offsets[day] as usize;
+        let end = offsets[day + 1] as usize;
+        if end - start < 21 {
+            continue;
+        }
+        for col in 0..close.ncols() {
+            let (mut count, mut total, mut squares) = (0usize, 0.0, 0.0);
+            for row in start + 1..end {
+                let ret = close[[row, col]] / close[[row - 1, col]] - 1.0;
+                if ret.is_finite() {
+                    count += 1;
+                    let down = (-ret).max(0.0);
+                    total += down;
+                    squares += down * down;
+                }
+            }
+            if count >= 20 && total > 1e-12 {
+                out[[day, col]] = squares.sqrt() / total;
+            }
+        }
+    }
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
 fn daily_return_stats<'py>(
     py: Python<'py>,
     close: PyReadonlyArray2<'py, f64>,
@@ -2158,6 +2199,7 @@ fn daily_liquidity_event_features<'py>(
 #[pymodule]
 fn _mf_factor_kernels(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(daily_return_stats, module)?)?;
+    module.add_function(wrap_pyfunction!(daily_downside_concentration, module)?)?;
     module.add_function(wrap_pyfunction!(daily_unary_stats, module)?)?;
     module.add_function(wrap_pyfunction!(daily_pair_stats, module)?)?;
     module.add_function(wrap_pyfunction!(daily_lagged_pair_stats, module)?)?;

@@ -12,6 +12,46 @@ from core.config import load_config, load_strategy_library
 from core.sectors import FRAMEWORK_UNIVERSE
 
 
+def test_frozen_json_definition_loads_without_executing_python(tmp_path):
+    definition = tmp_path / "members.json"
+    definition.write_text(json.dumps({"FACTORS": {"a": 1, "b": -1}}), encoding="utf-8")
+    loaded = ide._load_factor_definition(definition)
+    assert loaded["factors"] == ["a", "b"]
+    assert loaded["directions"] == {"a": 1, "b": -1}
+    assert len(loaded["sha256"]) == 64
+
+
+def test_shipped_legacy_definitions_are_portable():
+    root = Path(ide.__file__).resolve().parent
+    catalog = load_strategy_library(root / "config/strategy_library.yaml")
+    for entry in catalog.strategies:
+        if entry.factor_definition_path:
+            definition = root / entry.factor_definition_path
+            assert definition.is_relative_to(root / "config/factor_sets")
+            loaded = ide._load_factor_definition(definition)
+            assert set(loaded["directions"].values()) <= {-1, 1}
+    assert len([s for s in catalog.strategies if s.status != "archived"]) == 8
+    assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_balanced"]
+
+
+def test_comparison_plot_uses_actual_dates_and_nine_distinct_colors(tmp_path, monkeypatch):
+    import matplotlib.figure
+    dates = pd.date_range("2016-03-31", periods=3)
+    nav = pd.DataFrame({f"候选{i}": [1., 1.01, 1.02+i*.001] for i in range(9)}, index=dates)
+    captured = {}
+    original = matplotlib.figure.Figure.savefig
+    def save(fig, *args, **kwargs):
+        captured["title"] = fig.axes[0].get_title()
+        captured["colors"] = [line.get_color() for line in fig.axes[0].lines]
+        return original(fig, *args, **kwargs)
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save)
+    ide._write_comparison_plot(tmp_path, nav, [{"strategy": n} for n in nav])
+    assert "2016-03-31至2016-04-02" in captured["title"]
+    assert "最新" not in captured["title"]
+    assert len(set(captured["colors"])) == 9
+    assert (tmp_path / "nav_comparison.png").stat().st_size > 10000
+
+
 def _write_config(tmp_path, *, approved_period=5, holding_period=5):
     library = tmp_path / "library.json"
     library.write_text(json.dumps({
@@ -36,6 +76,61 @@ def _write_config(tmp_path, *, approved_period=5, holding_period=5):
         encoding="utf-8",
     )
     return config
+
+
+def test_comparison_plot_marks_forward_observation(tmp_path, monkeypatch):
+    import matplotlib.figure
+    dates = pd.to_datetime(["2026-05-15", "2026-05-18", "2026-05-19"])
+    nav = pd.DataFrame({"候选1": [1., 1.01, 1.02]}, index=dates)
+    captured = {}
+    original = matplotlib.figure.Figure.savefig
+    def save(fig, *args, **kwargs):
+        captured["labels"] = fig.axes[0].get_legend_handles_labels()[1]
+        return original(fig, *args, **kwargs)
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save)
+    ide._write_comparison_plot(tmp_path, nav, [{"strategy": "候选1"}], cutoff=dates[0])
+    assert "研究截止日 2026-05-15" in captured["labels"]
+    assert "模拟实盘观察期（截止日之后）" in captured["labels"]
+
+
+def test_comparison_default_start_inherits_framework():
+    assert ide.COMPARISON_START == load_config("config/default.yaml").date_range.start
+
+
+def test_saved_eight_candidates_and_default_retain_frozen_members(monkeypatch):
+    monkeypatch.setattr(ide, "CATALOG_PATH", "config/strategy_library.yaml")
+    monkeypatch.setattr(ide, "STRATEGY_IDS", ())
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
+    _, catalog, selected = ide._validated_specs()
+    assert len(selected) == 1
+    assert selected[0][0].id == "multi_source_balanced"
+    assert selected[0][0].name == "多源稳衡"
+    assert len(selected[0][2].factors) == 17
+    assert selected[0][2].factor_library.enforce_effective_membership
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
+    _, _, peers = ide._validated_specs()
+    assert len(peers) == 8
+    assert len({s.name for s, _, _ in peers}) == 8
+    assert "snapshot_6f_icir" not in {s.id for s, _, _ in peers}
+    subsets = {s.id: s for s in catalog.factor_sets}
+    for strategy, _, config in peers:
+        if strategy.source == "effective_library":
+            subset = subsets[strategy.factor_set_id]
+            assert config.factors == subset.factors
+            assert ide._effective_factor_directions(config, config.factors) == subset.selection_context["directions"]
+            assert subset.selection_context["production_approved"] is False
+        else:
+            definition = ide._load_factor_definition(ide._resolve(strategy.factor_definition_path))
+            assert config.factors == definition["factors"]
+
+
+def test_default_rejects_silent_direction_change(monkeypatch):
+    import pytest
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
+    monkeypatch.setattr(ide, "STRATEGY_IDS", ())
+    monkeypatch.setattr(ide, "_effective_factor_directions", lambda config, factors: {name: 1 for name in factors})
+    with pytest.raises(ValueError, match="frozen directions differ"):
+        ide._validated_specs()
 
 
 def _write_catalog(tmp_path, config, *, plot=False):
@@ -93,7 +188,7 @@ def test_legacy_peer_comparison_scope_is_in_memory_only(tmp_path, monkeypatch):
     config = _write_config(tmp_path)
     config.write_text(
         config.read_text(encoding="utf-8").replace(
-            f"start: '{ide.COMPARISON_START}'", "start: '2017-01-01'"
+            f"start: '{ide.COMPARISON_START}'", "start: '2018-01-01'"
         ),
         encoding="utf-8",
     )
@@ -109,7 +204,7 @@ def test_legacy_peer_comparison_scope_is_in_memory_only(tmp_path, monkeypatch):
     assert strategy.source == "legacy_observation"
     assert resolved.date_range.start == ide.COMPARISON_START
     assert not any(step.type == "fillna" for step in resolved.processing)
-    assert "2017-01-01" in config.read_text(encoding="utf-8")
+    assert "2018-01-01" in config.read_text(encoding="utf-8")
 
 
 def test_catalog_allows_only_one_preferred_strategy(tmp_path):
@@ -145,6 +240,7 @@ def test_config_kinds_cannot_be_routed_through_the_wrong_loader():
 
 
 def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED)
     config = _write_config(tmp_path)
     catalog = _write_catalog(tmp_path, config)
     monkeypatch.setattr(ide, "CATALOG_PATH", str(catalog))
@@ -181,14 +277,16 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert "process_peak_working_set_mib" in performance
 
 
-def test_all_strategy_branch_selects_current_and_archived_peers(monkeypatch):
+def test_all_strategy_branch_selects_eight_active_peers_not_retired_six(monkeypatch):
     monkeypatch.setattr(
         ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_ALL
     )
-    _catalog_path, _catalog, specs = ide._validated_specs()
-    assert [strategy.id for strategy, _path, _config in specs] == list(
-        ide.ALL_STRATEGY_IDS
-    )
+    _catalog_path, catalog, specs = ide._validated_specs()
+    assert [strategy.id for strategy, _path, _config in specs] == [
+        entry.id for entry in catalog.strategies if entry.status != "archived"
+    ]
+    assert len(specs) == 8
+    assert all(strategy.id != "snapshot_6f_icir" for strategy, _, _ in specs)
 
 
 def test_shared_production_panel_computes_union_once(monkeypatch):

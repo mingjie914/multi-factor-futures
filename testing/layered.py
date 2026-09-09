@@ -142,7 +142,8 @@ class LayeredBacktest(FactorTest):
         gm: Dict[str, dict] = {g: _metrics(gs[g]) for g in group_labels}
         gm["long_short"] = _metrics(ls)
 
-        # Monotonicity: rank correlation of Q1~Q5 annual returns
+        # Pearson correlation of ordered group indices with annual returns.
+        # This shape diagnostic is not a strict adjacent-group monotonicity test.
         ann_rets = np.asarray(
             [gm[g]["annual_return"] for g in group_labels], dtype=float
         )

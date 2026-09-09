@@ -1518,7 +1518,7 @@ class ParquetFuturesSource(DataSource):
             return pd.DataFrame(columns=roots, dtype=object)
         schedule = plan.pivot(
             on="root", index="trade_date", values="contract"
-        ).select("trade_date", *roots).to_pandas().set_index("trade_date")
+        ).to_pandas().set_index("trade_date")
         schedule.index = pd.DatetimeIndex(schedule.index).rename("trade_date")
         schedule.columns.name = "root"
         return schedule.sort_index().reindex(columns=roots)

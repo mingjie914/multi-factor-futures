@@ -136,4 +136,5 @@ def test_ide_selection_routes_to_effective_library_workflow(monkeypatch):
     assert called == {
         "run_id": "selection_probe",
         "config_path": "config/default.yaml",
+        "selection_start": "2016-03-31",
     }

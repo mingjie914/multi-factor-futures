@@ -853,6 +853,17 @@ def test_active_epoch_restarts_schedule_without_bridging_old_contract(tmp_path):
     assert close.loc["2024-01-04", "A"] == 126.0
 
 
+def test_contract_schedule_keeps_unavailable_roots_empty(tmp_path, monkeypatch):
+    source = ParquetFuturesSource({"root_path": str(_fixture_root(tmp_path))})
+    plan = pl.DataFrame({"trade_date": [pd.Timestamp("2016-03-31")],
+                         "root": ["A"], "contract": ["A1605"]})
+    monkeypatch.setattr(source, "_continuous_plan_polars", lambda *args: plan)
+    result = source.fetch_contract_schedule(["A", "FU"], "2016-03-31", "2016-03-31")
+    assert list(result.columns) == ["A", "FU"]
+    assert result.loc["2016-03-31", "A"] == "A1605"
+    assert result["FU"].isna().all()
+
+
 def test_same_source_instance_invalidates_panel_when_parquet_changes(tmp_path):
     root = _fixture_root(tmp_path)
     source = ParquetFuturesSource({

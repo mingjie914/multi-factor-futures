@@ -1,9 +1,9 @@
 """Frozen effective-factor subset selection for the intraday daily contract.
 
 This workflow consumes the current admitted effective-factor library (not a
-fixed-size candidate pool), computes the frozen admission interval with its
-required warm-up, clusters all daily signals together by default, and builds
-an exact nested portfolio path under the production construction recipe. It
+fixed-size candidate pool), computes an independent long-history interval with
+required warm-up, records daily-signal clusters, and evaluates multiple forward
+search paths under the production construction recipe. It
 never mutates the effective library and never uses post-cutoff data for
 selection. The input count is always discovered from the configured effective
 library path, so a future library version needs no workflow change.
@@ -26,17 +26,18 @@ from scipy.spatial.distance import squareform
 
 from core.config import load_config
 from core.date_policy import factor_admission_start, research_cutoff
+from core.period import iter_overlapping_chunks
 from core.registry import list_registered
-from core.sectors import SECTOR_MAP
+from core.sectors import FRAMEWORK_UNIVERSE, portfolio_selection_group_for
 from optimization.costs import SimpleFuturesCost
 from optimization.factor_weighting import (
-    prepare_complete_history,
     rank_information_coefficients,
 )
 from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
 from research.effective_factor_library import load_library
 from research.governance import factor_family
+from research.portfolio_experiment_support import FactorPanelRunner
 from research.historical_portfolio_search import (
     PortfolioEvaluator,
     PortfolioRecipe,
@@ -46,15 +47,17 @@ from research.historical_portfolio_search import (
 )
 
 
-SELECTION_SCHEMA_VERSION = 3
+SELECTION_SCHEMA_VERSION = 4
 CLUSTER_CORRELATION_THRESHOLD = 0.50
 MIN_CROSS_SECTION = 10
 N_IS_SEGMENTS = 4
 COMPACT_MAX_FACTORS = 12
-PORTFOLIO_SEARCH_MAX_FACTORS = 24
-PORTFOLIO_SEARCH_EXACT_WIDTH = 16
-PORTFOLIO_SEARCH_PATIENCE = 3
-PORTFOLIO_SEARCH_SHARPE_TOLERANCE = 0.10
+PORTFOLIO_SEARCH_MAX_FACTORS = 20
+PORTFOLIO_SEARCH_EXACT_WIDTH = 3
+PORTFOLIO_SEARCH_BEAM_WIDTH = 20
+PORTFOLIO_CAP_GROUPS = {
+    name: portfolio_selection_group_for(name) for name in FRAMEWORK_UNIVERSE
+}
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -169,72 +172,28 @@ def _compact_representatives(rows: list[dict], max_count: int) -> list[str]:
     return [str(row["factor"]) for row in ranked[:max_count]]
 
 
-def _segment_bounds(dates: pd.DatetimeIndex, count: int = 4) -> list[tuple]:
-    chunks = np.array_split(np.asarray(dates), int(count))
-    return [
-        (pd.Timestamp(chunk[0]), pd.Timestamp(chunk[-1]))
-        for chunk in chunks if len(chunk)
-    ]
 
 
-def _combined_ic_key(
-    ic: pd.DataFrame,
-    factors: Iterable[str],
-    segments: list[tuple],
-) -> tuple[float, float, float]:
-    combined = ic[list(factors)].mean(axis=1, skipna=True)
-    means: list[float] = []
-    sharpes: list[float] = []
-    for start, end in segments:
-        values = combined.loc[start:end].dropna()
-        if len(values) < 20:
-            continue
-        mean = float(values.mean())
-        std = float(values.std(ddof=1))
-        means.append(mean)
-        sharpes.append(
-            mean / std * np.sqrt(252.0) if std > 0.0 else -10.0
-        )
-    if not sharpes:
-        return (0.0, -10.0, -10.0)
-    return (
-        float(np.mean(np.asarray(means) > 0.0)),
-        float(np.min(sharpes)),
-        float(np.median(sharpes)),
-    )
-
-
-def _recommended_nested_candidate(
-    path: list[dict],
-    *,
-    sharpe_tolerance: float = PORTFOLIO_SEARCH_SHARPE_TOLERANCE,
-) -> dict:
-    """Choose the smallest near-best robust member of one nested path."""
-    if not path:
-        raise ValueError("nested portfolio path is empty")
-    best_positive = max(float(row["positive_segment_ratio"]) for row in path)
-    stable = [
-        row for row in path
-        if float(row["positive_segment_ratio"]) == best_positive
-    ]
-    best_worst = max(float(row["worst_sharpe"]) for row in stable)
-    stable = [
-        row for row in stable
-        if float(row["worst_sharpe"]) >= best_worst - float(sharpe_tolerance)
-    ]
-    best_median = max(float(row["median_sharpe"]) for row in stable)
-    stable = [
-        row for row in stable
-        if float(row["median_sharpe"]) >= best_median - float(sharpe_tolerance)
-    ]
-    return min(
-        stable,
-        key=lambda row: (
-            int(row["factor_count"]),
-            float(row["annual_turnover"]),
-            tuple(-value for value in robustness_key(row)),
-        ),
-    )
+def _portfolio_shortlist(rows: list[dict], limit: int = 5) -> list[dict]:
+    """Keep diverse, non-dominated net-performance candidates without size bias."""
+    valid = [r for r in rows if r["status"] == "evaluated"
+             and r["segment_count"] >= 4 and r["positive_segment_ratio"] >= 0.6
+             and r["median_sharpe"] > 0 and r["full_annual_return"] > 0]
+    def objectives(row):
+        return (*robustness_key(row), -float(row["annual_turnover"]))
+    frontier = [r for r in valid if not any(
+        all(a >= b for a, b in zip(objectives(other), objectives(r)))
+        and any(a > b for a, b in zip(objectives(other), objectives(r)))
+        for other in valid if other is not r)]
+    chosen = []
+    for row in sorted(frontier, key=objectives, reverse=True):
+        members = set(row["factors"])
+        if all(len(members & set(r["factors"])) / len(members | set(r["factors"])) < 0.85
+               for r in chosen):
+            chosen.append(row)
+        if len(chosen) == limit:
+            break
+    return chosen
 
 
 def _production_recipe(config) -> PortfolioRecipe:
@@ -263,170 +222,107 @@ def _configured_cost_model(config) -> SimpleFuturesCost:
     )
 
 
-def _run_nested_portfolio_search(
-    *,
-    evaluator: PortfolioEvaluator,
-    portfolio_ic: pd.DataFrame,
-    representatives: list[str],
-    recipe: PortfolioRecipe,
-    segments: list[tuple[pd.Timestamp, pd.Timestamp]],
+def _run_portfolio_search(
+    *, evaluator: PortfolioEvaluator, portfolio_ic: pd.DataFrame,
+    representatives: list[str], recipe: PortfolioRecipe, segments: list[tuple],
     max_factors: int = PORTFOLIO_SEARCH_MAX_FACTORS,
     exact_width: int = PORTFOLIO_SEARCH_EXACT_WIDTH,
-    patience: int = PORTFOLIO_SEARCH_PATIENCE,
+    beam_width: int = PORTFOLIO_SEARCH_BEAM_WIDTH,
+    output: Path | None = None,
 ) -> tuple[list[dict], list[dict], str]:
-    """Build one exact, nested path without fixing the final factor count."""
-    pool = list(dict.fromkeys(map(str, representatives)))
-    if len(pool) < 2:
-        raise ValueError("nested portfolio search requires at least two factors")
-    if int(exact_width) < 1 or int(patience) < 1 or int(max_factors) < 2:
-        raise ValueError("nested portfolio search limits must be positive")
+    """Multi-path forward proposals; exact net portfolios judge every size.
 
-    selection_dates = portfolio_ic.loc[segments[0][0]:segments[-1][1]].index
-
-    def icir_history_available(factors: tuple[str, ...]) -> bool:
-        values = portfolio_ic[list(factors)]
-        started = False
-        for date in selection_dates:
-            history = prepare_complete_history(
-                values.loc[values.index < date].tail(60),
-                minimum_observations=30,
-            )
-            available = history.shape[1] >= 2
-            if started and not available:
-                return False
-            started = started or available
-        return started
-
-    def cheap_candidates(candidates: Iterable[tuple[str, ...]]) -> list[tuple]:
-        rows = [
-            (_combined_ic_key(portfolio_ic, factors, segments), tuple(factors))
-            for factors in candidates
-            if icir_history_available(tuple(factors))
-        ]
-        return sorted(rows, key=lambda row: (row[0], row[1]), reverse=True)
-
-    evaluations: list[dict] = []
-
-    def evaluate(
-        factors: tuple[str, ...],
-        *,
-        step: int,
-        added_factor: str,
-        cheap_key: tuple[float, float, float],
-    ) -> dict | None:
-        row = {
-            "step": int(step),
-            "factor_count": len(factors),
-            "added_factor": str(added_factor),
-            "factors": list(factors),
-            "cheap_positive_segment_ratio": float(cheap_key[0]),
-            "cheap_worst_ic_sharpe": float(cheap_key[1]),
-            "cheap_median_ic_sharpe": float(cheap_key[2]),
-            "status": "rejected_runtime",
-            "error": "",
-            "segment_count": 0,
-            "positive_segment_ratio": 0.0,
-            "worst_sharpe": -10.0,
-            "median_sharpe": -10.0,
-            "median_annual_return": -1.0,
-            "worst_drawdown": -1.0,
-            "annual_turnover": float("nan"),
-            "full_annual_return": float("nan"),
-            "full_sharpe": float("nan"),
-            "full_max_drawdown": float("nan"),
-            "full_total_return": float("nan"),
-        }
-        try:
-            ledger = evaluator.ledger(factors, recipe)
-        except RuntimeError as exc:
-            row["error"] = str(exc)
-            evaluations.append(row)
-            return None
-        robust = robust_summary(ledger, segments, initial_anchor=True)
-        full = performance_metrics(ledger["net_return"], initial_anchor=True)
-        row.update({
-            "status": "evaluated",
-            **robust,
-            "annual_turnover": (
-                float(ledger["executed_traded_notional"].iloc[1:].mean() * 252.0)
-                if len(ledger) > 1 else float("nan")
-            ),
-            "full_annual_return": float(full.get("annual_return", np.nan)),
-            "full_sharpe": float(full.get("sharpe", np.nan)),
-            "full_max_drawdown": float(full.get("max_drawdown", np.nan)),
-            "full_total_return": float(full.get("total_return", np.nan)),
-        })
-        evaluations.append(row)
-        return row
-
-    def exact_candidates(
-        shortlisted: list[tuple], *, step: int
-    ) -> list[dict]:
-        rows: list[dict] = []
-        for cheap_key, factors in shortlisted:
-            row = evaluate(
-                factors,
-                step=step,
-                added_factor=("|".join(factors) if step == 2 else factors[-1]),
-                cheap_key=cheap_key,
-            )
-            if row is not None:
-                rows.append(row)
-            if len(rows) >= int(exact_width):
+    Historical blocks are development evidence conditional on today's admitted
+    pool. They are not independent out-of-sample folds.
+    """
+    pool = sorted(set(representatives))
+    if len(pool) < 2 or min(exact_width, beam_width) < 1 or max_factors < 2:
+        raise ValueError("portfolio search requires at least two factors and positive widths")
+    panel = portfolio_ic[pool]
+    arrays = [panel.loc[left:right].to_numpy(dtype=float) for left, right in segments]
+    positions = {name: i for i, name in enumerate(pool)}
+    def proxy(members):
+        ids = [positions[n] for n in members]
+        means, sharpes = [], []
+        for values in arrays:
+            x = values[:, ids]
+            count = np.isfinite(x).sum(axis=1)
+            combined = np.divide(np.nansum(x, axis=1), count,
+                                 out=np.full(len(x), np.nan), where=count > 0)
+            combined = combined[np.isfinite(combined)]
+            if len(combined) < 20:
+                return (0.0, -10.0, -10.0)
+            mean, std = combined.mean(), combined.std(ddof=1)
+            means.append(mean)
+            sharpes.append(mean / std * np.sqrt(252) if std > 0 else -10.0)
+        return (float(np.mean(np.asarray(means) > 0)), float(min(sharpes)), float(np.median(sharpes)))
+    beam = []
+    preferred_parent = None
+    evaluations, path = [], []
+    limit = min(max_factors, len(pool))
+    for size in range(2, limit + 1):
+        proposals = (set(combinations(pool, 2)) if size == 2 else
+                     {tuple(sorted((*members, n))) for members in beam for n in pool if n not in members})
+        ranked = sorted(((proxy(m), m) for m in proposals), reverse=True)
+        # Reserve one expansion of the previous exact winner. Merely sorting
+        # its parent earlier would not affect the next global proxy ranking.
+        if preferred_parent is not None:
+            continuation = next((r for r in ranked if set(preferred_parent).issubset(r[1])), None)
+            if continuation is not None:
+                ranked.remove(continuation)
+                ranked.insert(0, continuation)
+        # Preserve multiple starting points; no permanent cluster representatives.
+        beam = []
+        for key, members in ranked:
+            if all(len(set(members) & set(other)) / len(set(members) | set(other)) < 0.95
+                   for other in beam):
+                beam.append(members)
+            if len(beam) >= beam_width:
                 break
-        return rows
-
-    initial_rows = exact_candidates(
-        cheap_candidates(combinations(pool, 2)), step=2
-    )
-    if not initial_rows:
-        raise RuntimeError("no executable two-factor portfolio survived exact evaluation")
-    selected_row = max(
-        initial_rows,
-        key=lambda row: (
-            *robustness_key(row),
-            -float(row["annual_turnover"]),
-            tuple(row["factors"]),
-        ),
-    )
-    path = [dict(selected_row)]
-    selected = tuple(selected_row["factors"])
-    best_key = robustness_key(selected_row)
-    stale_steps = 0
-    stop_reason = "candidate_pool_exhausted"
-    search_limit = min(len(pool), int(max_factors))
-    for size in range(3, search_limit + 1):
-        remaining = [name for name in pool if name not in selected]
-        shortlisted = cheap_candidates(
-            tuple((*selected, candidate)) for candidate in remaining
-        )
-        exact_rows = exact_candidates(shortlisted, step=size)
-        if not exact_rows:
-            stop_reason = f"no_executable_extension_at_size_{size}"
+        if not beam:
             break
-        selected_row = max(
-            exact_rows,
-            key=lambda row: (
-                *robustness_key(row),
-                -float(row["annual_turnover"]),
-                str(row["added_factor"]),
-            ),
-        )
-        path.append(dict(selected_row))
-        selected = tuple(selected_row["factors"])
-        current_key = robustness_key(selected_row)
-        if current_key > best_key:
-            best_key = current_key
-            stale_steps = 0
-        else:
-            stale_steps += 1
-        if stale_steps >= int(patience):
-            stop_reason = f"no_robustness_improvement_for_{int(patience)}_sizes"
-            break
-    else:
-        if search_limit < len(pool):
-            stop_reason = f"computational_safety_cap_{search_limit}"
-    return path, evaluations, stop_reason
+        exact_rows = []
+        for members in beam:
+            if any(len(set(members) & set(other["factors"])) /
+                   len(set(members) | set(other["factors"])) >= 0.85 for other in exact_rows):
+                continue
+            started = time.perf_counter()
+            row = dict(step=size, factor_count=size, added_factor="", factors=list(members),
+                       status="rejected_runtime", error="", seconds=0.0,
+                       segment_count=0, positive_segment_ratio=0.0, worst_sharpe=-10.0,
+                       median_sharpe=-10.0, median_annual_return=-1.0, worst_drawdown=-1.0,
+                       annual_turnover=float("nan"), full_annual_return=float("nan"),
+                       full_sharpe=float("nan"), full_max_drawdown=float("nan"),
+                       full_total_return=float("nan"))
+            try:
+                ledger = evaluator.ledger(members, recipe)
+                if any(len(ledger.loc[left:right]) < 20 for left, right in segments):
+                    raise RuntimeError("insufficient portfolio history in a declared block")
+                metrics = performance_metrics(ledger["net_return"], initial_anchor=True)
+                row.update(status="evaluated", **robust_summary(ledger, segments, initial_anchor=True),
+                           annual_turnover=float(ledger["executed_traded_notional"].iloc[1:].mean() * 252),
+                           full_annual_return=metrics["annual_return"], full_sharpe=metrics["sharpe"],
+                           full_max_drawdown=metrics["max_drawdown"], full_total_return=metrics["total_return"])
+                exact_rows.append(row)
+            except RuntimeError as exc:
+                row["error"] = str(exc)
+            row["seconds"] = time.perf_counter() - started
+            evaluations.append(row)
+            if output is not None:
+                _write_json(output / "portfolio_search_progress.json", evaluations)
+            print(f"portfolio size={size} status={row['status']} seconds={row['seconds']:.1f}", flush=True)
+            if len(exact_rows) >= exact_width:
+                break
+        if exact_rows:
+            winner = max(exact_rows, key=robustness_key)
+            path.append(winner)
+            preferred_parent = tuple(winner["factors"])
+            # Exact portfolio evidence influences the next size, while other
+            # proxy paths survive even when three consecutive sizes deteriorate.
+            beam = list(dict.fromkeys([tuple(r["factors"]) for r in
+                        sorted(exact_rows, key=robustness_key, reverse=True)] + beam))[:beam_width]
+    return path, evaluations, ("candidate_pool_exhausted" if limit == len(pool)
+                              else f"declared_compute_budget_size_{limit}")
 
 
 def _load_library(
@@ -527,6 +423,7 @@ def run_effective_factor_selection(
     source_run_dir: str | None = None,
     common_horizon: int | None = None,
     group_by_best_period: bool = False,
+    selection_start: str = "2016-03-31",
 ) -> Path:
     """Run governed effective-library subset selection and write one immutable run."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(run_id)):
@@ -556,10 +453,12 @@ def run_effective_factor_selection(
         }))
     output.mkdir(parents=True, exist_ok=False)
     runner = PipelineRunner(config=config)
-    selection_start = factor_admission_start(config)
+    selection_start = (factor_admission_start(config) if source_run_dir is not None
+                       else pd.Timestamp(selection_start))
     cutoff = research_cutoff(config)
     warmup_days = int(config.validation_policy.warmup_days_by_frequency["daily"])
     factor_start = selection_start - pd.Timedelta(days=warmup_days)
+    source_fingerprint = runner.data_manager.source.checkpoint_source_fingerprint(factor_start, cutoff)
     selection_dates = pd.DatetimeIndex(
         runner.data_manager.get_calendar(selection_start, cutoff)
     )
@@ -571,9 +470,19 @@ def run_effective_factor_selection(
     universe = pd.Index(config.universe)
     names = sorted(str(row["factor"]) for row in library_rows)
     factor_compute_started = time.perf_counter()
-    raw = runner.factor_engine.compute_factors(
-        names, requested_dates, universe, parallel=False, chunk_size=64
-    )
+    from factors.library.intraday import clear_transient_data_caches
+    raw = {}
+    for target_dates, chunk_dates in iter_overlapping_chunks(requested_dates, 400, 128):
+        part = FactorPanelRunner._compute_part(
+            runner.factor_engine, names, chunk_dates, universe, raw
+        )
+        for name, frame in part.items():
+            if name not in raw:
+                raw[name] = pd.DataFrame(np.nan, index=requested_dates, columns=universe)
+            raw[name].loc[target_dates] = frame.reindex(index=target_dates, columns=universe)
+        runner.factor_engine.clear_cache()
+        clear_transient_data_caches()
+        print(f"factor panel through {target_dates[-1].date()}: {len(raw)}/{len(names)}", flush=True)
     factor_compute_seconds = time.perf_counter() - factor_compute_started
     factor_timings = list(runner.factor_engine.computation_timings)
     if set(raw) != set(names):
@@ -771,7 +680,7 @@ def run_effective_factor_selection(
             close_tradable=close_tradable,
             contract_schedule=schedule,
             env=SimpleNamespace(
-                sector_of={name: SECTOR_MAP.get(name, "other") for name in universe}
+                sector_of={name: PORTFOLIO_CAP_GROUPS[name] for name in universe}
             ),
         )
         recipe = _production_recipe(config)
@@ -796,25 +705,74 @@ def run_effective_factor_selection(
                 config.production_portfolio.risk_lookback_calendar_days
             ),
         )
-        representatives = factor_sets["balanced_core_mixed"]["factors"]
+        # Clusters describe redundancy, but no member is permanently excluded.
+        representatives = names
+        history_segments = [
+            (max(selection_dates[0], pd.Timestamp(left)), min(cutoff, pd.Timestamp(right)))
+            for left, right in (("2016-03-31", "2019-12-31"), ("2020-01-01", "2021-12-31"),
+                                ("2022-01-01", "2023-12-31"), ("2024-01-01", "2024-12-31"),
+                                ("2025-01-01", str(cutoff.date())))
+            if pd.Timestamp(right) >= selection_dates[0] and pd.Timestamp(left) <= cutoff
+        ]
         nested_path, candidate_evaluations, nested_stop_reason = (
-            _run_nested_portfolio_search(
+            _run_portfolio_search(
                 evaluator=evaluator,
                 portfolio_ic=portfolio_ic,
                 representatives=representatives,
                 recipe=recipe,
-                segments=_segment_bounds(selection_dates),
+                segments=history_segments,
+                output=output,
             )
         )
-        recommended = _recommended_nested_candidate(nested_path)
+        shortlist = _portfolio_shortlist(candidate_evaluations)
+        factor_sets["portfolio_candidates"] = {
+            "purpose": "diverse Pareto candidates; historical development evidence only",
+            "candidates": shortlist,
+            "qualified_count": len(shortlist),
+        }
+        candidate_returns = pd.DataFrame({
+            f"candidate_{i}_{row['factor_count']}f": evaluator.ledger(row["factors"], recipe)["net_return"]
+            for i, row in enumerate(shortlist, 1)
+        })
+        if not candidate_returns.empty:
+            candidate_returns.to_csv(output / "candidate_returns.csv")
+            candidate_returns.corr().to_csv(output / "candidate_return_correlation.csv")
+            extra_files.extend(["candidate_returns.csv", "candidate_return_correlation.csv"])
+            block_metrics = []
+            for i, row in enumerate(shortlist, 1):
+                ledger = evaluator.ledger(row["factors"], recipe)
+                for left, right in history_segments:
+                    values = ledger.loc[left:right, "net_return"]
+                    block_metrics.append({
+                        "candidate": f"candidate_{i}_{row['factor_count']}f",
+                        "start": str(left.date()), "end": str(right.date()),
+                        **performance_metrics(values, initial_anchor=values.index[0] == ledger.index[0]),
+                    })
+            _write_csv(output / "candidate_block_metrics.csv", block_metrics)
+            extra_files.append("candidate_block_metrics.csv")
+            from run_portfolio_workflow import _write_comparison_plot
+            labels = {name: f"候选{i}（{row['factor_count']}因子）"
+                      for i, (name, row) in enumerate(zip(candidate_returns, shortlist), 1)}
+            plot_rows = []
+            for name, row in zip(candidate_returns, shortlist):
+                metrics = performance_metrics(candidate_returns[name], initial_anchor=True)
+                plot_rows.append({"strategy": labels[name], **metrics,
+                                  "volatility": metrics["annual_volatility"],
+                                  "annualized_turnover": row["annual_turnover"]})
+            _write_comparison_plot(
+                output, (1 + candidate_returns).cumprod().rename(columns=labels), plot_rows,
+                title=f"候选组合净值对比（{selection_dates[0]:%Y-%m-%d}至{cutoff:%Y-%m-%d}）\n历史开发样本；统一组合配方与成本，非独立样本外",
+            )
+            extra_files.append("nav_comparison.png")
+        recommended = shortlist[0] if shortlist else None
         factor_sets["recommended_core"] = {
             "purpose": (
-                "smallest near-best robust member of the nested fixed-recipe path; "
+                "first robust candidate for display only; no automatic promotion; "
                 "membership still requires independent post-selection validation"
             ),
-            "factor_count": int(recommended["factor_count"]),
-            "factors": list(recommended["factors"]),
-            "selection_metrics": {
+            "factor_count": int(recommended["factor_count"]) if recommended else 0,
+            "factors": list(recommended["factors"]) if recommended else [],
+            "selection_metrics": ({
                 key: recommended[key]
                 for key in (
                     "positive_segment_ratio", "worst_sharpe", "median_sharpe",
@@ -822,10 +780,10 @@ def run_effective_factor_selection(
                     "full_annual_return", "full_sharpe", "full_max_drawdown",
                     "full_total_return",
                 )
-            },
+            } if recommended else {}),
         }
-        factor_sets["nested_candidates"] = {
-            "purpose": "complete nested path retained for independent validation",
+        factor_sets["size_candidates"] = {
+            "purpose": "best exact candidate at every explored size; paths need not be nested",
             "stop_reason": nested_stop_reason,
             "candidates": [
                 {
@@ -845,7 +803,7 @@ def run_effective_factor_selection(
         }
         portfolio_search_seconds = time.perf_counter() - portfolio_started
         for filename, rows_to_write in (
-            ("nested_candidate_path.csv", nested_path),
+            ("size_candidate_path.csv", nested_path),
             ("portfolio_candidate_evaluations.csv", candidate_evaluations),
         ):
             serializable = [
@@ -866,11 +824,12 @@ def run_effective_factor_selection(
         "selection_mode": (
             "common_horizon" if source_run_dir else
             "best_period_sleeves" if group_by_best_period else
-            "mixed_daily_nested_portfolio"
+            "mixed_daily_multipath_portfolio"
         ),
         "common_horizon": int(common_horizon) if common_horizon is not None else None,
         "library_count": len(names),
         "data_source": config.data.source,
+        "data_sha256": source_fingerprint,
         "research_cutoff": cutoff.date().isoformat(),
         "warmup": [
             factor_start.date().isoformat(),
@@ -882,6 +841,9 @@ def run_effective_factor_selection(
             len(selection_dates),
         ],
         "post_cutoff_data_used": False,
+        "historical_evidence_role": "development_stability_conditional_on_current_admitted_pool",
+        "admission_window": [str(factor_admission_start(config).date()), str(cutoff.date())],
+        "library_sha256": sha256_file(library_path),
         "input_bar_frequencies": {
             frequency: sum(
                 str(row["input_bar_frequency"]) == frequency
@@ -904,6 +866,7 @@ def run_effective_factor_selection(
             {
                 "enabled": True,
                 "recipe": recipe.to_dict(),
+                "cap_groups": {name: PORTFOLIO_CAP_GROUPS[name] for name in universe},
                 "ic_horizon": 1,
                 "risk_lookback_calendar_days": int(
                     config.production_portfolio.risk_lookback_calendar_days
@@ -914,13 +877,15 @@ def run_effective_factor_selection(
                 "covariance_shrinkage": float(
                     config.production_portfolio.covariance_shrinkage
                 ),
-                "segments": 4,
+                "segments": [[str(a.date()), str(b.date())] for a, b in history_segments],
                 "initial_factor_count": 2,
                 "final_factor_count_is_fixed": False,
                 "maximum_explored_factor_count": PORTFOLIO_SEARCH_MAX_FACTORS,
                 "exact_shortlist_width": PORTFOLIO_SEARCH_EXACT_WIDTH,
-                "no_improvement_patience": PORTFOLIO_SEARCH_PATIENCE,
-                "near_best_sharpe_tolerance": PORTFOLIO_SEARCH_SHARPE_TOLERANCE,
+                "beam_width": PORTFOLIO_SEARCH_BEAM_WIDTH,
+                "size_penalty": False,
+                "early_stop_on_nonimprovement": False,
+                "proxy_role": "H1 IC proposal only; exact net portfolios determine shortlist",
                 "stop_reason": nested_stop_reason,
                 "recommended_factor_count": int(
                     factor_sets["recommended_core"]["factor_count"]
@@ -944,7 +909,7 @@ def run_effective_factor_selection(
         },
         "factor_sets": {
             key: value for key, value in factor_sets.items()
-            if key in {"balanced_core", "compact_core", "recommended_core"}
+            if key in {"balanced_core", "compact_core", "recommended_core", "portfolio_candidates"}
         },
         "correlation_files": correlation_files,
     }

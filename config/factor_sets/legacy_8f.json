@@ -1,0 +1,12 @@
+{
+  "FACTORS": {
+    "intraday_ma_count_bullish_20d": 1,
+    "intraday_price_peak_count_20d": 1,
+    "intraday_lowest_time_20d": 1,
+    "intraday_basis_momentum_20d": 1,
+    "intraday_price_delay_20d": -1,
+    "intraday_torrent_down_20d": -1,
+    "intraday_open_close_volume_ratio_20d": -1,
+    "intraday_zero_ret_freq_20d": -1
+  }
+}

@@ -48,6 +48,31 @@ from factors.library.intraday import (
 )
 
 
+@pytest.mark.parametrize("mode", ["reference", "native", "shadow"])
+def test_downside_concentration_preserves_daily_gaps_and_rolling(monkeypatch, mode):
+    import factors.library.intraday as intraday
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", mode)
+    rng = np.random.default_rng(41)
+    dates = pd.bdate_range("2025-01-01", periods=26)
+    index = pd.DatetimeIndex([d + pd.Timedelta(minutes=i) for d in dates for i in range(31)])
+    close = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, .001, (len(index), 6)), axis=0)),
+                         index=index, columns=list("ABCDEF"))
+    close.iloc[::31, 0] *= 1.1  # daily boundary, not an overnight return
+    close.iloc[2:8, 1] = np.nan
+    close.iloc[:31, 2] = np.nan
+    close.iloc[:, 3] = np.arange(len(index)) + 100.0  # no downside
+    close.iloc[4, 4] = np.inf
+    close.iloc[9, 4] = 0.0
+    close.iloc[:, 5] = np.nan
+    panel = {"close": close}
+    expected_daily = intraday._daily_path_impact_features(panel)["downside_path_concentration"]
+    expected = intraday._roll_mean(expected_daily, 20, 5).reindex(index=dates, columns=close.columns).shift(1)
+    monkeypatch.setattr(intraday, "_get_minute_panel", lambda *a, **kw: {"close": close})
+    monkeypatch.setattr(intraday, "_daily_path_impact_features", lambda *a: pytest.fail("unrelated family called"))
+    actual = intraday.IntradayDownsidePathConcentration20d().compute(None, dates, close.columns)
+    pd.testing.assert_frame_equal(actual, expected, rtol=1e-12, atol=1e-14)
+
+
 def test_daily_path_impact_features_are_complete_cached_and_numerically_aligned():
     index = pd.DatetimeIndex(
         list(pd.date_range("2026-01-05 09:00", periods=30, freq="min"))

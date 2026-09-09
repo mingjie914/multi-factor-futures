@@ -9,9 +9,16 @@ import pytest
 from workflows.factor_selection import (
     _compact_representatives,
     _load_library,
-    _recommended_nested_candidate,
-    _run_nested_portfolio_search,
 )
+
+
+def test_search_cap_groups_match_production_not_fine_sector_taxonomy():
+    from strategies.combined import SECTOR_OF
+    from workflows.factor_selection import PORTFOLIO_CAP_GROUPS
+    assert PORTFOLIO_CAP_GROUPS == SECTOR_OF
+    assert PORTFOLIO_CAP_GROUPS["AU"] == PORTFOLIO_CAP_GROUPS["CU"]
+    assert PORTFOLIO_CAP_GROUPS["IF"] == PORTFOLIO_CAP_GROUPS["T"]
+    assert len(set(PORTFOLIO_CAP_GROUPS.values())) == 5
 
 
 def test_effective_library_selection_accepts_registered_daily_horizon_three(tmp_path):
@@ -84,61 +91,57 @@ def test_compact_selection_keeps_strongest_distinct_cluster_representatives():
     assert _compact_representatives(rows, 2) == ["strong_a", "strong_b"]
 
 
-def test_recommended_nested_candidate_uses_smallest_near_best_size():
-    base = {
-        "positive_segment_ratio": 1.0,
-        "median_annual_return": 0.12,
-        "worst_drawdown": -0.10,
-        "annual_turnover": 20.0,
-    }
-    path = [
-        {**base, "factor_count": 4, "worst_sharpe": 0.93,
-         "median_sharpe": 1.13, "factors": ["a", "b", "c", "d"]},
-        {**base, "factor_count": 5, "worst_sharpe": 1.00,
-         "median_sharpe": 1.20, "factors": ["a", "b", "c", "d", "e"]},
-        {**base, "factor_count": 6, "worst_sharpe": 1.02,
-         "median_sharpe": 1.22, "factors": ["a", "b", "c", "d", "e", "f"]},
+def test_shortlist_does_not_prefer_smallest_and_keeps_tradeoffs():
+    from workflows.factor_selection import _portfolio_shortlist
+    base = dict(status="evaluated", segment_count=5, positive_segment_ratio=1.,
+                median_annual_return=.12, full_annual_return=.12, worst_drawdown=-.1,
+                annual_turnover=20.)
+    rows = [
+        dict(base, factor_count=2, factors=["a", "b"], worst_sharpe=.9, median_sharpe=1.1),
+        dict(base, factor_count=6, factors=list("abcdef"), worst_sharpe=1.1, median_sharpe=1.3),
+        dict(base, factor_count=8, factors=list("ghijklmn"), worst_sharpe=1., median_sharpe=1.5),
     ]
-
-    selected = _recommended_nested_candidate(path, sharpe_tolerance=0.10)
-
-    assert selected["factor_count"] == 4
+    assert {r["factor_count"] for r in _portfolio_shortlist(rows)} == {6, 8}
 
 
-def test_nested_search_produces_a_true_incremental_path():
-    dates = pd.bdate_range("2025-01-01", periods=80)
-    ic = pd.DataFrame({
-        "a": 0.02,
-        "b": 0.018,
-        "c": 0.016,
-        "d": 0.014,
-    }, index=dates)
-
+def test_multipath_search_explores_beyond_three_flat_sizes():
+    import numpy as np
+    from workflows.factor_selection import _run_portfolio_search
+    dates = pd.bdate_range("2020-01-01", periods=160)
+    rng = np.random.default_rng(2)
+    ic = pd.DataFrame(rng.normal(.02, .1, (160, 8)), index=dates, columns=list("abcdefgh"))
     class Evaluator:
         def ledger(self, factors, recipe):
-            del recipe
-            scale = 0.0001 * len(factors)
-            values = pd.Series(scale, index=dates, dtype=float)
-            values.iloc[0] = 0.0
-            return pd.DataFrame({
-                "net_return": values,
-                "executed_traded_notional": 0.1,
-            }, index=dates)
+            values = .0002 + .001 * np.sin(np.arange(160))
+            values[0] = 0.0
+            return pd.DataFrame({"net_return": values, "executed_traded_notional": .1}, index=dates)
+    path, rows, reason = _run_portfolio_search(
+        evaluator=Evaluator(), portfolio_ic=ic, representatives=list(ic), recipe=None,
+        segments=[(dates[i], dates[i+39]) for i in range(0,160,40)],
+        max_factors=8, exact_width=2, beam_width=4)
+    assert [r["factor_count"] for r in path] == list(range(2,9))
+    assert reason == "candidate_pool_exhausted"
+    assert len([r for r in rows if r["factor_count"] == 2]) == 2
 
-    path, _, stop_reason = _run_nested_portfolio_search(
-        evaluator=Evaluator(),
-        portfolio_ic=ic,
-        representatives=["a", "b", "c", "d"],
-        recipe=SimpleNamespace(),
-        segments=[(dates[0], dates[39]), (dates[40], dates[-1])],
-        max_factors=4,
-        exact_width=3,
-        patience=3,
-    )
 
-    assert [row["factor_count"] for row in path] == [2, 3, 4]
-    assert all(
-        set(path[index - 1]["factors"]).issubset(path[index]["factors"])
-        for index in range(1, len(path))
-    )
-    assert stop_reason == "candidate_pool_exhausted"
+def test_exact_winner_has_a_reserved_expansion():
+    import numpy as np
+    from workflows.factor_selection import _run_portfolio_search
+    dates = pd.bdate_range("2020-01-01", periods=160)
+    rng = np.random.default_rng(7)
+    ic = pd.DataFrame(rng.normal(.02, .1, (160, 6)), index=dates, columns=list("abcdef"))
+    calls = []
+    class Evaluator:
+        def ledger(self, factors, recipe):
+            calls.append(tuple(factors))
+            # The second exact pair wins despite being behind the first proxy.
+            mean = .001 if len(calls) == 2 else .0001
+            values = mean + .001 * np.sin(np.arange(160))
+            values[0] = 0.0
+            return pd.DataFrame({"net_return": values, "executed_traded_notional": .1}, index=dates)
+    _run_portfolio_search(
+        evaluator=Evaluator(), portfolio_ic=ic, representatives=list(ic), recipe=None,
+        segments=[(dates[i], dates[i+39]) for i in range(0,160,40)],
+        max_factors=3, exact_width=2, beam_width=4)
+    assert len(calls[2]) == 3
+    assert set(calls[1]).issubset(calls[2])
