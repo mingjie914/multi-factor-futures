@@ -310,11 +310,9 @@ class FactorEngine:
         non_spec_names: List[str] = []
         spec_specs: list = []
 
-        try:
-            from factors.specs import SPEC_BY_SLUG
-        except ImportError:
-            # SPEC 模块未加载, 全部走原路径
-            return spec_result, list(factor_names)
+        # 只读取显式研究调用者已加载的目录，默认计算不得反向加载生成器。
+        import sys
+        SPEC_BY_SLUG = getattr(sys.modules.get("factors.specs"), "SPEC_BY_SLUG", {})
 
         for name in factor_names:
             if name in SPEC_BY_SLUG:

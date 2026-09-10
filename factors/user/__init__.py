@@ -20,7 +20,7 @@ def load_user_factors() -> tuple[str, ...]:
     module_names = sorted(
         module.name
         for module in pkgutil.iter_modules(__path__)
-        if not module.name.startswith("_")
+        if not module.name.startswith("_") and module.name != "auto_mined_bridge"
     )
     for module_name in module_names:
         importlib.import_module(f"{__name__}.{module_name}")

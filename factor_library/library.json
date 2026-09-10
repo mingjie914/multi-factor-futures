@@ -1,7 +1,7 @@
 {
   "schema_version": 3,
-  "updated_at": "2026-09-09",
-  "source_run": "20260908_intraday605_datarepair_ic_hac",
+  "updated_at": "2026-09-10",
+  "source_run": "20260910_daily_volume_corr5",
   "factors": [
     {
       "factor": "amihud_illiquidity_20d",
@@ -2434,6 +2434,24 @@
       "evidence_sha256": "3420e7124d3d5599f4c088823d040d50457e6907c45316c5693b4205399d006a"
     },
     {
+      "factor": "intraday_volume_abs_return_partial_corr_20d",
+      "family": "volume_price",
+      "status": "effective",
+      "input_bar_frequency": "daily",
+      "signal_frequency": "daily",
+      "best_period": 40,
+      "direction": -1,
+      "admitted_at": "2026-09-10",
+      "source_run": "20260910_daily_volume_corr5",
+      "research_start": "2025-01-01",
+      "research_cutoff": "2026-05-15",
+      "ic": -0.08942363771919619,
+      "t": -2.768230005477195,
+      "q": 0.018008588522672734,
+      "evidence_file": "runs/factor_validation/20260910_daily_volume_corr5/passed_factors.csv",
+      "evidence_sha256": "e2ce5e2d0f7e8fbe10e85dbb8944eade0591feacb4b519e05fc83479417ae82c"
+    },
+    {
       "factor": "intraday_volume_dispersion_20d",
       "family": "intraday_advanced",
       "status": "effective",
@@ -2504,6 +2522,24 @@
       "q": 0.0022097157525678163,
       "evidence_file": "runs/factor_validation/20260908_intraday605_datarepair_ic_hac/passed_factors.csv",
       "evidence_sha256": "3420e7124d3d5599f4c088823d040d50457e6907c45316c5693b4205399d006a"
+    },
+    {
+      "factor": "intraday_volume_surprise_abs_return_corr_20d",
+      "family": "volume_price",
+      "status": "effective",
+      "input_bar_frequency": "daily",
+      "signal_frequency": "daily",
+      "best_period": 40,
+      "direction": -1,
+      "admitted_at": "2026-09-10",
+      "source_run": "20260910_daily_volume_corr5",
+      "research_start": "2025-01-01",
+      "research_cutoff": "2026-05-15",
+      "ic": -0.10534435565500962,
+      "t": -3.1453988342735713,
+      "q": 0.005498205076381185,
+      "evidence_file": "runs/factor_validation/20260910_daily_volume_corr5/passed_factors.csv",
+      "evidence_sha256": "e2ce5e2d0f7e8fbe10e85dbb8944eade0591feacb4b519e05fc83479417ae82c"
     },
     {
       "factor": "intraday_volume_tail_conc_20d",
@@ -2702,6 +2738,24 @@
       "q": 0.004897911510800799,
       "evidence_file": "runs/factor_validation/20260908_intraday605_datarepair_ic_hac/passed_factors.csv",
       "evidence_sha256": "3420e7124d3d5599f4c088823d040d50457e6907c45316c5693b4205399d006a"
+    },
+    {
+      "factor": "volume_price_corr_20d",
+      "family": "volume_price",
+      "status": "effective",
+      "input_bar_frequency": "daily",
+      "signal_frequency": "daily",
+      "best_period": 40,
+      "direction": -1,
+      "admitted_at": "2026-09-10",
+      "source_run": "20260910_daily_volume_corr5",
+      "research_start": "2025-01-01",
+      "research_cutoff": "2026-05-15",
+      "ic": -0.11696473426766366,
+      "t": -4.806702625160341,
+      "q": 7.435559824673698e-06,
+      "evidence_file": "runs/factor_validation/20260910_daily_volume_corr5/passed_factors.csv",
+      "evidence_sha256": "e2ce5e2d0f7e8fbe10e85dbb8944eade0591feacb4b519e05fc83479417ae82c"
     },
     {
       "factor": "vp_corr_intraday_eod",

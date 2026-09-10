@@ -1015,9 +1015,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
 
     workflow_started = time.perf_counter()
     policy = runner.config.validation_policy
-    from factor_mining.bridge import registered_expected_directions
-
-    mined_directions = registered_expected_directions(tuple(all_factors))
+    mined_directions = {}
+    # 普通因子也可冻结方向；未声明的已有因子继续沿用原策略。
+    for name in all_factors:
+        declared = getattr(registry_get("factor", name), "expected_direction", None)
+        if declared in (-1, 1):
+            mined_directions.setdefault(name, int(declared))
     if mined_directions:
         effective_directions = dict(policy.expected_directions or {})
         conflicts = {
@@ -1028,7 +1031,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         }
         if conflicts:
             raise ValueError(
-                "mined snapshot expected directions conflict with validation policy: "
+                "factor expected directions conflict with validation policy: "
                 f"{conflicts}"
             )
         effective_directions.update(mined_directions)

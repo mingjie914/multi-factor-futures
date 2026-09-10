@@ -1,4 +1,6 @@
-"""日内因子 (分钟数据聚合为日度值).
+"""日内因子及日频补充因子 (以各类 input_bar_frequency 为准).
+
+多数因子由分钟数据聚合为日度值；日频补充因子直接读取日线，不视为分钟因子。
 
 依赖主框架已配置的本地分钟数据源，由框架按精确合约根和因果主力日程聚合为日度字段:
 - vwap: 成交量加权均价
@@ -30319,3 +30321,734 @@ class IntradayMarketPathResidualStability20d(_MinutePathImpactFactorBase):
     name = "intraday_market_path_residual_stability_20d"
     description = "市场路径残差稳定度 (同步性与低噪声结合)"
     FEATURE = "market_path_residual_stability"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 584. volume_price_corr — 日度成交量与绝对收益相关性 (第606个登记因子)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("volume_price_corr_20d", category="volume_price")
+class VolumePriceCorr20D(Factor):
+    """日度成交量与绝对收益相关性因子.
+
+    【用法说明】factor=corr(volume, abs(close/prev_close-1), 20)，按品种
+    计算20个交易日的滚动Pearson相关系数；必须有20对有效观测。
+    输入为日线close、volume，输出为日频；20d是计算窗口，不是预测期或持仓期。
+    不额外平滑或shift，使用当日收盘数据的暴露只能在数据可得后用于后续决策，
+    执行时序由组合模块处理。声明检验预测期为10/20/40个交易日。
+
+    【含义】高值表示成交量与价格变动幅度同步，不区分上涨或下跌。
+    负向使用表示偏好量与波动幅度相关性较弱的品种；实际方向由准入证据冻结。
+
+    ⚠ 跨日依赖: 20对量价观测至少需要21个连续有效收盘价；缺失不前填。
+    """
+    name = "volume_price_corr_20d"
+    category = "volume_price"
+    frequency = "daily"
+    input_bar_frequency = "daily"
+    signal_frequency = "daily"
+    validation_horizons = (10, 20, 40)
+    description = "过去 20 日成交量与收益率绝对值的相关系数 (量价关系因子)"
+
+    def dependencies(self) -> list:
+        return ["close", "volume"]
+
+    def compute(self, data, dates, universe):
+        close = data.get("close", dates, universe)
+        volume = data.get("volume", dates, universe)
+        if close.empty or volume.empty:
+            return pd.DataFrame(index=dates, columns=universe)
+        ret_abs = close.pct_change(fill_method=None).abs()
+        return ret_abs.rolling(20).corr(volume)
+
+
+def _daily_corr20(x, y):
+    """20对完整日观测的相关系数；零方差不构造信号。"""
+    import polars as pl
+    valid = (x.rolling_var(20) > 0) & (y.rolling_var(20) > 0)
+    return pl.when(valid).then(pl.rolling_corr(x, y, window_size=20).clip(-1, 1))
+
+
+class _DailyVolumeReturnCorrFactor(VolumePriceCorr20D):
+    """日度量价变体共用读取与Polars/Rust表达式执行，不计算其他成员。"""
+
+    def compute(self, data, dates, universe):
+        import polars as pl
+        close = data.get("close", dates, universe).reindex(index=dates, columns=universe)
+        volume = data.get("volume", dates, universe).reindex(index=dates, columns=universe)
+        if close.empty:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        columns, expressions = {}, []
+        for i in range(len(universe)):
+            c, v = close.iloc[:, i].to_numpy(float), volume.iloc[:, i].to_numpy(float)
+            columns[f"c{i}"] = np.where(np.isfinite(c) & (c > 0), c, np.nan)
+            columns[f"v{i}"] = np.where(np.isfinite(v) & (v >= 0), v, np.nan)
+            price, amount = pl.col(f"c{i}"), pl.col(f"v{i}")
+            r, logv = price / price.shift(1) - 1, amount.log1p()
+            expressions.append(self._expression(logv, r).alias(str(i)))
+        values = pl.DataFrame(columns, nan_to_null=True).select(expressions).to_numpy()
+        return pd.DataFrame(np.where(np.isfinite(values), values, np.nan), index=dates, columns=universe)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 585. intraday_volume_surprise_abs_return_corr — 异常量与绝对收益相关 (登记607)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_surprise_abs_return_corr_20d", category="volume_price")
+class IntradayVolumeSurpriseAbsReturnCorr20d(_DailyVolumeReturnCorrFactor):
+    """异常成交量与波动幅度的同步性.
+
+    【用法说明】令r=close/prev_close-1、v=log(1+volume)，异常量为v减去
+    前20日v均值；factor=corr(异常量, abs(r), 20)。日线输入、日频输出，
+    不额外shift；声明检验预测期10/20/40日，非调仓周期。
+    【含义】剔除慢变量能水平，衡量超出近期常态的放量是否伴随价格大幅变动。
+    方向: 待检验，不预设有效方向。
+    ⚠ 前置20日量能基准加20对相关观测，至少需40日数据；缺失不填充。
+    """
+    name = "intraday_volume_surprise_abs_return_corr_20d"
+    description = "异常量与绝对收益相关 (剔除前20日常态量能)"
+
+    def _expression(self, v, r):
+        return _daily_corr20(v - v.rolling_mean(20).shift(1), r.abs())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 586. intraday_volume_directional_corr_spread — 上下行量价相关差 (登记608)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_directional_corr_spread_20d", category="volume_price")
+class IntradayVolumeDirectionalCorrSpread20d(_DailyVolumeReturnCorrFactor):
+    """下行与上行量价耦合的不对称性.
+
+    【用法说明】v=log(1+volume)，factor=corr(v, max(-r,0),20)
+    -corr(v,max(r,0),20)。两侧均使用同一20日窗口，不筛成两段不等长样本。
+    日线输入、日频输出，不额外shift；检验预测期10/20/40日。
+    【含义】高值表示成交量与下跌幅度的联系强于上涨幅度，区分卖压与买盘。
+    方向: 待检验，不预设有效方向。
+    ⚠ 至少21日收盘数据；任一侧窗口内无变化时输出NaN，不将单边行情补为0。
+    """
+    name = "intraday_volume_directional_corr_spread_20d"
+    description = "上下行量价相关差 (下行耦合减上行耦合)"
+
+    def _expression(self, v, r):
+        return _daily_corr20(v, r.clip(upper_bound=0).abs()) - _daily_corr20(v, r.clip(lower_bound=0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 587. intraday_lagged_volume_abs_return_corr — 前日量与当日波动相关 (登记609)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lagged_volume_abs_return_corr_20d", category="volume_price")
+class IntradayLaggedVolumeAbsReturnCorr20d(_DailyVolumeReturnCorrFactor):
+    """成交量先于价格变动幅度的时序关系.
+
+    【用法说明】factor=corr(log(1+volume).shift(1),abs(r),20)。只使用
+    已发生的前日量与当日收益，不使用未来收益；日线输入、日频输出，不再整体shift。
+    声明检验预测期10/20/40日，组合仍按既定执行时序使用。
+    【含义】高值表示放量后次日波动幅度往往更大，区别于当日量价同步关系。
+    方向: 待检验，不预设有效方向。
+    ⚠ 至少21日输入，窗口内须有20对有效量价观测。
+    """
+    name = "intraday_lagged_volume_abs_return_corr_20d"
+    description = "前日量与当日波动相关 (滞后量价联系)"
+
+    def _expression(self, v, r):
+        return _daily_corr20(v.shift(1), r.abs())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 588. intraday_volume_abs_return_partial_corr — 剔除波动延续的量价偏相关 (登记610)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_abs_return_partial_corr_20d", category="volume_price")
+class IntradayVolumeAbsReturnPartialCorr20d(_DailyVolumeReturnCorrFactor):
+    """控制前日波动幅度后的量价偏相关.
+
+    【用法说明】x=log(1+volume)、y=abs(r)、z=abs(r).shift(1)，三个相关
+    系数均在同一20组三元完整观测上计算；factor=(corr(x,y)-corr(x,z)*corr(y,z))
+    /sqrt((1-corr(x,z)^2)*(1-corr(y,z)^2))，截于[-1,1]。
+    日线输入、日频输出，不额外shift；检验预测期10/20/40日。
+    【含义】降低波动聚集造成的量价关联，衡量控制前日波动后的独立同步关系。
+    方向: 待检验，不预设有效方向。
+    ⚠ 至少22日输入；三元观测任一缺失均不使用，分母≤1e-12时输出NaN。
+    """
+    name = "intraday_volume_abs_return_partial_corr_20d"
+    description = "剔除波动延续的量价偏相关 (控制前日绝对收益)"
+
+    def _expression(self, v, r):
+        import polars as pl
+        y, z = r.abs(), r.abs().shift(1)
+        valid = v.is_finite() & y.is_finite() & z.is_finite()
+        x, y, z = (pl.when(valid).then(value) for value in (v, y, z))
+        xy, xz, yz = _daily_corr20(x, y), _daily_corr20(x, z), _daily_corr20(y, z)
+        denominator = ((1 - xz*xz).clip(lower_bound=0) * (1 - yz*yz).clip(lower_bound=0)).sqrt()
+        return pl.when(denominator > 1e-12).then(((xy - xz*yz) / denominator).clip(-1, 1))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 分钟量价与持仓结构: 窗口按输入bar计数，日末输出，不做额外日度平滑。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _structure_bound(value):
+    """每个运算节点转float32并限幅；原始特征不提前限幅。"""
+    value = np.asarray(value, dtype=np.float32)
+    return np.where(np.isfinite(value), np.clip(value, -1e8, 1e8), np.nan)
+
+
+def _structure_divide(left, right):
+    result = np.full(left.shape, np.nan, dtype=np.float32)
+    finite = np.isfinite(left) & np.isfinite(right)
+    stable = finite & (np.abs(right) > 1e-8)
+    np.divide(left, right, out=result, where=stable)
+    result[finite & ~stable] = 0.
+    return _structure_bound(result)
+
+
+def _structure_roll(value, window, method):
+    minimum = max(2, min(window, max(3, window // 2)))
+    frame = pd.DataFrame(np.asarray(value, dtype=float))
+    if method == "mean":
+        return _roll_mean(frame, window, minimum).to_numpy()
+    if method == "std":
+        # 近零标准差会放大舍入误差；保留样本标准差的既定算法。
+        return frame.rolling(window, min_periods=minimum).std().to_numpy()
+    import polars as pl
+    return pl.DataFrame(frame.to_numpy(), nan_to_null=True).select(
+        pl.all().rolling_max(window, min_samples=minimum)
+    ).to_numpy()
+
+
+def _structure_zscore(value, window):
+    return _structure_divide(value - _structure_roll(value, window, "mean"),
+                             _structure_roll(value, window, "std"))
+
+
+def _structure_demean(value, mask):
+    from factors.numerics import _row_nanmean
+    value = value if mask is None else np.where(mask, value, np.nan)
+    return _structure_bound(value - _row_nanmean(value))
+
+
+def _structure_feature(entry, name):
+    """只计算实际使用的特征；Polars在列方向调用Rust窗口内核。"""
+    import polars as pl
+    cache = entry["features"]
+    if name in cache:
+        return cache[name]
+    provider, bars, universe = entry["provider"], entry["bars"], entry["universe"]
+    def raw(field):
+        if field not in entry["raw"]:
+            entry["raw"][field] = pl.DataFrame(
+                provider.get(field, bars, universe).to_numpy(dtype=float), nan_to_null=True)
+        return entry["raw"][field]
+    def divide(left, right):
+        return pl.when(right.abs() > 1e-12).then(left / right)
+    match = re.fullmatch(r"(.+)_(\d+)p", name)
+    if match is None:
+        result = raw(name)
+    else:
+        kind, window = match.group(1), int(match.group(2))
+        minimum = max(2, min(window, max(3, window // 2)))
+        x = pl.all()
+        mean = x.rolling_mean(window, min_samples=minimum)
+        if "_lag" in kind:
+            result = raw(kind.split("_")[0]).select(x.shift(window))
+        elif kind in {"oi_change", "return"}:
+            result = raw("oi" if kind == "oi_change" else "close").select(x / x.shift(window) - 1)
+        elif kind.endswith("_mean"):
+            result = raw(kind.split("_")[0]).select(mean)
+        elif kind.endswith("_relative") or kind == "close_ma_gap":
+            result = raw(kind.split("_")[0]).select(divide(x, mean) - 1)
+        elif kind == "close_ema_gap":
+            ema = x.ewm_mean(span=window, adjust=False, min_samples=minimum,
+                             ignore_nulls=False).forward_fill()
+            result = raw("close").select(divide(x, ema) - 1)
+        elif kind == "boll_width":
+            result = raw("close").select(
+                divide(x.rolling_std(window, min_samples=minimum, ddof=1) * 4, mean.abs()))
+        elif kind in {"realized_vol", "amihud"}:
+            returns = raw("close").select(divide(x, x.shift(1)) - 1)
+            if kind == "amihud":
+                # 同列相除，不跨品种聚合；金额尺度保持数据源原始单位。
+                amounts = raw("amount").to_numpy()
+                r = returns.to_numpy()
+                values = np.divide(np.abs(r), np.abs(amounts),
+                    out=np.full(r.shape, np.nan), where=np.abs(amounts) > 1e-12)
+                result = pl.DataFrame(values, nan_to_null=True).select(mean)
+            else:
+                result = returns.select(x.rolling_std(window, min_samples=minimum, ddof=1))
+        else:
+            raise KeyError(f"unsupported minute structure feature: {name}")
+    value = result.to_numpy().astype(np.float32)
+    cache[name] = np.where(np.isfinite(value), value, np.nan)
+    return cache[name]
+
+
+class _MinuteStructureFactor(Factor):
+    """固定分钟输入、两bar滞后、日末采样的量价持仓复合因子。
+
+    特征先转float32，每个运算节点限幅±1e8；保护除法在有限分母绝对值
+    ≤1e-8时取0，缺失仍为NaN。信号与60bar收益波动率均滞后2bar，
+    依次做5倍MAD去极值、截面去均值及波动率中性化，再取每个品种实际
+    最后报价bar的值（不向前寻找非空信号）。交易日归属沿用数据源会话日历。
+    原始窗口、滞后均按输入bar计数，不等同于日度预测期或组合持仓期。
+    """
+    frequency = signal_frequency = "daily"
+    input_bar_frequency = "5min"
+    expected_direction = 1
+    validation_horizons = (5, 10, 20)
+    requires_training_sample_contract = True
+
+    def dependencies(self):
+        return list(self.FIELDS)
+
+    def prefetch_dependencies(self):
+        return []
+
+    def compute(self, data, dates, universe):
+        from data.manager import FrequencyDataProvider
+        from factors.numerics import shift_signal, mad_winsorize, neutralize_signal
+        dates = pd.DatetimeIndex(dates)
+        if len(dates) == 0 or len(universe) == 0:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        key = _panel_cache_key(dates, universe, self.input_bar_frequency + ":structure",
+                               _source_cache_namespace(data))
+        # 复用现有面板缓存及清理入口，不改动其他因子的缓存内容或计算分组。
+        with _PANEL_CACHE_LOCK:
+            if key not in _PANEL_CACHE:
+                provider = FrequencyDataProvider(data, self.input_bar_frequency, dates[0], dates[-1], universe)
+                bars = provider.get_calendar()
+                _remember_panel(key, dict(provider=provider, bars=bars, universe=universe,
+                                          features={}, raw={}))
+            entry = _PANEL_CACHE[key]
+            provider, bars = entry["provider"], entry["bars"]
+            for field in self.FIELDS:
+                if provider.get(field, bars, universe).isna().all().all():
+                    raise ValueError(f"{self.name}: missing required {self.input_bar_frequency} field {field}")
+            sessions = data.source.trading_session_index(bars).normalize()
+            eligibility = getattr(data, "_factor_eligibility", None)
+            mask = None if eligibility is None else eligibility.reindex(
+                index=sessions, columns=universe, fill_value=False).fillna(False).to_numpy(bool)
+            feature = lambda name: _structure_feature(entry, name)
+            raw = self._formula(feature, mask)
+            volatility = feature("realized_vol_60p")
+        if mask is not None:
+            raw, volatility = (np.where(mask, x, np.nan) for x in (raw, volatility))
+        signal = neutralize_signal(
+            mad_winsorize(shift_signal(self.RAW_DIRECTION * raw, 2), 5.),
+            volatility=shift_signal(volatility, 2))
+        if mask is not None:
+            signal = np.where(mask, signal, np.nan)
+        close = provider.get("close", bars, universe).to_numpy(dtype=float)
+        unique = sessions.unique().sort_values()
+        codes = unique.get_indexer(sessions)
+        result = np.full((len(unique), len(universe)), np.nan)
+        for col in range(len(universe)):
+            quoted = np.flatnonzero(np.isfinite(close[:, col]))
+            last = np.full(len(unique), -1, dtype=int)
+            np.maximum.at(last, codes[quoted], quoted)
+            present = last >= 0
+            result[present, col] = signal[last[present], col]
+        return pd.DataFrame(result * self.DAILY_DIRECTION, index=unique,
+                            columns=universe).reindex(dates)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 589. intraday_amount_bandwidth_oi_5min — 成交额波动带宽与头部持仓 (登记611)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amount_bandwidth_oi_5min", category="term_structure")
+class IntradayAmountBandwidthOi5min(_MinuteStructureFactor):
+    """成交额波动带宽与头部持仓.
+
+    【用法说明】原始表达式:
+    max(curve_top2_oi,mul(amount_lag_4p,ts_std(boll_width_30p,30)))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量成交额波动带宽与头部持仓对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_amount_bandwidth_oi_5min"
+    category = "term_structure"
+    description = "成交额波动带宽与头部持仓 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_top2_oi",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = 1
+    training_days = training_bars = 1215
+    training_start = "2018-01-02 09:00:00"
+    training_end = "2022-12-30 14:55:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.maximum(f("curve_top2_oi"), _structure_bound(f("amount_lag_4p") * _structure_bound(_structure_roll(f("boll_width_30p"), 30, "std")))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 590. intraday_oi_breadth_deviation_5min — 持仓广度与总持仓异常 (登记612)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_oi_breadth_deviation_5min", category="term_structure")
+class IntradayOiBreadthDeviation5min(_MinuteStructureFactor):
+    """持仓广度与总持仓异常.
+
+    【用法说明】原始表达式:
+    mul(curve_oi_breadth,sub(curve_oi_hhi,ts_zscore(curve_total_oi,60)))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量持仓广度与总持仓异常对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_oi_breadth_deviation_5min"
+    category = "term_structure"
+    description = "持仓广度与总持仓异常 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("close","curve_oi_breadth","curve_oi_hhi","curve_total_oi",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(f("curve_oi_breadth") * _structure_bound(f("curve_oi_hhi") - _structure_zscore(f("curve_total_oi"), 60)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 591. intraday_oi_breadth_concentration_clip_5min — 持仓广度与集中度截断 (登记613)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_oi_breadth_concentration_clip_5min", category="term_structure")
+class IntradayOiBreadthConcentrationClip5min(_MinuteStructureFactor):
+    """持仓广度与集中度截断.
+
+    【用法说明】原始表达式:
+    min(sub(curve_oi_hhi,ts_zscore(curve_total_oi,60)),curve_oi_breadth)
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量持仓广度与集中度截断对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_oi_breadth_concentration_clip_5min"
+    category = "term_structure"
+    description = "持仓广度与集中度截断 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("close","curve_oi_breadth","curve_oi_hhi","curve_total_oi",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.minimum(_structure_bound(f("curve_oi_hhi") - _structure_zscore(f("curve_total_oi"), 60)), f("curve_oi_breadth")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 592. intraday_amount_price_deviation_5min — 成交额与价格偏离强度 (登记614)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amount_price_deviation_5min", category="momentum")
+class IntradayAmountPriceDeviation5min(_MinuteStructureFactor):
+    """成交额与价格偏离强度.
+
+    【用法说明】原始表达式:
+    abs(neg(div(amount_mean_12p,ts_zscore(close_ma_gap_12p,24))))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量成交额与价格偏离强度对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_amount_price_deviation_5min"
+    category = "momentum"
+    description = "成交额与价格偏离强度 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.abs(_structure_bound(-_structure_divide(f("amount_mean_12p"), _structure_zscore(f("close_ma_gap_12p"), 24)))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 593. intraday_illiquidity_total_oi_5min — 非流动性与总持仓比 (登记615)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_illiquidity_total_oi_5min", category="term_structure")
+class IntradayIlliquidityTotalOi5min(_MinuteStructureFactor):
+    """非流动性与总持仓比.
+
+    【用法说明】原始表达式:
+    div(amihud_24p,curve_total_oi)
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量非流动性与总持仓比对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_illiquidity_total_oi_5min"
+    category = "term_structure"
+    description = "非流动性与总持仓比 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_total_oi",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_divide(f("amihud_24p"), f("curve_total_oi"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 594. intraday_amount_concentration_spread_5min — 截面成交额与持仓集中度差 (登记616)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amount_concentration_spread_5min", category="term_structure")
+class IntradayAmountConcentrationSpread5min(_MinuteStructureFactor):
+    """截面成交额与持仓集中度差.
+
+    【用法说明】原始表达式:
+    sub(cs_demean(amount_lag_8p),ts_max(curve_oi_concentration,3))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量截面成交额与持仓集中度差对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_amount_concentration_spread_5min"
+    category = "term_structure"
+    description = "截面成交额与持仓集中度差 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_oi_concentration",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = 1
+    training_days = training_bars = 1215
+    training_start = "2018-01-02 09:00:00"
+    training_end = "2022-12-30 14:55:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(_structure_demean(f("amount_lag_8p"), mask) - _structure_bound(_structure_roll(f("curve_oi_concentration"), 3, "max")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 595. intraday_trend_oi_composite_5min — 均线趋势与增仓复合 (登记617)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trend_oi_composite_5min", category="momentum")
+class IntradayTrendOiComposite5min(_MinuteStructureFactor):
+    """均线趋势与增仓复合.
+
+    【用法说明】原始表达式:
+    max(close_ma_gap_48p,add(min(volume_lag_12p,close_ma_gap_60p),add(close_ema_gap_48p,oi_change_15p)))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量均线趋势与增仓复合对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_trend_oi_composite_5min"
+    category = "momentum"
+    description = "均线趋势与增仓复合 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("close","oi","volume",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = 1
+    training_days = training_bars = 1215
+    training_start = "2018-01-02 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.maximum(f("close_ma_gap_48p"), _structure_bound(_structure_bound(np.minimum(f("volume_lag_12p"), f("close_ma_gap_60p"))) + _structure_bound(f("close_ema_gap_48p") + f("oi_change_15p")))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 596. intraday_relative_oi_trend_clip_1min — 相对持仓与均线趋势截断 (登记618)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_oi_trend_clip_1min", category="momentum")
+class IntradayRelativeOiTrendClip1min(_MinuteStructureFactor):
+    """相对持仓与均线趋势截断.
+
+    【用法说明】原始表达式:
+    max(oi_relative_48p,neg(min(min(close_ema_gap_60p,close_ma_gap_48p),close_ma_gap_48p)))
+    p及窗口整数均为1min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量相对持仓与均线趋势截断对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_relative_oi_trend_clip_1min"
+    category = "momentum"
+    description = "相对持仓与均线趋势截断 (1min输入、日频输出)"
+    input_bar_frequency = "1min"
+    FIELDS = ("close","oi",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.maximum(f("oi_relative_48p"), _structure_bound(-_structure_bound(np.minimum(_structure_bound(np.minimum(f("close_ema_gap_60p"), f("close_ma_gap_48p"))), f("close_ma_gap_48p"))))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 597. intraday_oi_change_concentration_adjusted_5min — 集中度调整的增仓强度 (登记619)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_oi_change_concentration_adjusted_5min", category="term_structure")
+class IntradayOiChangeConcentrationAdjusted5min(_MinuteStructureFactor):
+    """集中度调整的增仓强度.
+
+    【用法说明】原始表达式:
+    sub(oi_change_30p,div(oi_relative_48p,add(curve_oi_hhi,signed_sqrt(curve_oi_hhi))))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量集中度调整的增仓强度对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_oi_change_concentration_adjusted_5min"
+    category = "term_structure"
+    description = "集中度调整的增仓强度 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("close","curve_oi_hhi","oi",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(f("oi_change_30p") - _structure_divide(f("oi_relative_48p"), _structure_bound(f("curve_oi_hhi") + _structure_bound(np.sign(f("curve_oi_hhi")) * np.sqrt(np.abs(f("curve_oi_hhi")))))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 598. intraday_volume_amount_concentration_clip_5min — 量额比与持仓集中度截断 (登记620)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_amount_concentration_clip_5min", category="term_structure")
+class IntradayVolumeAmountConcentrationClip5min(_MinuteStructureFactor):
+    """量额比与持仓集中度截断.
+
+    【用法说明】原始表达式:
+    min(signed_sqrt(curve_oi_hhi),div(volume_mean_48p,amount_lag_12p))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量量额比与持仓集中度截断对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_volume_amount_concentration_clip_5min"
+    category = "term_structure"
+    description = "量额比与持仓集中度截断 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_oi_hhi","volume",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = 1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.minimum(_structure_bound(np.sign(f("curve_oi_hhi")) * np.sqrt(np.abs(f("curve_oi_hhi")))), _structure_divide(f("volume_mean_48p"), f("amount_lag_12p"))))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 599. intraday_oi_breadth_price_divergence_5min — 持仓广度与增仓价格背离 (登记621)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_oi_breadth_price_divergence_5min", category="term_structure")
+class IntradayOiBreadthPriceDivergence5min(_MinuteStructureFactor):
+    """持仓广度与增仓价格背离.
+
+    【用法说明】原始表达式:
+    mul(min(amount_lag_1p,curve_oi_breadth),sub(oi_change_30p,return_30p))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量持仓广度与增仓价格背离对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_oi_breadth_price_divergence_5min"
+    category = "term_structure"
+    description = "持仓广度与增仓价格背离 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_oi_breadth","oi",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1459
+    training_start = "2017-01-03 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(_structure_bound(np.minimum(f("amount_lag_1p"), f("curve_oi_breadth"))) * _structure_bound(f("oi_change_30p") - f("return_30p")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 600. intraday_relative_oi_price_clip_1min — 相对持仓与价格偏离截断 (登记622)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_oi_price_clip_1min", category="momentum")
+class IntradayRelativeOiPriceClip1min(_MinuteStructureFactor):
+    """相对持仓与价格偏离截断.
+
+    【用法说明】原始表达式:
+    min(neg(oi_relative_48p),close_ma_gap_60p)
+    p及窗口整数均为1min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量相对持仓与价格偏离截断对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_relative_oi_price_clip_1min"
+    category = "momentum"
+    description = "相对持仓与价格偏离截断 (1min输入、日频输出)"
+    input_bar_frequency = "1min"
+    FIELDS = ("close","oi",)
+    RAW_DIRECTION = 1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1215
+    training_start = "2018-01-02 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.minimum(_structure_bound(-f("oi_relative_48p")), f("close_ma_gap_60p")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 601. intraday_amount_oi_change_intensity_5min — 成交额异常与增仓强度 (登记623)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_amount_oi_change_intensity_5min", category="term_structure")
+class IntradayAmountOiChangeIntensity5min(_MinuteStructureFactor):
+    """成交额异常与增仓强度.
+
+    【用法说明】原始表达式:
+    signed_sqrt(mul(mul(abs(amount_relative_48p),div(oi_change,amount_mean_12p)),curve_contract_count))
+    p及窗口整数均为5min bar数；日频输出，统一执行基类两bar滞后及截面处理。
+    【含义】衡量成交额异常与增仓强度对应的量价和持仓结构联系，保留非线性截断。
+    方向: 原始表达式乘-1后处理，日末再乘-1，方向冻结。
+    ⚠ 至少覆盖60bar波动率基准及表达式嵌套窗口；跨日连续滚动，不填充缺失。
+    检验预测期为5/10/20个交易日，不决定调仓或机械持仓日数。
+    """
+    name = "intraday_amount_oi_change_intensity_5min"
+    category = "term_structure"
+    description = "成交额异常与增仓强度 (5min输入、日频输出)"
+    input_bar_frequency = "5min"
+    FIELDS = ("amount","close","curve_contract_count","oi_change",)
+    RAW_DIRECTION = -1
+    DAILY_DIRECTION = -1
+    training_days = training_bars = 1215
+    training_start = "2018-01-02 09:00:00"
+    training_end = "2022-12-30 15:10:00"
+
+    def _formula(self, f, mask):
+        return _structure_bound(np.sign(_structure_bound(_structure_bound(_structure_bound(np.abs(f("amount_relative_48p"))) * _structure_divide(f("oi_change"), f("amount_mean_12p"))) * f("curve_contract_count"))) * np.sqrt(np.abs(_structure_bound(_structure_bound(_structure_bound(np.abs(f("amount_relative_48p"))) * _structure_divide(f("oi_change"), f("amount_mean_12p"))) * f("curve_contract_count")))))

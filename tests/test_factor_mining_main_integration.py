@@ -55,6 +55,26 @@ def test_main_exposes_factor_mining_as_first_class_command():
     assert main.WORKFLOW_COMMANDS["mining"][0] == "factor_mining.cli"
 
 
+def test_explicit_snapshot_registers_before_dispatch(tmp_path, monkeypatch):
+    from core.registry import list_registered
+    from factor_mining.bridge import _REGISTERED_EXPECTED_DIRECTIONS
+    snapshot = _snapshot(tmp_path)
+    name = "mined_gp_main_gateway_test"
+    monkeypatch.setattr(main.sys, "argv", ["main.py", "research", "--mined-snapshot", str(snapshot)])
+    monkeypatch.setenv(SNAPSHOT_ENV, "old-missing-snapshot.json")
+    calls = []
+    def dispatch(command):
+        assert list_registered("factor")["factor"][name].expected_direction == 1
+        calls.append(command)
+    monkeypatch.setattr(main, "_dispatch", dispatch)
+    try:
+        main.main()
+        assert calls == ["research"]
+    finally:
+        list_registered("factor")["factor"].pop(name, None)
+        _REGISTERED_EXPECTED_DIRECTIONS.pop(name, None)
+
+
 def test_formal_mining_uses_the_unified_framework_data_source(monkeypatch):
     index = pd.date_range("2025-01-02 09:00", periods=3, freq="min")
     source = SimpleNamespace(closed=False)

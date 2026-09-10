@@ -794,7 +794,7 @@ def _add_search_arguments(parser: argparse.ArgumentParser, *, synthetic: bool) -
         "--use-fast-rolling",
         action="store_true",
         help=(
-            "use optional Bottleneck for verified mean/std/min/max; "
+            "use verified Bottleneck mean and Polars/Rust min/max; "
             "all other rolling operators remain on Pandas"
         ),
     )

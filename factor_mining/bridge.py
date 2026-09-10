@@ -50,7 +50,7 @@ def _load_panels(candidate: CandidateSpec, data, dates, universe) -> dict[str, p
 
 
 def compute_symbolic_candidate(
-    candidate: CandidateSpec, data, dates, universe
+    candidate: CandidateSpec, data, dates, universe, *, features=None, evaluator=None
 ) -> pd.DataFrame:
     if candidate.kind != "symbolic":
         raise TypeError("the first framework bridge supports symbolic candidates only")
@@ -71,9 +71,10 @@ def compute_symbolic_candidate(
     if postprocess.get("neutralize_volatility") and volatility_name:
         required_features.add(str(volatility_name))
     try:
-        features = FeatureEngine(candidate.feature_config).build(
-            panels, required_features=required_features
-        )
+        if features is None:
+            features = FeatureEngine(candidate.feature_config).build(
+                panels, required_features=required_features
+            )
     except KeyError:
         return pd.DataFrame(np.nan, index=dates, columns=universe)
     eligibility = getattr(data, "_factor_eligibility", None)
@@ -84,9 +85,9 @@ def compute_symbolic_candidate(
             columns=features.symbols,
             fill_value=False,
         ).fillna(False).to_numpy(dtype=bool)
-    raw = ExpressionEvaluator(
-        features, cross_section_mask=eligibility_values
-    ).evaluate(expression, copy=False)
+    if evaluator is None:
+        evaluator = ExpressionEvaluator(features, cross_section_mask=eligibility_values)
+    raw = evaluator.evaluate(expression, copy=False)
     if eligibility_values is not None:
         raw = np.where(eligibility_values, raw, np.nan)
     if postprocess.get("neutralize_volatility") and volatility_name:
@@ -130,6 +131,7 @@ def make_factor_class(candidate: CandidateSpec):
     from core.interfaces import Factor
 
     class SnapshotFactor(Factor):
+        expected_direction = 1
         name = candidate.framework_name
         category = candidate.category
         frequency = candidate.frequency
@@ -160,7 +162,7 @@ def make_factor_class(candidate: CandidateSpec):
 
 
 def register_snapshot(path: str | Path) -> tuple[str, ...]:
-    from factors.user import register_user_factor
+    from core.registry import register_factor
 
     names: list[str] = []
     for candidate in load_snapshot(path, require_framework=True):
@@ -169,7 +171,7 @@ def register_snapshot(path: str | Path) -> tuple[str, ...]:
                 f"candidate {candidate.candidate_id} is not supported by the symbolic bridge"
             )
         factor_class = make_factor_class(candidate)
-        register_user_factor(
+        register_factor(
             candidate.framework_name, category=candidate.category
         )(factor_class)
         # compute_symbolic_candidate multiplies raw values by the training

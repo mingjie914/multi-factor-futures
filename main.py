@@ -153,6 +153,9 @@ def main() -> None:
         raise SystemExit(2) from exc
     sys.argv = configured_argv
     if candidate_count:
+        import factors.library  # Register built-ins before explicit candidates.
+        from factor_mining.bridge import register_snapshot_from_environment
+        register_snapshot_from_environment()
         print(f"Validated mined-factor snapshot: {candidate_count} candidates")
     _dispatch(command)
 

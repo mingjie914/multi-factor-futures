@@ -5,8 +5,85 @@ from __future__ import annotations
 import importlib.util
 from importlib.metadata import PackageNotFoundError, version
 import os
+from typing import Sequence
 
 import numpy as np
+
+
+def shift_signal(signal: np.ndarray, bars: int) -> np.ndarray:
+    value = np.asarray(signal, dtype=np.float32)
+    result = np.full(value.shape, np.nan, dtype=np.float32)
+    if bars < len(value):
+        result[bars:] = value[:-bars]
+    return result
+
+
+def mad_winsorize(signal: np.ndarray, clip: float) -> np.ndarray:
+    value = np.asarray(signal, dtype=float)
+    usable_rows = np.isfinite(value).any(axis=1)
+    median = np.full((len(value), 1), np.nan, dtype=float)
+    mad = np.full((len(value), 1), np.nan, dtype=float)
+    if usable_rows.any():
+        usable = value[usable_rows]
+        usable_median = np.nanmedian(usable, axis=1, keepdims=True)
+        median[usable_rows] = usable_median
+        mad[usable_rows] = np.nanmedian(
+            np.abs(usable - usable_median), axis=1, keepdims=True
+        )
+    scale = 1.4826 * mad
+    lower = median - clip * scale
+    upper = median + clip * scale
+    usable = np.isfinite(scale) & (scale > 1e-12)
+    clipped = np.where(usable, np.minimum(np.maximum(value, lower), upper), value)
+    return clipped.astype(np.float32)
+
+
+def neutralize_signal(
+    signal: np.ndarray,
+    *,
+    volatility: np.ndarray | None = None,
+    group_labels: Sequence[str] | None = None,
+) -> np.ndarray:
+    """Cross-sectionally remove group means and one volatility control."""
+    result = np.asarray(signal, dtype=float).copy()
+    if group_labels is not None:
+        labels = np.asarray(group_labels)
+        if labels.shape != (result.shape[1],):
+            raise ValueError("group_labels must contain one label per symbol")
+        for label in np.unique(labels):
+            columns = labels == label
+            result[:, columns] -= _row_nanmean(result[:, columns])
+
+    row_mean = _row_nanmean(result)
+    result -= row_mean
+    if volatility is not None:
+        control = np.asarray(volatility, dtype=float)
+        if control.shape != result.shape:
+            raise ValueError("volatility control shape does not match signal")
+        control = control - _row_nanmean(control)
+        valid = np.isfinite(result) & np.isfinite(control)
+        covariance = np.nansum(np.where(valid, result * control, np.nan), axis=1, keepdims=True)
+        variance = np.nansum(np.where(valid, control * control, np.nan), axis=1, keepdims=True)
+        beta = np.divide(
+            covariance,
+            variance,
+            out=np.zeros_like(covariance),
+            where=variance > 1e-12,
+        )
+        result = result - beta * control
+    return result.astype(np.float32)
+
+
+def _row_nanmean(value: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(value)
+    total = np.where(finite, value, 0.0).sum(axis=1, keepdims=True)
+    count = finite.sum(axis=1, keepdims=True)
+    return np.divide(
+        total,
+        count,
+        out=np.full_like(total, np.nan, dtype=float),
+        where=count > 0,
+    )
 
 
 _RETURN_STAT_FIELDS = (

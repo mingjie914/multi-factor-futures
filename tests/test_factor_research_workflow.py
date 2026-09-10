@@ -170,7 +170,7 @@ def test_registered_factor_contract_rejects_formal_horizon_override():
         )
 
 
-def test_intraday_admission_horizons_are_uniform_h5_h10_h20():
+def test_intraday_admission_horizons_preserve_minute_and_daily_contracts():
     from core.registry import list_registered
     import factors.library.intraday  # noqa: F401
 
@@ -180,7 +180,13 @@ def test_intraday_admission_horizons_are_uniform_h5_h10_h20():
         if factor.__module__.startswith("factors.library.intraday")
     ]
     assert intraday
-    assert {factor.validation_horizons for factor in intraday} == {(5, 10, 20)}
+    daily = [factor for factor in intraday if getattr(factor, "input_bar_frequency", "1min") == "daily"]
+    assert len(daily) == 5
+    assert "volume_price_corr_20d" in {factor.name for factor in daily}
+    assert {factor.validation_horizons for factor in daily} == {(10, 20, 40)}
+    minute = [factor for factor in intraday if getattr(factor, "input_bar_frequency", "1min") != "daily"]
+    assert len(minute) == 618
+    assert {factor.validation_horizons for factor in minute} == {(5, 10, 20)}
 
 
 def test_requested_factor_validation_rejects_unknown_names():

@@ -106,19 +106,23 @@ reference/shadow对照，再运行全量测试与单线程全池画像。
 
 ## 动态注册检查
 
-`factors.library` 的导入会注册内置、SPEC 和 user 因子；`factors.user` 会按文件名排序
-自动发现公开模块。新增 user 文件即改变发现池，必须同时增加测试并记录研究边界。
+`factors.library` 默认只注册内置因子，不导入SPEC或扫描user目录。
+显式研究调用 `factors.library.load_research_factor_catalog()` 才加载SPEC/user候选目录；
+`factors.user` 的显式加载仍按文件名排序扫描，但排除自动快照桥接模块。
+新增候选文件需要测试和研究边界；候选生成不能自动写入intraday源码、有效库或策略配置。
 
 Mined 因子只通过以下路径进入同一个 registry：
 
 ```text
 SQLite candidate catalog -> immutable JSON snapshot
   -> main.py --mined-snapshot
-  -> factors/user/auto_mined_bridge.py
+  -> factor_mining.bridge.register_snapshot_from_environment (explicit call)
   -> ordinary Factor subclass
 ```
 
 不得从 SQLite 直接运行因子，也不得让候选覆盖既有注册名。
+遗留 `MF_MINED_CANDIDATE_SNAPSHOT` 环境变量本身不启动默认流程的快照加载。
+默认因子计算与方向检验不反向导入生成器；只消费已显式注册因子的接口和元数据。
 
 ## 组合优化器生命周期
 

@@ -38,6 +38,79 @@ class FrameProvider:
         )
 
 
+def test_shared_candidate_evaluation_matches_original():
+    from factor_mining.features import FeatureEngine
+    from factor_mining.operators import ExpressionEvaluator
+    c = _candidate()
+    panels = make_synthetic_panels(periods=100, symbols=5)
+    data = FrameProvider(panels)
+    dates, universe = panels["close"].index, panels["close"].columns
+    features = FeatureEngine(c.feature_config).build(panels, required_features={"return_1p"})
+    actual = compute_symbolic_candidate(c, data, dates, universe, features=features,
+                                        evaluator=ExpressionEvaluator(features, rolling_backend="fast"))
+    expected = compute_symbolic_candidate(c, data, dates, universe)
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_daily_end_uses_session_and_keeps_last_bar_nan():
+    from factor_mining.daily import daily_end, daily_end_locations
+    dates = pd.to_datetime(["2025-01-03 21:00", "2025-01-06 09:00", "2025-01-06 15:00"])
+    session = pd.to_datetime(["2025-01-06 03:00", "2025-01-06 15:00", "2025-01-06 21:00"])
+    close = pd.DataFrame([[1., 1.], [2., 2.], [3., np.nan]], index=dates)
+    signal = pd.DataFrame([[10., 10.], [20., 20.], [np.nan, 30.]], index=dates)
+    out = daily_end(signal, close, session)
+    assert out.index.tolist() == [pd.Timestamp("2025-01-06")]
+    assert np.isnan(out.iloc[0, 0])
+    assert out.iloc[0, 1] == 20.
+    pd.testing.assert_frame_equal(out, daily_end(signal, close, session,
+        locations=daily_end_locations(close, session)))
+
+
+def test_daily_registration_cleans_up_on_failure():
+    from factor_mining.daily import registered_daily, daily_name
+    from core.registry import list_registered
+    c = _candidate()
+    n = daily_name(c)
+    with pytest.raises(RuntimeError):
+        with registered_daily([c], {n: {"direction": -1, "training_days": 900}}):
+            cls = list_registered("factor")["factor"][n]
+            assert cls.frequency == "daily" and cls.input_bar_frequency == "1min"
+            assert cls.validation_horizons == (5, 10, 20)
+            assert registered_expected_directions([n]) == {n: 1}
+            raise RuntimeError("probe")
+    assert n not in list_registered("factor")["factor"]
+    assert registered_expected_directions([n]) == {}
+
+
+def test_daily_registration_computes_shared_batch_once_in_parallel(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import time
+    from factor_mining.daily import registered_daily, daily_name
+    c = _candidate()
+    name = daily_name(c)
+    dates = pd.date_range("2025-01-01", periods=4)
+    frame = pd.DataFrame(1., index=dates, columns=["RB"])
+    calls = []
+    started = Event()
+    def batch(*args):
+        calls.append(1)
+        started.set()
+        time.sleep(.1)
+        return {name: frame}, {}, []
+    monkeypatch.setattr("factor_mining.daily.compute_daily_batch", batch)
+    data = object()
+    with registered_daily([c], {name: {"direction": -1, "training_days": 900}}):
+        factor = get("factor", name)()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(factor.compute, data, dates, ["RB"])
+            assert started.wait(2)
+            second = pool.submit(factor.compute, data, dates, ["RB"])
+            for future in (first, second):
+                pd.testing.assert_frame_equal(future.result(), -frame)
+    assert len(calls) == 1
+
+
 def _candidate(name="mined_bridge_contract_test"):
     expression = Expr.operation("cs_rank", Expr.terminal("return_1p"))
     return CandidateSpec(

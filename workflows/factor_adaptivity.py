@@ -60,9 +60,6 @@ from scipy import stats as scipy_stats
 from core.logger import setup_logger
 from core.registry import list_registered
 from factors.library import *  # noqa: F401,F403 注册所有因子
-from factors.specs.technicals import *  # noqa: F401,F403
-from factors.specs.directional import *  # noqa: F401,F403
-from factors.specs.volume_stat import *  # noqa: F401,F403
 from core.config import load_config
 from core.period import PeriodContext
 from core.sectors import (

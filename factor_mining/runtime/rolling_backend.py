@@ -47,6 +47,16 @@ def pandas_rolling(
 def _fast_rolling(
     value: np.ndarray, window: int, method: str
 ) -> np.ndarray:
+    if method in {"min", "max"}:
+        # Polars executes these order-statistic kernels in Rust.  Keep sums
+        # and variance on their existing paths: rounding can affect GP ranks.
+        import polars as pl
+        source = np.asarray(value, dtype=float)
+        frame = pl.DataFrame(np.where(np.isfinite(source), source, np.nan), nan_to_null=True)
+        expression = getattr(pl.all(), f"rolling_{method}")(
+            int(window), min_samples=minimum_periods(window)
+        )
+        return frame.select(expression).to_numpy()
     if _bottleneck is None:
         raise RuntimeError("bottleneck is unavailable")
     source = np.asarray(value, dtype=float)
@@ -74,7 +84,7 @@ def _backend_is_compatible(method: str, window: int) -> bool:
     # implementation can prove end-to-end equivalence.
     if method == "std":
         return False
-    if _bottleneck is None or method not in FAST_METHODS:
+    if method not in FAST_METHODS or (_bottleneck is None and method == "mean"):
         return False
     rows = max(32, int(window) * 3)
     rng = np.random.default_rng(731 + int(window))
@@ -85,7 +95,7 @@ def _backend_is_compatible(method: str, window: int) -> bool:
     expected = pandas_rolling(probe, window, method)
     try:
         actual = _fast_rolling(probe, window, method)
-    except (MemoryError, RuntimeError, TypeError, ValueError):
+    except (ImportError, MemoryError, RuntimeError, TypeError, ValueError):
         return False
     return bool(
         np.array_equal(np.isnan(actual), np.isnan(expected))
@@ -111,7 +121,7 @@ def rolling(
     ):
         try:
             return _fast_rolling(value, window, method)
-        except (MemoryError, RuntimeError, TypeError, ValueError):
+        except (ImportError, MemoryError, RuntimeError, TypeError, ValueError):
             pass
     return pandas_rolling(value, window, method)
 

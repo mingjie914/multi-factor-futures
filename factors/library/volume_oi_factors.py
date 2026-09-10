@@ -9,6 +9,7 @@ import pandas as pd
 
 from core.interfaces import Factor
 from core.registry import register_factor
+from .intraday import VolumePriceCorr20D  # 保留原导入路径，不重复注册或计算。
 
 
 @register_factor("oi_change_20d", category="volume_oi")
@@ -149,26 +150,6 @@ class OIChangeRate5D(Factor):
         # 替换 inf 为 NaN (新合约上市首日 oi 从 0 跳到正值会产生 inf)
         change_rate = change_rate.replace([np.inf, -np.inf], np.nan)
         return change_rate
-
-@register_factor("volume_price_corr_20d", category="volume_price")
-class VolumePriceCorr20D(Factor):
-    name = "volume_price_corr_20d"
-    category = "volume_price"
-    frequency = "daily"
-    description = "过去 20 日成交量与收益率绝对值的相关系数 (量价关系因子)"
-
-    def dependencies(self) -> list:
-        return ["close", "volume"]
-
-    def compute(self, data, dates, universe):
-        close = data.get("close", dates, universe)
-        volume = data.get("volume", dates, universe)
-        if close.empty or volume.empty:
-            return pd.DataFrame(index=dates, columns=universe)
-        ret_abs = close.pct_change(fill_method=None).abs()
-        # 量价同向 (正相关): 放量上涨/下跌, 趋势确认
-        # 量价背离 (负相关): 放量但价格不动, 可能反转
-        return ret_abs.rolling(20).corr(volume)
 
 @register_factor("oi_momentum_20d", category="volume_oi")
 class OIMomentum20D(Factor):

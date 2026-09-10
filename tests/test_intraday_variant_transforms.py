@@ -6,6 +6,94 @@ import pytest
 
 import factors.numerics as numerics
 
+
+@pytest.mark.parametrize("kind", ["surprise", "asymmetry", "lead", "partial"])
+@pytest.mark.parametrize("case", ["ordinary", "missing", "constant", "empty"])
+def test_daily_volume_corr_extensions_match_reference_and_prefix(kind, case):
+    from factors.library import intraday
+    classes = {
+        "surprise": "IntradayVolumeSurpriseAbsReturnCorr20d",
+        "asymmetry": "IntradayVolumeDirectionalCorrSpread20d",
+        "lead": "IntradayLaggedVolumeAbsReturnCorr20d",
+        "partial": "IntradayVolumeAbsReturnPartialCorr20d",
+    }
+    factor = getattr(intraday, classes[kind])()
+    dates = pd.date_range("2025-01-01", periods=100, freq="B")
+    rng = np.random.default_rng(607)
+    close = pd.DataFrame(100 + rng.normal(size=(100, 3)).cumsum(axis=0), index=dates)
+    volume = pd.DataFrame(rng.uniform(100, 1000, size=(100, 3)), index=dates)
+    if case == "missing":
+        close.iloc[30, 0] = np.nan
+        volume.iloc[40, 1] = np.inf
+    elif case == "constant":
+        close.iloc[:, 0] = 100
+        volume.iloc[:, 1] = 300
+    elif case == "empty":
+        dates = dates[:0]
+
+    class Data:
+        def get(self, field, requested, universe):
+            return {"close": close, "volume": volume}[field].reindex(index=requested, columns=universe)
+
+    actual = factor.compute(Data(), dates, volume.columns)
+    r = close.reindex(dates).pct_change(fill_method=None)
+    v = np.log1p(volume.reindex(dates).replace([np.inf, -np.inf], np.nan))
+    def corr(x, y):
+        result = x.rolling(20).corr(y)
+        return result.where((x.rolling(20).var() > 0) & (y.rolling(20).var() > 0)).clip(-1, 1)
+    if kind == "surprise":
+        expected = corr(v - v.rolling(20).mean().shift(1), r.abs())
+    elif kind == "asymmetry":
+        expected = corr(v, r.clip(upper=0).abs()) - corr(v, r.clip(lower=0))
+    elif kind == "lead":
+        expected = corr(v.shift(1), r.abs())
+    else:
+        y, z = r.abs(), r.abs().shift(1)
+        valid = v.notna() & y.notna() & z.notna()
+        x, y, z = v.where(valid), y.where(valid), z.where(valid)
+        xy, xz, yz = corr(x, y), corr(x, z), corr(y, z)
+        denom = np.sqrt((1-xz*xz).clip(lower=0) * (1-yz*yz).clip(lower=0))
+        expected = ((xy-xz*yz) / denom.where(denom > 1e-12)).clip(-1, 1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-8, atol=1e-10, equal_nan=True)
+    prefix = factor.compute(Data(), dates[:73], volume.columns)
+    pd.testing.assert_frame_equal(actual.reindex(prefix.index), prefix)
+    assert factor.input_bar_frequency == factor.signal_frequency == "daily"
+    assert factor.validation_horizons == (10, 20, 40)
+
+
+@pytest.mark.parametrize("case", ["ordinary", "missing", "constant", "empty"])
+def test_daily_volume_price_corr_preserves_formula_and_registration(case):
+    from core.registry import list_registered
+    from factors.library.intraday import VolumePriceCorr20D
+    from factors.library.volume_oi_factors import VolumePriceCorr20D as LegacyImport
+
+    dates = pd.date_range("2025-01-01", periods=60, freq="B")
+    rng = np.random.default_rng(606)
+    close = pd.DataFrame(100 + rng.normal(size=(60, 3)).cumsum(axis=0), index=dates)
+    volume = pd.DataFrame(rng.uniform(100, 1000, size=(60, 3)), index=dates)
+    if case == "missing":
+        close.iloc[25, 0] = np.nan
+        volume.iloc[32, 1] = np.nan
+    elif case == "constant":
+        close.iloc[:, 0] = 100
+        volume.iloc[:, 1] = 300
+    elif case == "empty":
+        close = close.iloc[:0]
+
+    class DailyData:
+        def get(self, field, requested_dates, universe):
+            return {"close": close, "volume": volume}[field]
+
+    actual = VolumePriceCorr20D().compute(DailyData(), dates, volume.columns)
+    expected = (pd.DataFrame(index=dates, columns=volume.columns) if close.empty
+                else close.pct_change(fill_method=None).abs().rolling(20).corr(volume))
+    pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    assert LegacyImport is VolumePriceCorr20D
+    assert list_registered("factor")["factor"]["volume_price_corr_20d"] is VolumePriceCorr20D
+    assert VolumePriceCorr20D.input_bar_frequency == "daily"
+    assert VolumePriceCorr20D.signal_frequency == VolumePriceCorr20D.frequency == "daily"
+    assert VolumePriceCorr20D.validation_horizons == (10, 20, 40)
+
 from factors.numerics import (
     daily_breakout_statistics,
     daily_candle_path_statistics,

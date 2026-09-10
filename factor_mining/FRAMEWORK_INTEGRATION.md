@@ -69,16 +69,18 @@ SQLite 与 `Factor`/spec 不冲突：SQLite 是可变研究目录；JSON 是不�
 周期必须匹配该批候选的挖掘目标。H=1、H=5 和 H=15 候选应拆成三个冻结研究，不能
 把同一批公式事后放进多个周期挑最优。
 
-`main.py` 会先校验快照，再导入具体工作流。随后
-`factors/user/auto_mined_bridge.py` 会：
+只有显式传入该选项，`main.py` 才校验快照并直接调用
+`factor_mining.bridge.register_snapshot_from_environment()`，然后进入具体工作流：
 
 1. 校验快照 SHA-256、候选内容哈希、数量和名称唯一性；
 2. 把每个符号候选转换为无参数 `Factor` 子类；
-3. 通过现有 `register_user_factor` 注册；
+3. 通过现有 `register_factor` 注册，名称冲突仍失败关闭；
 4. 保留候选声明的依赖、1 分钟频率、决策 lag、MAD 和波动率中性化。
 
-未传入 `--mined-snapshot` 时，该文件不做任何注册，现有框架行为完全不变。网关内部使用
-`MF_MINED_CANDIDATE_SNAPSHOT` 在导入前传递已校验路径，不应由普通研究命令手工设置。
+未传入 `--mined-snapshot` 时，默认流程不导入GP桥接器、不注册挖掘候选。网关内部使用
+`MF_MINED_CANDIDATE_SNAPSHOT` 传递已校验路径；单独遗留该环境变量不会触发默认加载。
+SPEC/user目录同样仅在显式研究调用时加载。候选交给既有检验流程，不自动加入有效库、
+策略或改写intraday；源码迁移需要另外明确授权，并验证等价性和重新检验。
 主框架不会读取 SQLite，也不会访问远程行情源。
 
 ### 4. 用现有分钟研究流程生成冻结证据

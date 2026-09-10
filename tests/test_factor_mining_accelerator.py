@@ -98,6 +98,38 @@ def test_optional_fast_rolling_matches_pandas_or_falls_back(method):
     )
 
 
+@pytest.mark.parametrize("method", ["min", "max"])
+@pytest.mark.parametrize("window", [2, 15, 130])
+def test_polars_rust_extrema_match_reference_exactly(method, window):
+    from factor_mining.runtime.rolling_backend import _fast_rolling
+    values = np.random.default_rng(391).normal(size=(91, 8))
+    values[::3, 0] = np.nan
+    values[:, 1] = np.nan
+    values[:, 2] = 0.
+    values[::5, 3] = np.inf
+    values[::7, 4] = -np.inf
+    expected = rolling(values, window, method, backend="pandas")
+    actual = _fast_rolling(values, window, method)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_rust_extrema_preserve_expression_direction_and_fitness(tmp_path):
+    from factor_mining.validation import evaluate_candidate
+    _, _, features, target, volatility, labels, _ = _fixture(tmp_path)
+    expression = Expr.operation("cs_rank", Expr.operation("sub",
+        Expr.operation("ts_max", Expr.terminal("return_1p"), window=15),
+        Expr.operation("ts_min", Expr.terminal("return_1p"), window=15)))
+    reference = ExpressionEvaluator(features).evaluate(expression)
+    accelerated = ExpressionEvaluator(features, rolling_backend="fast").evaluate(expression)
+    np.testing.assert_array_equal(accelerated, reference)
+    kwargs = dict(complexity=expression.complexity, volatility=volatility, group_labels=labels)
+    old = evaluate_candidate(reference, target, ValidationConfig(), **kwargs)
+    new = evaluate_candidate(accelerated, target, ValidationConfig(), **kwargs)
+    assert old.direction == new.direction
+    assert old.mean_ic == new.mean_ic
+    assert old.fitness == new.fitness
+
+
 def test_missing_bottleneck_uses_pandas_fallback(monkeypatch):
     rng = np.random.default_rng(74)
     value = rng.normal(size=(51, 7)).astype(np.float32)

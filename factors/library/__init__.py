@@ -17,10 +17,13 @@ from . import (
     cross_frequency,
 )
 
-# === SPEC-driven factors; the runtime log is the authoritative count ===
-from factors.specs import register_all_spec_factors
+# Candidate catalogs are explicitly loaded by research callers, never on import.
+from functools import lru_cache
 
-_registered = register_all_spec_factors()
 
-# Load user-authored factors after built-ins so duplicate names fail closed.
-from factors import user as _user_factors  # noqa: E402,F401
+@lru_cache(maxsize=1)
+def load_research_factor_catalog():
+    """Explicitly expose SPEC/user candidates; do not launch GP or migrate code."""
+    from factors.specs import register_all_spec_factors
+    register_all_spec_factors()
+    from factors import user  # noqa: F401
