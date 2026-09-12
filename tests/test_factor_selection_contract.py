@@ -145,3 +145,49 @@ def test_exact_winner_has_a_reserved_expansion():
         max_factors=3, exact_width=2, beam_width=4)
     assert len(calls[2]) == 3
     assert set(calls[1]).issubset(calls[2])
+
+
+def test_budgeted_pool_covers_all_factors_resumes_and_ignores_future(tmp_path):
+    import duckdb
+    import numpy as np
+    from workflows.factor_selection import _run_budgeted_pool_search
+    dates = pd.bdate_range("2020-01-01", periods=180)
+    rng = np.random.default_rng(42)
+    ic = pd.DataFrame(rng.normal(.03, .1, (180, 8)), index=dates, columns=list("abcdefgh"))
+    segments = [(dates[i], dates[i+39]) for i in range(0, 160, 40)]
+    class Evaluator:
+        end = dates[159]
+        def __init__(self):
+            self.calls = []
+        def clear_transient_caches(self):
+            pass
+        def ledger(self, members, recipe):
+            self.calls.append(tuple(members))
+            if len(self.calls) == 1:
+                raise ValueError("no positive weight")
+            r = .0002 + .001*np.sin(np.arange(160))
+            r[0] = 0
+            return pd.DataFrame({"net_return": r, "nav": 1000*np.cumprod(1+r),
+                                 "executed_traded_notional": .1}, index=dates[:160])
+    def run(folder, evaluator, frame):
+        folder.mkdir(exist_ok=True)
+        with duckdb.connect(str(folder / "results.duckdb")) as db:
+            return _run_budgeted_pool_search(evaluator=evaluator, portfolio_ic=frame,
+                pool=list(frame), recipe=None, segments=segments,
+                clusters={n: i % 3 for i, n in enumerate(frame)}, db=db, output=folder,
+                budget=40, beam_width=4, round_width=8)
+    evaluator = Evaluator()
+    _, rows, reason = run(tmp_path / "original", evaluator, ic)
+    assert reason == "exact_backtest_budget_exhausted"
+    assert len(rows) == len(set(evaluator.calls)) == 40
+    assert {n for r in rows if r["phase"] == "seed_coverage" for n in r["factors"]} == set(ic)
+    assert rows[0]["status"] == "rejected_runtime"
+    assert max(r["factor_count"] for r in rows) >= 4
+    resumed = Evaluator()
+    _, replay, _ = run(tmp_path / "original", resumed, ic)
+    assert resumed.calls == []
+    assert replay == rows
+    poisoned = ic.copy()
+    poisoned.loc[dates[159]:] = rng.normal(-100, 1000, (21, 8))
+    _, comparison, _ = run(tmp_path / "future_poisoned", Evaluator(), poisoned)
+    assert [(r["factors"], r["status"]) for r in comparison] == [(r["factors"], r["status"]) for r in rows]

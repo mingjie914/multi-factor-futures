@@ -372,6 +372,8 @@ def _write_comparison_plot(
     *,
     title: str | None = None,
     cutoff: pd.Timestamp | None = None,
+    background_batches=None,
+    background_limits: tuple[float, float] | None = None,
 ) -> None:
     """Use the framework's Chinese plotting conventions for peer comparison."""
     import matplotlib
@@ -386,12 +388,14 @@ def _write_comparison_plot(
     if nav_table.empty:
         return
 
+    extra_rows = max(len(rows) - 9, 0)
     fig, (ax, metrics_ax) = plt.subplots(
-        2, 1, figsize=(15, 10), gridspec_kw={"height_ratios": [5.0, 1.35]}
+        2, 1, figsize=(15, 10 + 0.27 * extra_rows),
+        gridspec_kw={"height_ratios": [5.0, 1.35 + 0.22 * extra_rows]}
     )
     colors = [
         "#1a73e8", "#e8710a", "#1e8e3e", "#d93025", "#9334e6", "#00897b",
-        "#795548", "#d81b60", "#607d8b",
+        "#795548", "#d81b60", "#607d8b", "#bcbd22", "#17becf", "#ff9896", "#9467bd",
     ]
     for idx, name in enumerate(nav_table.columns):
         series = nav_table[name].dropna()
@@ -464,8 +468,39 @@ def _write_comparison_plot(
     table.auto_set_font_size(False)
     table.set_fontsize(8.5)
     table.scale(1.0, 1.35)
-    fig.tight_layout()
-    fig.savefig(output / "nav_comparison.png", dpi=150, bbox_inches="tight")
+    if background_batches is not None:
+        # Stream every background curve into the existing Chinese report
+        # canvas. Do not retain millions of Line2D artists or sample away jobs.
+        from matplotlib.collections import LineCollection
+        from matplotlib.dates import date2num
+        from PIL import Image
+        import numpy as np
+
+        if background_limits is not None:
+            low, high = background_limits
+            margin = max((high - low) * 0.03, 0.01)
+            ax.set_ylim(low - margin, high + margin)
+        fig.set_dpi(150)
+        fig.tight_layout()
+        fig.canvas.draw()
+        for batch in background_batches:
+            if batch.empty:
+                continue
+            dates = date2num(pd.DatetimeIndex(batch.index).to_pydatetime())
+            values = batch.to_numpy(dtype=float).T
+            segments = np.stack((np.broadcast_to(dates, values.shape), values), axis=-1)
+            collection = LineCollection(segments, colors="#777777", linewidths=0.45, alpha=0.025)
+            ax.add_collection(collection, autolim=False)
+            ax.draw_artist(collection)
+            collection.remove()
+        for line in ax.lines:
+            ax.draw_artist(line)
+        if ax.get_legend() is not None:
+            ax.draw_artist(ax.get_legend())
+        Image.fromarray(np.asarray(fig.canvas.buffer_rgba()).copy()).save(output / "nav_comparison.png")
+    else:
+        fig.tight_layout()
+        fig.savefig(output / "nav_comparison.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -834,17 +869,17 @@ def _write_segment_report(
             (
                 "- 本次默认生产方法比较中，所有选定策略均采用 "
                 "config/default.yaml::production_portfolio 的同一默认方法："
-                "ICIR + Top10/Bottom10 + cap3 + ERC，总敞口2；只改变因子集合。"
+                "因子加权、选池、板块上限、品种分配及敞口参数以运行合同为准；只改变因子集合。"
             )
             if production_method_compare and int(ic_horizon) == 1
             else (
                 f"- 本次显式 H{int(ic_horizon)} IC 敏感性比较中，所有选定策略均采用 "
-                "同一 Top10/Bottom10 + cap3 + ERC、总敞口2 配方；"
+                "同一冻结配方，参数以运行合同为准；"
                 "仅将 IC 历史标签改为 H{0}，不作为默认方法。".format(int(ic_horizon))
                 if production_method_compare
                 else
                 "- 旧10因子采用 config/default.yaml::production_portfolio 的默认方法："
-                "ICIR + Top10/Bottom10 + cap3 + ERC，总敞口2；其独立配置未改写。"
+                "参数以运行合同为准；其独立配置未改写。"
             )
         ),
         "- `research_through_cutoff`：用于查看研究截止日前的历史表现。",
@@ -860,7 +895,7 @@ def _write_segment_report(
         cells = [row["strategy"], row["segment"], row["start"], row["end"]]
         for column in metric_columns:
             value = float(row.get(column, 0.0) or 0.0)
-            cells.append(f"{value:.4f}" if "turnover" in column else f"{value:.4f}")
+            cells.append(f"{value:.4f}")
         lines.append("| " + " | ".join(cells) + " |")
     if failures:
         lines.extend([

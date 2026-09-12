@@ -11,6 +11,73 @@ import factors.library.intraday as intraday
 DATES = pd.date_range("2026-05-11", "2026-05-13", freq="D")
 
 
+@pytest.mark.parametrize("cls", [intraday.IntradayFlowRetResid20d, intraday.IntradayFlowRetResidVol20d])
+@pytest.mark.parametrize("case", ["ordinary", "missing", "constant", "thin"])
+def test_flow_residual_is_daily_cross_sectional_and_causal(monkeypatch, cls, case):
+    days = pd.bdate_range("2025-01-02", periods=80)
+    bars = pd.DatetimeIndex([d + pd.Timedelta(minutes=540 + m) for d in days for m in range(40)])
+    columns = list("ABCDEFGH")
+    rng = np.random.default_rng(914)
+    close = pd.DataFrame(100 + rng.normal(0, .2, (len(bars), len(columns))).cumsum(axis=0), index=bars, columns=columns)
+    amount = pd.DataFrame(rng.lognormal(12, 1, close.shape), index=bars, columns=columns)
+    if case == "missing":
+        close.iloc[::17, 0] = np.nan
+        amount.iloc[::13, 1] = np.nan
+        amount.iloc[::31, 2] = np.inf
+        close.iloc[::29, 3] = np.inf
+        close.iloc[15*40:16*40, :] = np.nan
+    elif case == "constant":
+        close[:] = 100.0
+    elif case == "thin":
+        close.iloc[20*40:30*40, 2:] = np.nan
+    panel = {"close": close, "amount": amount}
+
+    def fetch(data, requested, universe, **kwargs):
+        assert kwargs.get("freq") == "1min"
+        return {k: f.loc[f.index.normalize().isin(requested), universe].copy() for k, f in panel.items()}
+
+    monkeypatch.setattr(intraday, "_get_minute_panel", fetch)
+    # Independent oracle: build one daily cross-section, then fit along symbols.
+    residuals = {}
+    for day in days:
+        f, r = {}, {}
+        for col in columns:
+            pairs = pd.concat([close.loc[day:day+pd.Timedelta(hours=23), col],
+                               amount.loc[day:day+pd.Timedelta(hours=23), col]], axis=1)
+            pairs = pairs.loc[np.isfinite(pairs).all(axis=1)]
+            if len(pairs) < 20 or pairs.iloc[1:, 1].sum() < 1e-12:
+                continue
+            f[col] = float((np.sign(pairs.iloc[:, 0].diff().iloc[1:]) * pairs.iloc[1:, 1]).sum() / pairs.iloc[1:, 1].sum())
+            if pairs.iloc[0, 0] > 0:
+                r[col] = float(pairs.iloc[-1, 0] / pairs.iloc[0, 0] - 1)
+        if not f or not r:
+            continue
+        row = pd.Series(np.nan, index=columns)
+        usable = [c for c in columns if c in f and c in r and np.isfinite(f[c]) and np.isfinite(r[c])]
+        if len(usable) >= 3:
+            x = np.column_stack([np.ones(len(usable)), [r[c] for c in usable]])
+            y = np.array([f[c] for c in usable])
+            row.loc[usable] = y - x @ np.linalg.lstsq(x, y, rcond=None)[0]
+        residuals[day] = row
+    raw = pd.DataFrame(residuals).T
+    expected = (raw.rolling(20, min_periods=5).mean() if cls is intraday.IntradayFlowRetResid20d
+                else -raw.rolling(20, min_periods=5).std())
+    expected = expected.reindex(index=days, columns=columns).shift(1)
+    factor = cls()
+    actual = factor.compute(None, days, columns)
+    pd.testing.assert_frame_equal(actual, expected, check_exact=False, rtol=1e-12, atol=1e-12)
+    prefix = factor.compute(None, days[:60], columns)
+    pd.testing.assert_frame_equal(actual.iloc[:60], prefix, check_exact=True)
+    amount.loc[amount.index.normalize() > days[59]] *= 1 + 5*(close.diff().gt(0).astype(float)).loc[amount.index.normalize() > days[59]]
+    changed = factor.compute(None, days, columns)
+    pd.testing.assert_frame_equal(actual.iloc[:60], changed.iloc[:60], check_exact=True)
+    # 25 observed days cover this factor's 20-day window plus shift.
+    chunk = factor.compute(None, days[25:60], columns)
+    pd.testing.assert_frame_equal(prefix.iloc[50:60], chunk.loc[days[50:60]], check_exact=False, rtol=1e-12, atol=1e-12)
+    if cls is intraday.IntradayFlowRetResidVol20d:
+        assert not (actual > 1e-12).any().any()
+
+
 class ScheduleData:
     def __init__(self):
         self.fields = {

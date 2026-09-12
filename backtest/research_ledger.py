@@ -149,15 +149,15 @@ def contract_transition_turnover(
     target_contracts = pd.Series(target_contracts).reindex(current.index)
     rollover = 0.0
     for symbol in current.index:
-        current_weight = float(current.loc[symbol])
-        target_weight = float(target.loc[symbol])
+        current_weight = float(current.at[symbol])
+        target_weight = float(target.at[symbol])
         if (
             abs(current_weight) <= ACTIVE_WEIGHT_TOLERANCE
             and abs(target_weight) <= ACTIVE_WEIGHT_TOLERANCE
         ):
             continue
-        current_contract = current_contracts.loc[symbol]
-        target_contract = target_contracts.loc[symbol]
+        current_contract = current_contracts.at[symbol]
+        target_contract = target_contracts.at[symbol]
         if (
             abs(current_weight) > ACTIVE_WEIGHT_TOLERANCE
             and abs(target_weight) > ACTIVE_WEIGHT_TOLERANCE
@@ -184,10 +184,10 @@ def contract_transition_weight_vectors(
     target_by_contract: dict[str, float] = {}
 
     for root in current.index:
-        current_weight = float(current.loc[root])
-        target_weight = float(target.loc[root])
-        current_contract = current_contracts.loc[root]
-        target_contract = target_contracts.loc[root]
+        current_weight = float(current.at[root])
+        target_weight = float(target.at[root])
+        current_contract = current_contracts.at[root]
+        target_contract = target_contracts.at[root]
         if abs(current_weight) > ACTIVE_WEIGHT_TOLERANCE:
             if pd.isna(current_contract):
                 raise ResearchLedgerError(

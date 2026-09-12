@@ -7,7 +7,8 @@ factor search.  Every rolling estimate excludes the current return observation.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from itertools import combinations, product
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -20,7 +21,6 @@ from scipy.spatial.distance import squareform
 from backtest.research_ledger import build_close_marked_ledger
 from optimization.factor_weighting import (
     causal_history,
-    combine_available_factor_scores,
     factor_weights,
     prepare_complete_history,
 )
@@ -80,6 +80,69 @@ class PortfolioRecipe:
 
     def to_dict(self) -> dict:
         return {"name": self.name, **asdict(self)}
+
+
+def portfolio_recipe_grid(base: PortfolioRecipe) -> tuple[PortfolioRecipe, ...]:
+    """Full declared grid; preserve every non-search production constraint."""
+    return tuple(
+        replace(base, factor_weight=method, top_n=top_n,
+                sector_cap=cap, asset_weight=allocation)
+        for method, top_n, cap, allocation in product(
+            ("equal", "diag_icir", "lw_abs", "lw_positive"),
+            (5, 8, 10, 12), (0, 3), ("equal", "inverse_volatility", "erc"),
+        )
+    )
+
+
+def factor_neighborhood(
+    seed: Sequence[str], candidates: Sequence[str], *,
+    max_remove: int = 2, max_add: int = 2,
+):
+    """Enumerate the entire declared neighborhood, without performance pruning.
+
+    Emit deterministic membership and its edit provenance. Candidates already
+    in the seed cannot be re-added, and fewer than two factors are excluded by
+    the existing factor-weight contract. This is not a global subset search.
+    """
+    if max_remove < 0 or max_add < 0:
+        raise ValueError("neighborhood limits must be nonnegative")
+    old = tuple(sorted(set(seed)))
+    new = tuple(sorted(set(candidates) - set(old)))
+    for r in range(min(max_remove, len(old)) + 1):
+        for removed in combinations(old, r):
+            remaining = set(old) - set(removed)
+            for a in range(min(max_add, len(new)) + 1):
+                for added in combinations(new, a):
+                    members = tuple(sorted(remaining | set(added)))
+                    if len(members) >= 2:
+                        yield members, removed, added
+
+
+def unique_factor_neighborhoods(seeds: Sequence[Mapping], candidates: Mapping):
+    """Yield original baselines first, then every signed neighborhood once.
+
+    Identity includes frozen direction; ordering is deterministic for checkpoint
+    offsets. Shared memberships retain their first provenance, not a second
+    independently evaluated (and potentially inconsistent) copy of the ledger.
+    """
+    seen = set()
+    new_directions = {name: int(row["direction"]) for name, row in candidates.items()}
+    for originals_only in (True, False):
+        for seed in seeds:
+            old_directions = {name: int(value) for name, value in seed["directions"].items()}
+            directions = {**new_directions, **old_directions}
+            if any(value not in (-1, 1) for value in directions.values()):
+                raise ValueError("factor directions must be frozen signs")
+            rows = ([(tuple(sorted(old_directions)), (), ())] if originals_only else
+                    factor_neighborhood(old_directions, candidates))
+            for members, removed, added in rows:
+                signature = tuple((name, directions[name]) for name in members)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                yield {"seed": seed["id"], "directions": dict(signature),
+                       "removed": removed, "added": added,
+                       "original": originals_only}
 
 
 class CausalEligibilityEnvironment:
@@ -597,34 +660,37 @@ class PortfolioEvaluator:
         missing = sorted(set(factor_tuple) - set(self.runner.ranks))
         if missing:
             raise KeyError(f"factor runner did not compute: {missing}")
-        score = pd.DataFrame(np.nan, index=self.dates, columns=self.runner.u, dtype=float)
+        weight_matrix = pd.DataFrame(0.0, index=self.dates, columns=factor_tuple)
         if method == "equal":
-            weights = pd.Series(
-                1.0 / len(factor_tuple), index=factor_tuple, dtype=float
-            )
+            weight_matrix.loc[:, :] = 1.0 / len(factor_tuple)
+        else:
+            ic = self.runner.ic[list(factor_tuple)]
             for date in self.dates:
-                score.loc[date] = combine_available_factor_scores(
-                    {name: self.runner.ranks[name].loc[date] for name in factor_tuple},
-                    weights,
-                    self.runner.u,
+                history = prepare_complete_history(
+                    causal_history(ic, date, self.ic_window), minimum_observations=30,
                 )
-            self._score_cache[key] = score
-            return score
-
-        ic = self.runner.ic[list(factor_tuple)]
-        for date in self.dates:
-            history = prepare_complete_history(
-                causal_history(ic, date, self.ic_window),
-                minimum_observations=30,
-            )
-            weights = factor_weights(history, method)
-            if weights.empty:
-                continue
-            score.loc[date] = combine_available_factor_scores(
-                {name: self.runner.ranks[name].loc[date] for name in weights.index},
-                weights,
-                self.runner.u,
-            )
+                weights = factor_weights(history, method)
+                if weights.empty:
+                    continue
+                if (not np.isfinite(weights.to_numpy()).all()
+                        or (weights < 0.0).any() or float(weights.sum()) <= 0.0):
+                    raise ValueError("factor weights must contain non-negative finite mass")
+                weight_matrix.loc[date, weights.index] = weights.to_numpy()
+        # Same ordered multiply/add/divide as the daily public combiner, but
+        # broadcast over dates to avoid constructing millions of small Series.
+        # Keep the sequential factor order (not a tree reduction) for ties.
+        numerator = np.zeros((len(self.dates), len(self.runner.u)), dtype=float)
+        denominator = np.zeros_like(numerator)
+        for name in factor_tuple:
+            frame = self.runner.ranks[name].loc[self.dates].reindex(columns=self.runner.u)
+            values = frame.to_numpy(dtype=float)
+            available = np.isfinite(values)
+            weight = weight_matrix[name].to_numpy(dtype=float)[:, None]
+            numerator += np.where(available, values, 0.0) * weight
+            denominator += available * weight
+        values = np.full_like(numerator, np.nan)
+        np.divide(numerator, denominator, out=values, where=denominator > 0.0)
+        score = pd.DataFrame(values, index=self.dates, columns=self.runner.u)
         self._score_cache[key] = score
         return score
 

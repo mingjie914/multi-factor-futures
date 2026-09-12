@@ -14,9 +14,54 @@ from backtest.research_ledger import (
     align_transition_weights,
     build_close_marked_ledger,
     close_marked_step,
+    contract_transition_turnover,
+    contract_transition_weight_vectors,
     default_research_ledger_metadata,
 )
 from data.market_quality import CloseDataQualityError, prepare_close_data
+
+
+def test_contract_transitions_match_ordered_reference_with_collisions_and_exits():
+    rng = np.random.default_rng(914)
+    for size in (1, 5, 10, 38):
+        roots = [f"R{i}" for i in range(size)]
+        for _ in range(12):
+            current = pd.Series(rng.normal(size=size), index=roots)
+            target = pd.Series(rng.normal(size=size), index=roots[::-1])
+            current.iloc[0] = 1e-13
+            target.iloc[-1] = 0.0
+            # Different root labels may refer to the same concrete contract;
+            # aggregate in original root order, retaining both exit/entry legs.
+            old = pd.Series([f"C{i % 3}" for i in range(size)], index=roots)
+            new = pd.Series([f"C{(i + 1) % 4}" for i in range(size)], index=roots)
+            old.iloc[0] = pd.NA
+            expected_old, expected_new, roll = {}, {}, 0.0
+            aligned_target, aligned_current = align_transition_weights(target, current)
+            for root in aligned_current.index:
+                cw, tw = float(aligned_current.loc[root]), float(aligned_target.loc[root])
+                if abs(cw) > 1e-12:
+                    key = str(old.loc[root]); expected_old[key] = expected_old.get(key, 0.0) + cw
+                if abs(tw) > 1e-12:
+                    key = str(new.loc[root]); expected_new[key] = expected_new.get(key, 0.0) + tw
+                if abs(cw) > 1e-12 and abs(tw) > 1e-12 and str(old.loc[root]) != str(new.loc[root]):
+                    roll += abs(cw) + abs(tw)
+            index = pd.Index(expected_old).union(pd.Index(expected_new), sort=False)
+            old_vector = pd.Series(expected_old, dtype=float).reindex(index).fillna(0)
+            new_vector = pd.Series(expected_new, dtype=float).reindex(index).fillna(0)
+            kwargs = dict(current_contracts=old, target_contracts=new)
+            actual_new, actual_old = contract_transition_weight_vectors(target, current, **kwargs)
+            pd.testing.assert_series_equal(actual_old, old_vector, check_exact=True)
+            pd.testing.assert_series_equal(actual_new, new_vector, check_exact=True)
+            assert contract_transition_turnover(target, current, **kwargs) == (
+                float((new_vector - old_vector).abs().sum()), roll)
+    # Exit-only and entry-only roots remain in the aligned union.
+    assert contract_transition_turnover(pd.Series({"B": -.4}), pd.Series({"A": .6}),
+        current_contracts=pd.Series({"A": "A1"}), target_contracts=pd.Series({"B": "B1"})) == (1.0, 0.0)
+    for missing_side in ("current", "target"):
+        kwargs = dict(current_contracts=pd.Series({"A": "A1"}), target_contracts=pd.Series({"A": "A2"}))
+        kwargs[f"{missing_side}_contracts"].iloc[0] = pd.NA
+        with pytest.raises(ResearchLedgerError, match="no .*contract"):
+            contract_transition_turnover(pd.Series({"A": -.2}), pd.Series({"A": .3}), **kwargs)
 
 
 def test_build_close_marked_ledger_applies_target_on_next_bar():

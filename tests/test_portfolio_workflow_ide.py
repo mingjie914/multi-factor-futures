@@ -97,6 +97,38 @@ def test_comparison_default_start_inherits_framework():
     assert ide.COMPARISON_START == load_config("config/default.yaml").date_range.start
 
 
+def test_segment_report_does_not_hardcode_recipe_parameters(tmp_path):
+    dates = pd.bdate_range("2026-05-14", periods=5)
+    strategy = SimpleNamespace(id="probe", status="observing", factor_set_id="probe")
+    combined = SimpleNamespace(nav=pd.Series([1., 1.01, 1.02, 1.01, 1.03], index=dates))
+    for production, horizon in ((True, 1), (True, 5), (False, 1)):
+        ide._write_segment_report(
+            tmp_path, [(strategy, combined, None)], pd.Timestamp("2026-05-15"),
+            production_method_compare=production, ic_horizon=horizon,
+        )
+        report = (tmp_path / "portfolio_report.md").read_text(encoding="utf-8")
+        assert "参数以运行合同为准" in report
+        assert "ICIR + Top10" not in report
+        assert "总敞口2" not in report
+
+
+def test_comparison_streams_every_background_batch(tmp_path):
+    from PIL import Image
+    dates = pd.bdate_range("2026-05-14", periods=4)
+    nav = pd.DataFrame({"基准": [1.0, 1.02, 1.01, 1.04]}, index=dates)
+    consumed = []
+    def batches():
+        for index in range(3):
+            consumed.append(index)
+            yield nav * (1.0 + index * .01)
+    ide._write_comparison_plot(
+        tmp_path, nav, [{"strategy": "基准"}], cutoff=pd.Timestamp("2026-05-15"),
+        background_batches=batches(), background_limits=(1.0, 1.1))
+    assert consumed == [0, 1, 2]
+    with Image.open(tmp_path / "nav_comparison.png") as rendered:
+        assert rendered.size == (2250, 1500)
+
+
 def test_saved_eight_candidates_and_default_retain_frozen_members(monkeypatch):
     monkeypatch.setattr(ide, "CATALOG_PATH", "config/strategy_library.yaml")
     monkeypatch.setattr(ide, "STRATEGY_IDS", ())

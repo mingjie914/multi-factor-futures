@@ -555,7 +555,7 @@ def test_selected_contract_cache_reuses_validated_request_across_instances(
 
     for field in expected:
         pd.testing.assert_frame_equal(actual[field], expected[field])
-    assert len(list(cache_path.glob("selected_v5_5min_*.parquet"))) == 1
+    assert len(list(cache_path.glob("selected_v6_5min_*.parquet"))) == 1
 
 
 def test_selected_contract_cache_rejects_duplicate_long_keys(tmp_path):
@@ -571,8 +571,8 @@ def test_selected_contract_cache_rejects_duplicate_long_keys(tmp_path):
     source.fetch_price_at_frequency(
         ["A"], "2024-01-03", "2024-01-03 23:59", ["close"], "5min"
     )
-    data_path = next(cache_path.glob("selected_v5_5min_*.parquet"))
-    metadata_path = next(cache_path.glob("selected_v5_5min_*.json"))
+    data_path = next(cache_path.glob("selected_v6_5min_*.parquet"))
+    metadata_path = next(cache_path.glob("selected_v6_5min_*.json"))
     cached = pd.read_parquet(data_path)
     pd.concat([cached, cached.iloc[[0]]], ignore_index=True).to_parquet(
         data_path, index=False
@@ -924,3 +924,27 @@ def test_unexecutable_dominant_switch_is_deferred_without_same_day_fallback(tmp_
         source.fetch_price_at_frequency(
             ["A"], "2024-01-02", "2024-01-05", ["close"], "daily"
         )
+
+
+def test_roll_never_returns_to_earlier_delivery_and_remains_causal(tmp_path):
+    # The near contract's OI rises again after a valid forward roll, then its
+    # quotes disappear. Returning to it would strand the entire later series.
+    rows = []
+    for day, near_oi, far_oi in ((2, 2000, 1000), (3, 1000, 2000),
+                                (4, 3000, 1000), (5, 3000, 1000),
+                                (8, 0, 1000), (9, 0, 1000)):
+        date = f"2024-01-{day:02d}"
+        if near_oi:
+            rows.append(_row("A2401", date, 100 + day, 100, near_oi))
+        rows.append(_row("A2405", date, 120 + day, 100, far_oi))
+    _write_dataset(tmp_path, DATASETS["daily"], rows)
+    _write_dataset(tmp_path, DATASETS["1min"], [])
+    _write_dataset(tmp_path, DATASETS["15min"], [])
+    source = ParquetFuturesSource({"root_path": str(tmp_path), "eager_fields": False})
+    full = source._continuous_plan_polars(("A",), "2024-01-02", "2024-01-09")
+    assert full["contract"].to_list() == ["A2401", "A2405", "A2405", "A2405", "A2405"]
+    assert full["adjustment"].to_list() == pytest.approx([1.0] + [103 / 123] * 4)
+    prefix = source._continuous_plan_polars(("A",), "2024-01-02", "2024-01-05")
+    assert prefix.equals(full.filter(pl.col("trade_date") <= pd.Timestamp("2024-01-05").date()))
+    prices = source.fetch_price(["A"], "2024-01-02", "2024-01-09", ["close"])["close"]
+    assert prices["A"].notna().all()

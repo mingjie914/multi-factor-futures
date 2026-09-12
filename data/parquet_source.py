@@ -72,7 +72,7 @@ _DEFAULT_EAGER_FIELDS = tuple(
 )
 _CONTRACT_SELECTION_SEMANTICS = "exact_yymm_executable_previous_day_oi_epoch_v5"
 _CURVE_CACHE_SCHEMA_VERSION = 4
-_SELECTED_CACHE_SCHEMA_VERSION = 5
+_SELECTED_CACHE_SCHEMA_VERSION = 6
 _FREQUENCY_ROUTE = {
     "daily": ("daily", None),
     "1min": ("1min", None),
@@ -871,7 +871,12 @@ class ParquetFuturesSource(DataSource):
             if observed_contract is not None:
                 if current_contract is None:
                     current_contract = observed_contract
-                elif observed_contract != current_contract:
+                elif int(observed_contract[-4:]) > int(current_contract[-4:]):
+                    # A continuous roll advances delivery maturity, never back
+                    # into an earlier contract whose residual delivery OI may
+                    # temporarily dominate (and strand the plan after expiry).
+                    # YYMM comes from validated concrete symbols; no future
+                    # quotes or ex-post last trading dates enter this decision.
                     quoted = quoted_by_date.get((root, trade_date), set())
                     if current_contract in quoted and observed_contract in quoted:
                         current_contract = observed_contract

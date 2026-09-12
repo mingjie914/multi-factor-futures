@@ -18,6 +18,7 @@ import monitoring.config as C
 from monitoring import io
 from monitoring.attribution import AttributionReport
 from monitoring.factor_health import FactorHealthMonitor
+from monitoring.plot_style import signed_heatmap_cmap
 
 _PNG_FONT = {"font.sans-serif": ["SimHei", "Microsoft YaHei", "DejaVu Sans"],
              "axes.unicode_minus": False}
@@ -70,7 +71,7 @@ def _chart_ic_heatmap(snap: dict, path) -> None:
     df.columns = [f.split("intraday_")[1][:12] if f.startswith("intraday_") else f[:12]
                   for f in labels]
     fig, ax = plt.subplots(figsize=(12, max(3, 0.5 * len(df.columns) + 1)))
-    im = ax.imshow(df.T.values, aspect="auto", cmap="RdYlGn", vmin=-0.06, vmax=0.06)
+    im = ax.imshow(df.T.values, aspect="auto", cmap=signed_heatmap_cmap(), vmin=-0.06, vmax=0.06)
     ax.set_yticks(range(len(df.columns))); ax.set_yticklabels(df.columns)
     ax.set_xlabel("日期"); ax.set_title("因子滚动 20 日 IC 热力图")
     ax.grid(False)

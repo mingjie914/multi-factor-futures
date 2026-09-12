@@ -25244,6 +25244,53 @@ class IntradaySmartMoneyVwap20d(Factor):
         return daily.rolling(20, min_periods=5).mean().reindex(dates).shift(1).reindex(columns=universe)
 
 
+def _daily_flow_return_residual(data, dates, universe):
+    """当日资金流对当日收益的截面残差；不跨日期拟合，不提前移动信号。"""
+    panel = _get_minute_panel(data, dates, universe, freq="1min")
+    if "close" not in panel or "amount" not in panel:
+        return pd.DataFrame(np.nan, index=pd.DatetimeIndex(dates), columns=universe)
+    cache_key = "_daily_flow_return_residual"
+    with _PANEL_CACHE_LOCK:
+        if cache_key in panel:
+            return panel[cache_key]
+        close = panel["close"]
+        amount = panel["amount"].reindex(index=close.index, columns=close.columns)
+        index, offsets = _day_offsets(close.index)
+        prices, amounts = close.to_numpy(dtype=float), amount.to_numpy(dtype=float)
+        rows, observed = [], []
+        for day, (start, end) in zip(index, zip(offsets[:-1], offsets[1:])):
+            if end - start < 20:
+                continue
+            flow = np.full(len(close.columns), np.nan)
+            ret = np.full(len(close.columns), np.nan)
+            for col in range(len(close.columns)):
+                c, a = prices[start:end, col], amounts[start:end, col]
+                valid = np.isfinite(c) & np.isfinite(a)
+                c, a = c[valid], a[valid]
+                if len(c) < 20:
+                    continue
+                total = a[1:].sum()
+                if total < 1e-12:
+                    continue
+                flow[col] = (np.sign(np.diff(c)) * a[1:]).sum() / total
+                if c[0] > 0:
+                    ret[col] = c[-1] / c[0] - 1.0
+            if not np.isfinite(flow).any() or not np.isfinite(ret).any():
+                continue
+            valid = np.isfinite(flow) & np.isfinite(ret)
+            residual = np.full(len(close.columns), np.nan)
+            # 截距和一项控制变量，至少3个有效品种；常量收益由OLS降秩处理。
+            if valid.sum() >= 3:
+                x = np.column_stack([np.ones(valid.sum()), ret[valid]])
+                beta = np.linalg.lstsq(x, flow[valid], rcond=None)[0]
+                residual[valid] = flow[valid] - x @ beta
+            observed.append(day)
+            rows.append(residual)
+        result = pd.DataFrame(rows, index=pd.DatetimeIndex(observed), columns=close.columns)
+        panel[cache_key] = result
+        return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 485. intraday_flow_ret_resid — 资金流对涨跌幅残差
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25253,7 +25300,7 @@ class IntradayFlowRetResid20d(Factor):
     """资金流对涨跌幅残差因子.
 
     大单资金流强度(期货: 符号成交额占比)与涨跌幅同步正相关 → 横截面回归剥离涨跌幅:
-    resid = flow_strength − beta × ret (截面OLS).
+    resid = flow_strength − alpha − beta × ret (当日截面OLS, 至少3个有效品种).
     剥离涨跌幅后的资金流 → 与价格同步无关的纯资金行为 → 正向.
     与 #453-455(对动量回归) 不同: 本因子对**当日涨跌幅**横截面回归.
     方向: 正向.
@@ -25268,55 +25315,9 @@ class IntradayFlowRetResid20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel or "amount" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        day = close.index.normalize()
-        flows: dict = {}
-        rets: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_a = amount.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            fvals, rvals = {}, {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                a = grp_a[col].dropna()
-                common = c.index.intersection(a.index)
-                if len(common) < 20:
-                    continue
-                r = c.loc[common].diff()
-                amt = a.loc[common].iloc[1:]
-                r = r.iloc[1:]
-                total = amt.sum()
-                if total < 1e-12:
-                    continue
-                fvals[col] = float((np.sign(r) * amt).sum() / total)
-                if c.loc[common].iloc[0] > 0:
-                    rvals[col] = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0)
-            if fvals and rvals:
-                flows[dt] = pd.Series(fvals)
-                rets[dt] = pd.Series(rvals)
-        if not flows:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        fdf = pd.DataFrame(flows).T
-        rdf = pd.DataFrame(rets).T
-        fdf.index = pd.DatetimeIndex(fdf.index)
-        rdf.index = pd.DatetimeIndex(rdf.index)
-        resid = pd.DataFrame(index=fdf.index, columns=universe, dtype=float)
-        for col in fdf.columns:
-            f = fdf[col].values
-            r = rdf[col].values
-            valid = ~(np.isnan(f) | np.isnan(r))
-            if valid.sum() < 20:
-                continue
-            x = np.column_stack([np.ones(valid.sum()), r[valid]])
-            b = np.linalg.lstsq(x, f[valid], rcond=None)[0]
-            resid.loc[:, col] = np.nan
-            resid.loc[fdf.index[valid], col] = f[valid] - x @ b
-        return resid.rolling(20, min_periods=5).mean().reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+        resid = _daily_flow_return_residual(data, dates, universe)
+        daily = resid.rolling(20, min_periods=5).mean()
+        return daily.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -25630,7 +25631,7 @@ class IntradaySmartMoneyRet20d(Factor):
 class IntradayFlowRetResidVol20d(Factor):
     """资金流残差波动因子 (原创: #485 改进).
 
-    #485 用剥离涨跌幅的资金流残差水平, 本因子用残差的 20 日波动:
+    #485 用当日截面回归剥离涨跌幅的资金流残差水平, 本因子用残差的 20 日波动:
     残差波动大 → 资金流与价格脱钩后的行为不稳定 → 资金方向反复 → 负向.
     残差波动小 → 纯资金行为稳定 → 正向.
     方向: 负向.
@@ -25645,56 +25646,9 @@ class IntradayFlowRetResidVol20d(Factor):
         return []
 
     def compute(self, data, dates, universe):
-        panel = _get_minute_panel(data, dates, universe, freq="1min")
-        if "close" not in panel or "amount" not in panel:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        close, amount = panel["close"], panel["amount"]
-        day = close.index.normalize()
-        flows: dict = {}
-        rets: dict = {}
-        for dt in sorted(set(day)):
-            grp_c = close.loc[day == dt]
-            grp_a = amount.loc[day == dt]
-            if len(grp_c) < 20:
-                continue
-            fvals, rvals = {}, {}
-            for col in grp_c.columns:
-                c = grp_c[col].dropna()
-                a = grp_a[col].dropna()
-                common = c.index.intersection(a.index)
-                if len(common) < 20:
-                    continue
-                r = c.loc[common].diff()
-                amt = a.loc[common].iloc[1:]
-                r = r.iloc[1:]
-                total = amt.sum()
-                if total < 1e-12:
-                    continue
-                fvals[col] = float((np.sign(r) * amt).sum() / total)
-                if c.loc[common].iloc[0] > 0:
-                    rvals[col] = float(c.loc[common].iloc[-1] / c.loc[common].iloc[0] - 1.0)
-            if fvals and rvals:
-                flows[dt] = pd.Series(fvals)
-                rets[dt] = pd.Series(rvals)
-        if not flows:
-            return pd.DataFrame(np.nan, index=dates, columns=universe)
-        fdf = pd.DataFrame(flows).T
-        rdf = pd.DataFrame(rets).T
-        fdf.index = pd.DatetimeIndex(fdf.index)
-        rdf.index = pd.DatetimeIndex(rdf.index)
-        resid = pd.DataFrame(index=fdf.index, columns=universe, dtype=float)
-        for col in fdf.columns:
-            f = fdf[col].values
-            r = rdf[col].values
-            valid = ~(np.isnan(f) | np.isnan(r))
-            if valid.sum() < 20:
-                continue
-            x = np.column_stack([np.ones(valid.sum()), r[valid]])
-            b = np.linalg.lstsq(x, f[valid], rcond=None)[0]
-            resid.loc[:, col] = np.nan
-            resid.loc[fdf.index[valid], col] = f[valid] - x @ b
-        vol = resid.rolling(20, min_periods=5).std()
-        return (-vol).reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
+        resid = _daily_flow_return_residual(data, dates, universe)
+        daily = -resid.rolling(20, min_periods=5).std()
+        return daily.reindex(index=pd.DatetimeIndex(dates), columns=universe).shift(1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

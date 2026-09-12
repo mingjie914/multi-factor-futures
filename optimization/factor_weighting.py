@@ -15,7 +15,14 @@ def causal_history(
     """Return up to the latest ``window`` rows strictly before ``date``."""
     if int(window) <= 0:
         raise ValueError("history window must be positive")
-    return frame.loc[frame.index < pd.Timestamp(date)].tail(int(window))
+    decision = pd.Timestamp(date)
+    if (isinstance(frame.index, pd.DatetimeIndex)
+            and frame.index.is_monotonic_increasing and pd.notna(decision)):
+        # Binary search avoids rescanning the full IC panel for every decision.
+        # Copy preserves the old filtered result's independence from its input.
+        stop = frame.index.searchsorted(decision, side="left")
+        return frame.iloc[max(0, stop - int(window)):stop].copy()
+    return frame.loc[frame.index < decision].tail(int(window))
 
 
 def prepare_complete_history(

@@ -209,7 +209,9 @@ def causal_risk_window(
     if lookback <= 0:
         raise PortfolioConstructionError("risk lookback must be positive")
     start = decision - pd.Timedelta(days=lookback)
-    return frame.loc[(index >= start) & (index < decision)]
+    left = index.searchsorted(start, side="left")
+    right = index.searchsorted(decision, side="left")
+    return frame.iloc[left:right].copy()
 
 
 def _box_simplex_projection(

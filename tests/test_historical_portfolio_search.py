@@ -30,6 +30,233 @@ from factors.engine import FactorComputationError
 from research.portfolio_experiment_support import FactorPanelRunner
 
 
+def test_declared_recipe_grid_is_full_cartesian_and_preserves_constraints():
+    from itertools import product
+    from research.historical_portfolio_search import portfolio_recipe_grid
+    base = PortfolioRecipe(asset_min_fraction=0.01, asset_max_fraction=0.30,
+                           gross_exposure=1.5, sector_weight_caps=(("metals", 0.4),))
+    recipes = portfolio_recipe_grid(base)
+    assert len(recipes) == len(set(recipes)) == 96
+    assert {(r.factor_weight, r.top_n, r.sector_cap, r.asset_weight) for r in recipes} == set(product(
+        ("equal", "diag_icir", "lw_abs", "lw_positive"), (5, 8, 10, 12),
+        (0, 3), ("equal", "inverse_volatility", "erc"),
+    ))
+    assert base in recipes
+    assert all((r.asset_min_fraction, r.asset_max_fraction, r.gross_exposure,
+                r.sector_weight_caps) == (0.01, 0.30, 1.5, (("metals", 0.4),))
+               for r in recipes)
+
+
+def test_neighborhood_matches_independent_powerset_oracle():
+    from itertools import combinations
+    from research.historical_portfolio_search import factor_neighborhood
+    old, new = set("abc"), set("def")
+    expected = set()
+    for size in range(2, 7):
+        for values in combinations(sorted(old | new), size):
+            members = set(values)
+            if len(old - members) <= 2 and len(members - old) <= 2:
+                expected.add(values)
+    rows = list(factor_neighborhood(sorted(old), sorted(new)))
+    assert {row[0] for row in rows} == expected
+    assert len(rows) == len(expected)
+    for members, removed, added in rows:
+        assert set(members) == (old - set(removed)) | set(added)
+    assert rows == list(factor_neighborhood("cbac", "fedaa"))
+
+
+def test_top5_with_existing_twenty_percent_cap_has_equal_final_weights():
+    from optimization.portfolio_construction import PortfolioConstraints, allocate_sleeve
+    rng = np.random.default_rng(47)
+    history = pd.DataFrame(rng.normal(size=(90, 5)) * np.arange(1, 6),
+                           columns=list("ABCDE"))
+    constraints = PortfolioConstraints(top_n_per_side=5)
+    for method in ("equal", "inverse_volatility", "erc"):
+        weights = allocate_sleeve(history, method=method, constraints=constraints,
+                                  sector_of={name: name for name in history})
+        np.testing.assert_allclose(weights.to_numpy(), np.full(5, 0.2), atol=1e-9)
+
+
+def test_neighborhood_full_declared_counts_and_invalid_limits():
+    from research.historical_portfolio_search import factor_neighborhood
+    new = [f"new_{i}" for i in range(14)]
+    counts = [sum(1 for _ in factor_neighborhood([f"old_{i}" for i in range(n)], new))
+              for n in (10, 8, 13, 17, 17, 18, 13, 10)]
+    assert sum(counts) == 86178
+    assert sum(counts) * 96 == 8273088
+    with np.testing.assert_raises(ValueError):
+        list(factor_neighborhood(["a", "b"], new, max_add=-1))
+
+
+def test_joint_neighborhood_generator_preserves_signs_and_originals_first():
+    from research.historical_portfolio_search import unique_factor_neighborhoods
+    seeds = [{"id": "one", "directions": {"a": 1, "b": -1}},
+             {"id": "two", "directions": {"a": 1, "b": 1}}]
+    candidates = {"c": {"direction": -1}, "d": {"direction": 1}}
+    rows = list(unique_factor_neighborhoods(seeds, candidates))
+    assert [row["seed"] for row in rows[:2]] == ["one", "two"]
+    assert all(row["original"] for row in rows[:2])
+    assert not any(row["original"] for row in rows[2:])
+    identities = [tuple(row["directions"].items()) for row in rows]
+    assert len(identities) == len(set(identities))
+    assert (("a", 1), ("b", -1)) in identities
+    assert (("a", 1), ("b", 1)) in identities
+    assert identities.count((("c", -1), ("d", 1))) == 1
+    assert rows == list(unique_factor_neighborhoods(seeds, candidates))
+
+
+def test_batched_scores_are_bitwise_equal_to_daily_public_combiner():
+    from optimization.factor_weighting import causal_history
+    rng = np.random.default_rng(17)
+    dates = pd.bdate_range("2024-01-02", periods=100)
+    names, universe = ["a", "b", "c", "d", "e"], ["Y", "X", "Z"]
+    ranks = {name: pd.DataFrame(rng.uniform(size=(100, 3)), index=dates, columns=universe)
+             for name in names}
+    ranks["a"].iloc[70, 1] = np.nan
+    ranks["b"].iloc[65, 2] = np.inf
+    ranks["c"].iloc[80, :] = np.nan
+    ic = pd.DataFrame(rng.normal(0.5, 0.02, size=(100, len(names))), index=dates, columns=names)
+    ic.iloc[15, 1] = np.nan
+    runner = SimpleNamespace(cal=dates, u=universe, ranks=ranks, ic=ic)
+    evaluator = PortfolioEvaluator(runner, start=dates[0], end=dates[-1])
+    for method in ("equal", "diag_icir", "lw_abs", "lw_positive"):
+        expected = pd.DataFrame(np.nan, index=dates, columns=universe)
+        for date in dates:
+            if method == "equal":
+                weights = pd.Series(1 / len(names), index=names)
+            else:
+                history = prepare_complete_history(causal_history(ic, date, 60), minimum_observations=30)
+                weights = factor_weights(history, method)
+            expected.loc[date] = combine_available_factor_scores(
+                {name: ranks[name].loc[date] for name in names}, weights, universe)
+        pd.testing.assert_frame_equal(evaluator._score_matrix(names, method), expected, check_exact=True)
+
+
+def test_neighborhood_pilot_keeps_frozen_recipe_and_records_failed_jobs(monkeypatch, tmp_path):
+    base = PortfolioRecipe(asset_min_fraction=0.01, asset_max_fraction=0.3,
+                           gross_exposure=1.5, sector_weight_caps=(("metals", 0.4),))
+    contract = {
+        "input_sha256": {}, "factor_source_sha256": "frozen", "source_fingerprint": "market",
+        "seeds": [{"id": "small", "directions": {"a": 1, "b": -1}},
+                  {"id": "large", "directions": {"a": 1, "b": -1, "c": 1}}],
+        "panel_start": "2015-04-01", "performance_start": "2016-03-31",
+        "end": "2016-04-01", "baseline_recipe": base.to_dict(),
+        "frozen_runtime": {"ic_window": 60, "risk_lookback_calendar_days": 90},
+    }
+    (tmp_path / "search_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    class FakeRunner:
+        _source_tree_fingerprint = staticmethod(lambda: "frozen")
+        def __init__(self, *args, **kwargs):
+            assert kwargs["ic_horizon"] == 1
+        def get_contract_schedule(self):
+            return None
+        def performance_profile(self):
+            return {}
+        def for_factors(self, factors, *, factor_directions):
+            assert factor_directions["b"] == -1
+            return self
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["start"] == "2016-03-31"
+        def clear_transient_caches(self):
+            pass
+        def ledger(self, factors, recipe):
+            assert recipe.gross_exposure == 1.5
+            assert recipe.sector_weight_caps == (("metals", 0.4),)
+            if recipe.factor_weight == "equal":
+                raise RuntimeError("test unavailable history")
+            return pd.DataFrame({"net_return": [0.0, 0.01]},
+                                index=pd.bdate_range("2016-03-31", periods=2))
+    monkeypatch.setattr(workflow, "Runner", FakeRunner)
+    monkeypatch.setattr(workflow, "PortfolioEvaluator", FakeEvaluator)
+    monkeypatch.setattr(workflow, "_search_source_snapshot", lambda *_args: {"source_fingerprint": "market"})
+    result = workflow.benchmark_neighborhood_search(tmp_path)
+    assert len(result["jobs"]) == 10
+    assert sum(row["status"] == "failed" for row in result["jobs"]) == 2
+    assert result["new_factor_compute_included"] is False
+    assert {row["recipe"]["top_n"] for row in result["jobs"]} == {5, 10}
+    with np.testing.assert_raises(FileExistsError):
+        workflow.benchmark_neighborhood_search(tmp_path)
+
+
+def test_native_batch_resumes_without_repeating_or_dropping_failures(monkeypatch, tmp_path):
+    import duckdb
+    dates = pd.bdate_range("2016-03-31", periods=3)
+    recipes = [PortfolioRecipe("equal", 5, 3, "equal"),
+               PortfolioRecipe("diag_icir", 5, 3, "equal")]
+    contract = {
+        "input_sha256": {}, "factor_source_sha256": "code", "source_fingerprint": "market",
+        "panel_start": "2015-04-01", "performance_start": "2016-03-31", "end": "2016-04-04",
+        "selection_end": "2016-04-01", "observation_start": "2016-04-02",
+        "seeds": [{"id": "baseline", "directions": {"a": 1, "b": -1}}],
+        "candidates": {}, "recipes": [r.to_dict() for r in recipes],
+        "baseline_recipe": recipes[0].to_dict(),
+        "historical_folds": [{"fold": "one", "test_start": "2016-04-01", "test_end": "2016-04-04"}],
+        "fold_role": "historical_stability_not_independent_factor_discovery_oos",
+        "counts": {"jobs_after_dedup": 2},
+        "frozen_runtime": {"ic_horizon": 1, "ic_window": 60, "risk_lookback_calendar_days": 90},
+    }
+    (tmp_path / "search_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    (tmp_path / "pilot_profile.json").write_text(json.dumps({
+        "role": "cost_measurement_not_selection", "jobs": [{}] * 10}), encoding="utf-8")
+    (tmp_path / "ledger_parity.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    checkpoint = tmp_path / "factor_panel_checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "manifest.json").write_text(json.dumps({"contract": {"factors": ["a", "b"]},
+        "completed": {"a": "a.parquet", "b": "b.parquet"}}), encoding="utf-8")
+    for name in ("a", "b"):
+        pd.DataFrame({"X": [1, 2, 3]}, index=dates).to_parquet(checkpoint / f"{name}.parquet")
+    calls = []
+    class FakeRunner:
+        _source_tree_fingerprint = staticmethod(lambda: "code")
+        def __init__(self, names, **kwargs):
+            assert names == ["a", "b"]
+            self.raw_ranks = {}
+            self.cal = dates
+            self.daily_ret = pd.DataFrame({"X": 0.0}, index=dates)
+            self.env = SimpleNamespace(sector_of={"X": "X"})
+        def _load_factor_checkpoint(self, *args):
+            return {n: pd.DataFrame({"X": [1, 2, 3]}, index=dates) for n in ["a", "b"]}, None
+        def for_factors(self, *args, **kwargs):
+            assert kwargs["factor_directions"] == {"a": 1, "b": -1}
+            return self
+        def get_contract_schedule(self):
+            pass
+        def performance_profile(self):
+            return {}
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs):
+            self._ledger_cache = {}
+        def ledger(self, factors, recipe):
+            calls.append(recipe.factor_weight)
+            if recipe.factor_weight == "diag_icir":
+                raise RuntimeError("insufficient historical sample")
+            return pd.DataFrame({"net_return": [0.0, 0.01, -0.02], "nav": [1000., 1010., 989.8]}, index=dates)
+        def clear_transient_caches(self):
+            pass
+    monkeypatch.setattr(workflow, "Runner", FakeRunner)
+    monkeypatch.setattr(workflow, "PortfolioEvaluator", FakeEvaluator)
+    monkeypatch.setattr(workflow, "_search_source_snapshot", lambda *args: {"source_fingerprint": "market"})
+    first = workflow.run_neighborhood_batch(tmp_path, max_jobs=1)
+    assert workflow.report_neighborhood_search(tmp_path)["complete"] is False
+    assert "部分完成" in (tmp_path / "conclusion_report.md").read_text(encoding="utf-8")
+    second = workflow.run_neighborhood_batch(tmp_path, max_jobs=1)
+    third = workflow.run_neighborhood_batch(tmp_path, max_jobs=1)
+    assert calls == ["equal", "diag_icir"]
+    assert first["full_search_complete"] is False
+    assert second["counts"] == {"completed": 1, "failed": 1}
+    assert second["full_search_complete"] is True
+    assert third["performed_this_batch"] == 0
+    with duckdb.connect(str(tmp_path / "search_results.duckdb"), read_only=True) as db:
+        assert db.execute("select id from results order by id").fetchall() == [(0,), (1,)]
+    report = workflow.report_neighborhood_search(tmp_path)
+    assert report["complete"] is True
+    assert report["counts"] == {"completed": 1, "failed": 1}
+    assert len(pd.read_parquet(tmp_path / "all_performance.parquet")) == 2
+    assert (tmp_path / "nav_comparison.png").stat().st_size > 10000
+    assert "失败 1" in (tmp_path / "conclusion_report.md").read_text(encoding="utf-8")
+
+
 def test_historical_period_protocol_is_frozen_and_copy_safe():
     from research.validation import (
         LONG_HISTORY_REPLAY_END,
@@ -741,3 +968,119 @@ def test_risk_lookback_calendar_days_is_explicit_and_causal():
     assert len(short_history) < len(long_history)
     assert short_history.index.max() < dates[-1]
     assert long_history.index.max() < dates[-1]
+
+
+def test_attribution_compounds_costs_sides_and_subintervals_exactly():
+    from workflows.experiments.portfolio_attribution import attributed_period
+    from backtest.research_ledger import build_close_marked_ledger
+    dates = pd.bdate_range("2026-01-01", periods=5)
+    targets = pd.DataFrame({"A": [0.5, 0.5, -0.5, -0.5, 0], "B": [-0.5]*5}, index=dates)
+    returns = pd.DataFrame({"A": [0, .02, -.01, .03, -.02], "B": [0, -.01, .01, -.02, .01]}, index=dates)
+    result = build_close_marked_ledger(targets, returns, trade_cost_rate=.001, annual_fee=.01)
+    for frame in (result.daily.iloc[1:], result.daily.iloc[3:]):
+        row = attributed_period(frame, result.contributions, result.effective_weights,
+                                {"A": "same", "B": "same"}, {"A": "x", "B": "y"})
+        expected = (1 + frame.net_return).prod()-1
+        assert abs(row["total_return"]-expected) < 1e-14
+        assert abs(row["reconciliation_error"]) < 1e-14
+        gross = sum(x["contribution"] for x in row["assets"])
+        assert abs(gross-row["long_contribution"]-row["short_contribution"]) < 1e-14
+        assert row["trade_cost_contribution"] <= 0
+        assert row["holding_cost_contribution"] <= 0
+        assert abs(sum(row["sector"].values())-gross) < 1e-14
+    import pytest
+    bad = result.contributions.copy()
+    bad.iloc[2, 0] += .01
+    with pytest.raises(AssertionError):
+        attributed_period(result.daily, bad, result.effective_weights,
+                          {"A": "s", "B": "s"}, {"A": "s", "B": "s"})
+
+
+def test_deletions_cover_factors_clusters_and_preserve_direction_identity():
+    from workflows.experiments.portfolio_attribution import deletion_jobs
+    peers = [{"name": "first", "directions": {"a": 1, "b": -1, "c": 1}},
+             {"name": "second", "directions": {"a": -1, "b": -1, "c": 1}}]
+    jobs = deletion_jobs(peers, {"a": 1, "b": 2, "c": 2})
+    uses = [use for job in jobs.values() for use in job["uses"]]
+    assert len(uses) == 10
+    assert len(jobs) == 7
+    assert all(set(job["directions"]) | set(use["removed"]) == {"a", "b", "c"}
+               for job in jobs.values() for use in job["uses"])
+    assert any(job["directions"] == {"a": 1} for job in jobs.values())
+    assert any(job["directions"] == {"a": -1} for job in jobs.values())
+
+
+def test_attribution_periods_do_not_use_observation_for_selection_metrics():
+    from workflows.experiments.portfolio_attribution import period_metrics
+    dates = pd.bdate_range("2016-03-31", "2026-09-08")
+    returns = .0003 + np.sin(np.arange(len(dates))) * .003
+    returns[0] = 0
+    daily = pd.DataFrame({"net_return": returns, "trade_cost": .0001, "holding_cost": .00002}, index=dates)
+    daily.iloc[0] = 0
+    cutoff = pd.Timestamp("2026-05-15")
+    first = period_metrics(daily, str(dates[0].date()), cutoff)
+    daily.loc[daily.index > cutoff, "net_return"] = -.02
+    second = period_metrics(daily, str(dates[0].date()), cutoff)
+    assert first["selection"] == second["selection"]
+    assert first["robustness"] == second["robustness"]
+    assert first["observation"] != second["observation"]
+    assert first["selection"]["static_cost_2x"]["annual_return"] < first["selection"]["base"]["annual_return"]
+
+
+def test_history_optimization_preserves_recipe_grid_targets(monkeypatch):
+    from itertools import product
+    import research.historical_portfolio_search as hp
+
+    rng = np.random.default_rng(915)
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    symbols = [f"S{i:02}" for i in range(38)]
+    names = [f"f{i}" for i in range(20)]
+    returns = pd.DataFrame(rng.normal(0, .01, (80, 38)), index=dates, columns=symbols)
+    ranks = {name: pd.DataFrame(rng.normal(size=(80, 38)), index=dates, columns=symbols).rank(axis=1, pct=True) for name in names}
+    ic = pd.DataFrame(rng.normal(.01, .02, (80, 20)), index=dates, columns=names)
+    ic.iloc[:5, :3] = np.nan
+    runner = SimpleNamespace(cal=dates, u=symbols, daily_ret=returns, ranks=ranks, ic=ic,
+                             env=SimpleNamespace(sector_of={s: str(i % 6) for i, s in enumerate(symbols)}))
+
+    def old_history(frame, date, window):
+        return frame.loc[frame.index < pd.Timestamp(date)].tail(int(window))
+
+    def old_risk(frame, date, lookback):
+        index = pd.DatetimeIndex(frame.index)
+        return frame.loc[(index >= date - pd.Timedelta(days=lookback)) & (index < date)]
+
+    for method, allocation, (count, top) in product(
+        ("equal", "diag_icir", "lw_abs", "lw_positive"),
+        ("equal", "inverse_volatility", "erc"), ((4, 5), (8, 10), (20, 12)),
+    ):
+        recipe = PortfolioRecipe(method, top, 3 if top != 12 else 0, allocation)
+        actual = PortfolioEvaluator(runner, start=dates[-3], end=dates[-1]).weights(names[:count], recipe)
+        with monkeypatch.context() as patch:
+            patch.setattr(hp, "causal_history", old_history)
+            patch.setattr(hp, "causal_risk_window", old_risk)
+            expected = PortfolioEvaluator(runner, start=dates[-3], end=dates[-1]).weights(names[:count], recipe)
+        pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+
+
+def test_repair_audit_rejects_unverified_provenance_before_loading_data(monkeypatch, tmp_path):
+    import workflows.experiments.portfolio_attribution as audit
+    reference, output, baseline = tmp_path / "search", tmp_path / "repair", tmp_path / "old"
+    old = {"factor_source_sha256": "old", "input_sha256": {}}
+    valid = {"baseline_audit": str(baseline), "before_factor_source_sha256": "old",
+             "after_factor_source_sha256": "new", "unchanged_module_ast_exact": True,
+             "old_tree_reconstructed_exact": True, "recomputed_factors": ["factor"],
+             "engineering_parity": "engineering.json"}
+    monkeypatch.setattr(audit.Runner, "_source_tree_fingerprint", staticmethod(lambda: "new"))
+    for field, value in (("after_factor_source_sha256", "different"),
+                         ("before_factor_source_sha256", "different"),
+                         ("unchanged_module_ast_exact", False),
+                         ("old_tree_reconstructed_exact", False),
+                         ("baseline_audit", str(tmp_path / "wrong"))):
+        documents = {str(reference / "pool_contract.json"): old,
+                     str(output / "repair_provenance.json"): {**valid, field: value},
+                     "engineering.json": {"all_13_exact": True},
+                     str(baseline / "contract.json"): {"source": old}}
+        monkeypatch.setattr(audit, "read_json", lambda p: documents[str(p)])
+        with np.testing.assert_raises_regex(ValueError, "repair provenance"):
+            audit.run(reference, output, repair_reference=baseline)
+    assert not output.exists()

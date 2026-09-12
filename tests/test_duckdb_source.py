@@ -111,6 +111,35 @@ def _fixture(tmp_path: Path, *, build: bool = True):
     return updater, root, table_root, database
 
 
+def test_duckdb_and_parquet_reject_delivery_month_regression(tmp_path):
+    updater, root, table_root, database = _fixture(tmp_path, build=False)
+    path = table_root / "futureshistoryprices1d/year_month=2024-01/part.parquet"
+    frame = pd.read_parquet(path)
+    frame = pd.concat([frame, pd.DataFrame([
+        _market_row("A2401", "2024-01-05", 105.0, 3000),
+        _market_row("A2405", "2024-01-05", 125.0, 1000),
+        _market_row("A2405", "2024-01-08", 128.0, 1000),
+    ])], ignore_index=True)
+    frame.to_parquet(path, index=False)
+    updater.build_database(root, database, tmp_path / "market.json", "market-v1",
+                           tmp_path / "seat.json", "seat-v2", 1)
+    config = {"root_path": str(table_root), "eager_fields": False}
+    parquet = ParquetFuturesSource(config)
+    source = DuckDBFuturesSource({"path": str(database)}, config)
+    try:
+        for method in ("fetch_contract_schedule",):
+            left = getattr(parquet, method)(["A"], "2024-01-02", "2024-01-08")
+            right = getattr(source, method)(["A"], "2024-01-02", "2024-01-08")
+            pd.testing.assert_frame_equal(left, right)
+            assert right.loc["2024-01-08", "A"] == "A2405"
+        pd.testing.assert_frame_equal(
+            parquet.fetch_price(["A"], "2024-01-02", "2024-01-08", ["close"])["close"],
+            source.fetch_price(["A"], "2024-01-02", "2024-01-08", ["close"])["close"],
+        )
+    finally:
+        source.close()
+
+
 def test_duckdb_preserves_market_frequency_term_structure_and_seat_semantics(
     tmp_path
 ):

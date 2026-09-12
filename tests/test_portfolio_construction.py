@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from optimization.factor_weighting import causal_history
 from optimization.portfolio_construction import (
     PortfolioConstraints,
+    PortfolioConstructionError,
     allocate_sleeve,
     combine_sleeves,
+    causal_risk_window,
 )
 from optimization.risk_budgeting import RiskBudgetingOptimizer
 
@@ -21,6 +24,33 @@ def test_causal_ic_history_uses_exactly_sixty_rows_before_decision():
     assert len(actual) == 60
     assert actual.index.max() < dates[-1]
     assert actual.index.equals(dates[:-1])
+
+
+@pytest.mark.parametrize("timezone", [None, "Asia/Shanghai"])
+def test_history_slices_match_boolean_reference_and_do_not_alias(timezone):
+    dates = pd.bdate_range("2025-01-01", periods=100, tz=timezone)
+    original = pd.DataFrame({"x": np.arange(100, dtype=float)}, index=dates)
+    original.iloc[8] = np.nan
+    original.iloc[12] = np.inf
+    for frame in (original, original.iloc[::-1], original.iloc[[0, 1, 1, 2]], original.iloc[:0]):
+        for decision in (dates[0], dates[45], dates[45] + pd.Timedelta(hours=12), dates[-1] + pd.Timedelta(days=4)):
+            for window in (1, 60, 150):
+                expected = frame.loc[frame.index < decision].tail(window)
+                actual = causal_history(frame, decision, window)
+                pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+                if len(actual):
+                    snapshot = frame.copy()
+                    actual.iloc[0, 0] = -999
+                    pd.testing.assert_frame_equal(frame, snapshot, check_exact=True)
+        pd.testing.assert_frame_equal(causal_history(frame, pd.NaT, 60), frame.loc[frame.index < pd.NaT].tail(60), check_exact=True)
+    for decision in (dates[0], dates[60], dates[-1] + pd.Timedelta(days=7), pd.NaT):
+        for lookback in (1, 90, 400):
+            expected = original.loc[(dates >= decision - pd.Timedelta(days=lookback)) & (dates < decision)]
+            actual = causal_risk_window(original, decision, lookback)
+            pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    for invalid in (original.iloc[::-1], original.iloc[[0, 1, 1, 2]]):
+        with pytest.raises(PortfolioConstructionError, match="unique and sorted"):
+            causal_risk_window(invalid, dates[-1], 90)
 
 
 def test_erc_asset_cap_still_holds_after_unit_sleeve_projection(monkeypatch):

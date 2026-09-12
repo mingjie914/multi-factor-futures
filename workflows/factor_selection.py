@@ -325,6 +325,142 @@ def _run_portfolio_search(
                               else f"declared_compute_budget_size_{limit}")
 
 
+def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments,
+                              clusters, db, output, budget=512, beam_width=6,
+                              round_width=16):
+    """Explicit research-only multi-start search; never changes default selection.
+
+    Every factor gets an exact seed-pair attempt. IC only orders proposals;
+    exact net backtests choose the moving beam and the final Pareto archive.
+    Growth lanes survive temporary deterioration. Size is not a stop rule.
+    """
+    names = sorted(set(pool))
+    if len(names) < 2 or budget < len(names) or not 1 <= beam_width <= round_width:
+        raise ValueError("budget must cover the full pool and widths must be positive")
+    # IC at T contains T+1 returns. Drop the last selection-day label even if
+    # the caller supplied a panel extending into the observation period.
+    panel = portfolio_ic.loc[:evaluator.end, names].iloc[:-1]
+    arrays = [panel.loc[left:right].to_numpy(dtype=float) for left, right in segments]
+    positions, proxies = {n: i for i, n in enumerate(names)}, {}
+    def proxy(members):
+        if members not in proxies:
+            means, sharpes = [], []
+            for values in arrays:
+                x = values[:, [positions[n] for n in members]]
+                count = np.isfinite(x).sum(axis=1)
+                y = np.divide(np.nansum(x, axis=1), count,
+                              out=np.full(len(x), np.nan), where=count > 0)
+                y = y[np.isfinite(y)]
+                if len(y) < 20:
+                    proxies[members] = (0.0, -10.0, -10.0)
+                    break
+                mean, std = y.mean(), y.std(ddof=1)
+                means.append(mean)
+                sharpes.append(mean / std * np.sqrt(252) if std > 0 else -10.0)
+            else:
+                proxies[members] = (float(np.mean(np.asarray(means) > 0)),
+                                    float(min(sharpes)), float(np.median(sharpes)))
+        return proxies[members]
+    db.execute("""CREATE TABLE IF NOT EXISTS pool_results (
+        signature VARCHAR PRIMARY KEY, result VARCHAR, dates DATE[],
+        nav DOUBLE[], net_returns DOUBLE[])""")
+    cached = {key: json.loads(value) for key, value in db.execute(
+        "SELECT signature,result FROM pool_results").fetchall()}
+    evaluations, visited, path = [], set(), []
+    def evaluate(members, phase, iteration):
+        members = tuple(sorted(members))
+        if members in visited or len(evaluations) >= budget:
+            return None
+        key = json.dumps(members)
+        row = cached.get(key)
+        if row is None:
+            started, cpu = time.perf_counter(), time.process_time()
+            row = {"factors": list(members), "factor_count": len(members),
+                   "phase": phase, "step": iteration, "status": "rejected_runtime",
+                   "error": "", "segment_count": 0, "positive_segment_ratio": 0.0,
+                   "worst_sharpe": -10.0, "median_sharpe": -10.0,
+                   "median_annual_return": -1.0, "worst_drawdown": -1.0,
+                   "annual_turnover": None, "full_annual_return": None}
+            dates, nav, returns = [], [], []
+            try:
+                ledger = evaluator.ledger(members, recipe)
+                if ledger.index.max() > evaluator.end:
+                    raise AssertionError("selection ledger escaped the cutoff")
+                metrics = performance_metrics(ledger["net_return"], initial_anchor=True)
+                if any(len(ledger.loc[left:right]) < 20 for left, right in segments):
+                    raise RuntimeError("insufficient history in a declared block")
+                row.update(status="evaluated", **robust_summary(ledger, segments, initial_anchor=True),
+                           annual_turnover=float(ledger["executed_traded_notional"].iloc[1:].mean()*252),
+                           **{f"full_{k}": v for k, v in metrics.items()})
+                dates, nav, returns = list(ledger.index.date), ledger["nav"].tolist(), ledger["net_return"].tolist()
+            except (RuntimeError, ValueError) as exc:
+                row["error"] = str(exc)
+            row.update(seconds=time.perf_counter()-started, cpu_seconds=time.process_time()-cpu)
+            db.execute("INSERT INTO pool_results VALUES (?,?,?,?,?)",
+                       [key, json.dumps(row), dates, nav, returns])
+            cached[key] = row
+            evaluator.clear_transient_caches()
+        visited.add(members)
+        evaluations.append(row)
+        _write_json(output / "pool_progress.json", {
+            "attempted": len(evaluations), "budget": budget,
+            "cached_total": len(cached), "phase": phase, "round": iteration,
+            "evaluated": sum(r["status"] == "evaluated" for r in evaluations),
+            "covered_factors": len({n for r in evaluations for n in r["factors"]})})
+        print(f"pool {len(evaluations)}/{budget} {phase} {len(members)}f {row['status']}", flush=True)
+        return row
+    def choose(rows, count, existing=()):
+        selected = list(existing)
+        for row in sorted((r for r in rows if r and r["status"] == "evaluated"),
+                          key=lambda r: (*robustness_key(r), -r["annual_turnover"]), reverse=True):
+            members = tuple(row["factors"])
+            if all(len(set(members)&set(other))/len(set(members)|set(other)) < .95 for other in selected):
+                selected.append(members)
+            if len(selected) >= count:
+                break
+        return selected
+    pairs = sorted(combinations(names, 2), key=lambda m: (proxy(m), m), reverse=True)
+    seeds = []
+    for name in names:
+        pair = next((m for m in pairs if name in m and clusters[m[0]] != clusters[m[1]]),
+                    next(m for m in pairs if name in m))
+        if pair not in seeds:
+            seeds.append(pair)
+    seed_rows = [evaluate(m, "seed_coverage", 0) for m in seeds]
+    beam = choose(seed_rows, beam_width)
+    iteration = 0
+    while beam and len(evaluations) < budget:
+        iteration += 1
+        proposals, growth = set(), set()
+        for parent in beam:
+            added = {tuple(sorted((*parent, n))) for n in names if n not in parent} - visited
+            proposals.update(added)
+            if added:
+                growth.add(max(added, key=lambda m: (proxy(m), m)))
+            for old in parent:
+                remainder = tuple(n for n in parent if n != old)
+                if len(remainder) >= 2:
+                    proposals.add(remainder)
+                proposals.update(tuple(sorted((*remainder, n))) for n in names if n not in parent)
+        proposals -= visited
+        if not proposals:
+            break
+        ordered = sorted(growth, key=lambda m: (proxy(m), m), reverse=True)
+        ordered += sorted(proposals-growth, key=lambda m: (proxy(m), m), reverse=True)
+        rows = [evaluate(m, "grow" if m in growth else "add_delete_swap", iteration)
+                for m in ordered[:round_width] if len(evaluations) < budget]
+        grown = choose([r for r in rows if r and r["phase"] == "grow"], max(1, beam_width//2))
+        beam = choose(rows, beam_width, grown)
+        if rows and any(r and r["status"] == "evaluated" for r in rows):
+            path.append(max((r for r in rows if r and r["status"] == "evaluated"), key=robustness_key))
+    reason = "exact_backtest_budget_exhausted" if len(evaluations) >= budget else "reachable_proposals_exhausted"
+    _write_json(output / "pool_selection.json", {
+        "stop_reason": reason, "budget": budget, "attempted": len(evaluations),
+        "scope": names, "shortlist": _portfolio_shortlist(evaluations), "path": path,
+        "observation_used_for_selection": False})
+    return path, evaluations, reason
+
+
 def _load_library(
     config,
     *,

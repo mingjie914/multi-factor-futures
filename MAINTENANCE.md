@@ -24,8 +24,8 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1
 ```
 
-完整测试在当前开发机约 25 秒。机器、BLAS、测试数量和依赖版本会改变绝对值，
-持续集成更适合检查明显回退，而不是维护容易过期的固定秒数或测试项数量。
+测试耗时随机器、BLAS、测试数量和依赖版本变化；实测记录见性能报告，
+不在维护步骤中维护另一套易过期的固定秒数或测试项数量。
 
 ## Rust数值核心
 
@@ -97,7 +97,11 @@ reference/shadow对照，再运行全量测试与单线程全池画像。
 - 本框架只消费已发布的本地Parquet或其认证DuckDB镜像，不包含远程核对、回填或发布逻辑。
 - 严格健康门同时覆盖日线、1/5/15分钟行情和六张席位表；`delivery_seat`即使当前没有
   因子直接消费，也必须与其他五张正式发布席位表一起通过自然键、规范根和分区检查。
-- 连续价格与合约日程必须来自同一份点时主力选择。组合账本逐日检查下一交易日具体合约，
+- 连续价格与合约日程必须来自同一份点时主力选择。主力换月只向更远交割月份推进，
+  不因近月残余持仓反超而倒退；仍要求决策当日双腿可成交，并按既定T-1日程执行。
+  这不是完整到期日历：从未形成可成交接续的序列仍失败关闭，不用事后最后报价日补救。
+  该语义使用selected缓存v6，旧v5缓存不复用；历史结果需在同版本下重新对照。
+  组合账本逐日检查下一交易日具体合约，
   即使根权重不变、当天也不是常规调仓日，换月仍按旧约平仓＋新约开仓记录；停牌日延迟
   至首次可交易收盘执行。数据源不能提供合约日程时，账本元数据必须标记`unavailable`。
 - 交易所重启上市或合约规格发生经济断代时，在`data.parquet.root_active_from`按品种配置
@@ -142,22 +146,18 @@ SQLite candidate catalog -> immutable JSON snapshot
 SHA-256；任一变化必须新建输出目录并按影响范围重跑迁移对照或正式滚动WF。失效 bundle
 在完成必要外部归档后应从工作区删除。
 
-当前长历史迁移对照为`runs/factor_research/20260820_intraday599_rebuild/`。目录名记录最初
-599个历史注册类；11个不可估计死定义已清理，该次可估计池为588；此后新增18个因子，
-2026-09-06正式扫描时为606。`intraday_scene_amp_flow_20d`因高耗时且无统计发现退役后，
-现行日内发现池为605。结果中的
-`research_contract`绑定运行时代码、配置、Parquet元数据和候选名；20个统计发现经
-`|corr|>=0.5`去重为13个观察候选。该结果不参与当前选择；正式单因子证据来自
-`run_factor_workflow.py`的全历史准入，滚动WF只验证冻结组合，生产批准仍为0。
+旧599/588/606/605迁移目录名记录当时范围，不代表当前注册池。正式单因子证据来自
+`run_factor_workflow.py`的近期准入窗口；长历史回测和滚动WF只验证组合，不能混作全历史准入。
+当前库与策略状态分别以其权威文件为准，已完成修复和本地证据链统一列在`runs/README.md`。
 
 ## 清理策略
 
-可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、`_work/`、空的
+可以直接再生并清理：`.pytest_cache/`、所有 `__pycache__/`、已结束测试的`.test_tmp/`、`_work/`、空的
 `signals_output/`、`monitoring_data/` 和 `weeklyreport/`。清理前必须确认路径位于仓库内。
 
 不要清理：`cache/` 和 `runs/factor_research/holdout_ledger.jsonl`。前者是本地行情缓存，
-后者记录已消费 OOS。`runs/factor_mining/`、普通 `runs/factor_research/<study_id>/` 和
-回测输出在协议变更后应清理；若结果仍需审计，先保存 manifest、哈希和外部归档 URI。
+后者记录已消费 OOS。协议变更不自动授权删除旧run：被当前库、修复对照、
+配置或任何仍保留合同引用的证据必须保留；确认未引用且仍需审计时，先保存manifest、哈希和归档位置。
 正式研究使用不可变 study/run 目录，这是审计要求；只有明确的研究入口可以创建这类
 目录。运维脚本默认覆盖固定目标或要求显式输出路径，不得在项目根目录自动堆积日期文件。
 
@@ -174,12 +174,13 @@ Git 是本地版本历史和可回滚边界；当前`origin`是Gitee、`github`�
 推送前必须确认没有把行情、SQLite、普通runs、
 本机配置或凭据加入暂存区：
 
-1. 日常开发使用短分支和 pull request，不直接在 `main` 上累积大批改动。
-2. `main` 启用保护：完整测试通过、至少一次审阅、禁止 force push。
-3. CI 使用 Python 3.10 和 3.12，安装唯一依赖清单 `requirements.txt`，执行 compileall 和 pytest。
+1. 日常建议短分支与pull request；用户要求直接提交现有分支时，先审阅并完成本地测试。
+2. 分支保护与CI是建议配置，不把未核准的远端设置写成已启用；不使用force push。
+3. 按唯一依赖清单`requirements.txt`验证本地环境，运行语法检查和完整pytest；CI可配置Python 3.10/3.12矩阵。
 4. 密钥、`config/local.yaml`、Parquet、SQLite 和普通 runs 继续由 `.gitignore` 排除。
 5. 大型研究证据放对象存储或只读 NAS，并在 Git 中保存 manifest、哈希和证据 URI。
 6. Git LFS 只适合少量必须版本化的大文件，不适合作为 1 分钟行情仓库。
+7. 推送`origin`与`github`后，分别读取远端`refs/heads/main`并与本地提交核对；不只根据push返回值声称两端一致。
 
 个人单机可选私有 GitHub；需要数据内网、权限审计或自托管时优先公司 GitLab/Gitea。
 无论选择哪一种，Git 仍是本地版本历史和可回滚边界。

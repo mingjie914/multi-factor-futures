@@ -31,6 +31,16 @@ def test_default_config_is_the_framework_contract():
 
 
 # ---------- 工具 ----------
+def test_signed_heatmap_palette_has_white_zero_and_distinct_missing():
+    from monitoring.plot_style import signed_heatmap_cmap
+    cmap = signed_heatmap_cmap()
+    np.testing.assert_array_equal(cmap(0.5), [1, 1, 1, 1])
+    negative, positive = cmap(0.0), cmap(1.0)
+    assert negative[1] > negative[0]
+    assert positive[0] > positive[1]
+    assert cmap(np.nan) != cmap(0.5)
+
+
 def make_ic_series(n=120, seed=7, signal_strength=0.0, drop_after=0):
     """构造 IC 序列: 前段(可选强相关) + 后段噪声."""
     rng = np.random.default_rng(seed)
