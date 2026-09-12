@@ -10,6 +10,78 @@ from core.registry import register
 from core.types import Date, WeightVector
 
 
+def static_cost_stress(
+    daily: pd.DataFrame, *, trade_multiplier: float = 1.0, holding_multiplier: float = 1.0,
+) -> pd.Series:
+    """Fixed-path sensitivity, NOT a re-executed portfolio or a fill simulation."""
+    multipliers = np.asarray([trade_multiplier, holding_multiplier], dtype=float)
+    values = daily[["net_return", "trade_cost", "holding_cost"]]
+    if (not np.isfinite(multipliers).all() or (multipliers < 0).any()
+            or not np.isfinite(values.to_numpy(dtype=float)).all()
+            or (values[["trade_cost", "holding_cost"]] < 0).any().any()):
+        raise ValueError("static cost stress requires finite returns and nonnegative costs/multipliers")
+    result = (daily["net_return"] - (trade_multiplier - 1) * daily["trade_cost"]
+              - (holding_multiplier - 1) * daily["holding_cost"])
+    if result.le(-1).any():
+        raise ValueError("static cost stress exhausts NAV")
+    return result.rename("net_return")
+
+
+def evaluate_cost_sensitivity(
+    daily: pd.DataFrame, *, rates=(.0001, .0002, .0003, .0004, .0006, .0008),
+    initial_anchor: bool = False, periods_per_year: int = 252,
+) -> dict:
+    """Generic post-backtest audit; replace trading fees, retain holding costs.
+
+    Input is an executed ledger, never raw factor scores or target weights.
+    This does not change weights, the selected strategy, or the cost policy.
+    """
+    from backtest.metrics import compute_all_metrics, compute_turnover_metrics
+    frame = daily.iloc[1:] if initial_anchor else daily
+    if frame.empty:
+        raise ValueError("cost sensitivity needs holding intervals")
+    # Shared validation also rejects nonfinite returns and negative costs.
+    static_cost_stress(frame)
+    turnover = frame["executed_traded_notional"]
+    summary = compute_turnover_metrics(turnover, periods_per_year)
+    rates = tuple(float(rate) for rate in rates)
+    if not np.isfinite(rates).all() or any(rate < 0 for rate in rates):
+        raise ValueError("cost sensitivity rates must be finite and nonnegative")
+    before_trade_cost = frame["net_return"] + frame["trade_cost"]
+
+    def metrics(returns):
+        nav = pd.Series(np.r_[1., np.cumprod(1 + returns.to_numpy())])
+        return compute_all_metrics(nav, returns=returns, periods_per_year=periods_per_year)
+
+    scenarios = []
+    for rate in rates:
+        returns = before_trade_cost - turnover * rate
+        exhausted = bool(returns.le(-1).any())
+        scenarios.append({"trade_cost_rate": rate, "status": "nav_exhausted" if exhausted else "evaluated",
+                          "metrics": None if exhausted else metrics(returns)})
+    # Exact zero compounded growth for this static normalized path. Not an
+    # account-capacity estimate or an approximation annual_alpha / turnover.
+    breakeven = None
+    if turnover.sum() == 0:
+        reason = "no_trading"
+    elif before_trade_cost.le(-1).any() or np.log1p(before_trade_cost).sum() <= 0:
+        reason = "nonpositive_even_without_transaction_fees"
+    else:
+        lo, hi = 0., float(((1 + before_trade_cost) / turnover.where(turnover > 0)).min())
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            returns = before_trade_cost - turnover * mid
+            if returns.le(-1).any() or np.log1p(returns).sum() <= 0:
+                hi = mid
+            else:
+                lo = mid
+        breakeven, reason = (lo + hi) / 2, "finite_static_breakeven"
+    return {"method": "static_turnover_rate_v1", "holding_cost_policy": "unchanged",
+            "observations": len(frame), **summary, "baseline": metrics(frame["net_return"]),
+            "breakeven_trade_cost_rate": breakeven, "breakeven_status": reason,
+            "scenarios": scenarios}
+
+
 def marginal_turnover_cost_rate(
     cost_model: Optional[CostModel],
     universe,

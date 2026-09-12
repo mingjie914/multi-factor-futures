@@ -368,14 +368,14 @@ strategies:
   # (ICIR + Top10/Bottom10 + cap3 + ERC), not the generic model/risk pipeline.
   # It does not claim membership in the effective-factor subset catalog.
   - id: current_single_baseline
-    name: 量价脉冲
+    name: 量价脉冲*
     factor_definition_path: config/factor_sets/legacy_10f.json
-    status: observing
+    status: archived
     source: legacy_observation
     factor_set_id: ''
     config_path: config/default.yaml
     mode: single
-    description: Fixed 10f observation baseline using the default production recipe; not production approved.
+    description: 历史10因子归档审计；仅显式请求时加载，保留冻结成员和方向，不属于当前备选池。
   - id: intraday_balanced_ridge
     status: archived
     source: legacy_observation
@@ -401,26 +401,26 @@ strategies:
     mode: single
     description: 旧6因子退出当前候选池：统一口径长期年化-3.67%、回撤49.36%；保留审计，不删除单因子。
   - id: snapshot_8f_icir
-    name: 量价趋势
-    status: observing
+    name: 量价趋势*
+    status: archived
     source: legacy_observation
     factor_set_id: ''
     factor_definition_path: config/factor_sets/legacy_8f.json
     config_path: config/default.yaml
     mode: single
-    description: 量价趋势；历史8因子观察备选，保留历史方向，不声称全部成员属于当前有效库。
+    description: 历史8因子归档审计；仅显式请求时加载，保留冻结成员和方向，不属于当前备选池。
   - id: snapshot_13f_icir
-    name: 量价持仓
-    status: observing
+    name: 量价持仓*
+    status: archived
     source: legacy_observation
     factor_set_id: ''
     factor_definition_path: config/factor_sets/legacy_13f.json
     config_path: config/default.yaml
     mode: single
-    description: 量价持仓；历史13因子观察备选，保留历史方向，不声称全部成员属于当前有效库。
+    description: 历史13因子归档审计；仅显式请求时加载，保留冻结成员和方向，不属于当前备选池。
 
   - id: multi_source_balanced
-    name: 多源稳衡
+    name: 多源稳衡(17)
     status: preferred
     source: effective_library
     factor_set_id: multi_source_balanced
@@ -429,7 +429,7 @@ strategies:
     description: 多源稳衡；17因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
 
   - id: curve_resonance
-    name: 期限共振
+    name: 期限共振(17)
     status: observing
     source: effective_library
     factor_set_id: curve_resonance
@@ -438,7 +438,7 @@ strategies:
     description: 期限共振；17因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
 
   - id: shock_enhanced
-    name: 冲击增强
+    name: 冲击增强(18)
     status: observing
     source: effective_library
     factor_set_id: shock_enhanced
@@ -447,7 +447,7 @@ strategies:
     description: 冲击增强；18因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
 
   - id: position_trend
-    name: 持仓趋势
+    name: 持仓趋势(13)
     status: observing
     source: effective_library
     factor_set_id: position_trend
@@ -456,7 +456,7 @@ strategies:
     description: 持仓趋势；13因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
 
   - id: compact_diversified
-    name: 精简多源
+    name: 精简多源(10)
     status: observing
     source: effective_library
     factor_set_id: compact_diversified
@@ -465,7 +465,7 @@ strategies:
     description: 精简多源；10因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
 
   - id: sector_volume_position
-    name: 板块量持
+    name: 板块量持(15)
     status: observing
     source: effective_library
     factor_set_id: sector_volume_position
@@ -474,7 +474,7 @@ strategies:
     description: 板块量持；15因子，共享默认生产方法参数；仅观察，不替换默认。
 
   - id: seat_price_structure
-    name: 席位价形
+    name: 席位价形(15)
     status: observing
     source: effective_library
     factor_set_id: seat_price_structure
@@ -483,7 +483,7 @@ strategies:
     description: 席位价形；15因子，共享默认生产方法参数；仅观察，不替换默认。
 
   - id: compact_sector
-    name: 精简板块
+    name: 精简板块(10)
     status: observing
     source: effective_library
     factor_set_id: compact_sector
@@ -492,7 +492,7 @@ strategies:
     description: 精简板块；10因子，共享默认生产方法参数；仅观察，不替换默认。
 
   - id: volatility_follow
-    name: 波动跟随
+    name: 波动跟随(16)
     status: observing
     source: effective_library
     factor_set_id: volatility_follow
@@ -501,7 +501,7 @@ strategies:
     description: 波动跟随；16因子，共享默认生产方法参数；仅观察，不替换默认。
 
   - id: structure_fusion
-    name: 结构融合
+    name: 结构融合(20)
     status: observing
     source: effective_library
     factor_set_id: structure_fusion

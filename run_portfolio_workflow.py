@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics
+from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics, compute_turnover_metrics
 from core.config import ProcessingStepConfig, load_config, load_strategy_library
 from core.date_policy import research_cutoff
 from pipeline.runner import PipelineRunner
@@ -356,12 +356,10 @@ def _comparison_metrics(combined) -> dict:
     )
     turnover = pd.Series(
         getattr(combined, "turnover", pd.Series(dtype=float)), dtype=float
-    ).reindex(nav.index).fillna(0.0)
+    ).reindex(nav.index)
     intervals = turnover.iloc[1:]
-    metrics["annualized_turnover"] = (
-        float(intervals.mean()) * TRADING_DAYS_PER_YEAR
-        if not intervals.empty else 0.0
-    )
+    metrics.update(compute_turnover_metrics(intervals) if intervals.notna().all() else
+                   dict.fromkeys(compute_turnover_metrics(pd.Series(dtype=float))))
     return metrics
 
 
@@ -439,7 +437,7 @@ def _write_comparison_plot(
         ("volatility", "年化波动", "pct"),
         ("total_return", "总收益", "pct"),
         ("calmar", "卡玛", "num"),
-        ("annualized_turnover", "年化换手", "num"),
+        ("annualized_turnover", "年化换手(倍/年)", "num"),
     )
     table_rows, labels = [], []
     for row in rows:
@@ -515,7 +513,7 @@ def _segment_rows(
     """Compute full/pre-cutoff/forward metrics without changing the backtest."""
     nav = pd.Series(nav, dtype=float).dropna().sort_index()
     nav.index = pd.DatetimeIndex(nav.index)
-    turnover = pd.Series(turnover, dtype=float).reindex(nav.index).fillna(0.0)
+    turnover = pd.Series(turnover, dtype=float).reindex(nav.index)
     rows: list[dict] = []
     segments = (
         ("full_observation", pd.Series(True, index=nav.index)),
@@ -524,9 +522,15 @@ def _segment_rows(
     )
     for label, mask in segments:
         segment = nav.loc[mask]
-        if len(segment) < 2:
+        if segment.empty:
             continue
-        normalized = segment / float(segment.iloc[0])
+        first = int(nav.index.get_loc(segment.index[0]))
+        # Segment dates identify holding days. Retain the preceding close as
+        # an anchor so the first post-cutoff return/trade is not discarded.
+        anchored = pd.concat([nav.iloc[first - 1:first], segment]) if first else segment
+        if len(anchored) < 2:
+            continue
+        normalized = anchored / float(anchored.iloc[0])
         returns = normalized.pct_change(fill_method=None).iloc[1:]
         metrics = compute_all_metrics(normalized, returns=returns)
         # ``compute_all_metrics.win_rate`` is reserved for trade-signal
@@ -535,18 +539,9 @@ def _segment_rows(
         metrics["positive_day_ratio"] = (
             float(returns.gt(0.0).mean()) if not returns.empty else 0.0
         )
-        segment_turnover = turnover.loc[segment.index]
-        intervals = segment_turnover.iloc[1:]
-        active = intervals[intervals > 0.0]
-        metrics.update({
-            "avg_turnover": float(active.mean()) if not active.empty else 0.0,
-            "avg_daily_turnover": float(intervals.mean()) if not intervals.empty else 0.0,
-            "annualized_turnover": (
-                float(intervals.mean()) * TRADING_DAYS_PER_YEAR
-                if not intervals.empty else 0.0
-            ),
-            "total_turnover": float(intervals.sum()) if not intervals.empty else 0.0,
-        })
+        intervals = turnover.loc[returns.index]
+        metrics.update(compute_turnover_metrics(intervals) if intervals.notna().all() else
+                       dict.fromkeys(compute_turnover_metrics(pd.Series(dtype=float))))
         rows.append({
             "strategy": strategy,
             "status": status,
@@ -555,6 +550,8 @@ def _segment_rows(
             "start": segment.index[0].date().isoformat(),
             "end": segment.index[-1].date().isoformat(),
             "observations": int(len(segment)),
+            "return_intervals": int(len(returns)),
+            "anchor_date": anchored.index[0].date().isoformat(),
             **metrics,
         })
     return rows
@@ -752,11 +749,10 @@ def _run_production_portfolio(
     ledger = evaluator.ledger_from_weights(weights)
     nav = pd.Series(ledger["nav"], dtype=float).sort_index()
     returns = pd.Series(ledger["net_return"], dtype=float).reindex(nav.index)
-    # The ledger exposes both absolute traded notional and the normalized
-    # turnover ratio.  Reports use the latter so annualized turnover remains
-    # comparable across NAV and gross-exposure scales.
+    # Both turnover and executed_traded_notional are normalized weight ratios,
+    # not currency amounts. Gross leverage is already included in the weights.
     turnover = pd.Series(ledger["turnover"], dtype=float).reindex(nav.index)
-    metrics = compute_all_metrics(nav, returns=returns)
+    metrics = compute_all_metrics(nav, returns=returns.iloc[1:])
     result = BacktestResult(
         nav=nav,
         weights_history=weights,
@@ -792,6 +788,10 @@ def _run_production_portfolio(
         ).hexdigest(),
     })
     ledger.to_csv(strategy_dir / "production_ledger.csv", encoding="utf-8-sig")
+    from optimization.costs import evaluate_cost_sensitivity
+    (strategy_dir / "cost_diagnostics.json").write_text(
+        json.dumps(evaluate_cost_sensitivity(ledger, initial_anchor=True),
+                   ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (strategy_dir / "production_recipe.json").write_text(
         json.dumps({
             "route": route,
@@ -887,6 +887,8 @@ def _write_segment_report(
         "- 信号时序：T 日收盘形成目标，下一交易日生效；收益按前一日有效权重乘 T 日收盘到收盘收益。",
         "- 价格口径：因子与连续收益使用因果的点时主连比例后复权价格；交易转换单独使用具体合约计划计量换手和换月成本。",
         "- `positive_day_ratio` 是日度净值收益为正的比例；`win_rate` 仅适用于独立交易信号账本，本报告不将其误作日度胜率。",
+        "- 分段按收益所属日归属，截止后第一日的收益和执行换手均计入；前一收盘只作净值锚点。年化换手单位为倍/年，包含零成交持有日。缺失交易账本标为不可得，不伪造零换手。",
+        "- 生产路径的cost_diagnostics.json使用通用static_turnover_rate_v1静态费率压力方法；不修改基线净值、默认费用或策略成员。",
         "",
         "| strategy | segment | start | end | annual_return | sharpe | max_drawdown | volatility | total_return | positive_day_ratio | avg_turnover | annualized_turnover | total_turnover |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -894,8 +896,8 @@ def _write_segment_report(
     for row in rows:
         cells = [row["strategy"], row["segment"], row["start"], row["end"]]
         for column in metric_columns:
-            value = float(row.get(column, 0.0) or 0.0)
-            cells.append(f"{value:.4f}")
+            value = row.get(column)
+            cells.append("—" if value is None or pd.isna(value) else f"{float(value):.4f}")
         lines.append("| " + " | ".join(cells) + " |")
     if failures:
         lines.extend([

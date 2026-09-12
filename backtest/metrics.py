@@ -9,6 +9,29 @@ TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_RATE = 0.0
 
 
+def compute_turnover_metrics(
+    executed_intervals: pd.Series,
+    periods_per_year: float = TRADING_DAYS_PER_YEAR,
+) -> Dict[str, float]:
+    """Summarize full executed notional; input excludes only the global NAV anchor.
+
+    Include zero-trade holding days. ``avg_turnover`` retains its legacy
+    active-trade-day meaning; annualization always uses all holding days.
+    """
+    values = pd.Series(executed_intervals, dtype=float)
+    if (not np.isfinite(values.to_numpy()).all() or values.lt(0).any()
+            or not np.isfinite(periods_per_year) or periods_per_year <= 0):
+        raise ValueError("turnover intervals must be finite and nonnegative; annualization positive")
+    active = values[values > 0]
+    daily = float(values.mean()) if len(values) else 0.0
+    return {
+        "avg_turnover": float(active.mean()) if len(active) else 0.0,
+        "avg_daily_turnover": daily,
+        "annualized_turnover": daily * periods_per_year,
+        "total_turnover": float(values.sum()),
+    }
+
+
 def compute_sharpe(
     returns: pd.Series,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
@@ -126,12 +149,11 @@ def compute_split_metrics(
     ret = ret.reindex(nav.index)
     ret_train = ret.iloc[1:split_idx]
 
-    # 测试期: 从 split_idx 到终点 (归一化 nav 从 1 开始)
-    nav_test = nav.iloc[split_idx:]
+    # Include the preceding close as the anchor, not as a test return.
+    # Every holding interval belongs to exactly one side of the split.
+    nav_test = nav.iloc[split_idx - 1:]
     nav_test = nav_test / nav_test.iloc[0]
-    # The first test NAV is the segment anchor; its return belongs to the
-    # preceding train-to-test boundary and must not be counted in either side.
-    ret_test = ret.iloc[split_idx + 1:]
+    ret_test = ret.iloc[split_idx:]
 
     return {
         "train": compute_all_metrics(

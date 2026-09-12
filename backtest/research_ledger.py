@@ -18,7 +18,7 @@ import pandas as pd
 from backtest.metrics import TRADING_DAYS_PER_YEAR
 
 
-LEDGER_SCHEMA_VERSION = 6
+LEDGER_SCHEMA_VERSION = 7
 ACTIVE_WEIGHT_TOLERANCE = 1e-12
 
 
@@ -133,7 +133,11 @@ def contract_transition_turnover(
     current_contracts: pd.Series | None = None,
     target_contracts: pd.Series | None = None,
 ) -> tuple[float, float]:
-    """Return full traded notional and its explicit rollover component."""
+    """Return full traded notional and all legs of changed-contract positions.
+
+    The second value includes resizing/reversal during a contract switch;
+    it is not a pure constant-size roll or an extra chargeable turnover.
+    """
     target, current = align_transition_weights(target, current)
     if current_contracts is None or target_contracts is None:
         return float((target - current).abs().sum()), 0.0
@@ -232,6 +236,7 @@ def build_close_marked_ledger(
     exposure.  If a contract schedule is supplied, a root-level rollover closes
     the old concrete contract and opens the new one even when root weight is
     unchanged.
+    ``cost_multiplier`` scales transaction fees only, not holding allowances.
     """
     rate = float(trade_cost_rate)
     fee = float(annual_fee)
@@ -399,7 +404,10 @@ def build_close_marked_ledger(
                 "gross_return": step.gross_return,
                 "trade_cost": step.trade_cost,
                 "holding_cost": step.holding_cost,
-                "management_fee": step.holding_cost,
+                "management_fee": 0.0 if position == 0 else fee / periods,
+                "roll_reserve_cost": (
+                    0.0 if position == 0 else float(current.abs().sum()) * roll_rate / periods
+                ),
                 "net_return": step.net_return,
                 "executed_traded_notional": pending_traded_notional,
                 "executed_roll_turnover": pending_roll_turnover,
@@ -457,6 +465,8 @@ def build_close_marked_ledger(
             "annual_roll_cost_policy": "gross_exposure_each_elapsed_bar_after_anchor",
             "periods_per_year": periods,
             "cost_multiplier": multiplier,
+            "cost_multiplier_scope": "transaction_cost_only",
+            "roll_turnover_definition": "all_legs_of_changed_contract_positions_including_resize",
         },
     )
     ledger.validate()
@@ -545,6 +555,11 @@ class ResearchReturnLedger:
             raise ResearchLedgerError(
                 "half turnover does not match executed traded notional"
             )
+        if {"management_fee", "roll_reserve_cost"} <= set(self.daily.columns):
+            parts = self.daily[["management_fee", "roll_reserve_cost"]]
+            if (not np.isfinite(parts.to_numpy()).all() or (parts < 0).any().any()
+                    or not np.allclose(parts.sum(axis=1), self.daily["holding_cost"], rtol=0, atol=atol)):
+                raise ResearchLedgerError("holding cost components do not reconcile")
         if bool(
             (
                 self.daily["roll_turnover"]

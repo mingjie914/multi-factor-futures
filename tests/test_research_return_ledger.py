@@ -533,7 +533,7 @@ def test_fixed_subportfolio_combine_rejects_trailing_nav_gap():
         )
 
 
-def test_annual_return_uses_nav_intervals_and_split_excludes_boundary_return():
+def test_annual_return_uses_nav_intervals_and_split_keeps_boundary_return():
     assert compute_annual_return(pd.Series([1.0, 2.0]), periods_per_year=1) == pytest.approx(1.0)
 
     dates = pd.date_range("2025-01-02", periods=8, freq="B")
@@ -546,7 +546,63 @@ def test_annual_return_uses_nav_intervals_and_split_excludes_boundary_return():
         minimum_test_bars=1,
     )
 
-    assert metrics["test"]["total_return"] == pytest.approx(0.0)
+    assert metrics["test"]["total_return"] == pytest.approx(1.0)
+    assert (1 + metrics["train"]["total_return"]) * (1 + metrics["test"]["total_return"]) == pytest.approx(nav.iloc[-1] / nav.iloc[0])
+
+
+def test_turnover_metrics_count_flat_days_and_do_not_rescale_leverage():
+    from backtest.metrics import compute_turnover_metrics
+    metrics = compute_turnover_metrics(pd.Series([2.0, 0.0, 4.0]))
+    assert metrics == {"avg_turnover": 3.0, "avg_daily_turnover": 2.0,
+                       "annualized_turnover": 504.0, "total_turnover": 6.0}
+    for invalid in ([np.nan], [-1.0], [np.inf]):
+        with pytest.raises(ValueError):
+            compute_turnover_metrics(pd.Series(invalid))
+
+
+def test_holding_fee_breakdown_and_transaction_only_multiplier():
+    from optimization.costs import static_cost_stress
+    dates = pd.bdate_range("2025-01-01", periods=4)
+    targets = pd.DataFrame({"A": 1., "B": -1.}, index=dates)
+    returns = targets * 0.0
+    options = dict(trade_cost_rate=.0002, annual_fee=.01, annual_roll_cost=.00105)
+    ledger = build_close_marked_ledger(targets, returns, **options)
+    frame = ledger.daily
+    assert frame.iloc[0]["management_fee"] == 0
+    np.testing.assert_allclose(frame["management_fee"].iloc[1:], .01 / 252)
+    np.testing.assert_allclose(frame["holding_cost"], frame["management_fee"] + frame["roll_reserve_cost"])
+    doubled = build_close_marked_ledger(targets, returns, cost_multiplier=2., **options).daily
+    np.testing.assert_allclose(doubled["trade_cost"], doubled["executed_traded_notional"] * .0004)
+    np.testing.assert_allclose(doubled["holding_cost"], frame["holding_cost"])
+    pd.testing.assert_series_equal(static_cost_stress(frame), frame["net_return"])
+    np.testing.assert_allclose(static_cost_stress(frame, trade_multiplier=2), frame["net_return"] - frame["trade_cost"])
+    stress = static_cost_stress(frame, trade_multiplier=2, holding_multiplier=2)
+    np.testing.assert_allclose(stress, frame["net_return"] - frame["trade_cost"] - frame["holding_cost"])
+    assert (stress <= frame["net_return"]).all()
+    frame.loc[dates[1], "management_fee"] += .01
+    with pytest.raises(ResearchLedgerError, match="holding cost components"):
+        ledger.validate()
+
+
+def test_generic_cost_sensitivity_reproduces_base_and_breakeven():
+    from optimization.costs import evaluate_cost_sensitivity
+    dates = pd.bdate_range("2025-01-01", periods=20)
+    frame = pd.DataFrame({"net_return": .0007, "trade_cost": .0002,
+                          "holding_cost": .0001, "executed_traded_notional": 1.}, index=dates)
+    original = frame.copy(deep=True)
+    audit = evaluate_cost_sensitivity(frame)
+    base = next(s for s in audit["scenarios"] if s["trade_cost_rate"] == .0002)
+    assert base["metrics"]["total_return"] == pytest.approx(audit["baseline"]["total_return"])
+    assert audit["breakeven_trade_cost_rate"] == pytest.approx(.0009)
+    navs = [s["metrics"]["total_return"] for s in audit["scenarios"]]
+    assert navs == sorted(navs, reverse=True)
+    pd.testing.assert_frame_equal(original, frame)
+    frame["executed_traded_notional"] = 0.
+    assert evaluate_cost_sensitivity(frame)["breakeven_status"] == "no_trading"
+    frame["executed_traded_notional"] = 1.
+    frame["net_return"] = -.01
+    assert evaluate_cost_sensitivity(frame)["breakeven_status"] == "nonpositive_even_without_transaction_fees"
+    assert evaluate_cost_sensitivity(frame, rates=(2.,))["scenarios"][0]["status"] == "nav_exhausted"
 
 
 def test_backtester_emits_close_marked_ledger_and_uses_drifted_weights(monkeypatch):

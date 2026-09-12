@@ -996,6 +996,28 @@ def test_attribution_compounds_costs_sides_and_subintervals_exactly():
                           {"A": "s", "B": "s"}, {"A": "s", "B": "s"})
 
 
+def test_report_selection_excludes_archives_and_rejects_changed_members():
+    import pytest
+    from types import SimpleNamespace as NS
+    from workflows.experiments.portfolio_attribution import _report_peers
+    peer = {"name": "current", "directions": {"a": 1}}
+    subset = NS(id="current", factors=["a"], selection_context={"directions": {"a": 1}})
+    active = NS(id="current", name="current", status="observing", source="effective_library", factor_set_id="current")
+    archived = NS(id="old", name="old*", status="archived", source="legacy_observation")
+    catalog = NS(strategies=[archived, active], factor_sets=[subset])
+    assert _report_peers({"peers": [peer]}, catalog) == [peer]
+    subset.selection_context["directions"] = {"a": -1}
+    with pytest.raises(ValueError, match="members/directions differ"):
+        _report_peers({"peers": [peer]}, catalog)
+
+
+def test_filtered_report_cannot_overwrite_source_evidence(tmp_path):
+    import pytest
+    from workflows.experiments.portfolio_attribution import report
+    with pytest.raises(ValueError, match="preserve its source"):
+        report(tmp_path, source_dir=tmp_path, catalog_path="config/strategy_library.yaml")
+
+
 def test_deletions_cover_factors_clusters_and_preserve_direction_identity():
     from workflows.experiments.portfolio_attribution import deletion_jobs
     peers = [{"name": "first", "directions": {"a": 1, "b": -1, "c": 1}},

@@ -25,7 +25,7 @@ from core.interfaces import (
 from data.manager import DataManager
 from factors.engine import FactorEngine
 from factors.processor import FactorProcessor, build_processing_context
-from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics
+from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics, compute_turnover_metrics
 from backtest.research_ledger import (
     ResearchReturnLedger,
     align_transition_weights,
@@ -135,6 +135,11 @@ class BacktestResult:
             self.positions_history.to_csv(root / "positions.csv")
         if self.research_ledger is not None:
             self.research_ledger.save(root)
+            if len(self.research_ledger.daily) > 1:
+                from optimization.costs import evaluate_cost_sensitivity
+                (root / "cost_diagnostics.json").write_text(
+                    json.dumps(evaluate_cost_sensitivity(self.research_ledger.daily, initial_anchor=True),
+                               ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (root / "failures.json").write_text(
             json.dumps(
                 self.failure_ledger,
@@ -461,19 +466,8 @@ class MultiPortfolioResult:
         cost_history = (
             cost_history if cost_history is not None else pd.Series(dtype=float)
         )
-        active_turnover = turnover_history[turnover_history > 0].dropna()
-        combined_metrics["avg_turnover"] = (
-            float(active_turnover.mean()) if not active_turnover.empty else 0.0
-        )
-        combined_metrics["avg_daily_turnover"] = float(
-            turnover_history.dropna().mean()
-        ) if not turnover_history.empty else 0.0
-        combined_metrics["annualized_turnover"] = (
-            combined_metrics["avg_daily_turnover"] * TRADING_DAYS_PER_YEAR
-        )
-        combined_metrics["total_turnover"] = float(
-            turnover_history.dropna().sum()
-        )
+        # Meta histories already contain holding intervals, without a NAV anchor.
+        combined_metrics.update(compute_turnover_metrics(turnover_history))
         combined_metrics["total_transaction_cost"] = float(cost_history.fillna(0.0).sum())
         combined_metrics["avg_transaction_cost"] = (
             float(cost_history.fillna(0.0).mean()) if not cost_history.empty else 0.0
@@ -1641,18 +1635,7 @@ class Backtester:
         # avg_turnover保留“有成交日均值”兼容口径，其余字段显式报告
         # 交换手的逐日、年化与全期口径。
         executed_intervals = executed_turnover_series.iloc[1:]
-        reb_turnover = executed_intervals[executed_intervals > 0]
-        if not reb_turnover.empty:
-            metrics["avg_turnover"] = float(reb_turnover.mean())
-        else:
-            metrics["avg_turnover"] = 0.0
-        metrics["avg_daily_turnover"] = float(
-            executed_intervals.mean()
-        ) if len(executed_intervals) else 0.0
-        metrics["annualized_turnover"] = (
-            metrics["avg_daily_turnover"] * TRADING_DAYS_PER_YEAR
-        )
-        metrics["total_turnover"] = float(executed_intervals.sum())
+        metrics.update(compute_turnover_metrics(executed_intervals))
         metrics["total_transaction_cost"] = float(cost_series.sum())
         metrics["avg_transaction_cost"] = (
             float(cost_series.iloc[1:].mean()) if len(cost_series) > 1 else 0.0

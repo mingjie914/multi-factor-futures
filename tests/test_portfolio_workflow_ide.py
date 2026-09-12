@@ -30,7 +30,12 @@ def test_shipped_legacy_definitions_are_portable():
             assert definition.is_relative_to(root / "config/factor_sets")
             loaded = ide._load_factor_definition(definition)
             assert set(loaded["directions"].values()) <= {-1, 1}
-    assert len([s for s in catalog.strategies if s.status != "archived"]) == 13
+    assert len([s for s in catalog.strategies if s.status != "archived"]) == 10
+    historical = {"current_single_baseline", "snapshot_8f_icir", "snapshot_13f_icir"}
+    for entry in catalog.strategies:
+        if entry.id in historical:
+            assert entry.status == "archived"
+            assert entry.name.endswith("*")
     assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_balanced"]
 
 
@@ -43,12 +48,15 @@ def test_comparison_plot_uses_actual_dates_and_nine_distinct_colors(tmp_path, mo
     def save(fig, *args, **kwargs):
         captured["title"] = fig.axes[0].get_title()
         captured["colors"] = [line.get_color() for line in fig.axes[0].lines]
+        captured["table_text"] = [cell.get_text().get_text() for ax in fig.axes
+                                  for table in ax.tables for cell in table.get_celld().values()]
         return original(fig, *args, **kwargs)
     monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save)
     ide._write_comparison_plot(tmp_path, nav, [{"strategy": n} for n in nav])
     assert "2016-03-31至2016-04-02" in captured["title"]
     assert "最新" not in captured["title"]
     assert len(set(captured["colors"])) == 9
+    assert "年化换手(倍/年)" in captured["table_text"]
     assert (tmp_path / "nav_comparison.png").stat().st_size > 10000
 
 
@@ -97,6 +105,23 @@ def test_comparison_default_start_inherits_framework():
     assert ide.COMPARISON_START == load_config("config/default.yaml").date_range.start
 
 
+def test_segment_metrics_include_first_post_cutoff_return_and_trade():
+    import pytest
+    dates = pd.bdate_range("2026-05-14", periods=4)
+    nav = pd.Series([1., 1., 1.1, 1.1], index=dates)
+    turnover = pd.Series([0., 2., 4., 0.], index=dates)
+    rows = ide._segment_rows("probe", "observing", "probe", nav, turnover, dates[1])
+    full, before, after = rows
+    assert after["total_return"] == pytest.approx(.1)
+    assert after["total_turnover"] == 4.
+    assert after["annualized_turnover"] == 504.
+    assert after["anchor_date"] == "2026-05-15"
+    assert after["return_intervals"] == 2
+    assert full["total_turnover"] == before["total_turnover"] + after["total_turnover"]
+    single = ide._segment_rows("probe", "observing", "probe", nav.iloc[:3], turnover.iloc[:3], dates[1])
+    assert single[-1]["total_return"] == pytest.approx(.1)
+
+
 def test_segment_report_does_not_hardcode_recipe_parameters(tmp_path):
     dates = pd.bdate_range("2026-05-14", periods=5)
     strategy = SimpleNamespace(id="probe", status="observing", factor_set_id="probe")
@@ -129,21 +154,22 @@ def test_comparison_streams_every_background_batch(tmp_path):
         assert rendered.size == (2250, 1500)
 
 
-def test_saved_thirteen_candidates_and_default_retain_frozen_members(monkeypatch):
+def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     monkeypatch.setattr(ide, "CATALOG_PATH", "config/strategy_library.yaml")
     monkeypatch.setattr(ide, "STRATEGY_IDS", ())
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
     _, catalog, selected = ide._validated_specs()
     assert len(selected) == 1
     assert selected[0][0].id == "multi_source_balanced"
-    assert selected[0][0].name == "多源稳衡"
+    assert selected[0][0].name == "多源稳衡(17)"
     assert len(selected[0][2].factors) == 17
     assert selected[0][2].factor_library.enforce_effective_membership
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
     _, _, peers = ide._validated_specs()
-    assert len(peers) == 13
-    assert len({s.name for s, _, _ in peers}) == 13
-    assert sum(s.status == "observing" for s, _, _ in peers) == 12
+    assert len(peers) == 10
+    assert len({s.name for s, _, _ in peers}) == 10
+    assert sum(s.status == "observing" for s, _, _ in peers) == 9
+    assert all(s.source == "effective_library" for s, _, _ in peers)
     new_sets = {
         "sector_volume_position": 15, "seat_price_structure": 15,
         "compact_sector": 10, "volatility_follow": 16, "structure_fusion": 20,
@@ -158,6 +184,7 @@ def test_saved_thirteen_candidates_and_default_retain_frozen_members(monkeypatch
     for strategy, _, config in peers:
         if strategy.source == "effective_library":
             subset = subsets[strategy.factor_set_id]
+            assert strategy.name.endswith(f"({len(subset.factors)})")
             assert config.factors == subset.factors
             assert ide._effective_factor_directions(config, config.factors) == subset.selection_context["directions"]
             assert subset.selection_context["production_approved"] is False
@@ -319,7 +346,7 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert "process_peak_working_set_mib" in performance
 
 
-def test_all_strategy_branch_selects_thirteen_active_peers_not_retired_six(monkeypatch):
+def test_all_strategy_branch_selects_ten_active_peers_not_archives(monkeypatch):
     monkeypatch.setattr(
         ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_ALL
     )
@@ -327,7 +354,7 @@ def test_all_strategy_branch_selects_thirteen_active_peers_not_retired_six(monke
     assert [strategy.id for strategy, _path, _config in specs] == [
         entry.id for entry in catalog.strategies if entry.status != "archived"
     ]
-    assert len(specs) == 13
+    assert len(specs) == 10
     assert all(strategy.id != "snapshot_6f_icir" for strategy, _, _ in specs)
 
 
