@@ -226,6 +226,137 @@ factor_sets:
       directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
       production_approved: false
 
+  - id: sector_volume_position
+    status: active
+    description: 板块量持；修复后固定观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_volume_oi_price_confirm_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: 研究候选1（15因子）
+      comparison_run: 20260912_flow_residual_repair
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_volume_oi_price_confirm_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: seat_price_structure
+    status: active
+    description: 席位价形；修复后固定观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_oi_dispersion_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_seat_top5_long_conc_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: 研究候选2（15因子）
+      comparison_run: 20260912_flow_residual_repair
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_oi_dispersion_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_seat_top5_long_conc_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: compact_sector
+    status: active
+    description: 精简板块；修复后固定观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_oi_dispersion_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_wick_symmetry_20d
+    selection_context:
+      source_candidate: 研究候选3（10因子）
+      comparison_run: 20260912_flow_residual_repair
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_flow_ret_resid_vol_20d":1,"intraday_oi_dispersion_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_wick_symmetry_20d":1}
+      production_approved: false
+
+  - id: volatility_follow
+    status: active
+    description: 波动跟随；修复后固定观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_jump_ret_follow_ratio_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_vol_quarter_trend_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: 研究候选4（16因子）
+      comparison_run: 20260912_flow_residual_repair
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_jump_ret_follow_ratio_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_vol_quarter_trend_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: structure_fusion
+    status: active
+    description: 结构融合；修复后固定观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_path_bandwidth_20d
+      - intraday_permutation_entropy_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_slope_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_volume_oi_price_confirm_20d
+      - intraday_vwap_band_retention_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_candidate: 研究候选5（20因子）
+      comparison_run: 20260912_flow_residual_repair
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_path_bandwidth_20d":1,"intraday_permutation_entropy_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_volume_oi_price_confirm_20d":1,"intraday_vwap_band_retention_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
 strategies:
   # The two effective-library IDs and YAML filenames retain their historical
   # ``_ridge`` suffix for run/artifact compatibility; display names and
@@ -332,3 +463,48 @@ strategies:
     config_path: config/default.yaml
     mode: single
     description: 精简多源；10因子，统一ICIR＋Top10/Bottom10＋五大分组cap3＋ERC；仅默认方法观察。
+
+  - id: sector_volume_position
+    name: 板块量持
+    status: observing
+    source: effective_library
+    factor_set_id: sector_volume_position
+    config_path: config/default.yaml
+    mode: single
+    description: 板块量持；15因子，共享默认生产方法参数；仅观察，不替换默认。
+
+  - id: seat_price_structure
+    name: 席位价形
+    status: observing
+    source: effective_library
+    factor_set_id: seat_price_structure
+    config_path: config/default.yaml
+    mode: single
+    description: 席位价形；15因子，共享默认生产方法参数；仅观察，不替换默认。
+
+  - id: compact_sector
+    name: 精简板块
+    status: observing
+    source: effective_library
+    factor_set_id: compact_sector
+    config_path: config/default.yaml
+    mode: single
+    description: 精简板块；10因子，共享默认生产方法参数；仅观察，不替换默认。
+
+  - id: volatility_follow
+    name: 波动跟随
+    status: observing
+    source: effective_library
+    factor_set_id: volatility_follow
+    config_path: config/default.yaml
+    mode: single
+    description: 波动跟随；16因子，共享默认生产方法参数；仅观察，不替换默认。
+
+  - id: structure_fusion
+    name: 结构融合
+    status: observing
+    source: effective_library
+    factor_set_id: structure_fusion
+    config_path: config/default.yaml
+    mode: single
+    description: 结构融合；20因子，共享默认生产方法参数；仅观察，不替换默认。

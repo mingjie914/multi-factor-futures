@@ -30,7 +30,7 @@ def test_shipped_legacy_definitions_are_portable():
             assert definition.is_relative_to(root / "config/factor_sets")
             loaded = ide._load_factor_definition(definition)
             assert set(loaded["directions"].values()) <= {-1, 1}
-    assert len([s for s in catalog.strategies if s.status != "archived"]) == 8
+    assert len([s for s in catalog.strategies if s.status != "archived"]) == 13
     assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_balanced"]
 
 
@@ -129,7 +129,7 @@ def test_comparison_streams_every_background_batch(tmp_path):
         assert rendered.size == (2250, 1500)
 
 
-def test_saved_eight_candidates_and_default_retain_frozen_members(monkeypatch):
+def test_saved_thirteen_candidates_and_default_retain_frozen_members(monkeypatch):
     monkeypatch.setattr(ide, "CATALOG_PATH", "config/strategy_library.yaml")
     monkeypatch.setattr(ide, "STRATEGY_IDS", ())
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
@@ -141,8 +141,18 @@ def test_saved_eight_candidates_and_default_retain_frozen_members(monkeypatch):
     assert selected[0][2].factor_library.enforce_effective_membership
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
     _, _, peers = ide._validated_specs()
-    assert len(peers) == 8
-    assert len({s.name for s, _, _ in peers}) == 8
+    assert len(peers) == 13
+    assert len({s.name for s, _, _ in peers}) == 13
+    assert sum(s.status == "observing" for s, _, _ in peers) == 12
+    new_sets = {
+        "sector_volume_position": 15, "seat_price_structure": 15,
+        "compact_sector": 10, "volatility_follow": 16, "structure_fusion": 20,
+    }
+    for strategy, _, config in peers:
+        if strategy.id in new_sets:
+            assert strategy.status == "observing"
+            assert strategy.source == "effective_library"
+            assert len(config.factors) == new_sets[strategy.id]
     assert "snapshot_6f_icir" not in {s.id for s, _, _ in peers}
     subsets = {s.id: s for s in catalog.factor_sets}
     for strategy, _, config in peers:
@@ -309,7 +319,7 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert "process_peak_working_set_mib" in performance
 
 
-def test_all_strategy_branch_selects_eight_active_peers_not_retired_six(monkeypatch):
+def test_all_strategy_branch_selects_thirteen_active_peers_not_retired_six(monkeypatch):
     monkeypatch.setattr(
         ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_ALL
     )
@@ -317,7 +327,7 @@ def test_all_strategy_branch_selects_eight_active_peers_not_retired_six(monkeypa
     assert [strategy.id for strategy, _path, _config in specs] == [
         entry.id for entry in catalog.strategies if entry.status != "archived"
     ]
-    assert len(specs) == 8
+    assert len(specs) == 13
     assert all(strategy.id != "snapshot_6f_icir" for strategy, _, _ in specs)
 
 

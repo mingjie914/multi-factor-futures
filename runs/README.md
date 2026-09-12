@@ -13,15 +13,15 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 | factor_mining | 显式挖掘产物及不可变候选快照，不由默认入口主动加载 |
 | walkforward / historical_portfolio_search | 显式组合验证、隔离历史实验 |
 
-## 当前证据索引（2026-09-12）
+## 当前证据索引（2026-09-13）
 
 以下目录及其合同递归引用的面板、报告、验证结果均保留；不是可清空的临时缓存。
 
 | 阶段 | 本地run | 当前意义 |
 |---|---|---|
 | 原151条全池准入 | factor_validation/20260908_intraday605_datarepair_ic_hac | 原605/1815假设族；不是623因子全量再认证 |
-| 追加3条准入 | factor_validation/20260910_daily_volume_corr5 | 构成默认154条库的另一批正式证据 |
-| 13个改写因子检验 | factor_validation/20260910_intraday_structure_migration | 独立研究补充，未自动写默认库 |
+| 追加3条准入 | factor_validation/20260910_daily_volume_corr5 | 151→154的正式批次证据；后续加13个改写因子为167 |
+| 13个改写因子检验 | factor_validation/20260910_intraday_structure_migration | 2026-09-13显式提取规范名通过者入库；完整检验族与原q值保留 |
 | 原8组目录审阅 | factor_selection/20260909_eight_strategy_review | 冻结成员与登记证据；当前数值见后续固定验证 |
 | 邻域/96配方研究 | portfolio_factor_search/20260911_native14_neighborhood96 | 规划和已执行子集，不宣称全部笛卡尔积完成 |
 | 后续全池预算搜索 | portfolio_factor_search/20260911_effective_pool_multistart | 512次尝试、5个研究候选；含修复前因子，原路径未重跑 |
@@ -30,6 +30,8 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 | 当前固定13组修复 | portfolio_backtest/20260912_flow_residual_repair | 已审阅report、净值/热力图、原生账本、188项剔除和局部准入复核 |
 
 当前结果看最后一行的report.md与acceptance.json；其详细分类/归因不是新一轮选组或实盘批准。
+2026-09-13已据此登记新5组为观察备选，目录共13组、默认不变；原run内“未登记”
+及“#491标注未回写”描述保留为当时快照，当前状态以策略目录和有效库文档为准。
 日常入口仍是根目录两个workflow；上述研究由workflows/experiments中的显式分支执行，
 不会挂入默认流程。归因模块保留是为了复现真实证据，不是待删除的一次性调试脚本。
 对已审阅报告不要直接使用report-only覆盖人工审阅；图表或报告重生成应另行审阅。

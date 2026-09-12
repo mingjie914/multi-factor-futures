@@ -14,6 +14,38 @@ from research.effective_factor_library import (
 from pipeline.runner import PipelineRunner
 
 
+def test_shipped_library_contains_native_migrations_and_period_annotation():
+    from pathlib import Path
+    from core.registry import get
+    import factors.library.intraday  # noqa: F401
+
+    root = Path(__file__).resolve().parents[1]
+    records = load_library(root / "factor_library/library.json")["factors"]
+    assert len(records) == 167
+    migrated = [r for r in records if r["source_run"] == "20260910_intraday_structure_migration"]
+    assert len(migrated) == 13
+    assert all(r["factor"].startswith("intraday_") for r in migrated)
+    assert sum(r["input_bar_frequency"] == "1min" for r in migrated) == 2
+    assert sum(r["input_bar_frequency"] == "5min" for r in migrated) == 11
+    for row in migrated:
+        assert get("factor", row["factor"]).input_bar_frequency == row["input_bar_frequency"]
+        assert row["signal_frequency"] == "daily"
+        assert row["status"] == "effective"
+        assert row["best_period"] in {5, 10, 20}
+    by_name = {r["factor"]: r for r in records}
+    assert "volume_price_corr_20d" in by_name
+    assert not any(name.startswith("gp_daily_") for name in by_name)
+    repaired = by_name["intraday_flow_ret_resid_vol_20d"]
+    assert repaired["best_period"] == 10
+    assert repaired["direction"] == 1
+    assert repaired["best_period_review"]["previous_best_period"] == 20
+    with (root / "factor_library/current.csv").open(encoding="utf-8-sig", newline="") as handle:
+        exported = list(csv.DictReader(handle))
+    assert len(exported) == len(records)
+    for row in exported:
+        assert all(str(by_name[row["factor"]].get(key, "")) == value for key, value in row.items())
+
+
 def test_validation_run_admission_creates_structured_library(tmp_path):
     run = tmp_path / "run-1"
     run.mkdir()
