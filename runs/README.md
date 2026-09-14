@@ -13,12 +13,16 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 | factor_mining | 显式挖掘产物及不可变候选快照，不由默认入口主动加载 |
 | walkforward / historical_portfolio_search | 显式组合验证、隔离历史实验 |
 
-## 当前证据索引（2026-09-13）
+## 当前证据索引（2026-09-14）
 
 以下目录及其合同递归引用的面板、报告、验证结果均保留；不是可清空的临时缓存。
 
 | 阶段 | 本地run | 当前意义 |
 |---|---|---|
+| 新增98因子准入 | factor_validation/20260914_intraday98_admission | 98/294统一假设族；20个正式通过并追加入库167→187；library_admission.json记录登记回执 |
+| 12项正式准入 | factor_validation/20260914_gap12_admission | 12/36假设；1项通过并按授权入库187→188；library_admission.json为回执，report.md保留检验及编号方案 |
+| 编号统一与登记收口 | factor_research/20260914_numbering_closeout | 早期34项原地补#700–733；baseline.json/acceptance.json记录三种内核实值一致性，report.md记录清理与下一阶段建议 |
+| 12个原创补位/34项旧因子复核 | factor_research/20260914_gap12_extension | 原始设计及计算验收；后续正式结果见上一行；旧34中6项原已入库、28项未过FDR |
 | 原151条全池准入 | factor_validation/20260908_intraday605_datarepair_ic_hac | 原605/1815假设族；不是623因子全量再认证 |
 | 追加3条准入 | factor_validation/20260910_daily_volume_corr5 | 151→154的正式批次证据；后续加13个改写因子为167 |
 | 13个改写因子检验 | factor_validation/20260910_intraday_structure_migration | 2026-09-13显式提取规范名通过者入库；完整检验族与原q值保留 |

@@ -181,11 +181,18 @@ def test_intraday_admission_horizons_preserve_minute_and_daily_contracts():
     ]
     assert intraday
     daily = [factor for factor in intraday if getattr(factor, "input_bar_frequency", "1min") == "daily"]
-    assert len(daily) == 5
-    assert "volume_price_corr_20d" in {factor.name for factor in daily}
-    assert {factor.validation_horizons for factor in daily} == {(10, 20, 40)}
+    legacy_daily = {
+        "volume_price_corr_20d", "intraday_volume_surprise_abs_return_corr_20d",
+        "intraday_volume_directional_corr_spread_20d", "intraday_lagged_volume_abs_return_corr_20d",
+        "intraday_volume_abs_return_partial_corr_20d",
+    }
+    assert legacy_daily <= {factor.name for factor in daily}
+    for factor in daily:
+        # Input frequency does not determine the factor's forward-return horizons.
+        expected = (10, 20, 40) if factor.name in legacy_daily else (5, 10, 20)
+        assert factor.validation_horizons == expected
     minute = [factor for factor in intraday if getattr(factor, "input_bar_frequency", "1min") != "daily"]
-    assert len(minute) == 618
+    assert minute
     assert {factor.validation_horizons for factor in minute} == {(5, 10, 20)}
 
 

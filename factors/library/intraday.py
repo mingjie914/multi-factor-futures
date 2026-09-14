@@ -22,8 +22,11 @@
 - 依赖前10日 (rolling(10, min_periods=3), 需≥4日): #116 volatility_breakout, #142 vol_compression
 - 依赖昨日量 (prev_total 追踪, 需≥2日): #145 volume_momentum
 - 依赖前日高低 (需≥2日): #153 vs_prev_high, #154 vs_prev_low
-- 补充批次 (K/V 系列): #K2 overnight_intraday_vol (相邻日收盘, 需≥2日);
-  V 系列 rolling/diff 变体基于日度因子值变换, 预热期由基因子覆盖, 无需额外跨日标注
+- #715 overnight_intraday_vol: 相邻日收盘收益先计算短期波动，再做20窗口平滑；
+  #724–733 在已滞后的日度暴露上变换，rolling/diff 还需各自额外历史，见类注释。
+
+编号仅作人类检索标识，统一为 #1–733；注册名是持久身份，不另设登记序号。
+早期34项原地补为 #700–733；物理顺序保留依赖关系，不要求按编号排列。
 
 框架支持: compute 一次性接收整个研究期 (含预热期), rolling/跨日 dict 为标准模式;
 滚动窗口前的观测为 NaN, 有效值从预热期 (ic_start) 后开始. 各因子注释处均有 ⚠ 标注.
@@ -160,12 +163,16 @@ class _FiveMinuteDailyFactor(Factor):
 # 日内动量因子: 日内收益的滚动均值
 # ======================================================================
 
+# 700. intraday_momentum_5d — 日内动量（5日）
 @register_factor("intraday_momentum_5d", category="intraday")
 class IntradayMomentum5d(IntradayFactorBase):
-    """日内动量因子 (5日).
+    """日内动量（5日）。
 
-    日内收益 (close-open)/open 的 5 日滚动均值.
-    正值 = 日内趋势向上, 负值 = 日内趋势向下.
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5(C末/O首−1)，min_periods=3。
+    【含义】正值表示日内收益整体向上。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "intraday_momentum_5d"
     description = "日内动量 (日内收益5日均值)"
@@ -178,9 +185,17 @@ class IntradayMomentum5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 701. intraday_momentum_20d — 日内动量（20日）
 @register_factor("intraday_momentum_20d", category="intraday")
 class IntradayMomentum20d(IntradayMomentum5d):
-    """日内动量因子 (20日)."""
+    """日内动量（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_20(C末/O首−1)，min_periods=3。
+    【含义】与5日版本仅平滑窗口不同。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
+    """
     name = "intraday_momentum_20d"
     description = "日内动量 (日内收益20日均值)"
     WINDOW = 20
@@ -190,13 +205,16 @@ class IntradayMomentum20d(IntradayMomentum5d):
 # 隔夜跳空因子: 隔夜跳空的滚动均值
 # ======================================================================
 
+# 702. overnight_gap_5d — 隔夜跳空（5日）
 @register_factor("overnight_gap_5d", category="intraday")
 class OvernightGap5d(IntradayFactorBase):
-    """隔夜跳空因子 (5日).
+    """隔夜跳空（5日）。
 
-    隔夜跳空 (open-prev_close)/prev_close 的 5 日滚动均值.
-    正值 = 持续高开, 负值 = 持续低开.
-    逻辑: 隔夜跳空反映夜间信息冲击, 持续同方向跳空预示趋势.
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5(O首/C前日末−1)，min_periods=3。
+    【含义】正值表示持续高开；还需昨收，首日无值。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "overnight_gap_5d"
     description = "隔夜跳空 (隔夜收益5日均值)"
@@ -209,9 +227,17 @@ class OvernightGap5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 703. overnight_gap_20d — 隔夜跳空（20日）
 @register_factor("overnight_gap_20d", category="intraday")
 class OvernightGap20d(OvernightGap5d):
-    """隔夜跳空因子 (20日)."""
+    """隔夜跳空（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_20(O首/C前日末−1)，min_periods=3。
+    【含义】观察开收盘缺口的较慢变化；还需昨收，首日无值。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
+    """
     name = "overnight_gap_20d"
     description = "隔夜跳空 (隔夜收益20日均值)"
     WINDOW = 20
@@ -221,12 +247,16 @@ class OvernightGap20d(OvernightGap5d):
 # VWAP偏离因子: 收盘相对VWAP偏离的滚动均值
 # ======================================================================
 
+# 704. vwap_deviation_5d — 收盘VWAP偏离（5日）
 @register_factor("vwap_deviation_5d", category="intraday")
 class VWAPDeviation5d(IntradayFactorBase):
-    """VWAP偏离因子 (5日).
+    """收盘VWAP偏离（5日）。
 
-    (close-vwap)/vwap 的 5 日滚动均值.
-    正值 = 收盘价持续高于VWAP (买盘强), 负值 = 持续低于VWAP (卖盘强).
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】VWAP=Σ(C分钟×V分钟)/ΣV分钟；mean_5(C末/VWAP−1)，min_periods=3。
+    【含义】高值表示收盘持续高于成交量加权价格。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "vwap_deviation_5d"
     description = "VWAP偏离 (收盘-VWAP的5日均值)"
@@ -239,9 +269,17 @@ class VWAPDeviation5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 705. vwap_deviation_20d — 收盘VWAP偏离（20日）
 @register_factor("vwap_deviation_20d", category="intraday")
 class VWAPDeviation20d(VWAPDeviation5d):
-    """VWAP偏离因子 (20日)."""
+    """收盘VWAP偏离（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】VWAP=Σ(C分钟×V分钟)/ΣV分钟；mean_20(C末/VWAP−1)，min_periods=3。
+    【含义】收盘相对成交价格重心的持续偏离。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
+    """
     name = "vwap_deviation_20d"
     description = "VWAP偏离 (收盘-VWAP的20日均值)"
     WINDOW = 20
@@ -251,13 +289,16 @@ class VWAPDeviation20d(VWAPDeviation5d):
 # 尾盘动量因子: 尾盘动量的滚动均值
 # ======================================================================
 
+# 706. tail_momentum_5d — 尾段动量（5日）
 @register_factor("tail_momentum_5d", category="intraday")
 class TailMomentum5d(IntradayFactorBase):
-    """尾盘动量因子 (5日).
+    """尾段动量（5日）。
 
-    尾盘30分钟收益的 5 日滚动均值.
-    正值 = 尾盘持续走强 (机构买入), 负值 = 尾盘持续走弱 (机构卖出).
-    逻辑: 尾盘交易反映机构意图, 尾盘强→次日大概率延续.
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5(C末/C倒数第31个有效值−1)，min_periods=3。
+    【含义】最后30个有效价格间隔的走势，不等同于机构意图。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。 至少31个有效价格，缺行时不保证连续30分钟。
     """
     name = "tail_momentum_5d"
     description = "尾盘动量 (尾盘收益5日均值)"
@@ -270,24 +311,36 @@ class TailMomentum5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 707. tail_momentum_20d — 尾段动量（20日）
 @register_factor("tail_momentum_20d", category="intraday")
 class TailMomentum20d(TailMomentum5d):
-    """尾盘动量因子 (20日)."""
+    """尾段动量（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_20(C末/C倒数第31个有效值−1)，min_periods=3。
+    【含义】尾段价格走势的较慢变化。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。 至少31个有效价格，缺行时不保证连续30分钟。
+    """
     name = "tail_momentum_20d"
     description = "尾盘动量 (尾盘收益20日均值)"
     WINDOW = 20
 
 
 # ======================================================================
-# 日内波动率结构因子: 日内振幅 / 日度收益波动率
+# 日内振幅因子: 日内相对高低价格区间的滚动均值
 # ======================================================================
 
+# 708. intraday_vol_ratio_5d — 日内振幅（5日）
 @register_factor("intraday_vol_ratio_5d", category="intraday")
 class IntradayVolRatio5d(IntradayFactorBase):
-    """日内波动率结构因子 (5日).
+    """日内振幅（5日）。
 
-    日内振幅 (high-low)/open 的 5 日均值.
-    高值 = 日内波动剧烈 (趋势中), 低值 = 日内平淡 (盘整中).
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5((H日内最大−L日内最小)/O首)，min_periods=3。
+    【含义】日内价格区间；不是振幅除以日收益波动率。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "intraday_vol_ratio_5d"
     description = "日内波动率结构 (日内振幅5日均值)"
@@ -300,9 +353,17 @@ class IntradayVolRatio5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 709. intraday_vol_ratio_20d — 日内振幅（20日）
 @register_factor("intraday_vol_ratio_20d", category="intraday")
 class IntradayVolRatio20d(IntradayVolRatio5d):
-    """日内波动率结构因子 (20日)."""
+    """日内振幅（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_20((H日内最大−L日内最小)/O首)，min_periods=3。
+    【含义】日内相对价格区间；保留原vol_ratio注册名。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
+    """
     name = "intraday_vol_ratio_20d"
     description = "日内波动率结构 (日内振幅20日均值)"
     WINDOW = 20
@@ -312,12 +373,16 @@ class IntradayVolRatio20d(IntradayVolRatio5d):
 # 成交量集中度因子: 成交量集中度的滚动均值
 # ======================================================================
 
+# 710. volume_concentration_5d — 成交量集中度（5日）
 @register_factor("volume_concentration_5d", category="intraday")
 class VolumeConcentration5d(IntradayFactorBase):
-    """成交量集中度因子 (5日).
+    """成交量集中度（5日）。
 
-    成交量集中度 (峰值/均值) 的 5 日滚动均值.
-    高值 = 成交量集中在少数时段 (信息驱动), 低值 = 成交均匀 (流动性驱动).
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5(max(V分钟)/mean(V分钟))，min_periods=3。
+    【含义】单个时段成交的突出程度，不确定买卖方向。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "volume_concentration_5d"
     description = "成交量集中度 (5日均值)"
@@ -334,13 +399,16 @@ class VolumeConcentration5d(IntradayFactorBase):
 # Amihud非流动性因子: Amihud指标 的滚动均值
 # ======================================================================
 
+# 711. amihud_illiquidity_5d — 日收益非流动性（5日）
 @register_factor("amihud_illiquidity_5d", category="intraday")
 class AmihudIlliquidity5d(IntradayFactorBase):
-    """Amihud非流动性因子 (5日).
+    """日收益非流动性（5日）。
 
-    Amihud指标 (|收益|/金额) 的 5 日滚动均值.
-    高值 = 流动性差 (大额交易冲击大), 低值 = 流动性好.
-    逻辑: 流动性差的品种预期有流动性溢价.
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_5(abs(C末/O首−1)/A日)，min_periods=3。
+    【含义】每单位日成交额对应的绝对日内收益，不是分钟比率的日均值。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。 A日优先用成交额合计，缺字段时用Σ(C分钟×V分钟)；零分母无效。
     """
     name = "amihud_illiquidity_5d"
     description = "Amihud非流动性 (5日均值)"
@@ -353,9 +421,17 @@ class AmihudIlliquidity5d(IntradayFactorBase):
         return df.rolling(self.WINDOW, min_periods=3).mean()
 
 
+# 712. amihud_illiquidity_20d — 日收益非流动性（20日）
 @register_factor("amihud_illiquidity_20d", category="intraday")
 class AmihudIlliquidity20d(AmihudIlliquidity5d):
-    """Amihud非流动性因子 (20日)."""
+    """日收益非流动性（20日）。
+
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】mean_20(abs(C末/O首−1)/A日)，min_periods=3。
+    【含义】单位日成交额对应的价格变动强度。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。 A日优先用成交额合计，缺字段时用Σ(C分钟×V分钟)；零分母无效。
+    """
     name = "amihud_illiquidity_20d"
     description = "Amihud非流动性 (20日均值)"
     WINDOW = 20
@@ -365,12 +441,16 @@ class AmihudIlliquidity20d(AmihudIlliquidity5d):
 # 日内反转因子: 负的日内动量 (短期反转)
 # ======================================================================
 
+# 713. intraday_reversal_5d — 日内反转（5日）
 @register_factor("intraday_reversal_5d", category="intraday")
 class IntradayReversal5d(IntradayFactorBase):
-    """日内反转因子 (5日).
+    """日内反转（5日）。
 
-    负的日内动量: 日内收益5日均值的反面.
-    逻辑: 日内过度上涨的品种次日有回落倾向 (短期反转).
+    【用法说明】1min原始bar聚合daily；按交易日对齐后滚动，窗口内至少3个有效日值。
+    【公式】−mean_5(C末/O首−1)，min_periods=3。
+    【含义】暴露已经取负；勿因名称含反转再机械取负。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日值含当日收盘信息，本类不额外shift；执行延迟由调用链处理，不能视为当日开盘已知信号。
     """
     name = "intraday_reversal_5d"
     description = "日内反转 (负的日内动量5日均值)"
@@ -11251,11 +11331,11 @@ class IntradayCloseSlopeR220d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 以下为历史 K/V 兼容名批次，现已集中维护在本文件。
+# 以下为基础补充与日度变体；沿用既有注册名和计算位置。
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _finalize(daily: pd.DataFrame, dates, universe, window: int = 20) -> pd.DataFrame:
-    """统一的输出管线: 对齐日期索引 → 滚动平滑 → shift(1) → 对齐列."""
+    """统一输出: 日值滚动平滑 → 对齐日期 → shift(1) → 对齐列."""
     if daily.empty:
         return pd.DataFrame(np.nan, index=dates, columns=universe)
     daily.index = pd.DatetimeIndex(daily.index)
@@ -11266,12 +11346,18 @@ def _finalize(daily: pd.DataFrame, dates, universe, window: int = 20) -> pd.Data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K1. realized_kurtosis — 已实现峰度
-#     = 分钟收益四阶矩 / (二阶矩^2), 刻画收益分布的厚尾程度.
-#     高峰度 → 极端行情频繁 → 风险溢价.
+# 714. realized_kurtosis_20d — 已实现非中心峰度
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("realized_kurtosis_20d", category="intraday_advanced")
 class RealizedKurtosis20d(Factor):
+    """已实现非中心峰度。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】x=mean(r分钟^4)/mean(r分钟^2)^2。
+    【含义】尾部相对二阶矩的强度，不是中心化或减3后的超额峰度。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日内去除全空行后至少20行；二阶矩为0时无效。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "realized_kurtosis_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11301,12 +11387,18 @@ class RealizedKurtosis20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K2. overnight_intraday_vol — 隔夜/日内波动比
-#     = 隔夜跳空波动 / 日内实现波动. 高 → 隔夜信息主导.
-# ⚠ 跨日因子: 依赖相邻交易日收盘 (daily_close.pct_change), 需≥2个交易日历史; 首日为NaN
+# 715. overnight_intraday_vol_20d — 收盘间变动与短期波动比
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("overnight_intraday_vol_20d", category="intraday_advanced")
 class OvernightIntradayVol20d(Factor):
+    """收盘间变动与短期波动比。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】d=C日末/C前日末−1；x=abs(d)/std_5(d)，ddof=0、min_periods=3。
+    【含义】收盘间变化的标准化强度；不是独立的隔夜波动/日内波动比。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 先有昨收和短期波动，再做20窗口平滑；波动为0时无效。
+    """
     name = "overnight_intraday_vol_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11329,11 +11421,18 @@ class OvernightIntradayVol20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K3. jump_persistence — 跳跃持续性
-#     = 相邻跳跃方向一致的比例. 持续同向跳跃 → 趋势信息驱动.
+# 716. jump_persistence_20d — 分钟方向持续比例
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("jump_persistence_20d", category="intraday_advanced")
 class JumpPersistence20d(Factor):
+    """分钟方向持续比例。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】去除r分钟=0及缺失后，x=相邻剩余收益同号次数/(非零收益数−1)。
+    【含义】非零收益方向连续性；原jump名不表示幅度阈值筛选。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日内去除全空行后至少30行、每列至少10个非零收益。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "jump_persistence_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11368,11 +11467,18 @@ class JumpPersistence20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K4. intraday_amihud — 日内 Amihud 非流动性
-#     = |分钟收益| / 分钟成交额, 日内平均. 高 → 冲击成本大.
+# 717. intraday_amihud_20d — 分钟非流动性
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("intraday_amihud_20d", category="intraday_advanced")
 class IntradayAmihud20d(Factor):
+    """分钟非流动性。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】x=mean_日(abs(r分钟)/A分钟)。
+    【含义】分钟价格冲击与成交额的比率；区别于日收益除以日成交额。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 日组行数>10；零成交额转缺失，日均忽略缺失值。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "intraday_amihud_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11398,12 +11504,18 @@ class IntradayAmihud20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K5. liquidity_elasticity — 流动性弹性
-#     = 冲击后价格恢复比例: |冲击后5分钟累计收益| / |冲击时收益|.
-#     高 → 市场吸收冲击快 → 流动性好.
+# 718. liquidity_elasticity_20d — 放量冲击后价格响应
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("liquidity_elasticity_20d", category="intraday_advanced")
 class LiquidityElasticity20d(Factor):
+    """放量冲击后价格响应。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】S: V>mean(V)+2std(V)；x=mean_S完整后5步(abs(Σ后5步r))/max(mean_S(abs(r冲击)),1e-9)。
+    【含义】放量后价格响应相对冲击幅度；绝对值不区分延续与反转。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 价量联合有效至少30行；仅分子剔除尾部不足5步事件，分母仍含全部有效冲击。
+    """
     name = "liquidity_elasticity_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11422,11 +11534,18 @@ class LiquidityElasticity20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K6. early_late_vol_asym — 早盘/尾盘成交量不对称
-#     = 开盘30分钟成交量 / 尾盘30分钟成交量. 高 → 开盘集中交易.
+# 719. early_late_vol_asym_20d — 首尾成交量不对称
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("early_late_vol_asym_20d", category="intraday_advanced")
 class EarlyLateVolAsym20d(Factor):
+    """首尾成交量不对称。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】x=Σ前30个有效V/max(Σ后30个有效V,1e-9)。
+    【含义】成交在日组首尾的分布，不表示净买盘。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 每列至少60个有效成交量；首尾按有效观测取值，不是固定钟点。
+    """
     name = "early_late_vol_asym_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11459,11 +11578,18 @@ class EarlyLateVolAsym20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K7. tail_return_ratio — 尾部收益比
-#     = 上尾部均值 / 下尾部均值 (按 ±2σ 定义尾部). 高 → 正尾部占优.
+# 720. tail_return_ratio_20d — 上下尾收益比
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("tail_return_ratio_20d", category="intraday_advanced")
 class TailReturnRatio20d(Factor):
+    """上下尾收益比。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】σ=std_日(r,ddof=0)；x=mean(r>2σ)/abs(mean(r<−2σ))。
+    【含义】上尾相对下尾幅度；阈值以0为中心，不是均值±2σ。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 每列至少20个有效收益且σ≥1e-12；双尾都须存在、下尾绝对均值≥1e-9。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "tail_return_ratio_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11501,11 +11627,18 @@ class TailReturnRatio20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K8. vol_clustering — 波动率聚集
-#     = 日内分钟波动率的一阶自相关. 高 → 波动率持续性强.
+# 721. vol_clustering_20d — 绝对收益聚集
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("vol_clustering_20d", category="intraday_advanced")
 class VolClustering20d(Factor):
+    """绝对收益聚集。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】x=corr(abs(r分钟)[1:],abs(r分钟)[:-1])。
+    【含义】绝对收益的一阶自相关，表示波动连续性而非价格趋势。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 每列至少30个有效收益；常量序列相关性无效。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "vol_clustering_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11539,11 +11672,18 @@ class VolClustering20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K9. micro_price_impact — 微价格冲击
-#     = 成交额加权分钟收益的绝对值均值. 高 → 大资金推动价格.
+# 722. micro_price_impact_20d — 成交额加权价格冲击
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("micro_price_impact_20d", category="intraday_advanced")
 class MicroPriceImpact20d(Factor):
+    """成交额加权价格冲击。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】x=Σ(abs(r分钟)×A分钟)/ΣA分钟。
+    【含义】成交额加权绝对分钟收益，不是单位成交额冲击系数。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 收益和非零成交额联合有效至少10行。 分钟收益先在完整面板计算再按日分组，日首可能含相邻日末价格。
+    """
     name = "micro_price_impact_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11579,12 +11719,18 @@ class MicroPriceImpact20d(Factor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# K10. signed_volume_pressure — 买卖压力
-#     = 用 tick-test 近似: 价格上升分钟成交量占比 - 价格下降分钟成交量占比.
-#     正 → 买方主导.
+# 723. signed_volume_pressure_20d — 有向成交量压力
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("signed_volume_pressure_20d", category="intraday_advanced")
 class SignedVolumePressure20d(Factor):
+    """有向成交量压力。
+
+    【用法说明】读取1min、输出daily；先对已生成日值做20窗口均值（min_periods=5），再对齐日期并shift(1)。
+    【公式】日内r=C/C前一有效价−1；x=(ΣV[r>0]−ΣV[r<0])/max(ΣV[r≠0],1e-9)。
+    【含义】涨跌符号代理量差，不等同于真实主动买卖量。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 价量联合有效至少20行；首个收益取0，平价量不进入分母。
+    """
     name = "signed_volume_pressure_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11656,11 +11802,18 @@ def _v_cs_zscore(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V1. jump_intensity_rank_20d — 跳跃强度截面rank (方向: 负向不变)
+# 724. jump_intensity_rank_20d — 跳跃强度截面排名
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("jump_intensity_rank_20d", category="intraday_advanced")
 class JumpIntensityRank20d(_VariantBase):
-    """跳跃强度截面排名变体 (基于 intraday_jump_intensity_20d)."""
+    """跳跃强度截面排名。
+
+    【用法说明】基于intraday_jump_intensity_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】rank_pct_截面(B)，并列取平均秩。
+    【含义】保留相对排序、压缩极值影响。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 有效截面规模影响排名刻度。
+    """
     name = "jump_intensity_rank_20d"
     description = "跳跃强度截面排名"
     BASE = IntradayJumpIntensity20d
@@ -11670,11 +11823,18 @@ class JumpIntensityRank20d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V2. peak_count_zscore_20d — 价峰计数截面zscore (方向: 正向不变)
+# 725. peak_count_zscore_20d — 价峰计数截面标准化
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("peak_count_zscore_20d", category="intraday_advanced")
 class PeakCountZscore20d(_VariantBase):
-    """价峰计数截面标准化变体 (基于 intraday_price_peak_count_20d)."""
+    """价峰计数截面标准化。
+
+    【用法说明】基于intraday_price_peak_count_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】(B−mean_截面(B))/std_截面(B,ddof=0)。
+    【含义】价峰活动相对同期品种的偏离。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 截面标准差为0时无效。
+    """
     name = "peak_count_zscore_20d"
     description = "价峰计数截面标准化"
     BASE = IntradayPricePeakCount20d
@@ -11684,12 +11844,18 @@ class PeakCountZscore20d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V3. skewness_delta_10d — 已实现偏度10日差分 (方向: 正向)
-#     捕捉偏度水平的短期变化
+# 726. skewness_delta_10d — 已实现偏度10日差分
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("skewness_delta_10d", category="intraday_advanced")
 class SkewnessDelta10d(_VariantBase):
-    """已实现偏度10日差分变体 (基于 intraday_realised_skewness_20d)."""
+    """已实现偏度10日差分。
+
+    【用法说明】基于intraday_realised_skewness_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】B−B.shift(10)。
+    【含义】偏度暴露变化，不是重算10日偏度。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需10个输出日期间隔。
+    """
     name = "skewness_delta_10d"
     description = "已实现偏度10日差分"
     BASE = IntradayRealisedSkewness20d
@@ -11699,11 +11865,18 @@ class SkewnessDelta10d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V4. dtws_smooth_3d — 跌幅时间重心3日平滑 (方向: 正向)
+# 727. dtws_smooth_3d — 跌幅时间重心3日平滑
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("dtws_smooth_3d", category="intraday_advanced")
 class DTWSSmooth3d(_VariantBase):
-    """跌幅时间重心3日平滑变体 (基于 intraday_dtws_20d)."""
+    """跌幅时间重心3日平滑。
+
+    【用法说明】基于intraday_dtws_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】mean_3(B)，min_periods=2。
+    【含义】平滑既有跌幅时间重心暴露。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需窗口内至少2个有效暴露。
+    """
     name = "dtws_smooth_3d"
     description = "跌幅时间重心3日平滑"
     BASE = IntradayDTWS20d
@@ -11713,12 +11886,18 @@ class DTWSSmooth3d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V5. roll_spread_vol_scaled_20d — Roll价差波动率缩放 (方向: 负向)
-#     价差/波动率: 剔除波动影响的真实价差
+# 728. roll_spread_vol_scaled_20d — Roll价差自身波动缩放
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("roll_spread_vol_scaled_20d", category="intraday_advanced")
 class RollSpreadVolScaled20d(_VariantBase):
-    """Roll价差波动率缩放变体 (基于 intraday_roll_spread_20d)."""
+    """Roll价差自身波动缩放。
+
+    【用法说明】基于intraday_roll_spread_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】B/std_20(B)，min_periods=5、ddof=0。
+    【含义】以价差暴露自身波动缩放；分母不是价格收益波动。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需窗口内至少5个有效暴露；标准差0时无效。
+    """
     name = "roll_spread_vol_scaled_20d"
     description = "Roll价差波动率缩放"
     BASE = IntradayRollSpread20d
@@ -11729,12 +11908,18 @@ class RollSpreadVolScaled20d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V6. kyle_lambda_stability_20d — Kyle冲击稳定性 (方向: 负向)
-#     均值/标准差: 高=冲击行为稳定可预测
+# 729. kyle_lambda_stability_20d — Kyle冲击稳定性
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("kyle_lambda_stability_20d", category="intraday_advanced")
 class KyleLambdaStability20d(_VariantBase):
-    """Kyle冲击稳定性变体 (均值/标准差, 基于 intraday_kyle_lambda_20d)."""
+    """Kyle冲击稳定性。
+
+    【用法说明】基于intraday_kyle_lambda_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】mean_20(B)/std_20(B)，两者min_periods=5、标准差ddof=0。
+    【含义】冲击暴露均值相对自身波动的强度。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需窗口内至少5个有效暴露；标准差0时无效。
+    """
     name = "kyle_lambda_stability_20d"
     description = "Kyle冲击稳定性 (均值/标准差)"
     BASE = IntradayKyleLambda20d
@@ -11746,11 +11931,18 @@ class KyleLambdaStability20d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V7. open_close_vol_rank_20d — 开盘尾盘量比截面rank (方向: 负向不变)
+# 730. open_close_vol_rank_20d — 首尾成交量比截面排名
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("open_close_vol_rank_20d", category="intraday_advanced")
 class OpenCloseVolRank20d(_VariantBase):
-    """开盘尾盘量比截面排名变体 (基于 intraday_open_close_volume_ratio_20d)."""
+    """首尾成交量比截面排名。
+
+    【用法说明】基于intraday_open_close_volume_ratio_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】rank_pct_截面(B)，并列取平均秩。
+    【含义】品种之间首尾成交分布结构的相对排序。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 继承基因子首尾窗口；截面规模影响排名刻度。
+    """
     name = "open_close_vol_rank_20d"
     description = "开盘尾盘量比截面排名"
     BASE = IntradayOpenCloseVolumeRatio20d
@@ -11760,29 +11952,41 @@ class OpenCloseVolRank20d(_VariantBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V8. parkinson_over_rv_20d — Parkinson/已实现波动比 (方向: 负向)
-#     高=日内震荡但收盘不动→噪声主导
+# 731. parkinson_over_rv_20d — Parkinson比值自身波动缩放
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("parkinson_over_rv_20d", category="intraday_advanced")
 class ParkinsonOverRV20d(_VariantBase):
-    """Parkinson/已实现波动比变体 (基于 intraday_parkinson_vol_ratio_20d)."""
+    """Parkinson比值自身波动缩放。
+
+    【用法说明】基于intraday_parkinson_vol_ratio_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】B/std_20(B)，min_periods=5、ddof=0。
+    【含义】分母是基因子暴露标准差，不是另算的收益实现波动率。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需窗口内至少5个有效暴露；标准差0时无效。
+    """
     name = "parkinson_over_rv_20d"
     description = "Parkinson/已实现波动比"
     BASE = IntradayParkinsonVolRatio20d
 
     def _transform(self, base):
-        # 用基因子自身rolling std作为已实现波动代理
+        # 用基因子暴露自身的rolling std缩放，不是另算收益实现波动率
         rv = _roll_std(base, 20, 5).replace(0, np.nan)
         return base / rv
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V9. jump_times_skew_20d — 跳跃×偏度交互 (方向: 负向)
-#     负偏度伴随高跳跃→恐慌抛售信号增强
+# 732. jump_times_skew_20d — 跳跃与偏度交互
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("jump_times_skew_20d", category="intraday_advanced")
 class JumpTimesSkew20d(Factor):
-    """跳跃×偏度交互因子: 高跳跃低偏度→恐慌抛售信号增强."""
+    """跳跃与偏度交互。
+
+    【用法说明】基于intraday_jump_intensity_20d及intraday_realised_skewness_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】B跳跃×B偏度。
+    【含义】跳跃结构与偏度交互，符号取决于两个基因子实际输出。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 两个已滞后的基因子须同日有效；不因交互再额外shift。
+    """
     name = "jump_times_skew_20d"
     category = "intraday_advanced"
     frequency = "daily"
@@ -11795,17 +11999,23 @@ class JumpTimesSkew20d(Factor):
     def compute(self, data, dates, universe):
         jump = IntradayJumpIntensity20d().compute(data, dates, universe)
         skew = IntradayRealisedSkewness20d().compute(data, dates, universe)
-        # 跳跃(负向) × 偏度(正向): 高跳跃低偏度→负向信号更强
+        # 相乘两个基因子的实际输出；准入方向不由此注释指定
         return (jump * skew).reindex(index=dates, columns=universe)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# V10. peak_count_delta_20d — 价峰计数10日差分 (方向: 正向)
-#      跳跃活动上升→信息加速
+# 733. peak_count_delta_20d — 价峰计数10日差分
 # ═══════════════════════════════════════════════════════════════════════════
 @register_factor("peak_count_delta_20d", category="intraday_advanced")
 class PeakCountDelta20d(_VariantBase):
-    """价峰计数10日差分变体 (基于 intraday_price_peak_count_20d)."""
+    """价峰计数10日差分。
+
+    【用法说明】基于intraday_price_peak_count_20d的daily输出B（原始bar为1min）；继承已有滞后，不再额外shift。
+    【公式】B−B.shift(10)。
+    【含义】已平滑价峰暴露的变化；20d为兼容名，差分步长实际为10。
+    方向: 未预声明；含义说明不替代准入证据，实际方向以正式检验记录为准。
+    ⚠ 在基因子预热后还需10个输出日期间隔。
+    """
     name = "peak_count_delta_20d"
     description = "价峰计数10日差分"
     BASE = IntradayPricePeakCount20d
@@ -30345,7 +30555,7 @@ class _DailyVolumeReturnCorrFactor(VolumePriceCorr20D):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 585. intraday_volume_surprise_abs_return_corr — 异常量与绝对收益相关 (登记607)
+# 585. intraday_volume_surprise_abs_return_corr — 异常量与绝对收益相关
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_surprise_abs_return_corr_20d", category="volume_price")
@@ -30367,7 +30577,7 @@ class IntradayVolumeSurpriseAbsReturnCorr20d(_DailyVolumeReturnCorrFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 586. intraday_volume_directional_corr_spread — 上下行量价相关差 (登记608)
+# 586. intraday_volume_directional_corr_spread — 上下行量价相关差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_directional_corr_spread_20d", category="volume_price")
@@ -30389,7 +30599,7 @@ class IntradayVolumeDirectionalCorrSpread20d(_DailyVolumeReturnCorrFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 587. intraday_lagged_volume_abs_return_corr — 前日量与当日波动相关 (登记609)
+# 587. intraday_lagged_volume_abs_return_corr — 前日量与当日波动相关
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_lagged_volume_abs_return_corr_20d", category="volume_price")
@@ -30411,7 +30621,7 @@ class IntradayLaggedVolumeAbsReturnCorr20d(_DailyVolumeReturnCorrFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 588. intraday_volume_abs_return_partial_corr — 剔除波动延续的量价偏相关 (登记610)
+# 588. intraday_volume_abs_return_partial_corr — 剔除波动延续的量价偏相关
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_abs_return_partial_corr_20d", category="volume_price")
@@ -30606,7 +30816,7 @@ class _MinuteStructureFactor(Factor):
                             columns=universe).reindex(dates)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 589. intraday_amount_bandwidth_oi_5min — 成交额波动带宽与头部持仓 (登记611)
+# 589. intraday_amount_bandwidth_oi_5min — 成交额波动带宽与头部持仓
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_amount_bandwidth_oi_5min", category="term_structure")
@@ -30637,7 +30847,7 @@ class IntradayAmountBandwidthOi5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 590. intraday_oi_breadth_deviation_5min — 持仓广度与总持仓异常 (登记612)
+# 590. intraday_oi_breadth_deviation_5min — 持仓广度与总持仓异常
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_breadth_deviation_5min", category="term_structure")
@@ -30668,7 +30878,7 @@ class IntradayOiBreadthDeviation5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 591. intraday_oi_breadth_concentration_clip_5min — 持仓广度与集中度截断 (登记613)
+# 591. intraday_oi_breadth_concentration_clip_5min — 持仓广度与集中度截断
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_breadth_concentration_clip_5min", category="term_structure")
@@ -30699,7 +30909,7 @@ class IntradayOiBreadthConcentrationClip5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 592. intraday_amount_price_deviation_5min — 成交额与价格偏离强度 (登记614)
+# 592. intraday_amount_price_deviation_5min — 成交额与价格偏离强度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_amount_price_deviation_5min", category="momentum")
@@ -30730,7 +30940,7 @@ class IntradayAmountPriceDeviation5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 593. intraday_illiquidity_total_oi_5min — 非流动性与总持仓比 (登记615)
+# 593. intraday_illiquidity_total_oi_5min — 非流动性与总持仓比
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_illiquidity_total_oi_5min", category="term_structure")
@@ -30761,7 +30971,7 @@ class IntradayIlliquidityTotalOi5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 594. intraday_amount_concentration_spread_5min — 截面成交额与持仓集中度差 (登记616)
+# 594. intraday_amount_concentration_spread_5min — 截面成交额与持仓集中度差
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_amount_concentration_spread_5min", category="term_structure")
@@ -30792,7 +31002,7 @@ class IntradayAmountConcentrationSpread5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 595. intraday_trend_oi_composite_5min — 均线趋势与增仓复合 (登记617)
+# 595. intraday_trend_oi_composite_5min — 均线趋势与增仓复合
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_trend_oi_composite_5min", category="momentum")
@@ -30823,7 +31033,7 @@ class IntradayTrendOiComposite5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 596. intraday_relative_oi_trend_clip_1min — 相对持仓与均线趋势截断 (登记618)
+# 596. intraday_relative_oi_trend_clip_1min — 相对持仓与均线趋势截断
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_relative_oi_trend_clip_1min", category="momentum")
@@ -30854,7 +31064,7 @@ class IntradayRelativeOiTrendClip1min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 597. intraday_oi_change_concentration_adjusted_5min — 集中度调整的增仓强度 (登记619)
+# 597. intraday_oi_change_concentration_adjusted_5min — 集中度调整的增仓强度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_change_concentration_adjusted_5min", category="term_structure")
@@ -30885,7 +31095,7 @@ class IntradayOiChangeConcentrationAdjusted5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 598. intraday_volume_amount_concentration_clip_5min — 量额比与持仓集中度截断 (登记620)
+# 598. intraday_volume_amount_concentration_clip_5min — 量额比与持仓集中度截断
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_volume_amount_concentration_clip_5min", category="term_structure")
@@ -30916,7 +31126,7 @@ class IntradayVolumeAmountConcentrationClip5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 599. intraday_oi_breadth_price_divergence_5min — 持仓广度与增仓价格背离 (登记621)
+# 599. intraday_oi_breadth_price_divergence_5min — 持仓广度与增仓价格背离
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_oi_breadth_price_divergence_5min", category="term_structure")
@@ -30947,7 +31157,7 @@ class IntradayOiBreadthPriceDivergence5min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 600. intraday_relative_oi_price_clip_1min — 相对持仓与价格偏离截断 (登记622)
+# 600. intraday_relative_oi_price_clip_1min — 相对持仓与价格偏离截断
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_relative_oi_price_clip_1min", category="momentum")
@@ -30978,7 +31188,7 @@ class IntradayRelativeOiPriceClip1min(_MinuteStructureFactor):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 601. intraday_amount_oi_change_intensity_5min — 成交额异常与增仓强度 (登记623)
+# 601. intraday_amount_oi_change_intensity_5min — 成交额异常与增仓强度
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @register_factor("intraday_amount_oi_change_intensity_5min", category="term_structure")
@@ -31006,3 +31216,3986 @@ class IntradayAmountOiChangeIntensity5min(_MinuteStructureFactor):
 
     def _formula(self, f, mask):
         return _structure_bound(np.sign(_structure_bound(_structure_bound(_structure_bound(np.abs(f("amount_relative_48p"))) * _structure_divide(f("oi_change"), f("amount_mean_12p"))) * f("curve_contract_count"))) * np.sqrt(np.abs(_structure_bound(_structure_bound(_structure_bound(np.abs(f("amount_relative_48p"))) * _structure_divide(f("oi_change"), f("amount_mean_12p"))) * f("curve_contract_count")))))
+
+
+def _daily_volume_impact_entropy(panel: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按交易日边界计算同样本10桶熵，数组切片并缓存供三个因子复用。"""
+    key = "_daily_volume_impact_entropy"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(key)
+        if cached is not None:
+            return cached
+        volume = panel["volume"]
+        if volume.empty:
+            return tuple(pd.DataFrame(index=pd.DatetimeIndex([]), columns=volume.columns,
+                                      dtype=float) for _ in range(2))
+        days, offsets = _day_offsets(volume.index)
+        arrays = (
+            volume.to_numpy(dtype=float),
+            panel["open"].reindex_like(volume).to_numpy(dtype=float),
+            panel["close"].reindex_like(volume).to_numpy(dtype=float),
+        )
+        outputs = [np.full((len(days), len(volume.columns)), np.nan) for _ in range(2)]
+        for row, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+            v, o, c = (array[start:end] for array in arrays)
+            valid = (v > 0) & (o > 0) & (c > 0) & np.isfinite(v) & np.isfinite(o) & np.isfinite(c)
+            impact = np.full(v.shape, np.nan)
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                np.divide(c, o, out=impact, where=valid)
+                impact -= 1.0
+                np.abs(impact, out=impact)
+                np.divide(impact, v, out=impact, where=valid)
+            valid &= np.isfinite(impact)
+            for col in np.flatnonzero(valid.sum(axis=0) >= 30):
+                mask = valid[:, col]
+                for output, values in zip(outputs, (v[mask, col], impact[mask, col])):
+                    if values.min() == values.max():
+                        entropy = 0.0
+                    else:
+                        counts, _ = np.histogram(values, bins=10)
+                        probability = counts[counts > 0] / len(values)
+                        entropy = float(-np.sum(probability * np.log(probability)))
+                    output[row, col] = entropy
+        result = tuple(pd.DataFrame(values, index=days, columns=volume.columns) for values in outputs)
+        panel[key] = result
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 602. intraday_volume_impact_entropy_rank_gap — 量熵与冲击熵排名差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_impact_entropy_rank_gap_20d", category="intraday_advanced")
+class IntradayVolumeImpactEntropyRankGap20d(Factor):
+    """成交量分布与冲击分布的平滑排名差因子.
+
+    【用法说明】
+    输入真实1min open/close/volume，按数据源交易日归属聚合；成交量使用合约手数。
+    价格、成交量均为正且有限，两类熵采用同一组有效分钟，每日不少于30组。
+    日频输出并shift(1)；20d表示外层平滑窗口，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    q=abs(close/open-1)/volume。分别将volume、q按当日min~max等距分10桶，
+    p为桶内分钟数量占比，H=-Sum(p*log(p))；常量分布熵为0，数据不足为NaN。
+    V=Mean21(H_volume)，I=Mean21(H_q)，factor=Rank(Mean20(V))-Rank(Mean20(I))。
+    Rank为同日共同有效品种池内的平均秩百分位，应用可交易掩码，至少两个品种。
+
+    【含义】
+    高值表示成交量分布较分散、冲击分布相对集中，不比较原始冲击量级。
+    与#479先求两类熵差再平滑不同，此处分别平滑、分别排名后相减。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 21日及20日窗口均需完整观测，需40日历史，第41日输出；缺失不跳过、不前填。
+    """
+    name = "intraday_volume_impact_entropy_rank_gap_20d"
+    category = "intraday_advanced"
+    description = "量熵与冲击熵排名差 (21日底窗、20日平滑、日频滞后)"
+    frequency = signal_frequency = "daily"
+    input_bar_frequency = "1min"
+    validation_horizons = (5, 10, 20)
+    expected_direction = 1
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        dates = pd.DatetimeIndex(dates)
+        if len(dates) == 0 or len(universe) == 0:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close", "volume"}.issubset(panel):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        v, i = (
+            _roll_mean(frame.reindex(index=dates, columns=universe), 21, 21)
+            for frame in _daily_volume_impact_entropy(panel)
+        )
+        v, i = self._components(v, i)
+        valid = np.isfinite(v) & np.isfinite(i)
+        eligibility = getattr(data, "_factor_eligibility", None)
+        if eligibility is not None:
+            valid &= eligibility.reindex(index=dates, columns=universe).fillna(False).astype(bool)
+        return self._combine(v.where(valid), i.where(valid)).shift(1)
+
+    def _components(self, v, i):
+        return _roll_mean(v, 20, 20), _roll_mean(i, 20, 20)
+
+    def _combine(self, v, i):
+        return (v.rank(axis=1, pct=True) - i.rank(axis=1, pct=True)).where(
+            v.count(axis=1).ge(2), axis=0
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 603. intraday_volume_impact_entropy_innovation — 量与冲击熵相对变化
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_impact_entropy_innovation_20d", category="intraday_advanced")
+class IntradayVolumeImpactEntropyInnovation20d(IntradayVolumeImpactEntropyRankGap20d):
+    """相对自身历史的量熵与冲击熵结构变化因子.
+
+    【用法说明】
+    同#602的1min样本、10桶熵及21日均值V/I；不做截面排名，单品种可计算。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    对X分别取V和I，z_X=(X_t-Mean(X_{t-20:t-1}))/Std(X_{t-20:t-1})，
+    factor=z_V-z_I。标准差采用ddof=0；基准只含此前20日，标准差<=1e-12时为NaN。
+
+    【含义】
+    高值表示量分布相对自身常态更分散、冲击分布相对收敛，降低品种间长期差异影响。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 需41日历史，第42日输出；缺失交易日不跳过、不前填。
+    """
+    name = "intraday_volume_impact_entropy_innovation_20d"
+    description = "量与冲击熵相对变化 (各自历史标准化、基准滞后)"
+
+    def _components(self, v, i):
+        result = []
+        for frame in (v, i):
+            mean = _roll_mean(frame, 20, 20).shift(1)
+            std = _roll_std(frame, 20, 20).shift(1)
+            result.append((frame - mean).div(std.where(std > 1e-12)))
+        return tuple(result)
+
+    def _combine(self, v, i):
+        return v - i
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 604. intraday_volume_impact_entropy_joint_rank — 量分散与冲击集中共识
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_impact_entropy_joint_rank_20d", category="intraday_advanced")
+class IntradayVolumeImpactEntropyJointRank20d(IntradayVolumeImpactEntropyRankGap20d):
+    """量分散与冲击集中同时成立的截面共识因子.
+
+    【用法说明】
+    同#602的1min样本、10桶熵及21日底窗；两个排名使用同一有效池，至少两个品种。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    factor=min(Rank(Mean20(V)),Rank(-Mean20(I)))，Rank为应用可交易掩码后的平均秩百分位。
+
+    【含义】
+    高值要求高量熵和低冲击熵同时满足，以较弱一项为准，单项高分不能完全补偿另一项。
+    与#602的排名差互补。方向: 正向假设，期货收益方向待检验。
+    ⚠ 需完整40日历史，第41日输出；缺失交易日不跳过、不前填。
+    """
+    name = "intraday_volume_impact_entropy_joint_rank_20d"
+    description = "量分散与冲击集中共识 (双排名取较弱项)"
+
+    def _combine(self, v, i):
+        return np.minimum(v.rank(axis=1, pct=True), (-i).rank(axis=1, pct=True)).where(
+            v.count(axis=1).ge(2), axis=0
+        )
+
+
+def _daily_trade_pressure_components(panel: dict, conditional=False) -> tuple[pd.DataFrame, ...]:
+    """共同有效分钟的均额及方向均额/占比；Polars/Rust按日聚合并缓存。"""
+    import polars as pl
+
+    key = "_daily_trade_pressure_conditional" if conditional else "_daily_trade_pressure_components"
+    with _PANEL_CACHE_LOCK:
+        cached = panel.get(key)
+        if cached is not None:
+            return cached
+        amount = panel["amount"]
+        if amount.empty:
+            return tuple(pd.DataFrame(index=pd.DatetimeIndex([]), columns=amount.columns,
+                                      dtype=float) for _ in range(3))
+        days, offsets = _day_offsets(amount.index)
+        values = amount.to_numpy(dtype=float)
+        opening = panel["open"].reindex_like(amount).to_numpy(dtype=float)
+        close = panel["close"].reindex_like(amount).to_numpy(dtype=float)
+        columns = {"day": np.repeat(np.arange(len(days)), np.diff(offsets))}
+        expressions = []
+        for col in range(len(amount.columns)):
+            a, o, c = values[:, col], opening[:, col], close[:, col]
+            valid = (a > 0) & (o > 0) & (c > 0) & np.isfinite(a) & np.isfinite(o) & np.isfinite(c)
+            columns[f"a{col}"] = np.where(valid, a, np.nan)
+            columns[f"b{col}"] = np.where(valid & (c > o), a, 0.0)
+            columns[f"s{col}"] = np.where(valid & (c < o), a, 0.0)
+            if conditional:
+                columns[f"b{col}"] = np.where(valid & (c > o), a, np.nan)
+                columns[f"s{col}"] = np.where(valid & (c < o), a, np.nan)
+            amt = pl.col(f"a{col}")
+            total = amt.sum()
+            usable = (amt.count() >= 30) & (total > 0) & total.is_finite()
+            for prefix, expression in (
+                ("i", amt.mean()),
+                ("b", pl.col(f"b{col}").mean() if conditional else pl.col(f"b{col}").sum() / total),
+                ("s", pl.col(f"s{col}").mean() if conditional else pl.col(f"s{col}").sum() / total),
+            ):
+                expressions.append(pl.when(usable).then(expression).alias(f"{prefix}{col}"))
+        daily = pl.DataFrame(columns, nan_to_null=True).group_by("day", maintain_order=True).agg(expressions)
+        result = tuple(pd.DataFrame(
+            daily.select([f"{prefix}{col}" for col in range(len(amount.columns))]).to_numpy(),
+            index=days, columns=amount.columns,
+        ) for prefix in ("i", "b", "s"))
+        panel[key] = result
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 605. intraday_trade_strength_pressure_rank — 交易强度与买卖压力排名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trade_strength_pressure_rank_20d", category="intraday_advanced")
+class IntradayTradeStrengthPressureRank20d(Factor):
+    """分钟交易强度与方向压力的平滑排名组合因子.
+
+    【用法说明】
+    输入真实1min open/close/amount，按数据源交易日归属聚合；价格、成交额须为正且有限。
+    分钟成交额代理交易强度；close>open或close<open代理买卖方向，不采用隔夜跳空。
+    该口径不等于逐笔主动买卖或平均单笔成交额，每日不少于30组共同有效分钟。
+    成交额沿用数据源统一金额单位，其品种间规模差异属于本分量含义。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    I=有效分钟平均成交额，U=上涨分钟平均额，D=下跌分钟平均额。
+    平价分钟只计入I。factor=Rank(Mean20(I))-Rank(Mean20(D/I))+Rank(Mean20(U/D))。
+    任一方向没有有效分钟时该方向均额未定义；三项在共同有效池内取平均秩百分位，应用可交易掩码，
+    至少两个品种。与#29的单一涨跌分钟均量比、K10的符号量不平衡不同。
+
+    【含义】
+    数值高表示交易活跃、下跌分钟均额相对较低、上涨与下跌分钟均额比较高。
+    方向: 负向假设（单边交易拥挤后的反转），期货收益方向待检验。
+    ⚠ 20日窗口要求完整观测，第21日输出；缺失交易日不跳过、不前填。
+    """
+    name = "intraday_trade_strength_pressure_rank_20d"
+    category = "intraday_advanced"
+    description = "交易强度与买卖压力排名 (分钟均额、下行相对均额、涨跌均额比)"
+    frequency = signal_frequency = "daily"
+    input_bar_frequency = "1min"
+    validation_horizons = (5, 10, 20)
+    expected_direction = -1
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        dates = pd.DatetimeIndex(dates)
+        if len(dates) == 0 or len(universe) == 0:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        panel = _get_minute_panel(data, dates, universe, freq="1min")
+        if not {"open", "close", "amount"}.issubset(panel):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = tuple(frame.reindex(index=dates, columns=universe)
+                      for frame in self._daily_components(panel))
+        components = self._components(*daily)
+        valid = np.isfinite(components[0])
+        for frame in components[1:]:
+            valid &= np.isfinite(frame)
+        eligibility = getattr(data, "_factor_eligibility", None)
+        if eligibility is not None:
+            valid &= eligibility.reindex(index=dates, columns=universe).fillna(False).astype(bool)
+        return self._combine(*(frame.where(valid) for frame in components)).shift(1)
+
+    def _daily_components(self, panel):
+        return _daily_trade_pressure_components(panel, conditional=True)
+
+    def _components(self, strength, buy, sell):
+        return tuple(_roll_mean(frame, 20, 20) for frame in (
+            strength, sell.div(strength), buy.div(sell.where(sell > 0)),
+        ))
+
+    def _combine(self, strength, sell_share, buy_sell_ratio):
+        return (
+            strength.rank(axis=1, pct=True) - sell_share.rank(axis=1, pct=True)
+            + buy_sell_ratio.rank(axis=1, pct=True)
+        ).where(strength.count(axis=1).ge(2), axis=0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 606. intraday_relative_activity_pressure — 相对活跃度与方向压力
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_activity_pressure_20d", category="intraday_advanced")
+class IntradayRelativeActivityPressure20d(IntradayTradeStrengthPressureRank20d):
+    """以品种自身活跃度为权重的有界方向压力因子.
+
+    【用法说明】
+    同#605的1min样本；I为全天分钟均额，B/S分别为上涨/下跌分钟额占全天有效额的比例。
+    不做截面排名，单品种可计算，单边交易无需除以卖额。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    A=I/(I+Mean(I_{t-20:t-1}))，P=(B-S)/(B+S)，factor=Mean20(A*P)。
+    A在0至1之间，基准只含此前20日；全日平价时P=0，数据不足仍为NaN。
+    先在每天将相对活跃度与压力相乘，再平滑，保留二者同步变化。
+
+    【含义】
+    高值表示相对自身常态较活跃的日子里，买方方向持续占优。
+    将单品种全部成交额乘同一正常数不改变值，降低固定品种规模差异影响。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 两个20日窗口含基准滞后，需完整40日历史，第41日输出；缺失不跳过、不前填。
+    """
+    name = "intraday_relative_activity_pressure_20d"
+    description = "相对活跃度与方向压力 (自身历史归一、有界权重)"
+    expected_direction = 1
+
+    def _daily_components(self, panel):
+        return _daily_trade_pressure_components(panel)
+
+    def _components(self, strength, buy, sell):
+        baseline = _roll_mean(strength, 20, 20).shift(1)
+        activity = strength.div(strength + baseline)
+        total = buy + sell
+        pressure = (buy - sell).div(total.where(total > 0)).where(total.ne(0), 0.0)
+        return (_roll_mean(activity * pressure, 20, 20),)
+
+    def _combine(self, score):
+        return score
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 607. intraday_activity_pressure_consistency — 活跃度与方向压力一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_activity_pressure_consistency_20d", category="intraday_advanced")
+class IntradayActivityPressureConsistency20d(IntradayRelativeActivityPressure20d):
+    """结合活跃度与跨日方向一致性的压力因子.
+
+    【用法说明】
+    同#605的1min样本及#606的相对活跃度A；不做截面排名，单品种可计算。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Q=B-S，factor=Mean20(A)*Mean20(Q)/sqrt(Mean20(Q²))。
+    Q包含平价成交额的稀释作用；方向一致性为均值/均方根，介于-1至1，
+    20日Q全为0时取0，数据不足仍为NaN。各项分别平滑，区别于#606先相乘再平滑。
+
+    【含义】
+    高值要求相对活跃且买方压力多日稳定，方向交替会降低绝对值。
+    与#363的失衡变化斜率互补。方向: 正向假设，期货收益方向待检验。
+    ⚠ 需完整40日历史，第41日输出；缺失交易日不跳过、不前填。
+    """
+    name = "intraday_activity_pressure_consistency_20d"
+    description = "活跃度与方向压力一致性 (净额占比均值/均方根)"
+
+    def _components(self, strength, buy, sell):
+        baseline = _roll_mean(strength, 20, 20).shift(1)
+        activity = _roll_mean(strength.div(strength + baseline), 20, 20)
+        pressure = buy - sell
+        mean = _roll_mean(pressure, 20, 20)
+        rms = np.sqrt(_roll_mean(pressure.pow(2), 20, 20).clip(lower=0.0))
+        # 全零窗口用精确计数识别，避免滚动累加抵消误差形成微小伪信号。
+        flat = _roll_sum(pressure.eq(0).astype(float), 20, 20).eq(20)
+        consistency = mean.div(rms.where(rms > 0)).mask(flat, 0.0)
+        return (activity * consistency,)
+
+
+def _supplement_ratio(numerator, denominator):
+    """有界表达式的安全除法；有效零分母取0，缺测仍保留null。"""
+    import polars as pl
+    valid = denominator.is_finite() & numerator.is_finite()
+    return (pl.when(valid & (denominator > 1e-12)).then(numerator / denominator)
+            .when(valid & (denominator >= 0)).then(0.0))
+
+
+def _supplement_seat_shares(data, dates, universe):
+    """复用日度席位读取，Polars/Rust按真实席位汇总多空HHI，不用净额作分母。"""
+    import polars as pl
+    raw = _get_seat_table(data, dates, universe, "product_seat")
+    fields = ["_ts", "_root", "seat_name", "long_position", "short_position"]
+    if raw is None or not set(fields).issubset(raw.columns):
+        return {}
+    frame = pl.from_pandas(raw[fields], nan_to_null=True)
+    l, s = pl.col("long_position"), pl.col("short_position")
+    valid = (l.is_finite() & s.is_finite() & (l >= 0) & (s >= 0)
+             & pl.col("seat_name").is_not_null()).fill_null(False)
+    seats = frame.with_columns(valid.alias("valid")).group_by(
+        ["_ts", "_root", "seat_name"]
+    ).agg(l.sum(), s.sum(), pl.col("valid").all())
+    usable = pl.col("valid").all() & (pl.len() >= 3) & (l.sum() > 0) & (s.sum() > 0)
+    summary = seats.group_by(["_ts", "_root"]).agg(
+        pl.when(usable).then(l.pow(2).sum() / l.sum().pow(2)).alias("lh"),
+        pl.when(usable).then(s.pow(2).sum() / s.sum().pow(2)).alias("sh"),
+        pl.when(usable).then((l.sum() - s.sum()) / (l.sum() + s.sum())).alias("bias"),
+    ).to_pandas()
+    return {key: summary.pivot(index="_ts", columns="_root", values=key).reindex(
+        index=dates, columns=universe) for key in ("lh", "sh", "bias")}
+
+
+class _DailySupplementFactor(Factor):
+    """日频补充因子的共同读取/掩码/表达式执行；只计算调用者所需分量。"""
+    category = "intraday_advanced"
+    input_bar_frequency = signal_frequency = frequency = "daily"
+    validation_horizons = (5, 10, 20)
+    expected_direction = 1
+    FIELDS = ("close", "oi")
+    SEAT = False
+    PEERS = False
+
+    def dependencies(self) -> list:
+        return list(self.FIELDS)
+
+    def compute(self, data, dates, universe):
+        import polars as pl
+        dates = pd.DatetimeIndex(dates)
+        empty = pd.DataFrame(np.nan, index=dates, columns=universe)
+        if len(dates) == 0 or len(universe) == 0:
+            return empty
+        fields = (_supplement_seat_shares(data, dates, universe) if self.SEAT
+                  else {key: data.get(key, dates, universe) for key in self.FIELDS})
+        if not fields or any(v is None or v.empty for v in fields.values()):
+            return empty
+        eligibility = getattr(data, "_factor_eligibility", None)
+        mask = (pd.DataFrame(True, index=dates, columns=universe) if eligibility is None
+                else eligibility.reindex(index=dates, columns=universe).fillna(False).astype(bool))
+        columns = {}
+        for key, frame in fields.items():
+            values = frame.reindex(index=dates, columns=universe).to_numpy(dtype=float)
+            valid = np.isfinite(values) & mask.to_numpy()
+            if key in {"close", "oi"}:
+                valid &= values > 0
+            elif key == "volume":
+                valid &= values >= 0
+            for i in range(len(universe)):
+                columns[f"{key}{i}"] = np.where(valid[:, i], values[:, i], np.nan)
+        frame = pl.DataFrame(columns, nan_to_null=True)
+        if self.PEERS:
+            frame = frame.with_columns([
+                pl.col(f"close{i}").log().diff().alias(f"r{i}") for i in range(len(universe))
+            ])
+        expressions, peer_expressions = [], []
+        for i, root in enumerate(universe):
+            args = {key: pl.col(f"{key}{i}") for key in fields}
+            if self.PEERS:
+                sector = _SECTOR_MAP.get(str(root).upper())
+                peers = [pl.col(f"r{j}") for j, other in enumerate(universe)
+                         if j != i and sector not in (None, "other")
+                         and _SECTOR_MAP.get(str(other).upper()) == sector]
+                if len(peers) < 2:
+                    expressions.append(pl.lit(None, dtype=pl.Float64).alias(str(i)))
+                    continue
+                count = pl.sum_horizontal([v.is_not_null().cast(pl.Int32) for v in peers])
+                mean = pl.sum_horizontal(peers) / count
+                variance = pl.sum_horizontal([v.pow(2) for v in peers]) / count - mean.pow(2)
+                peer_expressions.extend([
+                    pl.when(count >= 2).then(mean).alias(f"peer{i}"),
+                    pl.when(count >= 2).then(variance.clip(0).sqrt()).alias(f"dispersion{i}"),
+                ])
+                args.update(r=pl.col(f"r{i}"), peer=pl.col(f"peer{i}"),
+                            dispersion=pl.col(f"dispersion{i}"))
+            expressions.append(self._expression(args).shift(1).alias(str(i)))
+        if peer_expressions:
+            frame = frame.with_columns(peer_expressions)
+        values = frame.with_columns(expressions).select([str(i) for i in range(len(universe))]).to_numpy()
+        return pd.DataFrame(np.where(np.isfinite(values), values, np.nan),
+                            index=dates, columns=universe).where(mask)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 608. intraday_oi_path_efficiency — 增减仓路径效率
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_oi_path_efficiency_20d", category="intraday_advanced")
+class IntradayOiPathEfficiency20d(_DailySupplementFactor):
+    """增减仓方向相对总变化的路径效率因子.
+
+    【用法说明】输入日线oi，日频输出并shift(1)；20日完整窗口，不前填。
+    【公式】g=Δlog(oi)，factor=Sum20(g)/Sum20(abs(g))，全零窗口取0。
+    【含义】高值表示增仓持续、反复撤仓较少；不是持仓水平变异系数或单日增仓幅度。
+    方向: 正向假设，待检验。检验预测期5/10/20交易日，不决定持仓期。
+    ⚠ 至少21日OI形成20次变化，第22日首次输出；OI需正且有限。
+    """
+    name = "intraday_oi_path_efficiency_20d"
+    description = "增减仓路径效率 (净变化/总变化)"
+    FIELDS = ("oi",)
+
+    def _expression(self, x):
+        g = x["oi"].log().diff()
+        return _supplement_ratio(g.rolling_sum(20), g.abs().rolling_sum(20))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 609. intraday_oi_stable_price_trend — 稳定持仓价格趋势
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_oi_stable_price_trend_20d", category="intraday_advanced")
+class IntradayOiStablePriceTrend20d(_DailySupplementFactor):
+    """以持仓稳定性调整价格趋势方向的一致性因子.
+
+    【用法说明】输入日线close/oi，完整20日窗口，日频shift(1)，缺失不前填。
+    【公式】r=Δlog(close)，factor=Mean20(r)/RMS20(r)/(1+Std20(oi)/Mean20(oi))。
+    Std采用ddof=0，零收益窗口取0；不改变价格或OI的固定单位尺度。
+    【含义】趋势方向稳定且OI水平反复较少时绝对值较高；不同于仅用OI变异系数。
+    方向: 正向假设，待检验。检验预测期5/10/20日，非持仓期。
+    ⚠ 需21日收盘价，第22日首次输出。
+    """
+    name = "intraday_oi_stable_price_trend_20d"
+    description = "稳定持仓价格趋势 (收益一致性×持仓稳定度)"
+
+    def _expression(self, x):
+        r, oi = x["close"].log().diff(), x["oi"]
+        return (_supplement_ratio(r.rolling_mean(20), r.pow(2).rolling_mean(20).sqrt())
+                / (1 + oi.rolling_std(20, ddof=0) / oi.rolling_mean(20)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 610. intraday_seat_concentration_pressure — 多空集中度变化差
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_seat_concentration_pressure_20d", category="intraday_advanced")
+class IntradaySeatConcentrationPressure20d(_DailySupplementFactor):
+    """分别归一化多空份额的集中度变化差因子.
+
+    【用法说明】输入product_seat日度long_position/short_position，按实际席位汇总。
+    每日需至少3个席位，两侧总持仓均>0；负值/缺测使对应品种日无效，不填补席位。
+    【公式】HL=Σ(L/ΣL)²，HS=Σ(S/ΣS)²；factor=Mean20(ΔHL-ΔHS)。
+    【含义】高值表示多头集中加速相对空头更强，不等于净持仓HHI或其一阶差。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 完整20次变化需21日席位数据，第22日输出；报告覆盖不是全市场持仓。
+    """
+    name = "intraday_seat_concentration_pressure_20d"
+    description = "多空集中度变化差 (两侧独立归一化HHI)"
+    FIELDS = ()
+    SEAT = True
+
+    def _expression(self, x):
+        return (x["lh"].diff() - x["sh"].diff()).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 611. intraday_seat_crowding_release — 席位方向拥挤释放
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_seat_crowding_release_20d", category="intraday_advanced")
+class IntradaySeatCrowdingRelease20d(IntradaySeatConcentrationPressure20d):
+    """有方向的席位集中度释放因子.
+
+    【用法说明】同#610的日度席位样本与有效条件，不读取分钟数据。
+    【公式】H=(HL+HS)/2，B=(ΣL-ΣS)/(ΣL+ΣS)，factor=Mean20(B[t-1]*(H[t-1]-H[t]))。
+    【含义】昨日偏多、今日集中度下降对应正值，刻画方向性持仓的分散承接假设；
+    集中度上升取反，不把席位净额较小造成的分母爆炸误认为拥挤。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 需21日完整席位观测，第22日输出；缺失不前填。
+    """
+    name = "intraday_seat_crowding_release_20d"
+    description = "席位方向拥挤释放 (昨日净方向×集中度下降)"
+
+    def _expression(self, x):
+        h = (x["lh"] + x["sh"]) / 2
+        return (x["bias"].shift(1) * -h.diff()).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 612. intraday_liquidation_reversal — 放量减仓反转压力
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_liquidation_reversal_20d", category="intraday_advanced")
+class IntradayLiquidationReversal20d(_DailySupplementFactor):
+    """按相对成交活跃度加权的减仓价格反转因子.
+
+    【用法说明】输入日线close/oi/volume，日频shift(1)，不前填。
+    【公式】r=Δlog(close)，g=Δlog(oi)，a=min(volume/Mean20(volume)[t-1],3)。
+    factor=-Sum20(sign(r)*max(-g,0)*a)/Sum20(abs(g)*a)；有效零分母取0。
+    【含义】放量减仓上涨偏负、放量减仓下跌偏正；区别于量仓价格三符号相乘。
+    方向: 正向假设，待检验。检验预测期5/10/20日，非持仓期。
+    ⚠ 成交量基准只用此前20日，随后20日聚合，第41日首次输出。
+    """
+    name = "intraday_liquidation_reversal_20d"
+    description = "放量减仓反转压力 (减仓方向×相对成交活跃度)"
+    FIELDS = ("close", "oi", "volume")
+
+    def _expression(self, x):
+        import polars as pl
+        r, g, v = x["close"].log().diff(), x["oi"].log().diff(), x["volume"]
+        baseline = v.rolling_mean(20).shift(1)
+        a = pl.when(baseline > 0).then((v / baseline).clip(0, 3))
+        return -_supplement_ratio((r.sign() * (-g).clip(0) * a).rolling_sum(20),
+                                  (g.abs() * a).rolling_sum(20))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 613. intraday_oi_price_response_asymmetry — 增减仓价格响应差
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_oi_price_response_asymmetry_20d", category="intraday_advanced")
+class IntradayOiPriceResponseAsymmetry20d(_DailySupplementFactor):
+    """增仓与减仓条件下的价格响应不对称因子.
+
+    【用法说明】输入日线close/oi；20日需20对有效变化，增仓、减仓各至少3日。
+    【公式】r=Δlog(close)，g=Δlog(oi)，factor=(Mean(r|g>0)-Mean(r|g<0))/RMS20(r)。
+    【含义】增仓日比减仓日更强对应正值；零增仓日只参与完整样本和收益RMS统计。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 至少21日原始观测，第22日可能输出；条件样本不足为NaN，不伪造零信号。
+    """
+    name = "intraday_oi_price_response_asymmetry_20d"
+    description = "增减仓价格响应差 (条件均值差/收益均方根)"
+
+    def _expression(self, x):
+        import polars as pl
+        r, g = x["close"].log().diff(), x["oi"].log().diff()
+        valid = r.is_not_null() & g.is_not_null()
+        up, down = (g > 0).cast(pl.Float64), (g < 0).cast(pl.Float64)
+        nu, nd = up.rolling_sum(20), down.rolling_sum(20)
+        diff = ((pl.when(g > 0).then(r).otherwise(0)).rolling_sum(20) / nu
+                - (pl.when(g < 0).then(r).otherwise(0)).rolling_sum(20) / nd)
+        return pl.when((nu >= 3) & (nd >= 3) & (valid.cast(pl.Int32).rolling_sum(20) == 20)).then(
+            _supplement_ratio(diff, r.pow(2).rolling_mean(20).sqrt()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 614. intraday_sector_dispersion_repair — 板块分化收敛修复
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_dispersion_repair_20d", category="intraday_advanced")
+class IntradaySectorDispersionRepair20d(_DailySupplementFactor):
+    """板块分化收敛时的落后品种修复因子.
+
+    【用法说明】输入日线close，按规范细板块剔除自身；每日至少2个有效同伴。
+    可交易掩码先作用于同伴池，未知板块不混组；r为对数收益，m/s为同伴均值/总体std。
+    【公式】z=(r-m)/(s+RMS20(r))，c=max((s[t-1]-s)/(s[t-1]+s),0)，factor=-Mean20(z*c)。
+    【含义】同伴分化缩小时偏好相对落后者，不等于板块宽度或龙头落后全距。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 两层完整20日窗口，第41日可能输出；缺失不前填，零分母取0。
+    """
+    name = "intraday_sector_dispersion_repair_20d"
+    description = "板块分化收敛修复 (同伴离散度下降×相对落后)"
+    FIELDS = ("close",)
+    PEERS = True
+
+    def _expression(self, x):
+        r, m, s = x["r"], x["peer"], x["dispersion"]
+        z = _supplement_ratio(r - m, s + r.pow(2).rolling_mean(20).sqrt())
+        contraction = _supplement_ratio(s.shift(1) - s, s.shift(1) + s).clip(0, 1)
+        return -(z * contraction).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 615. intraday_sector_dispersion_breakout — 板块分化扩张领涨
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_dispersion_breakout_20d", category="intraday_advanced")
+class IntradaySectorDispersionBreakout20d(IntradaySectorDispersionRepair20d):
+    """板块分化扩张条件下的相对强势因子.
+
+    【用法说明】同#614日线、同伴剔除及掩码口径，至少2个有效同伴。
+    【公式】沿用z，e=max((s-s[t-1])/(s+s[t-1]),0)，factor=Mean20(z*e)。
+    【含义】只在同伴收益分化扩大时奖励自身相对强势，与收敛修复使用不同状态样本。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 两层完整20日窗口，第41日可能输出；缺失不前填，零分母取0。
+    """
+    name = "intraday_sector_dispersion_breakout_20d"
+    description = "板块分化扩张领涨 (同伴离散度上升×相对强势)"
+
+    def _expression(self, x):
+        r, m, s = x["r"], x["peer"], x["dispersion"]
+        z = _supplement_ratio(r - m, s + r.pow(2).rolling_mean(20).sqrt())
+        expansion = _supplement_ratio(s - s.shift(1), s + s.shift(1)).clip(0, 1)
+        return (z * expansion).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 616. intraday_sector_direction_persistence — 板块同向趋势一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_direction_persistence_20d", category="intraday_advanced")
+class IntradaySectorDirectionPersistence20d(IntradaySectorDispersionRepair20d):
+    """同伴方向一致性与自身趋势的日度交互因子.
+
+    【用法说明】同#614的日线与同伴池，r为自身对数收益，m为剔除自身的同伴均值。
+    【公式】factor=Mean20(sign(r)*sign(m))*Mean20(r)/RMS20(r)。
+    【含义】同时衡量跨品种方向同步和自身跨日方向；不同于分钟路径相关或板块涨跌数。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 需20对完整收益，第22日可能输出；缺失不前填，零收益分母取0。
+    """
+    name = "intraday_sector_direction_persistence_20d"
+    description = "板块同向趋势一致性 (同伴同向率×自身趋势一致性)"
+
+    def _expression(self, x):
+        r, m = x["r"], x["peer"]
+        return (r.sign() * m.sign()).rolling_mean(20) * _supplement_ratio(
+            r.rolling_mean(20), r.pow(2).rolling_mean(20).sqrt())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 617. intraday_sector_downside_decoupling — 板块下跌脱钩韧性
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_downside_decoupling_20d", category="intraday_advanced")
+class IntradaySectorDownsideDecoupling20d(IntradaySectorDispersionRepair20d):
+    """同伴下跌冲击下的自身收益韧性因子.
+
+    【用法说明】同#614的日线和同伴池；完整20对收益中同伴下跌至少5日。
+    【公式】w=max(-m,0)，factor=Mean20(r*w)/(Mean20(w)*RMS20(r))。
+    【含义】同伴跌幅越大权重越高，自身仍保持较强收益时高分，区别于无条件同步性。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 至少21日原始收盘价，第22日可能输出；下跌样本不足为NaN。
+    """
+    name = "intraday_sector_downside_decoupling_20d"
+    description = "板块下跌脱钩韧性 (同伴跌幅加权的自身收益)"
+
+    def _expression(self, x):
+        import polars as pl
+        r, m = x["r"], x["peer"]
+        w = (-m).clip(0)
+        return pl.when((m < 0).cast(pl.Int32).rolling_sum(20) >= 5).then(
+            _supplement_ratio((r * w).rolling_mean(20),
+                              w.rolling_mean(20) * r.pow(2).rolling_mean(20).sqrt()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 618. intraday_sector_delayed_response — 板块滞后响应修复
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_delayed_response_20d", category="intraday_advanced")
+class IntradaySectorDelayedResponse20d(IntradaySectorDispersionRepair20d):
+    """同伴领先关系加权的自身滞后响应因子.
+
+    【用法说明】同#614的日线和同伴池，相关系数由此前20对完整观测估计。
+    【公式】C=Corr20(r,m[t-1])[t-1]，factor=Mean20(C*(m-r)/RMS20(r))。
+    【含义】历史上跟随同伴、今天又落后于同伴者高分；未使用未来同伴收益。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 相关估计与平滑叠加，第43日可能输出；零方差相关为NaN，不前填。
+    """
+    name = "intraday_sector_delayed_response_20d"
+    description = "板块滞后响应修复 (历史同伴领先×当前相对落后)"
+
+    def _expression(self, x):
+        r, m = x["r"], x["peer"]
+        c = _daily_corr20(r, m.shift(1)).shift(1)
+        return (c * _supplement_ratio(m - r, r.pow(2).rolling_mean(20).sqrt())).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 619. intraday_sector_leader_confirmation — 板块领涨关系确认
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_leader_confirmation_20d", category="intraday_advanced")
+class IntradaySectorLeaderConfirmation20d(IntradaySectorDispersionRepair20d):
+    """历史自身领先关系对当前价格方向的确认因子.
+
+    【用法说明】同#614的日线和同伴池；统计角色与#618相反，而非切换预测期。
+    【公式】C=Corr20(m,r[t-1])[t-1]，factor=Mean20(C*r/RMS20(r))。
+    【含义】此前自身变动经常先于同伴变动时，当前价格方向获得更高权重。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 第43日可能输出；20对完整相关观测，零方差为NaN，不前填。
+    """
+    name = "intraday_sector_leader_confirmation_20d"
+    description = "板块领涨关系确认 (历史自身领先×当前价格方向)"
+
+    def _expression(self, x):
+        r, m = x["r"], x["peer"]
+        c = _daily_corr20(m, r.shift(1)).shift(1)
+        return (c * _supplement_ratio(r, r.pow(2).rolling_mean(20).sqrt())).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 620. intraday_calendar_seasonal_excess — 历史同月超额季节性
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_calendar_seasonal_excess_20d", category="intraday_advanced")
+class IntradayCalendarSeasonalExcess20d(_DailySupplementFactor):
+    """仅以前五个已完成自然年估计的同月超额收益因子.
+
+    【用法说明】输入日线close；每年每月先算日对数收益均值，至少10日有效收益。
+    对当前年份Y仅用Y-5至Y-1，当前月必须至少3个历史年份可用，年份等权。
+    【公式】S=过去同月年度均值的均值减去过去全部合格年月均值，factor=Mean20(S)。
+    【含义】相对自身历史常态较强的月份高分；不是日内分时模式，不宣称供需因果。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 至少3个完整历史年份加20日平滑，建议预热1512交易日；当前年数据不进入估计。
+    缺失不前填；日历月份在滞后信号中按前一交易日归属，不使用未来交易日。
+    """
+    name = "intraday_calendar_seasonal_excess_20d"
+    description = "历史同月超额季节性 (仅完成年份、年度等权)"
+    FIELDS = ("close",)
+    CONSENSUS = False
+    warmup_trading_days = 1512  # 计算历史，不是训练样本或收益预测期。
+
+    def compute(self, data, dates, universe):
+        import polars as pl
+        dates = pd.DatetimeIndex(dates)
+        empty = pd.DataFrame(np.nan, index=dates, columns=universe)
+        if len(dates) == 0 or len(universe) == 0:
+            return empty
+        close = data.get("close", dates, universe).reindex(index=dates, columns=universe)
+        mask = getattr(data, "_factor_eligibility", None)
+        if mask is not None:
+            close = close.where(mask.reindex(index=dates, columns=universe).fillna(False))
+        values = close.to_numpy(dtype=float)
+        fields = {str(i): np.where(np.isfinite(values[:, i]) & (values[:, i] > 0),
+                                   values[:, i], np.nan) for i in range(len(universe))}
+        names = list(fields)
+        daily = pl.DataFrame(fields, nan_to_null=True).select([
+            pl.col(k).log().diff().alias(k) for k in names
+        ]).with_columns(pl.Series("year", dates.year), pl.Series("month", dates.month))
+        monthly = daily.group_by(["year", "month"]).agg([
+            pl.when(pl.col(k).count() >= 10).then(pl.col(k).mean()).alias(k) for k in names
+        ]).sort(["year", "month"])
+        result = np.full(values.shape, np.nan)
+        # 每个自然年仅12行统计，避免逐日/逐品种扫描多年历史。
+        for year in dates.year.unique():
+            history = monthly.filter((pl.col("year") >= year - 5) & (pl.col("year") < year))
+            if history.is_empty():
+                continue
+            baseline = history.select([pl.col(k).mean() for k in names]).row(0)
+            expressions = []
+            for i, k in enumerate(names):
+                v = pl.col(k)
+                score = (_supplement_ratio(v.mean(), v.pow(2).mean().sqrt()) * v.sign().mean().abs()
+                         if self.CONSENSUS else v.mean() - pl.lit(baseline[i], dtype=pl.Float64))
+                expressions.append(pl.when(v.count() >= 3).then(score).alias(k))
+            table = history.group_by("month").agg(expressions)
+            for row in table.iter_rows(named=True):
+                result[(dates.year == year) & (dates.month == row["month"])] = [
+                    np.nan if row[k] is None else row[k] for k in names]
+        smoothed = pl.DataFrame(result, schema=names, orient="row", nan_to_null=True).select([
+            pl.col(k).rolling_mean(20).shift(1) for k in names]).to_numpy()
+        output = pd.DataFrame(smoothed, index=dates, columns=universe)
+        return output if mask is None else output.where(mask.reindex(index=dates, columns=universe).fillna(False))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 621. intraday_calendar_seasonal_consensus — 历史同月方向共识
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_calendar_seasonal_consensus_20d", category="intraday_advanced")
+class IntradayCalendarSeasonalConsensus20d(IntradayCalendarSeasonalExcess20d):
+    """历年同月收益方向和幅度共同确认的季节性因子.
+
+    【用法说明】同#620的已完成年份、至少3年及每年月至少10日的观测要求。
+    【公式】对历年同月日均收益x，S=Mean(x)/RMS(x)*abs(Mean(sign(x)))，factor=Mean20(S)。
+    【含义】高值要求同月收益偏正且跨年方向一致；少数极端年份不能单独获得满分。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，非持仓期。
+    ⚠ 至少3个历史年份加20日平滑，建议1512交易日预热；当前年完全排除，缺失不填。
+    """
+    name = "intraday_calendar_seasonal_consensus_20d"
+    description = "历史同月方向共识 (完成年份的收益一致性)"
+    CONSENSUS = True
+
+
+def _method_daily_triplet(panel, method, eligibility=None):
+    """同日分钟统计的三个分量；Polars/Rust聚合，共享缓存且不跨日连接收益。"""
+    import polars as pl
+
+    close = panel["close"]
+    days, offsets = _day_offsets(close.index)
+    eligible = None if eligibility is None else eligibility.reindex(
+        index=days, columns=close.columns).fillna(False).to_numpy(dtype=bool)
+    key = ("_method_daily_triplet", method, None if eligible is None else eligible.tobytes())
+    with _PANEL_CACHE_LOCK:
+        if key in panel:
+            return panel[key]
+        out = [np.full((len(days), len(close.columns)), np.nan) for _ in range(3)]
+        day_ids = np.repeat(np.arange(len(days)), np.diff(offsets))
+        arrays = {k: panel[k].reindex_like(close).to_numpy(dtype=float)
+                  for k in ("open", "high", "low", "close", "volume", "amount") if k in panel}
+        market = None
+        if method in {"idio", "attention", "sync"}:
+            c = arrays["close"]
+            prices = pd.DataFrame(c, index=close.index, columns=close.columns).where(np.isfinite(c) & (c > 0))
+            ret = prices.pct_change(fill_method=None)
+            ret.iloc[offsets[:-1]] = np.nan
+            ret = ret.where(np.isfinite(ret) & (c > 0))
+            if eligible is not None:
+                ret = ret.where(eligible[day_ids])
+            market = ret.mean(axis=1).where(ret.count(axis=1) >= 2).to_numpy()
+        for j in range(len(close.columns)):
+            columns = {"day": day_ids, "pos": np.arange(len(close)),
+                       "mid": np.repeat((offsets[:-1] + offsets[1:]) / 2, np.diff(offsets))}
+            for field, values in arrays.items():
+                v = values[:, j]
+                columns[field] = np.where(np.isfinite(v) & (v > 0), v, np.nan)
+            if market is not None:
+                columns["market"] = market
+            f = pl.DataFrame(columns, nan_to_null=True)
+            c, o, a, v = (pl.col(k) for k in ("close", "open", "amount", "volume"))
+            prev = c.shift(1).over("day")
+            f = f.with_columns((c / prev - 1).alias("r"))
+            f = f.with_columns(
+                (c.is_not_null().cast(pl.Int64).cum_sum().over("day")-1).alias("pos"),
+                (c.count().over("day")/2).alias("mid"),
+            )
+            r = pl.col("r")
+            count = r.count()
+            if method == "strength":
+                valid = c.is_not_null() & o.is_not_null() & a.is_not_null()
+                down, up = (c<o)&valid, (c>o)&valid
+                ratio = a.filter(down).mean()/a.filter(valid).mean()
+                count = valid.sum()
+                direction_count = down.sum().cast(pl.Float64)-up.sum().cast(pl.Float64)
+                exprs = [ratio,ratio,(ratio-1)*direction_count/count]
+            elif method == "volatility":
+                down,up = r.filter(r<0).std(ddof=0),r.filter(r>0).std(ddof=0)
+                exprs = [r.std(ddof=0),r.std(ddof=0)/r.abs().median(),(down-up)/(down+up)]
+            elif method == "trend":
+                f = f.with_columns(r.cum_sum().over("day").alias("path"))
+                path = pl.col("path")
+                total = r.abs().sum()
+                efficiency = r.sum().abs() / total
+                trend = (path.drop_nulls().last() - path.drop_nulls().first()) / path.std(ddof=0)
+                base = trend * efficiency
+                early = r.filter(pl.col("pos") < pl.col("mid")).sum()
+                late = r.filter(pl.col("pos") >= pl.col("mid")).sum()
+                exprs = [base, base * (early * late > 0).cast(pl.Float64),
+                         base * (1 - r.pow(2).sum() / total.pow(2))]
+            elif method == "cvar":
+                lower = r.filter(r <= r.quantile(.05, interpolation="linear"))
+                upper = r.filter(r >= r.quantile(.95, interpolation="linear"))
+                loss, gain = -lower.mean(), upper.mean()
+                exprs = [loss, (loss + r.median()) / r.std(ddof=0),
+                         (loss - gain) / (loss.abs() + gain.abs())]
+            elif method in {"tr", "path"}:
+                h, l = pl.col("high"), pl.col("low")
+                if method == "tr":
+                    move = pl.max_horizontal(h-l, (h-prev).abs(), (l-prev).abs()) / prev
+                else:
+                    move = (2 * (h-l) - (c-o).abs()) / c
+                move = pl.when((h >= c) & (h >= o) & (l <= c) & (l <= o)).then(move)
+                move = pl.when(a.is_not_null()).then(move)
+                f = f.with_columns((move / a).alias("ill"), move.alias("move"))
+                ill = pl.col("ill")
+                count = ill.count()
+                early = ill.filter(pl.col("pos") < pl.col("mid")).mean()
+                late = ill.filter(pl.col("pos") >= pl.col("mid")).mean()
+                down, up = ill.filter(r < 0).mean(), ill.filter(r > 0).mean()
+                base = ill.mean() if method == "tr" else pl.col("move").sum() / a.filter(pl.col("move").is_not_null()).sum()
+                exprs = [base, (early-late)/(early+late), (down-up)/(down+up)]
+            elif method in {"cash", "kyle"}:
+                f = f.with_columns(pl.when(a.is_not_null()).then(r).alias("r"))
+                x = a if method == "cash" else r.sign() * a
+                f = f.with_columns(pl.when(r.is_not_null()).then(x).alias("x"))
+                x = pl.col("x")
+                count = (x.is_not_null() & r.is_not_null()).sum()
+                beta = pl.cov(x, r, ddof=0) / x.var(ddof=0)
+                base = beta * a.filter(r.is_not_null()).sum() if method == "cash" else beta
+                corr = pl.corr(x, r)
+                early = pl.col("pos") < pl.col("mid")
+                b0 = pl.cov(x.filter(early), r.filter(early), ddof=0) / x.filter(early).var(ddof=0)
+                b1 = pl.cov(x.filter(~early), r.filter(~early), ddof=0) / x.filter(~early).var(ddof=0)
+                exprs = [base, corr, (b0-b1)/(b0.abs()+b1.abs())]
+            elif method in {"idio", "attention", "sync"}:
+                e = r - pl.col("market")
+                if method == "idio":
+                    e = pl.when(a.is_not_null()).then(e)
+                f = f.with_columns(e.alias("e"))
+                e = pl.col("e")
+                count = e.count()
+                if method == "idio":
+                    ill = e.abs()/a
+                    up, down = ill.filter(e > 0).mean(), ill.filter(e < 0).mean()
+                    exprs = [ill.mean(), (down-up)/(down+up), e.abs().sum()/r.abs().filter(e.is_not_null()).sum()]
+                elif method == "attention":
+                    total = e.abs().sum()
+                    exprs = [e.abs().max(), e.abs().max()/e.std(ddof=0),
+                             e.pow(3).sum()/e.abs().pow(3).sum() * (e.pow(2).sum()/total.pow(2))]
+                else:
+                    tail = r >= r.quantile(.9, interpolation="linear")
+                    same = (r * pl.col("market") > 0).cast(pl.Float64)
+                    valid = e.is_not_null()
+                    selected = tail & valid & (r > 0)
+                    exprs = [same.filter(selected).mean(),
+                             (same*r.abs()).filter(selected).sum()/r.abs().filter(selected).sum(),
+                             same.filter(selected).mean() - same.filter(valid & ~selected).mean()]
+            elif method == "hit":
+                f = f.with_columns((c/o-1).alias("bar_r"))
+                bar = pl.col("bar_r")
+                previous = bar.shift(1).over("day")
+                valid = previous.is_not_null() & bar.is_not_null() & a.shift(1).over("day").is_not_null()
+                hit = (bar.sign() == previous.sign()).cast(pl.Float64)
+                count = valid.sum()
+                buy = hit.filter(valid & (previous > 0)).mean()
+                sell = hit.filter(valid & (previous < 0)).mean()
+                exprs = [hit.filter(valid).mean(), buy-sell,
+                         ((2*hit-1)*bar.abs()).filter(valid).sum()/bar.abs().filter(valid).sum()]
+            elif method == "marginal":
+                amp = (pl.col("high")-pl.col("low"))/c
+                f = f.with_columns(amp.diff().over("day").abs().alias("change"))
+                delta = pl.col("change")
+                f = f.with_columns((delta > delta.mean().over("day")+delta.std(ddof=0).over("day")).fill_null(False).alias("flag"))
+                flag = pl.col("flag")
+                isolated = flag & ~flag.shift(1).over("day").fill_null(False) & ~flag.shift(-1).over("day").fill_null(False)
+                log_r = (r+1).log()
+                selected = log_r.filter(isolated)
+                count = pl.when((r.count() >= 30) & (selected.count() >= 2)).then(30).otherwise(0)
+                sigma = selected.std(ddof=0)
+                exprs = [sigma, sigma/log_r.std(ddof=0),
+                         selected.mean()/selected.abs().mean() * isolated.sum()/r.count()]
+            elif method == "consistent":
+                span = pl.col("high")-pl.col("low")
+                body = pl.when(span == 0).then(1.).otherwise((c-o)/span)
+                valid = c.is_not_null() & o.is_not_null() & v.is_not_null() & (span >= 0)
+                total = v.filter(valid).sum()
+                buy = v.filter(valid & (body > .5)).sum()/total
+                sell = v.filter(valid & (body < -.5)).sum()/total
+                early = pl.col("pos") < pl.col("mid")
+                b0 = v.filter(valid & early & (body > .5)).sum()/v.filter(valid & early).sum()
+                b1 = v.filter(valid & ~early & (body > .5)).sum()/v.filter(valid & ~early).sum()
+                count = valid.sum()*5
+                exprs = [buy, buy-sell, b1-b0]
+            else:
+                raise ValueError(f"unknown minute method: {method}")
+            daily = f.group_by("day", maintain_order=True).agg([
+                pl.when(count >= 30).then(expr).alias(f"f{k}") for k, expr in enumerate(exprs)])
+            for k in range(3):
+                values = daily[f"f{k}"].to_numpy()
+                out[k][:, j] = np.where(np.isfinite(values), values, np.nan)
+        result = tuple(pd.DataFrame(x, index=days, columns=close.columns) for x in out)
+        panel[key] = result
+        return result
+
+
+def _method_mask(frame, data, dates, universe):
+    """截面操作前使用同日可交易掩码，不填充缺失或未定义的数值。"""
+    result = frame.reindex(index=dates, columns=universe).where(lambda x: np.isfinite(x))
+    eligibility = getattr(data, "_factor_eligibility", None)
+    if eligibility is not None:
+        result = result.where(eligibility.reindex(index=dates, columns=universe).fillna(False).astype(bool))
+    return result
+
+
+def _method_rank(*frames):
+    """同一有限值截面中的平均秩百分位，至少两个品种。"""
+    valid = np.isfinite(frames[0])
+    for frame in frames[1:]:
+        valid &= np.isfinite(frame)
+    return tuple(f.where(valid).rank(axis=1, pct=True).where(valid.sum(axis=1) >= 2, axis=0) for f in frames)
+
+
+class _MinuteMethodFactor(Factor):
+    """同一日统计的三种变换共用读取、缓存及严格日历窗口。"""
+    category = "intraday_advanced"
+    frequency = signal_frequency = "daily"
+    input_bar_frequency = "1min"
+    validation_horizons = (5, 10, 20)
+    component = 0
+    window = 20
+    method = ""
+    fields = ("close",)
+    distance = False
+    add_std = False
+    relative_history = False
+
+    def dependencies(self) -> list:
+        return []
+
+    def compute(self, data, dates, universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        panel = _get_minute_panel(data, dates, universe, freq=self.input_bar_frequency)
+        if not set(self.fields).issubset(panel):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        daily = _method_daily_triplet(panel, self.method, getattr(data, "_factor_eligibility", None))[self.component]
+        daily = _method_mask(daily, data, dates, universe)
+        if self.relative_history:
+            daily = daily/_roll_mean(daily,20,20).shift(1)-1
+        if self.distance:
+            std = daily.std(axis=1, ddof=0)
+            daily = daily.sub(daily.mean(axis=1), axis=0).abs().div(std.where(std > 0), axis=0)
+        result = _roll_mean(daily, self.window, self.window)
+        if self.add_std:
+            result += _roll_std(daily, self.window, self.window)
+        return result.shift(1)
+
+
+def _method_daily_bars(data, dates, universe, fields):
+    """配置日线的独立对齐视图，不修改共享面板索引。"""
+    panel = _get_minute_panel(data, dates, universe, freq="daily")
+    if not set(fields).issubset(panel):
+        return None
+    out = {}
+    for k in fields:
+        f = panel[k].copy(deep=False)
+        f.index = f.index.normalize()
+        out[k] = _method_mask(f, data, dates, universe).where(lambda x: x > 0)
+    return out
+
+
+class _DailyMethodFactor(_MinuteMethodFactor):
+    """日线补充方法，窗口内缺失不压缩，不把日线冒充分钟输入。"""
+    input_bar_frequency = "daily"
+    fields = ("open", "close", "volume", "amount")
+
+    def compute(self, data, dates, universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        bars = _method_daily_bars(data, dates, universe, self.fields)
+        if bars is None:
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        o, c = bars.get("open"), bars["close"]
+        ret = c.pct_change(fill_method=None)
+        if self.method == "gap":
+            gap, intraday = o / c.shift(1)-1, c/o-1
+            valid = gap.notna() & intraday.notna()
+            event = ((gap > 0) & (intraday < 0)).astype(float).where(valid)
+            if self.component == 0:
+                raw = event
+            elif self.component == 1:
+                raw = (-intraday/(gap.abs()+intraday.abs())).where(event.eq(1), 0.).where(valid)
+            else:
+                # 反转后仍低于昨收的程度，以全日往返幅度归一。
+                raw = (-(1+gap)*(1+intraday)+1).clip(lower=0).div(gap.abs()+intraday.abs())
+                raw = raw.where(event.eq(1), 0.).where(valid)
+        elif self.method == "fire":
+            v = bars["volume"] / _roll_mean(bars["volume"], 20, 20).shift(1)
+            common = np.isfinite(ret) & np.isfinite(v)
+            r_market = ret.where(common).mean(axis=1).where(common.sum(axis=1) >= 2)
+            v_market = v.where(common).mean(axis=1).where(common.sum(axis=1) >= 2)
+            valid = common & np.broadcast_to((r_market.notna() & v_market.notna()).to_numpy()[:, None], common.shape)
+            event = (ret < 0) & (v > 1) & np.broadcast_to(((r_market < 0) & (v_market > 1)).to_numpy()[:, None], common.shape)
+            base = ret.abs() * v.mul(v_market, axis=0)
+            if self.component == 0:
+                raw = base
+            elif self.component == 1:
+                # 只度量跌幅超出市场的部分，量能权重有界。
+                raw = (-ret.sub(r_market, axis=0)).clip(lower=0) * (v/(1+v)).mul(v_market/(1+v_market), axis=0)
+            else:
+                # 同期市场下跌品种广度确认，削弱少数品种驱动的市场跌幅。
+                breadth = (ret < 0).astype(float).where(common).mean(axis=1)
+                raw = base.mul(breadth.pow(2), axis=0)
+            raw = raw.where(event, 0.).where(valid)
+        elif self.method == "daily_ill":
+            raw = np.log1p(ret.abs()/bars["amount"])
+            if self.component == 1:
+                early = _roll_mean(raw, 10, 10).shift(10)
+                late = _roll_mean(raw, 10, 10)
+                return ((early-late)/(early+late)).shift(1)
+            if self.component == 2:
+                down = _roll_mean(raw.where(ret < 0, 0.).where(raw.notna()), 20, 20)
+                up = _roll_mean(raw.where(ret > 0, 0.).where(raw.notna()), 20, 20)
+                return ((down-up)/(down+up)).shift(1)
+        else:
+            raise ValueError(f"unknown daily method: {self.method}")
+        return _roll_mean(raw, 20, 20).where(lambda x: np.isfinite(x)).shift(1)
+
+
+def _daily_entropy_burst_components(panel, entropy=False):
+    """时段联合权重熵或连续放量区间数；两种频率分别聚合。"""
+    import polars as pl
+
+    key = "_daily_joint_entropy" if entropy else "_daily_burst_count"
+    with _PANEL_CACHE_LOCK:
+        if key in panel:
+            return panel[key]
+        v = panel["volume"]
+        days, offsets = _day_offsets(v.index)
+        columns = {"day": np.repeat(np.arange(len(days)), np.diff(offsets))}
+        exprs = []
+        for j in range(len(v.columns)):
+            vol = v.iloc[:, j].to_numpy(dtype=float)
+            valid = np.isfinite(vol) & (vol > 0)
+            if entropy:
+                close = panel["close"].reindex_like(v).iloc[:, j].to_numpy(dtype=float)
+                valid &= np.isfinite(close) & (close > 0)
+                values = close*vol
+            else:
+                values = vol
+            columns[f"x{j}"] = np.where(valid, values, np.nan)
+        f = pl.DataFrame(columns, nan_to_null=True)
+        if not entropy:
+            f = f.with_columns([
+                (pl.col(f"x{j}") > pl.col(f"x{j}").mean().over("day") + 1.5*pl.col(f"x{j}").std(ddof=0).over("day"))
+                .fill_null(False).alias(f"b{j}") for j in range(len(v.columns))])
+        for j in range(len(v.columns)):
+            x = pl.col(f"x{j}")
+            if entropy:
+                p = x/x.sum()
+                value = -(p*p.log()).sum()
+            else:
+                b = pl.col(f"b{j}")
+                f = f.with_columns((b & ~b.shift(1).over("day").fill_null(False)).alias(f"start{j}"))
+                value = pl.col(f"start{j}").sum()
+            exprs.append(pl.when(x.count() >= (3 if entropy else 30)).then(value).alias(f"v{j}"))
+        daily = f.group_by("day", maintain_order=True).agg(exprs)
+        result = pd.DataFrame(daily.select([f"v{j}" for j in range(len(v.columns))]).to_numpy(), index=days, columns=v.columns)
+        panel[key] = result
+        return result
+
+
+class _EntropyBurstMethodFactor(_MinuteMethodFactor):
+    """分钟脉冲与30分钟结构熵的联合排序，复用各自频率的缓存。"""
+    window = 10
+
+    def compute(self, data, dates, universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        minute = _get_minute_panel(data, dates, universe, freq="1min")
+        halfhour = _get_minute_panel(data, dates, universe, freq="30min")
+        if "volume" not in minute or not {"volume", "close"}.issubset(halfhour):
+            return pd.DataFrame(np.nan, index=dates, columns=universe)
+        h = _method_mask(_daily_entropy_burst_components(halfhour, True), data, dates, universe)
+        b = _method_mask(_daily_entropy_burst_components(minute), data, dates, universe)
+        h, b = _method_rank(h, b)
+        if self.component == 0:
+            h, b = _method_rank(_roll_mean(h, 10, 10), _roll_mean(b, 10, 10))
+            raw = h-b
+        elif self.component == 1:
+            raw = _roll_mean(h*(1-b), 10, 10)
+        else:
+            gap = h-b
+            rms = np.sqrt(_roll_mean(gap.pow(2), 10, 10))
+            raw = _roll_mean(h, 10, 10)*_roll_mean(gap, 10, 10)/rms.where(rms > 0)
+            raw = raw.mask(_roll_sum(gap.eq(0).astype(float), 10, 10).eq(10), 0.)
+        return raw.shift(1)
+
+
+def _daily_signed_amount_moments(panel):
+    """日内配对样本的OLS充分统计量；21日合并回归无需重复扫描分钟。"""
+    import polars as pl
+
+    key = "_daily_signed_amount_moments"
+    with _PANEL_CACHE_LOCK:
+        if key in panel:
+            return panel[key]
+        c = panel["close"]
+        days, offsets = _day_offsets(c.index)
+        out = [np.full((len(days), len(c.columns)), np.nan) for _ in range(6)]
+        for j in range(len(c.columns)):
+            price = c.iloc[:, j].to_numpy(dtype=float)
+            amount = panel["amount"].reindex_like(c).iloc[:, j].to_numpy(dtype=float)
+            f = pl.DataFrame({"day":np.repeat(np.arange(len(days)),np.diff(offsets)),
+                              "c":np.where((price>0)&np.isfinite(price),price,np.nan),
+                              "a":np.where((amount>0)&np.isfinite(amount),amount,np.nan)},nan_to_null=True)
+            f = f.with_columns((pl.col("c")/pl.col("c").shift(1).over("day")-1).alias("r"))
+            f = f.with_columns(pl.when(pl.col("a").is_not_null()).then(pl.col("r")).alias("r"))
+            f = f.with_columns((pl.col("r").sign()*pl.col("a")).alias("x"))
+            x,r = pl.col("x"),pl.col("r")
+            exprs = [r.count().cast(pl.Float64),x.sum(),r.sum(),x.pow(2).sum(),(x*r).sum(),r.pow(2).sum()]
+            daily = f.group_by("day",maintain_order=True).agg([
+                pl.when(r.count()>=30).then(e).alias(str(k)) for k,e in enumerate(exprs)])
+            for k in range(6):
+                out[k][:,j] = daily[str(k)].to_numpy()
+        result = tuple(pd.DataFrame(x,index=days,columns=c.columns) for x in out)
+        panel[key] = result
+        return result
+
+
+class _PooledAmountMethodFactor(_MinuteMethodFactor):
+    """成交额回归的日统计累加，区别于逐日斜率再平均。"""
+    fields = ("close", "amount")
+
+    def compute(self,data,dates,universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        panel = _get_minute_panel(data,dates,universe,freq="1min")
+        if not set(self.fields).issubset(panel):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        n,sx,sy,sxx,sxy,syy = (_roll_sum(_method_mask(f,data,dates,universe),21,21)
+                              for f in _daily_signed_amount_moments(panel))
+        cov = sxy-sx*sy/n
+        vx,vy = sxx-sx.pow(2)/n,syy-sy.pow(2)/n
+        beta = cov/vx.where(vx>0)
+        if self.component == 0:
+            raw = beta
+        elif self.component == 1:
+            raw = cov/np.sqrt((vx*vy).where((vx>0)&(vy>0)))
+        else:
+            # 衰减幅度以此前21日基准归一；两个窗口不重叠。
+            baseline = beta.shift(21)
+            raw = (baseline-beta)/(baseline.abs()+beta.abs())
+        return raw.where(lambda x:np.isfinite(x)).shift(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _daily_microstructure_components(panel):
+    """成交拥挤、价差、范围波动及量分布统计，共用Polars日分组。"""
+    import polars as pl
+
+    key = "_daily_microstructure_components"
+    with _PANEL_CACHE_LOCK:
+        if key in panel:
+            return panel[key]
+        c = panel["close"]
+        days, offsets = _day_offsets(c.index)
+        outputs = [np.full((len(days),len(c.columns)),np.nan) for _ in range(6)]
+        for j in range(len(c.columns)):
+            columns = {"day":np.repeat(np.arange(len(days)),np.diff(offsets))}
+            for k in ("open","high","low","close","volume","amount","position"):
+                values = panel[k].reindex_like(c).iloc[:,j].to_numpy(dtype=float) if k in panel else np.full(len(c),np.nan)
+                columns[k] = np.where(np.isfinite(values)&(values>0),values,np.nan)
+            f = pl.DataFrame(columns,nan_to_null=True)
+            c0,o,h,l,v,a,p = (pl.col(k) for k in ("close","open","high","low","volume","amount","position"))
+            f = f.with_columns((c0/c0.shift(1).over("day")-1).alias("r"),c0.diff().over("day").alias("dc"))
+            common = pl.all_horizontal([pl.col(k).is_not_null() for k in ("open","high","low","close","volume","amount")])
+            common &= (h>=c0)&(h>=o)&(l<=c0)&(l<=o)
+            f = f.with_columns([pl.when(common).then(pl.col(k)).alias(k)
+                                for k in ("open","high","low","close","volume","amount","position","r","dc")])
+            f = f.with_columns(pl.col("dc").shift(1).over("day").alias("lag_dc"))
+            r = pl.col("r")
+            prob = v/v.sum()
+            entropy = -(prob*prob.log()).sum()
+            skew,kurt = v.skew(bias=True),v.kurtosis(fisher=False,bias=True)
+            quality = entropy*(1-skew.abs())*pl.when(kurt<5).then(1.).otherwise(.5)*pl.corr(r.abs(),a)
+            bounded = entropy/v.count().cast(pl.Float64).log()/(1+skew.abs())/(1+(kurt-3).clip(0))*pl.corr(r.abs(),a)
+            directional = entropy/v.count().cast(pl.Float64).log()/(1+skew.abs())*pl.corr(r,a)
+            spread = 2*(-pl.cov("dc","lag_dc",ddof=0)).clip(0).sqrt()/a.sum()
+            gk = (.5*(h/l).log().pow(2)-(2*np.log(2)-1)*(c0/o).log().pow(2)).clip(0).sum().sqrt()/a.sum()
+            turnover = pl.when(p.count()>=30).then(v.sum()/p.mean())
+            exprs = [turnover,spread,gk,quality,bounded,directional]
+            daily = f.group_by("day",maintain_order=True).agg([
+                pl.when((r.count()>=30)&(v.count()>=30)&(a.count()>=30)).then(e).alias(str(k))
+                for k,e in enumerate(exprs)])
+            for k in range(6):
+                values = daily[str(k)].to_numpy()
+                outputs[k][:,j] = np.where(np.isfinite(values),values,np.nan)
+        result = tuple(pd.DataFrame(x,index=days,columns=c.columns) for x in outputs)
+        panel[key] = result
+        return result
+
+
+class _MicrostructureMethodFactor(_MinuteMethodFactor):
+    """流动性共振及量分布质量的日频合成；截面先掩码再排序。"""
+    fields = ("open","high","low","close","volume","amount")
+
+    def compute(self,data,dates,universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        panel = _get_minute_panel(data,dates,universe,freq="1min")
+        required = set(self.fields) | ({"position"} if self.method != "volume_quality" else set())
+        if not required.issubset(panel):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        turnover,spread,gk,q,bounded,directional = (_method_mask(f,data,dates,universe)
+                                                 for f in _daily_microstructure_components(panel))
+        ranks = _method_rank(turnover,spread,gk)
+        risk = ranks[0]*ranks[1]*ranks[2]
+        risk_mean = _roll_mean(risk,20,20)
+        sd = q.std(axis=1,ddof=0)
+        dist = q.sub(q.mean(axis=1),axis=0).abs().div(sd.where(sd>0),axis=0)
+        quality = _roll_mean(dist,20,20)+_roll_std(dist,20,20)
+        if self.method == "crash":
+            if self.component == 0:
+                raw = risk_mean
+            elif self.component == 1:
+                raw = _roll_mean(np.minimum(np.minimum(ranks[0],ranks[1]),ranks[2]),20,20)
+            else:
+                previous = _roll_mean(risk,20,20).shift(1)
+                raw = _roll_mean((risk-previous).clip(lower=0),20,20)
+        elif self.method == "volume_quality":
+            raw = [quality,_roll_mean(bounded,20,20),_roll_mean(directional,20,20)][self.component]
+        else:
+            if self.component == 0:
+                raw = (risk_mean+quality)/2
+            elif self.component == 1:
+                # 先统一百分位尺度，再要求两类结构同时偏高。
+                r1,r2 = _method_rank(risk_mean,quality)
+                raw = np.minimum(r1,r2)
+            else:
+                # 风险权重随自身历史共振程度降低，而非固定等权。
+                qmean = _roll_mean(bounded,20,20)
+                raw = qmean*(1-risk_mean)
+        return raw.where(lambda x:np.isfinite(x)).shift(1)
+
+
+class _DailyExpressionMethodFactor(_DailyMethodFactor):
+    """日线表达式的显式期货口径，沿用静态板块映射。"""
+    fields = ("open","close","volume")
+
+    def compute(self,data,dates,universe):
+        import polars as pl
+
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        bars = _method_daily_bars(data,dates,universe,self.fields)
+        if bars is None:
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        o,c,v = bars['open'],bars['close'],bars.get('volume')
+        if self.method == "candle_corr":
+            body = c-o if self.component==0 else c/o-1
+            corr = o.rolling(10).corr(c)
+            scale = _roll_std(body.abs(),10,10)
+            if self.component==0:
+                score = scale+body+corr
+                return (-_method_rank(score)[0]).shift(1)
+            if self.component==1:
+                a,b = _method_rank(scale+body,corr)
+                return (-(a+b)/2).shift(1)
+            return (body/(scale+body.abs())*(1-corr.abs())).shift(1)
+        # 板块内去均值，未知板块不参与，不把未知品种混成一个行业。
+        neutral = pd.DataFrame(np.nan,index=dates,columns=universe)
+        for sector in set(_SECTOR_MAP.values()):
+            cols = [col for col in universe if _SECTOR_MAP.get(str(col).upper())==sector]
+            if len(cols)>=2:
+                sub = v[cols]
+                neutral[cols] = sub.sub(sub.mean(axis=1),axis=0).where(sub.count(axis=1)>=2,axis=0)
+        def decay(frame,window):
+            cols = {str(i):frame.iloc[:,i].to_numpy(dtype=float) for i in range(len(universe))}
+            weights = np.arange(1,window+1,dtype=float);weights/=weights.sum()
+            result = pl.DataFrame(cols,nan_to_null=True).select([
+                pl.when(pl.all_horizontal([pl.col(str(i)).shift(lag).is_not_null() for lag in range(window)]))
+                .then(pl.sum_horizontal([pl.col(str(i)).shift(lag)*weights[-lag-1] for lag in range(window)]))
+                .alias(str(i))
+                for i in range(len(universe))]).to_numpy()
+            return pd.DataFrame(result,index=dates,columns=universe)
+        delta = o.diff() if self.component==0 else o.pct_change(fill_method=None)
+        first = _method_rank(decay(delta,15))[0]
+        second = decay(neutral.rolling(17).corr(o),7).rolling(13).rank(pct=True)
+        if self.component==0:
+            raw = -np.minimum(first,second)
+        elif self.component==1:
+            raw = -first*second
+        else:
+            # 要求两个反转分量同处高位，差异越大惩罚越强。
+            raw = -(first+second)/2*(1-(first-second).abs())
+        return raw.where(lambda x:np.isfinite(x)).shift(1)
+
+
+class _HistoricalShapeMethodFactor(_DailyMethodFactor):
+    """限定历史库、只使用已经实现标签的形态邻居，数组相关避免逐窗口DataFrame。"""
+    fields = ("open","high","low","close")
+    warmup_trading_days = 2531  # 2520日邻居末点、10日路径及信号滞后。
+
+    def compute(self,data,dates,universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        bars = _method_daily_bars(data,dates,universe,self.fields)
+        if bars is None:
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        price = sum(bars.values())/4
+        opening = bars['open'].to_numpy(dtype=float)
+        output = np.full(price.shape,np.nan)
+        if len(price)<31:
+            return pd.DataFrame(output,index=dates,columns=universe)
+        for j in range(len(universe)):
+            values = price.iloc[:,j].to_numpy(dtype=float)
+            windows = np.lib.stride_tricks.sliding_window_view(values,10)
+            centered = windows-windows.mean(axis=1,keepdims=True)
+            norms = np.sqrt((centered**2).sum(axis=1))
+            normalized = np.divide(centered,norms[:,None],out=np.full_like(centered,np.nan),where=norms[:,None]>0)
+            for t in range(30,len(dates)):
+                # 邻居形态末日s，标签为O[s+6]/O[s+1]-1，必须在t之前全部可见。
+                ends = np.arange(max(9,t-2520),t-9)
+                corr = normalized[ends-9]@normalized[t-9]
+                label = opening[ends+6,j]/opening[ends+1,j]-1
+                valid = np.isfinite(corr)&np.isfinite(label)
+                if valid.sum()<10:
+                    continue
+                ids = np.flatnonzero(valid)
+                ids = ids[np.argsort(corr[ids],kind='stable')[-10:]]
+                y = label[ids]
+                if self.component==0:
+                    value = y.mean()
+                elif self.component==1:
+                    weights = np.clip(corr[ids],0,None)**2
+                    value = np.dot(weights,y)/weights.sum() if weights.sum()>0 else np.nan
+                else:
+                    # 同号概率与中位数幅度共同约束，降低单个极端标签影响。
+                    value = np.median(np.abs(y))*(2*np.mean(y>0)-1)
+                output[t,j] = value
+        return pd.DataFrame(output,index=dates,columns=universe).shift(1)
+
+
+class _IntradayShapeMethodFactor(_MinuteMethodFactor):
+    """交易日内路径按相对位置匹配；只有过去交易日进入邻居库。"""
+    fields = ("open","high","low","close")
+    warmup_trading_days = 253  # 252个已完成交易日邻居及信号滞后。
+
+    def compute(self,data,dates,universe):
+        dates = pd.DatetimeIndex(dates)
+        if not len(dates) or not len(universe):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        panel = _get_minute_panel(data,dates,universe,freq="1min")
+        if not set(self.fields).issubset(panel):
+            return pd.DataFrame(np.nan,index=dates,columns=universe)
+        price = sum(panel[k] for k in self.fields)/4
+        days,offsets = _day_offsets(price.index)
+        # 使用完整60/120分钟前缀，预测随后30条；不把跨休市的条数称为自然分钟。
+        output = np.full((len(days),len(universe)),np.nan)
+        for j,col in enumerate(universe):
+            values = price[col].to_numpy(dtype=float)
+            estimates = []
+            for size in (60,120):
+                paths = np.full((len(days),size),np.nan)
+                labels = np.full(len(days),np.nan)
+                for d,(start,end) in enumerate(zip(offsets[:-1],offsets[1:])):
+                    observed = np.flatnonzero(np.isfinite(values[start:end]))
+                    if observed.size:
+                        start += int(observed[0])
+                    if end-start>=size+30:
+                        segment = values[start:start+size+30]
+                        if np.isfinite(segment).all() and (segment>0).all():
+                            paths[d] = segment[:size]
+                            labels[d] = segment[size+29]/segment[size-1]-1
+                centered = paths-paths.mean(axis=1,keepdims=True)
+                norm = np.sqrt((centered**2).sum(axis=1))
+                z = np.divide(centered,norm[:,None],out=np.full_like(centered,np.nan),where=norm[:,None]>0)
+                scores = np.full(len(days),np.nan)
+                for t in range(20,len(days)):
+                    ids = np.arange(max(0,t-252),t)
+                    corr = z[ids]@z[t]
+                    valid = np.isfinite(corr)&np.isfinite(labels[ids])
+                    if valid.sum()<20:
+                        continue
+                    take = np.flatnonzero(valid)
+                    take = take[np.argsort(corr[take],kind='stable')[-20:]]
+                    y,w = labels[ids[take]],corr[take]
+                    if self.component==0:
+                        value = np.dot(w,y)/w.sum() if abs(w.sum())>1e-12 else np.nan
+                    elif self.component==1:
+                        w = np.clip(w,0,None)**2
+                        value = np.dot(w,y)/w.sum() if w.sum()>0 else np.nan
+                    else:
+                        value = np.median(np.abs(y))*(2*np.mean(y>0)-1)
+                    scores[t] = value
+                estimates.append(scores)
+            both = np.column_stack(estimates)
+            output[:,j] = np.mean(both,axis=1)
+        return _method_mask(pd.DataFrame(output,index=days,columns=universe),data,dates,universe).shift(1)
+# 622. intraday_entropy_burst_rank_gap — 价量结构熵与放量脉冲排名差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_entropy_burst_rank_gap_10d", category="intraday_advanced")
+class IntradayEntropyBurstRankGap10d(_EntropyBurstMethodFactor):
+    """价量结构熵与放量脉冲排名差因子.
+
+    【用法说明】
+    输入真实1min量及显式30min收盘价/量；H为30min归一化价×量权重的Shannon熵，至少3桶。
+    B为1min量超过当日均值+1.5倍总体标准差的连续区间数，至少30条。
+    每日先在共同可交易池内取H/B平均秩百分位，记为h/b，至少两个品种。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Rank(Mean10(h))-Rank(Mean10(b))；外层Rank仍使用共同有效池。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_entropy_burst_rank_gap_10d"
+    description = "价量结构熵与放量脉冲排名差"
+    expected_direction = 1
+    component = 0
+    method = 'entropy_burst'
+    fields = ('close', 'volume')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 623. intraday_entropy_burst_joint_support — 价量均衡与低脉冲联合支持
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_entropy_burst_joint_support_10d", category="intraday_advanced")
+class IntradayEntropyBurstJointSupport10d(IntradayEntropyBurstRankGap10d):
+    """价量均衡与低脉冲联合支持因子.
+
+    【用法说明】
+    输入真实1min量及显式30min收盘价/量；H为30min归一化价×量权重的Shannon熵，至少3桶。
+    B为1min量超过当日均值+1.5倍总体标准差的连续区间数，至少30条。
+    每日先在共同可交易池内取H/B平均秩百分位，记为h/b，至少两个品种。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean10(h*(1-b))；逐日联合约束高结构熵和低脉冲，而非独立平滑后排名。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_entropy_burst_joint_support_10d"
+    description = "价量均衡与低脉冲联合支持"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 624. intraday_entropy_burst_persistence — 价量脉冲排名差持续性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_entropy_burst_persistence_10d", category="intraday_advanced")
+class IntradayEntropyBurstPersistence10d(IntradayEntropyBurstRankGap10d):
+    """价量脉冲排名差持续性因子.
+
+    【用法说明】
+    输入真实1min量及显式30min收盘价/量；H为30min归一化价×量权重的Shannon熵，至少3桶。
+    B为1min量超过当日均值+1.5倍总体标准差的连续区间数，至少30条。
+    每日先在共同可交易池内取H/B平均秩百分位，记为h/b，至少两个品种。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean10(h)*Mean10(h-b)/sqrt(Mean10((h-b)²))；十日排名差全零取0。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_entropy_burst_persistence_10d"
+    description = "价量脉冲排名差持续性"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 625. intraday_trend_efficiency_product — 日内趋势与效率乘积
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trend_efficiency_product_20d", category="intraday_advanced")
+class IntradayTrendEfficiencyProduct20d(_MinuteMethodFactor):
+    """日内趋势与效率乘积因子.
+
+    【用法说明】
+    真实1min收盘；r=C/C前一分钟-1，交易日首条不连接昨收，至少30个有效收益。
+    s为日内累加r；T=(s末-s首)/Std(s)，E=abs(Sum(r))/Sum(abs(r))；标准差为总体口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(T*E)；区别于单独使用路径效率或趋势强度。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_trend_efficiency_product_20d"
+    description = "日内趋势与效率乘积"
+    expected_direction = 1
+    component = 0
+    method = 'trend'
+    fields = ('close',)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 626. intraday_trend_efficiency_half_agreement — 趋势效率前后段同向确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trend_efficiency_half_agreement_20d", category="intraday_advanced")
+class IntradayTrendEfficiencyHalfAgreement20d(IntradayTrendEfficiencyProduct20d):
+    """趋势效率前后段同向确认因子.
+
+    【用法说明】
+    真实1min收盘；r=C/C前一分钟-1，交易日首条不连接昨收，至少30个有效收益。
+    s为日内累加r；T=(s末-s首)/Std(s)，E=abs(Sum(r))/Sum(abs(r))；标准差为总体口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(T*E*I(前半日Sum(r)*后半日Sum(r)>0))；以交易日分钟位置划分两段。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_trend_efficiency_half_agreement_20d"
+    description = "趋势效率前后段同向确认"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 627. intraday_trend_efficiency_diffuse — 趋势效率去集中度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_trend_efficiency_diffuse_20d", category="intraday_advanced")
+class IntradayTrendEfficiencyDiffuse20d(IntradayTrendEfficiencyProduct20d):
+    """趋势效率去集中度因子.
+
+    【用法说明】
+    真实1min收盘；r=C/C前一分钟-1，交易日首条不连接昨收，至少30个有效收益。
+    s为日内累加r；T=(s末-s首)/Std(s)，E=abs(Sum(r))/Sum(abs(r))；标准差为总体口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(T*E*(1-Sum(r²)/Sum(abs(r))²))；削弱由少数分钟贡献的单向路径。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_trend_efficiency_diffuse_20d"
+    description = "趋势效率去集中度"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 628. intraday_positive_gap_reversal_frequency — 正跳空日内反转频率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_positive_gap_reversal_frequency_20d", category="intraday_advanced")
+class IntradayPositiveGapReversalFrequency20d(_DailyMethodFactor):
+    """正跳空日内反转频率因子.
+
+    【用法说明】
+    使用配置日线的交易日开收盘；g=O/昨收-1，d=C/O-1，F=I(g>0且d<0)。
+    夜盘按交易日开盘定义；缺失昨收不填补，不将换月缺口解释为成交方向。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F)。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_positive_gap_reversal_frequency_20d"
+    description = "正跳空日内反转频率"
+    expected_direction = -1
+    component = 0
+    method = 'gap'
+    fields = ('open', 'close')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 629. intraday_positive_gap_reversal_absorption — 正跳空反转吸收比例
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_positive_gap_reversal_absorption_20d", category="intraday_advanced")
+class IntradayPositiveGapReversalAbsorption20d(IntradayPositiveGapReversalFrequency20d):
+    """正跳空反转吸收比例因子.
+
+    【用法说明】
+    使用配置日线的交易日开收盘；g=O/昨收-1，d=C/O-1，F=I(g>0且d<0)。
+    夜盘按交易日开盘定义；缺失昨收不填补，不将换月缺口解释为成交方向。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F*abs(d)/(abs(g)+abs(d)))；无事件日取0。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_positive_gap_reversal_absorption_20d"
+    description = "正跳空反转吸收比例"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 630. intraday_positive_gap_reversal_overshoot — 正跳空反转超调强度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_positive_gap_reversal_overshoot_20d", category="intraday_advanced")
+class IntradayPositiveGapReversalOvershoot20d(IntradayPositiveGapReversalFrequency20d):
+    """正跳空反转超调强度因子.
+
+    【用法说明】
+    使用配置日线的交易日开收盘；g=O/昨收-1，d=C/O-1，F=I(g>0且d<0)。
+    夜盘按交易日开盘定义；缺失昨收不填补，不将换月缺口解释为成交方向。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F*max(1-(1+g)*(1+d),0)/(abs(g)+abs(d)))；仅统计收盘跌破昨收的超调。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_positive_gap_reversal_overshoot_20d"
+    description = "正跳空反转超调强度"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 631. intraday_market_fire_sale_pressure — 市场抛压共振强度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_fire_sale_pressure_20d", category="intraday_advanced")
+class IntradayMarketFireSalePressure20d(_DailyMethodFactor):
+    """市场抛压共振强度因子.
+
+    【用法说明】
+    日线收盘收益r，v=今日量/此前20日均量；同日可交易且r/v完整的品种至少两个。
+    rm为等权r均值，vm为等权v均值；期货以相对量聚合市场活跃度，避免合约手数尺度混加。
+    F=I(r<0、rm<0、v>1、vm>1)，缺失不作为无事件。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F*abs(r)*v*vm)。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少40个交易日历史，第41日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_market_fire_sale_pressure_20d"
+    description = "市场抛压共振强度"
+    expected_direction = 1
+    component = 0
+    method = 'fire'
+    fields = ('close', 'volume')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 632. intraday_market_fire_sale_excess — 市场抛压共振超额跌幅
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_fire_sale_excess_20d", category="intraday_advanced")
+class IntradayMarketFireSaleExcess20d(IntradayMarketFireSalePressure20d):
+    """市场抛压共振超额跌幅因子.
+
+    【用法说明】
+    日线收盘收益r，v=今日量/此前20日均量；同日可交易且r/v完整的品种至少两个。
+    rm为等权r均值，vm为等权v均值；期货以相对量聚合市场活跃度，避免合约手数尺度混加。
+    F=I(r<0、rm<0、v>1、vm>1)，缺失不作为无事件。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F*max(rm-r,0)*v/(1+v)*vm/(1+vm))；相对量权重有界。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少40个交易日历史，第41日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_market_fire_sale_excess_20d"
+    description = "市场抛压共振超额跌幅"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 633. intraday_market_fire_sale_breadth — 市场抛压共振广度确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_fire_sale_breadth_20d", category="intraday_advanced")
+class IntradayMarketFireSaleBreadth20d(IntradayMarketFireSalePressure20d):
+    """市场抛压共振广度确认因子.
+
+    【用法说明】
+    日线收盘收益r，v=今日量/此前20日均量；同日可交易且r/v完整的品种至少两个。
+    rm为等权r均值，vm为等权v均值；期货以相对量聚合市场活跃度，避免合约手数尺度混加。
+    F=I(r<0、rm<0、v>1、vm>1)，缺失不作为无事件。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(F*abs(r)*v*vm*B²)，B为共同有效池的下跌品种占比。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少40个交易日历史，第41日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_market_fire_sale_breadth_20d"
+    description = "市场抛压共振广度确认"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 634. intraday_daily_log_illiquidity — 日线对数非流动性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_log_illiquidity_20d", category="intraday_advanced")
+class IntradayDailyLogIlliquidity20d(_DailyMethodFactor):
+    """日线对数非流动性因子.
+
+    【用法说明】
+    配置日线收盘收益r与正成交额A；L=log(1+abs(r)/A)，不对分钟非流动性先平均。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(L)。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_log_illiquidity_20d"
+    description = "日线对数非流动性"
+    expected_direction = -1
+    component = 0
+    method = 'daily_ill'
+    fields = ('close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 635. intraday_daily_log_illiquidity_improvement — 日线非流动性前后窗改善
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_log_illiquidity_improvement_20d", category="intraday_advanced")
+class IntradayDailyLogIlliquidityImprovement20d(IntradayDailyLogIlliquidity20d):
+    """日线非流动性前后窗改善因子.
+
+    【用法说明】
+    配置日线收盘收益r与正成交额A；L=log(1+abs(r)/A)，不对分钟非流动性先平均。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    (前10日Mean(L)-后10日Mean(L))/(前10日Mean(L)+后10日Mean(L))；两个窗口不重叠。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_log_illiquidity_improvement_20d"
+    description = "日线非流动性前后窗改善"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 636. intraday_daily_log_illiquidity_down_asymmetry — 日线非流动性下行不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_log_illiquidity_down_asymmetry_20d", category="intraday_advanced")
+class IntradayDailyLogIlliquidityDownAsymmetry20d(IntradayDailyLogIlliquidity20d):
+    """日线非流动性下行不对称因子.
+
+    【用法说明】
+    配置日线收盘收益r与正成交额A；L=log(1+abs(r)/A)，不对分钟非流动性先平均。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    (Mean20(L*I(r<0))-Mean20(L*I(r>0)))/(Mean20(L*I(r<0))+Mean20(L*I(r>0)))。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_log_illiquidity_down_asymmetry_20d"
+    description = "日线非流动性下行不对称"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 637. intraday_unweighted_tail_loss — 等权分钟尾部损失
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_unweighted_tail_loss_20d", category="intraday_advanced")
+class IntradayUnweightedTailLoss20d(_MinuteMethodFactor):
+    """等权分钟尾部损失因子.
+
+    【用法说明】
+    真实1min收盘收益，日首不接昨收，每日至少30条。
+    q05/q95为日内线性插值分位数，L=-Mean(r|r<=q05)，G=Mean(r|r>=q95)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(L)；收益序列不先乘成交量权重，区别于加权收益分布的CVaR。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_unweighted_tail_loss_20d"
+    description = "等权分钟尾部损失"
+    expected_direction = -1
+    component = 0
+    method = 'cvar'
+    fields = ('close',)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 638. intraday_tail_loss_median_excess — 尾部损失偏离中位数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tail_loss_median_excess_20d", category="intraday_advanced")
+class IntradayTailLossMedianExcess20d(IntradayUnweightedTailLoss20d):
+    """尾部损失偏离中位数因子.
+
+    【用法说明】
+    真实1min收盘收益，日首不接昨收，每日至少30条。
+    q05/q95为日内线性插值分位数，L=-Mean(r|r<=q05)，G=Mean(r|r>=q95)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((L+Median(r))/Std(r))；以全天波动归一，控制波动尺度。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_tail_loss_median_excess_20d"
+    description = "尾部损失偏离中位数"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 639. intraday_tail_loss_gain_asymmetry — 尾损与尾盈不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_tail_loss_gain_asymmetry_20d", category="intraday_advanced")
+class IntradayTailLossGainAsymmetry20d(IntradayUnweightedTailLoss20d):
+    """尾损与尾盈不对称因子.
+
+    【用法说明】
+    真实1min收盘收益，日首不接昨收，每日至少30条。
+    q05/q95为日内线性插值分位数，L=-Mean(r|r<=q05)，G=Mean(r|r>=q95)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((L-G)/(abs(L)+abs(G)))；同时考虑上尾补偿。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_tail_loss_gain_asymmetry_20d"
+    description = "尾损与尾盈不对称"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 640. intraday_relative_true_range_illiquidity — 相对真实振幅非流动性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_true_range_illiquidity_20d", category="intraday_advanced")
+class IntradayRelativeTrueRangeIlliquidity20d(_MinuteMethodFactor):
+    """相对真实振幅非流动性因子.
+
+    【用法说明】
+    1min有效OHLC及正成交额，日首收益缺失；TR=max(H-L,abs(H-C前),abs(L-C前))。
+    I=TR/C前/A；每日至少30条有效I，比较条件均值时缺少某一组返回NaN。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Mean日内(I))；比率的均值，不等同于分子分母分别求和后的比。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_true_range_illiquidity_20d"
+    description = "相对真实振幅非流动性"
+    expected_direction = -1
+    component = 0
+    method = 'tr'
+    fields = ('open', 'high', 'low', 'close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 641. intraday_true_range_illiquidity_recovery — 真实振幅非流动性日内修复
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_true_range_illiquidity_recovery_20d", category="intraday_advanced")
+class IntradayTrueRangeIlliquidityRecovery20d(IntradayRelativeTrueRangeIlliquidity20d):
+    """真实振幅非流动性日内修复因子.
+
+    【用法说明】
+    1min有效OHLC及正成交额，日首收益缺失；TR=max(H-L,abs(H-C前),abs(L-C前))。
+    I=TR/C前/A；每日至少30条有效I，比较条件均值时缺少某一组返回NaN。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((I前半日均值-I后半日均值)/(I前半日均值+I后半日均值))。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_true_range_illiquidity_recovery_20d"
+    description = "真实振幅非流动性日内修复"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 642. intraday_true_range_illiquidity_down_asymmetry — 真实振幅非流动性下行差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_true_range_illiquidity_down_asymmetry_20d", category="intraday_advanced")
+class IntradayTrueRangeIlliquidityDownAsymmetry20d(IntradayRelativeTrueRangeIlliquidity20d):
+    """真实振幅非流动性下行差因子.
+
+    【用法说明】
+    1min有效OHLC及正成交额，日首收益缺失；TR=max(H-L,abs(H-C前),abs(L-C前))。
+    I=TR/C前/A；每日至少30条有效I，比较条件均值时缺少某一组返回NaN。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((Mean(I|r<0)-Mean(I|r>0))/(Mean(I|r<0)+Mean(I|r>0)))。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_true_range_illiquidity_down_asymmetry_20d"
+    description = "真实振幅非流动性下行差"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 643. intraday_unsigned_amount_beta — 无符号成交额份额敏感度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_unsigned_amount_beta_20d", category="intraday_advanced")
+class IntradayUnsignedAmountBeta20d(_MinuteMethodFactor):
+    """无符号成交额份额敏感度因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A配对，日首不接昨收，每日至少30组。
+    x=A/Sum(A)，日内OLS带截距，beta=Cov(r,x)/Var(x)；不对成交额加买卖符号。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(beta)。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_unsigned_amount_beta_20d"
+    description = "无符号成交额份额敏感度"
+    expected_direction = -1
+    component = 0
+    method = 'cash'
+    fields = ('close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 644. intraday_unsigned_amount_correlation — 成交额收益标准化敏感度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_unsigned_amount_correlation_20d", category="intraday_advanced")
+class IntradayUnsignedAmountCorrelation20d(IntradayUnsignedAmountBeta20d):
+    """成交额收益标准化敏感度因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A配对，日首不接昨收，每日至少30组。
+    x=A/Sum(A)，日内OLS带截距，beta=Cov(r,x)/Var(x)；不对成交额加买卖符号。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Corr(r,A))；将双边量能敏感度标准化到-1至1。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_unsigned_amount_correlation_20d"
+    description = "成交额收益标准化敏感度"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 645. intraday_unsigned_amount_beta_recovery — 成交额敏感度日内转折
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_unsigned_amount_beta_recovery_20d", category="intraday_advanced")
+class IntradayUnsignedAmountBetaRecovery20d(IntradayUnsignedAmountBeta20d):
+    """成交额敏感度日内转折因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A配对，日首不接昨收，每日至少30组。
+    x=A/Sum(A)，日内OLS带截距，beta=Cov(r,x)/Var(x)；不对成交额加买卖符号。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((b前-b后)/(abs(b前)+abs(b后)))；b为各半日r对原始A的带截距斜率。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_unsigned_amount_beta_recovery_20d"
+    description = "成交额敏感度日内转折"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 646. intraday_market_residual_illiquidity — 市场残差非流动性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_market_residual_illiquidity_20d", category="intraday_advanced")
+class IntradayMarketResidualIlliquidity20d(_MinuteMethodFactor):
+    """市场残差非流动性因子.
+
+    【用法说明】
+    1min收益r；m为同时刻至少两个同日可交易品种的等权收益，e=r-m。
+    每日至少30个配对残差，I=abs(e)/A，A为正成交额；不是时序beta回归残差。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Mean日内(I))。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_market_residual_illiquidity_20d"
+    description = "市场残差非流动性"
+    expected_direction = -1
+    component = 0
+    method = 'idio'
+    fields = ('close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 647. intraday_residual_illiquidity_down_asymmetry — 残差非流动性下行不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_residual_illiquidity_down_asymmetry_20d", category="intraday_advanced")
+class IntradayResidualIlliquidityDownAsymmetry20d(IntradayMarketResidualIlliquidity20d):
+    """残差非流动性下行不对称因子.
+
+    【用法说明】
+    1min收益r；m为同时刻至少两个同日可交易品种的等权收益，e=r-m。
+    每日至少30个配对残差，I=abs(e)/A，A为正成交额；不是时序beta回归残差。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((Mean(I|e<0)-Mean(I|e>0))/(Mean(I|e<0)+Mean(I|e>0)))。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_residual_illiquidity_down_asymmetry_20d"
+    description = "残差非流动性下行不对称"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 648. intraday_residual_impact_path_share — 残差路径相对占比
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_residual_impact_path_share_20d", category="intraday_advanced")
+class IntradayResidualImpactPathShare20d(IntradayMarketResidualIlliquidity20d):
+    """残差路径相对占比因子.
+
+    【用法说明】
+    1min收益r；m为同时刻至少两个同日可交易品种的等权收益，e=r-m。
+    每日至少30个配对残差，I=abs(e)/A，A为正成交额；不是时序beta回归残差。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Sum(abs(e))/Sum(abs(r)))；两项使用相同残差有效分钟。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_residual_impact_path_share_20d"
+    description = "残差路径相对占比"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 649. intraday_relative_shortest_path_illiquidity — 相对最短路径非流动性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_shortest_path_illiquidity_20d", category="intraday_advanced")
+class IntradayRelativeShortestPathIlliquidity20d(_MinuteMethodFactor):
+    """相对最短路径非流动性因子.
+
+    【用法说明】
+    1min有效OHLC/正成交额；P=(2*(H-L)-abs(C-O))/C，A为成交额，I=P/A。
+    每日至少30条；与未除价格的最短路径非流动性不同，消除合约报价单位影响。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Sum(P)/Sum(A))；同样本分子分母分别求和。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_shortest_path_illiquidity_20d"
+    description = "相对最短路径非流动性"
+    expected_direction = -1
+    component = 0
+    method = 'path'
+    fields = ('open', 'high', 'low', 'close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 650. intraday_relative_path_illiquidity_recovery — 相对路径非流动性修复
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_path_illiquidity_recovery_20d", category="intraday_advanced")
+class IntradayRelativePathIlliquidityRecovery20d(IntradayRelativeShortestPathIlliquidity20d):
+    """相对路径非流动性修复因子.
+
+    【用法说明】
+    1min有效OHLC/正成交额；P=(2*(H-L)-abs(C-O))/C，A为成交额，I=P/A。
+    每日至少30条；与未除价格的最短路径非流动性不同，消除合约报价单位影响。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((I前半日均值-I后半日均值)/(I前半日均值+I后半日均值))。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_path_illiquidity_recovery_20d"
+    description = "相对路径非流动性修复"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 651. intraday_relative_path_illiquidity_asymmetry — 相对路径非流动性方向差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_path_illiquidity_asymmetry_20d", category="intraday_advanced")
+class IntradayRelativePathIlliquidityAsymmetry20d(IntradayRelativeShortestPathIlliquidity20d):
+    """相对路径非流动性方向差因子.
+
+    【用法说明】
+    1min有效OHLC/正成交额；P=(2*(H-L)-abs(C-O))/C，A为成交额，I=P/A。
+    每日至少30条；与未除价格的最短路径非流动性不同，消除合约报价单位影响。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((Mean(I|r<0)-Mean(I|r>0))/(Mean(I|r<0)+Mean(I|r>0)))。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_path_illiquidity_asymmetry_20d"
+    description = "相对路径非流动性方向差"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 652. intraday_pooled_signed_amount_beta — 合并窗口成交额冲击斜率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_pooled_signed_amount_beta_21d", category="intraday_advanced")
+class IntradayPooledSignedAmountBeta21d(_PooledAmountMethodFactor):
+    """合并窗口成交额冲击斜率因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A，x=sign(r)*A；每日至少30对，按交易日保存充分统计量。
+    合并最近完整21日全部分钟，以带截距OLS计算beta=Cov(r,x)/Var(x)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    21日合并OLS的beta；区别于日斜率的21日均值。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_pooled_signed_amount_beta_21d"
+    description = "合并窗口成交额冲击斜率"
+    expected_direction = -1
+    component = 0
+    method = 'pooled'
+    fields = ('close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 653. intraday_pooled_signed_amount_correlation — 合并窗口成交额冲击相关
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_pooled_signed_amount_correlation_21d", category="intraday_advanced")
+class IntradayPooledSignedAmountCorrelation21d(IntradayPooledSignedAmountBeta21d):
+    """合并窗口成交额冲击相关因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A，x=sign(r)*A；每日至少30对，按交易日保存充分统计量。
+    合并最近完整21日全部分钟，以带截距OLS计算beta=Cov(r,x)/Var(x)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    21日合并样本Corr(r,x)；控制成交额和收益的尺度差异。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_pooled_signed_amount_correlation_21d"
+    description = "合并窗口成交额冲击相关"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 654. intraday_pooled_signed_amount_beta_recovery — 合并窗口冲击衰减
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_pooled_signed_amount_beta_recovery_21d", category="intraday_advanced")
+class IntradayPooledSignedAmountBetaRecovery21d(IntradayPooledSignedAmountBeta21d):
+    """合并窗口冲击衰减因子.
+
+    【用法说明】
+    1min收盘收益r与正成交额A，x=sign(r)*A；每日至少30对，按交易日保存充分统计量。
+    合并最近完整21日全部分钟，以带截距OLS计算beta=Cov(r,x)/Var(x)。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    (beta延迟21日-beta)/(abs(beta延迟21日)+abs(beta))；比较两个完整不重叠窗口。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少42个交易日历史，第43日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_pooled_signed_amount_beta_recovery_21d"
+    description = "合并窗口冲击衰减"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 655. intraday_lagged_flow_direction_hit — 滞后资金方向命中率
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lagged_flow_direction_hit_20d", category="intraday_advanced")
+class IntradayLaggedFlowDirectionHit20d(_MinuteMethodFactor):
+    """滞后资金方向命中率因子.
+
+    【用法说明】
+    1min柱内收益r=C/O-1，上一分钟sign(r)*A代理有向资金。
+    H=I(sign(r当前)=sign(r上一条))，只在同交易日内配对且上一条成交额有效，至少30对。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Mean日内(H))；零收益符号为0，双零配对计命中。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_lagged_flow_direction_hit_20d"
+    description = "滞后资金方向命中率"
+    expected_direction = 1
+    component = 0
+    method = 'hit'
+    fields = ('open', 'close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 656. intraday_lagged_flow_hit_side_gap — 滞后资金方向命中侧差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lagged_flow_hit_side_gap_20d", category="intraday_advanced")
+class IntradayLaggedFlowHitSideGap20d(IntradayLaggedFlowDirectionHit20d):
+    """滞后资金方向命中侧差因子.
+
+    【用法说明】
+    1min柱内收益r=C/O-1，上一分钟sign(r)*A代理有向资金。
+    H=I(sign(r当前)=sign(r上一条))，只在同交易日内配对且上一条成交额有效，至少30对。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Mean(H|前条r>0)-Mean(H|前条r<0))；缺少任一方向则NaN。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_lagged_flow_hit_side_gap_20d"
+    description = "滞后资金方向命中侧差"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 657. intraday_lagged_flow_hit_return_weight — 滞后方向命中收益确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_lagged_flow_hit_return_weight_20d", category="intraday_advanced")
+class IntradayLaggedFlowHitReturnWeight20d(IntradayLaggedFlowDirectionHit20d):
+    """滞后方向命中收益确认因子.
+
+    【用法说明】
+    1min柱内收益r=C/O-1，上一分钟sign(r)*A代理有向资金。
+    H=I(sign(r当前)=sign(r上一条))，只在同交易日内配对且上一条成交额有效，至少30对。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Sum((2H-1)*abs(r))/Sum(abs(r)))；以当前价格移动幅度确认方向命中。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_lagged_flow_hit_return_weight_20d"
+    description = "滞后方向命中收益确认"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 658. intraday_extreme_up_market_sync — 极端上涨分钟市场同步
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_extreme_up_market_sync_21d", category="intraday_advanced")
+class IntradayExtremeUpMarketSync21d(_MinuteMethodFactor):
+    """极端上涨分钟市场同步因子.
+
+    【用法说明】
+    1min收益r与同时刻可交易池等权收益m；至少两个品种、每日30对。
+    极端上涨定义为r>0且r>=当日90%线性分位数，H=I(r*m>0)，不沿用股票固定时段。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21(Mean(H|极端上涨))。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_extreme_up_market_sync_21d"
+    description = "极端上涨分钟市场同步"
+    expected_direction = -1
+    window = 21
+    component = 0
+    method = 'sync'
+    fields = ('close',)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 659. intraday_extreme_up_market_sync_weighted — 极端上涨同步幅度确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_extreme_up_market_sync_weighted_21d", category="intraday_advanced")
+class IntradayExtremeUpMarketSyncWeighted21d(IntradayExtremeUpMarketSync21d):
+    """极端上涨同步幅度确认因子.
+
+    【用法说明】
+    1min收益r与同时刻可交易池等权收益m；至少两个品种、每日30对。
+    极端上涨定义为r>0且r>=当日90%线性分位数，H=I(r*m>0)，不沿用股票固定时段。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21(Sum(H*abs(r)|极端上涨)/Sum(abs(r)|极端上涨))。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_extreme_up_market_sync_weighted_21d"
+    description = "极端上涨同步幅度确认"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 660. intraday_extreme_up_market_sync_excess — 极端上涨额外同步度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_extreme_up_market_sync_excess_21d", category="intraday_advanced")
+class IntradayExtremeUpMarketSyncExcess21d(IntradayExtremeUpMarketSync21d):
+    """极端上涨额外同步度因子.
+
+    【用法说明】
+    1min收益r与同时刻可交易池等权收益m；至少两个品种、每日30对。
+    极端上涨定义为r>0且r>=当日90%线性分位数，H=I(r*m>0)，不沿用股票固定时段。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21(Mean(H|极端上涨)-Mean(H|其余配对分钟))；剥离日内一般同步度。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_extreme_up_market_sync_excess_21d"
+    description = "极端上涨额外同步度"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 661. intraday_daily_signed_amount_beta — 日内成交额冲击斜率均值
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_signed_amount_beta_21d", category="intraday_advanced")
+class IntradayDailySignedAmountBeta21d(_MinuteMethodFactor):
+    """日内成交额冲击斜率均值因子.
+
+    【用法说明】
+    1min配对收益r与正成交额A，x=sign(r)*A；至少30对，带截距日内回归。
+    b=Cov(r,x)/Var(x)，有向成交额而非有向手数或平方根手数。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21(b)；日斜率先算后平均，不等于21日样本合并回归。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_signed_amount_beta_21d"
+    description = "日内成交额冲击斜率均值"
+    expected_direction = -1
+    window = 21
+    component = 0
+    method = 'kyle'
+    fields = ('close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 662. intraday_daily_signed_amount_fit — 日内成交额冲击拟合相关
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_signed_amount_fit_21d", category="intraday_advanced")
+class IntradayDailySignedAmountFit21d(IntradayDailySignedAmountBeta21d):
+    """日内成交额冲击拟合相关因子.
+
+    【用法说明】
+    1min配对收益r与正成交额A，x=sign(r)*A；至少30对，带截距日内回归。
+    b=Cov(r,x)/Var(x)，有向成交额而非有向手数或平方根手数。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21(Corr(r,x))；按日标准化后等权，区别于合并样本相关。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_signed_amount_fit_21d"
+    description = "日内成交额冲击拟合相关"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 663. intraday_daily_signed_amount_beta_recovery — 日内成交额冲击斜率修复
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_daily_signed_amount_beta_recovery_21d", category="intraday_advanced")
+class IntradayDailySignedAmountBetaRecovery21d(IntradayDailySignedAmountBeta21d):
+    """日内成交额冲击斜率修复因子.
+
+    【用法说明】
+    1min配对收益r与正成交额A，x=sign(r)*A；至少30对，带截距日内回归。
+    b=Cov(r,x)/Var(x)，有向成交额而非有向手数或平方根手数。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean21((b前半日-b后半日)/(abs(b前半日)+abs(b后半日)))。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_daily_signed_amount_beta_recovery_21d"
+    description = "日内成交额冲击斜率修复"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 664. intraday_abnormal_return_max_attention — 异常收益最大关注度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_abnormal_return_max_attention_20d", category="intraday_advanced")
+class IntradayAbnormalReturnMaxAttention20d(_MinuteMethodFactor):
+    """异常收益最大关注度因子.
+
+    【用法说明】
+    1min收益r减同一时刻至少两个可交易品种的等权收益得到e，每日至少30对。
+    异常指相对市场的残差，区别于品种自身最大绝对分钟收益。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Max(abs(e)))。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_abnormal_return_max_attention_20d"
+    description = "异常收益最大关注度"
+    expected_direction = -1
+    component = 0
+    method = 'attention'
+    fields = ('close',)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 665. intraday_abnormal_attention_vol_scaled — 异常关注度波动归一
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_abnormal_attention_vol_scaled_20d", category="intraday_advanced")
+class IntradayAbnormalAttentionVolScaled20d(IntradayAbnormalReturnMaxAttention20d):
+    """异常关注度波动归一因子.
+
+    【用法说明】
+    1min收益r减同一时刻至少两个可交易品种的等权收益得到e，每日至少30对。
+    异常指相对市场的残差，区别于品种自身最大绝对分钟收益。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Max(abs(e))/Std(e))；将关注度与日内残差波动水平分离。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_abnormal_attention_vol_scaled_20d"
+    description = "异常关注度波动归一"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 666. intraday_abnormal_attention_signed_concentration — 异常关注度方向集中度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_abnormal_attention_signed_concentration_20d", category="intraday_advanced")
+class IntradayAbnormalAttentionSignedConcentration20d(IntradayAbnormalReturnMaxAttention20d):
+    """异常关注度方向集中度因子.
+
+    【用法说明】
+    1min收益r减同一时刻至少两个可交易品种的等权收益得到e，每日至少30对。
+    异常指相对市场的残差，区别于品种自身最大绝对分钟收益。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((Sum(e³)/Sum(abs(e)³))*(Sum(e²)/Sum(abs(e))²))；由尾部方向与路径集中度共同决定。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_abnormal_attention_signed_concentration_20d"
+    description = "异常关注度方向集中度"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 667. intraday_isolated_amplitude_event_volatility — 孤立振幅边际事件波动
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_isolated_amplitude_event_volatility_20d", category="intraday_advanced")
+class IntradayIsolatedAmplitudeEventVolatility20d(_MinuteMethodFactor):
+    """孤立振幅边际事件波动因子.
+
+    【用法说明】
+    1min相对振幅a=(H-L)/C，d=abs(a-a前条)；日首不连接昨收。
+    标记d>当日Mean(d)+Std(d)且前后均未标记的孤立异常；至少30收益、至少2个事件。
+    z=log(C/C前)，S为事件收益总体标准差；前后观察均在已收盘交易日内。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    日S在同日可交易池做abs(S-截面均值)/截面总体标准差，再Mean20。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_isolated_amplitude_event_volatility_20d"
+    description = "孤立振幅边际事件波动"
+    expected_direction = -1
+    distance = True
+    component = 0
+    method = 'marginal'
+    fields = ('high', 'low', 'close')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 668. intraday_isolated_amplitude_relative_volatility — 孤立振幅事件相对波动
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_isolated_amplitude_relative_volatility_20d", category="intraday_advanced")
+class IntradayIsolatedAmplitudeRelativeVolatility20d(IntradayIsolatedAmplitudeEventVolatility20d):
+    """孤立振幅事件相对波动因子.
+
+    【用法说明】
+    1min相对振幅a=(H-L)/C，d=abs(a-a前条)；日首不连接昨收。
+    标记d>当日Mean(d)+Std(d)且前后均未标记的孤立异常；至少30收益、至少2个事件。
+    z=log(C/C前)，S为事件收益总体标准差；前后观察均在已收盘交易日内。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(S/Std(z))；事件波动相对全天波动，不做截面距离变换。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_isolated_amplitude_relative_volatility_20d"
+    description = "孤立振幅事件相对波动"
+    expected_direction = -1
+    distance = False
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 669. intraday_isolated_amplitude_direction_density — 孤立振幅事件方向密度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_isolated_amplitude_direction_density_20d", category="intraday_advanced")
+class IntradayIsolatedAmplitudeDirectionDensity20d(IntradayIsolatedAmplitudeEventVolatility20d):
+    """孤立振幅事件方向密度因子.
+
+    【用法说明】
+    1min相对振幅a=(H-L)/C，d=abs(a-a前条)；日首不连接昨收。
+    标记d>当日Mean(d)+Std(d)且前后均未标记的孤立异常；至少30收益、至少2个事件。
+    z=log(C/C前)，S为事件收益总体标准差；前后观察均在已收盘交易日内。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(Mean(z|事件)/Mean(abs(z)|事件)*事件数/有效收益数)。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_isolated_amplitude_direction_density_20d"
+    description = "孤立振幅事件方向密度"
+    expected_direction = 1
+    distance = False
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 670. intraday_liquidity_crash_rank_product — 流动性脆弱共振
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_liquidity_crash_rank_product_20d", category="intraday_advanced")
+class IntradayLiquidityCrashRankProduct20d(_MicrostructureMethodFactor):
+    """流动性脆弱共振因子.
+
+    【用法说明】
+    真实1min行情及持仓量；日内至少30组，期货换手代理U=Sum(V)/Mean(OI)。
+    R=2*sqrt(max(-Cov(ΔC,ΔC前),0))/Sum(A)；G=sqrt(Sum(max(GK方差,0)))/Sum(A)。
+    GK方差=0.5*log(H/L)²-(2log(2)-1)*log(C/O)²；同日U/R/G在共同有效池取百分位u/r/g。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(u*r*g)，至少两个可交易品种。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_liquidity_crash_rank_product_20d"
+    description = "流动性脆弱共振"
+    expected_direction = -1
+    component = 0
+    method = 'crash'
+    fields = ('open', 'high', 'low', 'close', 'volume', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 671. intraday_liquidity_crash_weakest_link — 流动性脆弱共同下限
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_liquidity_crash_weakest_link_20d", category="intraday_advanced")
+class IntradayLiquidityCrashWeakestLink20d(IntradayLiquidityCrashRankProduct20d):
+    """流动性脆弱共同下限因子.
+
+    【用法说明】
+    真实1min行情及持仓量；日内至少30组，期货换手代理U=Sum(V)/Mean(OI)。
+    R=2*sqrt(max(-Cov(ΔC,ΔC前),0))/Sum(A)；G=sqrt(Sum(max(GK方差,0)))/Sum(A)。
+    GK方差=0.5*log(H/L)²-(2log(2)-1)*log(C/O)²；同日U/R/G在共同有效池取百分位u/r/g。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(min(u,r,g))；要求三个分量同时较高。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_liquidity_crash_weakest_link_20d"
+    description = "流动性脆弱共同下限"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 672. intraday_liquidity_crash_surprise — 流动性脆弱异常增量
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_liquidity_crash_surprise_20d", category="intraday_advanced")
+class IntradayLiquidityCrashSurprise20d(IntradayLiquidityCrashRankProduct20d):
+    """流动性脆弱异常增量因子.
+
+    【用法说明】
+    真实1min行情及持仓量；日内至少30组，期货换手代理U=Sum(V)/Mean(OI)。
+    R=2*sqrt(max(-Cov(ΔC,ΔC前),0))/Sum(A)；G=sqrt(Sum(max(GK方差,0)))/Sum(A)。
+    GK方差=0.5*log(H/L)²-(2log(2)-1)*log(C/O)²；同日U/R/G在共同有效池取百分位u/r/g。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(max(u*r*g-此前20日Mean(u*r*g),0))；完整40日后第41日生效。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少40个交易日历史，第41日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_liquidity_crash_surprise_20d"
+    description = "流动性脆弱异常增量"
+    expected_direction = -1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 673. intraday_volume_distribution_quality — 成交量分布质量
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_distribution_quality_20d", category="intraday_advanced")
+class IntradayVolumeDistributionQuality20d(_MicrostructureMethodFactor):
+    """成交量分布质量因子.
+
+    【用法说明】
+    真实1min行情，每日至少30组；p=V/Sum(V)，H=-Sum(p*log(p))。
+    s/k为日内量的总体偏度/Pearson峰度，c=Corr(abs(r),A)，d=Corr(r,A)，N为有效分钟数。
+    熵采用分钟权重分布，相关采用明确的收益/成交额配对口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Q=H*(1-abs(s))*I(k<5取1否则0.5)*c；Q做截面绝对z距离后Mean20+Std20。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_volume_distribution_quality_20d"
+    description = "成交量分布质量"
+    expected_direction = -1
+    component = 0
+    method = 'volume_quality'
+    fields = ('open', 'high', 'low', 'close', 'volume', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 674. intraday_volume_distribution_bounded_quality — 成交量分布有界偏度惩罚
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_distribution_bounded_quality_20d", category="intraday_advanced")
+class IntradayVolumeDistributionBoundedQuality20d(IntradayVolumeDistributionQuality20d):
+    """成交量分布有界偏度惩罚因子.
+
+    【用法说明】
+    真实1min行情，每日至少30组；p=V/Sum(V)，H=-Sum(p*log(p))。
+    s/k为日内量的总体偏度/Pearson峰度，c=Corr(abs(r),A)，d=Corr(r,A)，N为有效分钟数。
+    熵采用分钟权重分布，相关采用明确的收益/成交额配对口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(H/log(N)/(1+abs(s))/(1+max(k-3,0))*c)；偏度绝对值大于1时不会翻转符号。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_volume_distribution_bounded_quality_20d"
+    description = "成交量分布有界偏度惩罚"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 675. intraday_volume_distribution_direction_quality — 成交量分布方向质量
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_volume_distribution_direction_quality_20d", category="intraday_advanced")
+class IntradayVolumeDistributionDirectionQuality20d(IntradayVolumeDistributionQuality20d):
+    """成交量分布方向质量因子.
+
+    【用法说明】
+    真实1min行情，每日至少30组；p=V/Sum(V)，H=-Sum(p*log(p))。
+    s/k为日内量的总体偏度/Pearson峰度，c=Corr(abs(r),A)，d=Corr(r,A)，N为有效分钟数。
+    熵采用分钟权重分布，相关采用明确的收益/成交额配对口径。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(H/log(N)/(1+abs(s))*d)；量分布对称度与资金方向响应共同确认。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_volume_distribution_direction_quality_20d"
+    description = "成交量分布方向质量"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 676. intraday_microstructure_quality_blend — 微观结构质量等权组合
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_microstructure_quality_blend_20d", category="intraday_advanced")
+class IntradayMicrostructureQualityBlend20d(_MicrostructureMethodFactor):
+    """微观结构质量等权组合因子.
+
+    【用法说明】
+    真实1min行情及持仓量；沿用#670的流动性共振L和#673的成交量分布质量Q。
+    L/Q均使用同日可交易池及完整20日窗口；缺少持仓时不伪造换手。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    (L+Q)/2；保留两种日频结果的原始尺度。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_microstructure_quality_blend_20d"
+    description = "微观结构质量等权组合"
+    expected_direction = -1
+    component = 0
+    method = 'micro_quality'
+    fields = ('open', 'high', 'low', 'close', 'volume', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 677. intraday_microstructure_quality_joint_rank — 微观结构质量共同排名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_microstructure_quality_joint_rank_20d", category="intraday_advanced")
+class IntradayMicrostructureQualityJointRank20d(IntradayMicrostructureQualityBlend20d):
+    """微观结构质量共同排名因子.
+
+    【用法说明】
+    真实1min行情及持仓量；沿用#670的流动性共振L和#673的成交量分布质量Q。
+    L/Q均使用同日可交易池及完整20日窗口；缺少持仓时不伪造换手。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    min(Rank(L),Rank(Q))；先统一百分位尺度再约束共同偏高，至少两个品种。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_microstructure_quality_joint_rank_20d"
+    description = "微观结构质量共同排名"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 678. intraday_microstructure_quality_risk_discount — 微观结构质量风险折扣
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_microstructure_quality_risk_discount_20d", category="intraday_advanced")
+class IntradayMicrostructureQualityRiskDiscount20d(IntradayMicrostructureQualityBlend20d):
+    """微观结构质量风险折扣因子.
+
+    【用法说明】
+    真实1min行情及持仓量；沿用#670的流动性共振L和#673的成交量分布质量Q。
+    L/Q均使用同日可交易池及完整20日窗口；缺少持仓时不伪造换手。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    #674的有界分布质量*(1-L)；以共振风险降低分布质量的权重。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_microstructure_quality_risk_discount_20d"
+    description = "微观结构质量风险折扣"
+    expected_direction = 1
+    component = 2
+# 679. intraday_five_minute_consistent_buy — 五分钟一致买入
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_five_minute_consistent_buy_20d", category="intraday_advanced")
+class IntradayFiveMinuteConsistentBuy20d(_MinuteMethodFactor):
+    """五分钟一致买入因子.
+
+    【用法说明】
+    真实5min OHLCV，每日至少6条；a=(C-O)/(H-L)，H=L时a=1。
+    B=Sum(V|a>0.5)/Sum(V)，S=Sum(V|a<-0.5)/Sum(V)；不把1min柱直接当作5min柱。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(B)+Std20(B)，总体标准差。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_five_minute_consistent_buy_20d"
+    description = "五分钟一致买入"
+    expected_direction = -1
+    input_bar_frequency = "5min"
+    add_std = True
+    component = 0
+    method = 'consistent'
+    fields = ('open', 'high', 'low', 'close', 'volume')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 680. intraday_five_minute_consistent_side_gap — 五分钟一致买卖差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_five_minute_consistent_side_gap_20d", category="intraday_advanced")
+class IntradayFiveMinuteConsistentSideGap20d(IntradayFiveMinuteConsistentBuy20d):
+    """五分钟一致买卖差因子.
+
+    【用法说明】
+    真实5min OHLCV，每日至少6条；a=(C-O)/(H-L)，H=L时a=1。
+    B=Sum(V|a>0.5)/Sum(V)，S=Sum(V|a<-0.5)/Sum(V)；不把1min柱直接当作5min柱。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(B-S)；同时刻画一致卖出，剔除双向一致交易的共同部分。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_five_minute_consistent_side_gap_20d"
+    description = "五分钟一致买卖差"
+    expected_direction = 1
+    add_std = False
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 681. intraday_five_minute_consistent_late_gain — 五分钟一致买入尾段增强
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_five_minute_consistent_late_gain_20d", category="intraday_advanced")
+class IntradayFiveMinuteConsistentLateGain20d(IntradayFiveMinuteConsistentBuy20d):
+    """五分钟一致买入尾段增强因子.
+
+    【用法说明】
+    真实5min OHLCV，每日至少6条；a=(C-O)/(H-L)，H=L时a=1。
+    B=Sum(V|a>0.5)/Sum(V)，S=Sum(V|a<-0.5)/Sum(V)；不把1min柱直接当作5min柱。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(B后半日-B前半日)；两段各自以有效成交量为分母。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少20个交易日历史，第21日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_five_minute_consistent_late_gain_20d"
+    description = "五分钟一致买入尾段增强"
+    expected_direction = 1
+    add_std = False
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 682. intraday_historical_price_shape_return — 历史日线形态收益映射
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_price_shape_return_5d", category="intraday_advanced")
+class IntradayHistoricalPriceShapeReturn5d(_HistoricalShapeMethodFactor):
+    """历史日线形态收益映射因子.
+
+    【用法说明】
+    日线代表价格P=(O+H+L+C)/4；最近10日价格路径与最多2520日历史窗口求相关。
+    选择相关最高的10个完整样本，历史末日s的标签为O[s+6]/O[s+1]-1。
+    只允许s<=当前日-10且标签已实现；历史样本彼此可重叠，不与当前形态重叠，不要求完整十年。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    10个邻居的5交易日开盘到开盘收益均值，至少31日价格且10个完整标签。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少31个交易日历史，第32日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_price_shape_return_5d"
+    description = "历史日线形态收益映射"
+    expected_direction = 1
+    component = 0
+    method = 'daily_shape'
+    fields = ('open', 'high', 'low', 'close')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 683. intraday_historical_price_shape_weighted — 历史日线形态正相关加权
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_price_shape_weighted_5d", category="intraday_advanced")
+class IntradayHistoricalPriceShapeWeighted5d(IntradayHistoricalPriceShapeReturn5d):
+    """历史日线形态正相关加权因子.
+
+    【用法说明】
+    日线代表价格P=(O+H+L+C)/4；最近10日价格路径与最多2520日历史窗口求相关。
+    选择相关最高的10个完整样本，历史末日s的标签为O[s+6]/O[s+1]-1。
+    只允许s<=当前日-10且标签已实现；历史样本彼此可重叠，不与当前形态重叠，不要求完整十年。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Sum(max(相关,0)²*标签)/Sum(max(相关,0)²)；不让负相关邻居产生负权重。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少31个交易日历史，第32日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_price_shape_weighted_5d"
+    description = "历史日线形态正相关加权"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 684. intraday_historical_price_shape_sign_consensus — 历史日线形态方向共识
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_price_shape_sign_consensus_5d", category="intraday_advanced")
+class IntradayHistoricalPriceShapeSignConsensus5d(IntradayHistoricalPriceShapeReturn5d):
+    """历史日线形态方向共识因子.
+
+    【用法说明】
+    日线代表价格P=(O+H+L+C)/4；最近10日价格路径与最多2520日历史窗口求相关。
+    选择相关最高的10个完整样本，历史末日s的标签为O[s+6]/O[s+1]-1。
+    只允许s<=当前日-10且标签已实现；历史样本彼此可重叠，不与当前形态重叠，不要求完整十年。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Median(abs(标签))*(2*Mean(标签>0)-1)；以典型幅度乘方向广度。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少31个交易日历史，第32日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_price_shape_sign_consensus_5d"
+    description = "历史日线形态方向共识"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 685. intraday_historical_intraday_shape_return — 历史日内形态收益映射
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_intraday_shape_return_30m", category="intraday_advanced")
+class IntradayHistoricalIntradayShapeReturn30m(_IntradayShapeMethodFactor):
+    """历史日内形态收益映射因子.
+
+    【用法说明】
+    真实1min代表价格P=(O+H+L+C)/4，按交易日第60/120条分别匹配此前路径。
+    每个节点选此前252交易日内相关最高的20个完整样本，以其随后30条收益作为标签。
+    只用过去交易日，两个节点预测均有效才取均值；每日至少150条，日频滞后输出。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    节点值=Sum(相关*标签)/Sum(相关)，两个节点等权；至少20个历史样本。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_intraday_shape_return_30m"
+    description = "历史日内形态收益映射"
+    expected_direction = 1
+    component = 0
+    method = 'intraday_shape'
+    fields = ('open', 'high', 'low', 'close')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 686. intraday_historical_intraday_shape_positive_weight — 历史日内形态正相关加权
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_intraday_shape_positive_weight_30m", category="intraday_advanced")
+class IntradayHistoricalIntradayShapePositiveWeight30m(IntradayHistoricalIntradayShapeReturn30m):
+    """历史日内形态正相关加权因子.
+
+    【用法说明】
+    真实1min代表价格P=(O+H+L+C)/4，按交易日第60/120条分别匹配此前路径。
+    每个节点选此前252交易日内相关最高的20个完整样本，以其随后30条收益作为标签。
+    只用过去交易日，两个节点预测均有效才取均值；每日至少150条，日频滞后输出。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    节点值=Sum(max(相关,0)²*标签)/Sum(max(相关,0)²)，抑制负权重外推。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_intraday_shape_positive_weight_30m"
+    description = "历史日内形态正相关加权"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 687. intraday_historical_intraday_shape_sign_consensus — 历史日内形态方向共识
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_historical_intraday_shape_sign_consensus_30m", category="intraday_advanced")
+class IntradayHistoricalIntradayShapeSignConsensus30m(IntradayHistoricalIntradayShapeReturn30m):
+    """历史日内形态方向共识因子.
+
+    【用法说明】
+    真实1min代表价格P=(O+H+L+C)/4，按交易日第60/120条分别匹配此前路径。
+    每个节点选此前252交易日内相关最高的20个完整样本，以其随后30条收益作为标签。
+    只用过去交易日，两个节点预测均有效才取均值；每日至少150条，日频滞后输出。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    节点值=Median(abs(标签))*(2*Mean(标签>0)-1)，对极端历史收益不做线性放大。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少21个交易日历史，第22日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_historical_intraday_shape_sign_consensus_30m"
+    description = "历史日内形态方向共识"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 688. intraday_open_volume_decay_reversal — 开盘变化与量价衰减反转
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_volume_decay_reversal_13d", category="intraday_advanced")
+class IntradayOpenVolumeDecayReversal13d(_DailyExpressionMethodFactor):
+    """开盘变化与量价衰减反转因子.
+
+    【用法说明】
+    配置日线开盘O、成交量V；板块内V去均值得y，未知板块及少于两个有效品种返回NaN。
+    Dn为线性加权均值（最新权重n），TsRank13为完整13日当前值平均秩百分位。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    -min(Rank(D15(O-O前)),TsRank13(D7(Corr(y,O,17))))。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少35个交易日历史，第36日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_open_volume_decay_reversal_13d"
+    description = "开盘变化与量价衰减反转"
+    expected_direction = 1
+    component = 0
+    method = 'open_decay'
+    fields = ('open', 'close', 'volume')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 689. intraday_open_volume_decay_joint_reversal — 相对开盘变化联合反转
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_volume_decay_joint_reversal_13d", category="intraday_advanced")
+class IntradayOpenVolumeDecayJointReversal13d(IntradayOpenVolumeDecayReversal13d):
+    """相对开盘变化联合反转因子.
+
+    【用法说明】
+    配置日线开盘O、成交量V；板块内V去均值得y，未知板块及少于两个有效品种返回NaN。
+    Dn为线性加权均值（最新权重n），TsRank13为完整13日当前值平均秩百分位。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    a=Rank(D15(O/O前-1))，b=TsRank13(D7(Corr(y,O,17)))，factor=-a*b。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少35个交易日历史，第36日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_open_volume_decay_joint_reversal_13d"
+    description = "相对开盘变化联合反转"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 690. intraday_open_volume_decay_agreement — 相对开盘量价衰减一致性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_open_volume_decay_agreement_13d", category="intraday_advanced")
+class IntradayOpenVolumeDecayAgreement13d(IntradayOpenVolumeDecayReversal13d):
+    """相对开盘量价衰减一致性因子.
+
+    【用法说明】
+    配置日线开盘O、成交量V；板块内V去均值得y，未知板块及少于两个有效品种返回NaN。
+    Dn为线性加权均值（最新权重n），TsRank13为完整13日当前值平均秩百分位。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    a/b同#689，factor=-(a+b)/2*(1-abs(a-b))，惩罚两条反转分量分歧。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少35个交易日历史，第36日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_open_volume_decay_agreement_13d"
+    description = "相对开盘量价衰减一致性"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 691. intraday_candle_dispersion_open_close_rank — 实体离散与开收盘相关排名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_candle_dispersion_open_close_rank_10d", category="intraday_advanced")
+class IntradayCandleDispersionOpenCloseRank10d(_DailyExpressionMethodFactor):
+    """实体离散与开收盘相关排名因子.
+
+    【用法说明】
+    配置日线开收盘O/C；k=Corr(C,O,10)，所有10日统计要求完整观察。
+    Rank使用同日可交易池百分位；静态价格水平与收益尺度变换分别命名。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    -Rank(Std10(abs(C-O))+(C-O)+k)，总体标准差。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_candle_dispersion_open_close_rank_10d"
+    description = "实体离散与开收盘相关排名"
+    expected_direction = 1
+    component = 0
+    method = 'candle_corr'
+    fields = ('open', 'close')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 692. intraday_relative_candle_dispersion_rank — 相对实体离散与相关排名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_candle_dispersion_rank_10d", category="intraday_advanced")
+class IntradayRelativeCandleDispersionRank10d(IntradayCandleDispersionOpenCloseRank10d):
+    """相对实体离散与相关排名因子.
+
+    【用法说明】
+    配置日线开收盘O/C；k=Corr(C,O,10)，所有10日统计要求完整观察。
+    Rank使用同日可交易池百分位；静态价格水平与收益尺度变换分别命名。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    b=C/O-1，-(Rank(Std10(abs(b))+b)+Rank(k))/2，先消除报价单位差异再等权合成。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_candle_dispersion_rank_10d"
+    description = "相对实体离散与相关排名"
+    expected_direction = 1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 693. intraday_relative_candle_independence — 相对实体独立性
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_relative_candle_independence_10d", category="intraday_advanced")
+class IntradayRelativeCandleIndependence10d(IntradayCandleDispersionOpenCloseRank10d):
+    """相对实体独立性因子.
+
+    【用法说明】
+    配置日线开收盘O/C；k=Corr(C,O,10)，所有10日统计要求完整观察。
+    Rank使用同日可交易池百分位；静态价格水平与收益尺度变换分别命名。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    b=C/O-1，b/(Std10(abs(b))+abs(b))*(1-abs(k))，强调实体强度及开收盘序列独立性。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 至少10个交易日历史，第11日最早生效；缺失不跳过、不前填，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_relative_candle_independence_10d"
+    description = "相对实体独立性"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 694. intraday_downward_mean_amount_strength — 下行分钟相对均额强度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downward_mean_amount_strength_20d", category="intraday_advanced")
+class IntradayDownwardMeanAmountStrength20d(_MinuteMethodFactor):
+    """下行分钟相对均额强度因子.
+
+    【用法说明】
+    真实1min正开收盘与成交额，至少30组；I=全天分钟均额，D=下跌分钟均额，R=D/I。
+    用分钟均额代理单笔交易强度，不声称观测到逐笔或真实成交笔数；平价分钟仅计全天均额。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(R)；这是独立强度分量，区别于#605三项截面排名组合。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 完整20日后第21日最早生效；缺失不跳过，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_downward_mean_amount_strength_20d"
+    description = "下行分钟相对均额强度"
+    expected_direction = 1
+    component = 0
+    method = 'strength'
+    fields = ('open', 'close', 'amount')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 695. intraday_downward_mean_amount_surprise — 下行分钟均额强度异常
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downward_mean_amount_surprise_20d", category="intraday_advanced")
+class IntradayDownwardMeanAmountSurprise20d(IntradayDownwardMeanAmountStrength20d):
+    """下行分钟均额强度异常因子.
+
+    【用法说明】
+    真实1min正开收盘与成交额，至少30组；I=全天分钟均额，D=下跌分钟均额，R=D/I。
+    用分钟均额代理单笔交易强度，不声称观测到逐笔或真实成交笔数；平价分钟仅计全天均额。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(R/此前20日Mean(R)-1)；只用过去基准，完整40日后第41日生效。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 20日历史基准加20日平滑，完整40日后第41日最早生效；缺失不跳过。
+    """
+    name = "intraday_downward_mean_amount_surprise_20d"
+    description = "下行分钟均额强度异常"
+    expected_direction = 1
+    relative_history = True
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 696. intraday_downward_mean_amount_direction_confirm — 下行均额与方向广度确认
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_downward_mean_amount_direction_confirm_20d", category="intraday_advanced")
+class IntradayDownwardMeanAmountDirectionConfirm20d(IntradayDownwardMeanAmountStrength20d):
+    """下行均额与方向广度确认因子.
+
+    【用法说明】
+    真实1min正开收盘与成交额，至少30组；I=全天分钟均额，D=下跌分钟均额，R=D/I。
+    用分钟均额代理单笔交易强度，不声称观测到逐笔或真实成交笔数；平价分钟仅计全天均额。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((R-1)*(下跌分钟数-上涨分钟数)/有效分钟数)；均额偏离和方向广度联合确认。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 正向假设，期货收益方向待检验。
+    ⚠ 完整20日后第21日最早生效；缺失不跳过，分母零或统计未定义返回NaN。
+    """
+    name = "intraday_downward_mean_amount_direction_confirm_20d"
+    description = "下行均额与方向广度确认"
+    expected_direction = 1
+    component = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 697. intraday_minute_return_std — 分钟收益总体标准差
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_minute_return_std_20d", category="intraday_advanced")
+class IntradayMinuteReturnStd20d(_MinuteMethodFactor):
+    """分钟收益总体标准差因子.
+
+    【用法说明】
+    真实1min收盘收益r，按交易日分组，日首不连接昨收；每日至少30个有效收益。
+    sigma=Std(r)，使用总体标准差，不以平方收益和或OHLC估计量替代。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(sigma)。
+
+    【含义】
+    保留上述日内结构的数值定义。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 完整20日后第21日最早生效；缺失不跳过，统计未定义返回NaN。
+    """
+    name = "intraday_minute_return_std_20d"
+    description = "分钟收益总体标准差"
+    expected_direction = -1
+    component = 0
+    method = 'volatility'
+    fields = ('close',)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 698. intraday_minute_volatility_median_tension — 分钟波动中位幅度张力
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_minute_volatility_median_tension_20d", category="intraday_advanced")
+class IntradayMinuteVolatilityMedianTension20d(IntradayMinuteReturnStd20d):
+    """分钟波动中位幅度张力因子.
+
+    【用法说明】
+    真实1min收盘收益r，按交易日分组，日首不连接昨收；每日至少30个有效收益。
+    sigma=Std(r)，使用总体标准差，不以平方收益和或OHLC估计量替代。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20(sigma/Median(abs(r)))；以典型分钟幅度衡量极端波动拉升程度。
+
+    【含义】
+    在同一结构上增加条件确认或尺度约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 完整20日后第21日最早生效；缺失不跳过，典型幅度为零时返回NaN。
+    """
+    name = "intraday_minute_volatility_median_tension_20d"
+    description = "分钟波动中位幅度张力"
+    expected_direction = -1
+    component = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 699. intraday_minute_volatility_conditional_asymmetry — 分钟波动条件不对称
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@register_factor("intraday_minute_volatility_conditional_asymmetry_20d", category="intraday_advanced")
+class IntradayMinuteVolatilityConditionalAsymmetry20d(IntradayMinuteReturnStd20d):
+    """分钟波动条件不对称因子.
+
+    【用法说明】
+    真实1min收盘收益r，按交易日分组，日首不连接昨收；每日至少30个有效收益。
+    sigma=Std(r)，使用总体标准差，不以平方收益和或OHLC估计量替代。
+    日频输出并shift(1)，检验预测期5/10/20个交易日，非持仓期。
+
+    【公式】
+    Mean20((Std(r|r<0)-Std(r|r>0))/(Std(r|r<0)+Std(r|r>0)))；两个方向各自去均值。
+
+    【含义】
+    在同一结构上增加方向、时段或持续性约束。
+    方向: 负向假设，期货收益方向待检验。
+    ⚠ 完整20日后第21日最早生效；缺少任一方向或分母零返回NaN，缺失不跳过。
+    """
+    name = "intraday_minute_volatility_conditional_asymmetry_20d"
+    description = "分钟波动条件不对称"
+    expected_direction = -1
+    component = 2
+
+
+def _supplement_event_response(response, weight):
+    """20日事件加权均值/均方根；需完整配对及至少3次正权事件，零响应取0。"""
+    import polars as pl
+    valid = response.is_finite() & weight.is_finite() & (weight >= 0)
+    w = pl.when(valid).then(weight)
+    numerator = (w * response).rolling_sum(20)
+    denominator = (w.rolling_sum(20) * (w * response.pow(2)).rolling_sum(20)).clip(0).sqrt()
+    return pl.when((w > 0).cast(pl.Int32).rolling_sum(20) >= 3).then(
+        _supplement_ratio(numerator, denominator))
+
+
+# 空号沿用稳定注释标识，登记顺序继续追加；不移动或替换已有因子。
+# ═══════════════════════════════════════════════════════════════════════════════
+# 32. intraday_oi_pullback_recovery — 增仓承压后修复
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_oi_pullback_recovery_20d", category="intraday_advanced")
+class IntradayOiPullbackRecovery20d(_DailySupplementFactor):
+    """增仓下跌事件之后的价格修复因子.
+
+    【用法说明】日线close/oi，r=Δlog(close)，g=Δlog(oi)，完整20日配对。
+    【公式】w=max(-r[t-1],0)*max(g[t-1],0)；F=Σ(w*r)/sqrt(Σw*Σ(w*r²))。
+    【含义】衡量昨日增仓承压后今日能否恢复，区别于同日减仓反转或增减仓条件均值差。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 至少3次正权事件；完整22日输入，第23日可能输出；OI不代表净多资金流。
+    """
+    name = "intraday_oi_pullback_recovery_20d"
+    description = "增仓承压后修复 (滞后事件加权响应)"
+
+    def _expression(self, x):
+        r, g = x["close"].log().diff(), x["oi"].log().diff()
+        return _supplement_event_response(r, (-r.shift(1)).clip(0) * g.shift(1).clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 73. intraday_oi_cost_retention — 增仓价格锚保持度
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_oi_cost_retention_20d", category="intraday_advanced")
+class IntradayOiCostRetention20d(_DailySupplementFactor):
+    """价格相对增仓日加权价格锚的保持度因子.
+
+    【用法说明】日线close/oi，p=log(close)，r=Δp，g=Δlog(oi)，a=max(g,0)。
+    【公式】P=Σ20(a*p)/Σ20a；F=(p-P)/RMS20(r)。
+    【含义】价格保留在近期增仓事件价格锚上方为正；不是实际成交成本或持仓盈亏。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 20个完整变化、至少3次增仓；零收益窗口取0，第22日可能输出，不前填。
+    """
+    name = "intraday_oi_cost_retention_20d"
+    description = "增仓价格锚保持度 (价格偏离/收益均方根)"
+
+    def _expression(self, x):
+        import polars as pl
+        p, g = x["close"].log(), x["oi"].log().diff()
+        a = g.clip(0)
+        anchor = (a * p).rolling_sum(20) / a.rolling_sum(20)
+        return pl.when((a > 0).cast(pl.Int32).rolling_sum(20) >= 3).then(
+            _supplement_ratio(p - anchor, p.diff().pow(2).rolling_mean(20).sqrt()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 271. intraday_seat_concentration_followthrough — 席位集中后方向承接
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_seat_concentration_followthrough_20d", category="intraday_advanced")
+class IntradaySeatConcentrationFollowthrough20d(_DailySupplementFactor):
+    """多空集中度差扩张之后的席位净方向响应因子.
+
+    【用法说明】product_seat日度持仓；HL/HS为两侧独立份额HHI，B=(ΣL-ΣS)/(ΣL+ΣS)。
+    至少3席位、两侧总量为正，负值/缺测无效；仅表示已报告席位，名单变化会影响统计。
+    【公式】A=HL-HS，w=max(ΔA[t-1],0)；F=Σ(w*ΔB)/sqrt(Σw*Σ(w*(ΔB)²))。
+    【含义】昨日多头相对集中扩张，随后净方向是否承接；不是持仓或集中度本身的均值。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 20日完整配对且至少3次事件，第23日可能输出；零响应取0，不补造席位。
+    """
+    name = "intraday_seat_concentration_followthrough_20d"
+    description = "席位集中后方向承接 (滞后集中变化×净方向响应)"
+    FIELDS = ()
+    SEAT = True
+
+    def _expression(self, x):
+        a = x["lh"] - x["sh"]
+        return _supplement_event_response(x["bias"].diff(), a.diff().shift(1).clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 291. intraday_seat_concentration_rotation — 席位集中方向旋转
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_seat_concentration_rotation_20d", category="intraday_advanced")
+class IntradaySeatConcentrationRotation20d(IntradaySeatConcentrationFollowthrough20d):
+    """集中度差与净方向的有向路径面积因子.
+
+    【用法说明】日度product_seat，两侧HHI与B及席位有效条件同#271；不使用分钟近似。
+    【公式】A=HL-HS，u=A[t-1]*ΔB，v=B[t-1]*ΔA；F=Σ20(u-v)/Σ20(|u|+|v|)。
+    【含义】区分集中领先方向扩张与方向领先集中扩张的路径次序，而非两者静态相关性。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 完整20次变化，第22日输出；有效全零路径取0，缺测不跳过；报告名单并非固定样本。
+    """
+    name = "intraday_seat_concentration_rotation_20d"
+    description = "席位集中方向旋转 (有向面积/绝对路径面积)"
+
+    def _expression(self, x):
+        a, b = x["lh"] - x["sh"], x["bias"]
+        u, v = a.shift(1) * b.diff(), b.shift(1) * a.diff()
+        return _supplement_ratio((u - v).rolling_sum(20), (u.abs() + v.abs()).rolling_sum(20))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 317. intraday_sector_downside_oi_resilience — 板块下行增仓韧性
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_downside_oi_resilience_20d", category="intraday_advanced")
+class IntradaySectorDownsideOiResilience20d(_DailySupplementFactor):
+    """板块承压且自身增仓条件下的相对收益韧性因子.
+
+    【用法说明】日线close/oi；r=Δlog(close)，g=Δlog(oi)，m为剔除自身的同板块均值。
+    每日至少2个合格同伴，未分类品种不混池；e=r-m。
+    【公式】w=max(-m,0)*max(g,0)；F=Σ20(w*e)/sqrt(Σ20w*Σ20(w*e²))。
+    【含义】板块下跌时新增持仓伴随相对抗跌，区别于不考虑持仓的下行脱钩。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 20日完整配对且至少3次事件，第22日可能输出；不将增仓直接解释为买盘。
+    """
+    name = "intraday_sector_downside_oi_resilience_20d"
+    description = "板块下行增仓韧性 (条件相对收益/条件均方根)"
+    PEERS = True
+
+    def _expression(self, x):
+        g = x["oi"].log().diff()
+        return _supplement_event_response(x["r"] - x["peer"], (-x["peer"]).clip(0) * g.clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 356. intraday_sector_upside_oi_confirmation — 板块上行增仓确认
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_upside_oi_confirmation_20d", category="intraday_advanced")
+class IntradaySectorUpsideOiConfirmation20d(IntradaySectorDownsideOiResilience20d):
+    """板块上行且自身增仓条件下的相对推进因子.
+
+    【用法说明】日线close/oi，同#317的剔除自身板块及完整样本规则；e=r-m，g=Δlog(oi)。
+    【公式】w=max(m,0)*max(g,0)；F=Σ20(w*e)/sqrt(Σ20w*Σ20(w*e²))。
+    【含义】参与板块上涨时是否在增仓条件下领跑，与下行韧性覆盖互斥市场事件。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 至少2同伴、20日配对及3次正权事件，第22日可能输出；事件不足不填0。
+    """
+    name = "intraday_sector_upside_oi_confirmation_20d"
+    description = "板块上行增仓确认 (增仓参与的相对推进)"
+
+    def _expression(self, x):
+        g = x["oi"].log().diff()
+        return _supplement_event_response(x["r"] - x["peer"], x["peer"].clip(0) * g.clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 357. intraday_sector_dispersion_lag_response — 板块分化后落后修复
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_dispersion_lag_response_20d", category="intraday_advanced")
+class IntradaySectorDispersionLagResponse20d(_DailySupplementFactor):
+    """昨日板块分化扩张且自身落后之后的相对修复因子.
+
+    【用法说明】日线close，同板块剔除自身至少2个同伴，m/s为均值/总体标准差，e=r-m。
+    【公式】w=max(Δs[t-1],0)*max(-e[t-1],0)；F=Σ20(w*e)/sqrt(Σ20w*Σ20(w*e²))。
+    【含义】观测分化扩张事件发生后的次日承接，不以同日分化收敛乘相对收益替代。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 20日完整配对、至少3次事件，第24日可能输出；缺少合格同伴为NaN。
+    """
+    name = "intraday_sector_dispersion_lag_response_20d"
+    description = "板块分化后落后修复 (滞后分化事件响应)"
+    FIELDS = ("close",)
+    PEERS = True
+
+    def _expression(self, x):
+        e = x["r"] - x["peer"]
+        w = x["dispersion"].diff().shift(1).clip(0) * (-e.shift(1)).clip(0)
+        return _supplement_event_response(e, w)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 358. intraday_sector_residual_sign_balance — 板块分化尺度相对广度
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_sector_residual_sign_balance_20d", category="intraday_advanced")
+class IntradaySectorResidualSignBalance20d(IntradaySectorDispersionLagResponse20d):
+    """按同伴分化幅度软化相对收益符号的时间广度因子.
+
+    【用法说明】日线close；e=r-m，s为剔除自身的同板块总体标准差，至少2个合格同伴。
+    【公式】F=Mean20(e/(s+|e|))，有效的e=s=0取0。
+    【含义】相对强势是否持续超过同伴分化噪声；不是全板块上涨家数或原始相对动量。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 完整20个收益，第22日输出；有界[-1,1]，缺少同伴或价格无效不前填。
+    """
+    name = "intraday_sector_residual_sign_balance_20d"
+    description = "板块分化尺度相对广度 (相对方向的软符号均值)"
+
+    def _expression(self, x):
+        e = x["r"] - x["peer"]
+        return _supplement_ratio(e, x["dispersion"] + e.abs()).rolling_mean(20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 359. intraday_overnight_oi_repair — 隔夜承压日内增仓修复
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_overnight_oi_repair_20d", category="intraday_advanced")
+class IntradayOvernightOiRepair20d(_DailySupplementFactor):
+    """开盘前承压在当日日线开收盘段的增仓修复因子.
+
+    【用法说明】日线open/close/oi，n=log(open/昨收)，d=log(close/open)，g=Δlog(oi)。
+    日线开盘按数据交易日口径，可能包含夜盘，不强称为日历白盘或剔除移仓影响。
+    【公式】w=max(-n,0)*max(g,0)；F=Σ20(w*d)/sqrt(Σ20w*Σ20(w*d²))。
+    【含义】开盘缺口为负且增仓时的盘中修复强度，不等同于仅取隔夜缺口的反转。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 价格/OI须正，完整20日且至少3次事件，第22日可能输出；缺失不前填。
+    """
+    name = "intraday_overnight_oi_repair_20d"
+    description = "隔夜承压日内增仓修复 (开盘缺口条件响应)"
+    FIELDS = ("open", "close", "oi")
+
+    def _expression(self, x):
+        import polars as pl
+        opening = pl.when(x["open"] > 0).then(x["open"].log())
+        n, d = opening - x["close"].log().shift(1), x["close"].log() - opening
+        return _supplement_event_response(d, (-n).clip(0) * x["oi"].log().diff().clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 360. intraday_session_oi_transfer — 时段强弱持仓传导
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_session_oi_transfer_20d", category="intraday_advanced")
+class IntradaySessionOiTransfer20d(IntradayOvernightOiRepair20d):
+    """开盘前后收益强弱差的持仓方向加权因子.
+
+    【用法说明】日线open/close/oi，n/d/g及交易日划分同#359，不调用分钟频率近似。
+    【公式】F=Σ20(g*(d-n))/Σ20(|g|*(|d|+|n|))。
+    【含义】增仓伴随盘中强于开盘缺口为正，减仓时反向；区分跨时段的持仓价格传导。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 完整20日配对，第22日输出；有效全零权重取0，缺失或非正价格为NaN。
+    """
+    name = "intraday_session_oi_transfer_20d"
+    description = "时段强弱持仓传导 (增减仓加权时段差)"
+
+    def _expression(self, x):
+        import polars as pl
+        opening = pl.when(x["open"] > 0).then(x["open"].log())
+        n, d = opening - x["close"].log().shift(1), x["close"].log() - opening
+        g = x["oi"].log().diff()
+        return _supplement_ratio((g * (d - n)).rolling_sum(20),
+                                  (g.abs() * (d.abs() + n.abs())).rolling_sum(20))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 425. intraday_drawdown_oi_resilience — 回撤区间增仓承接
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_drawdown_oi_resilience_20d", category="intraday_advanced")
+class IntradayDrawdownOiResilience20d(_DailySupplementFactor):
+    """处于此前价格回撤区间时的增仓收益响应因子.
+
+    【用法说明】日线close/oi，p=log(close)，r=Δp，g=Δlog(oi)，D=Max20(p)-p。
+    【公式】w=D[t-1]*max(g,0)；F=Σ20(w*r)/sqrt(Σ20w*Σ20(w*r²))。
+    【含义】昨日回撤较深时今日增仓是否获得价格承接，与单日跌后修复区分状态尺度。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 先20日高点再20日响应，第41日可能输出；至少3次事件，缺失不跳过。
+    """
+    name = "intraday_drawdown_oi_resilience_20d"
+    description = "回撤区间增仓承接 (滞后回撤×增仓响应)"
+
+    def _expression(self, x):
+        p, g = x["close"].log(), x["oi"].log().diff()
+        drawdown = (p.rolling_max(20) - p).clip(0)
+        return _supplement_event_response(p.diff(), drawdown.shift(1) * g.clip(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 458. intraday_recovery_oi_retention — 修复区间持仓保持
+# ═══════════════════════════════════════════════════════════════════════════════
+@register_factor("intraday_recovery_oi_retention_20d", category="intraday_advanced")
+class IntradayRecoveryOiRetention20d(_DailySupplementFactor):
+    """自低点修复阶段的持仓保留加权收益因子.
+
+    【用法说明】日线close/oi，p=log(close)，r=Δp；所有状态先滞后一日再观察响应。
+    【公式】U=(p-Min20(p))[t-1]，K=(oi/Max20(oi))[t-1]，w=U*K；
+    F=Σ20(w*r)/sqrt(Σ20w*Σ20(w*r²))。
+    【含义】修复已有空间且持仓未明显撤离时，价格能否延续；不同于增仓路径效率。
+    方向: 正向假设，待检验。日频shift(1)，检验预测期5/10/20日，不决定持仓期。
+    ⚠ 先20日状态再20日响应，第41日可能输出；至少3次事件，不把持仓保留视为净买入。
+    """
+    name = "intraday_recovery_oi_retention_20d"
+    description = "修复区间持仓保持 (滞后价格修复×持仓保留)"
+
+    def _expression(self, x):
+        p, oi = x["close"].log(), x["oi"]
+        recovery = (p - p.rolling_min(20)).clip(0).shift(1)
+        retention = (oi / oi.rolling_max(20)).shift(1)
+        return _supplement_event_response(p.diff(), recovery * retention)

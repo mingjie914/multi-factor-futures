@@ -7,13 +7,13 @@ Usage:
     # 研究指定因子
     python main.py research --factors momentum_20d,skewness_20d
 
-    # 对指定因子执行完整多持有期筛选
+    # 对指定因子执行完整多预测期筛选
     python main.py research --factors momentum_20d,skewness_20d --multi-period
 
     # 筛选同输出频率的已注册因子；可用模块前缀限定假设族
     python main.py research --all --module-prefix factors.library.intraday
 
-    # 多持有期筛选；周期读取每个因子的冻结 validation_horizons
+    # 多预测期筛选；周期读取每个因子的冻结 validation_horizons
     python main.py research --all --multi-period
 
     # 显式周期仅用于契约完全相同的冻结因子批次（例如同一 GP horizon）
@@ -22,9 +22,9 @@ Usage:
     # 指定周期单位；非日频使用真实 bar 索引
     python main.py research --all --multi-period --frequency daily
 
-    # 单持有期探索性筛选可覆盖展示阈值；正式多周期筛选固定读取验证策略
+    # 单预测期探索性筛选可覆盖展示阈值；正式多周期筛选固定读取验证策略
     # 中的层级 FDR 与经济量级门槛。
-    python main.py research --all --multi-period --t-threshold 1.74
+    python main.py research --all --t-threshold 1.74
 
     # 自定义日期范围；预热读取 validation_policy.warmup_days_by_frequency
     python main.py research --all --multi-period --start 2021-01-01 --end 2025-06-30
@@ -36,8 +36,8 @@ Usage:
     python main.py research --correlation --corr-auto-threshold
 
 周期数语义说明:
-    - 因子 slug 中的 "5d" 后缀表示 "5个周期" (bar数), 不是 "5个日历天"
-    - 持有期 (holding_period) 同样是 "周期数" 语义
+    - 因子名后缀不替代计算契约；输入bar、平滑窗口及输出频率以实现和元数据为准
+    - 预测期 (接口名 holding_period) 是输出频率的周期数，不决定调仓或机械持仓天数
     - 当 --frequency=daily (默认) 时, 1个周期 = 1个交易日
     - 当 --frequency=15min 时, 1个周期 = 1个15分钟bar
 """
@@ -349,11 +349,39 @@ def _compute_factor_date_chunks(
     data_mgr, factor_names, date_chunks, universe, chunk_size,
     *, tolerate_failures: bool, clear_intraday_caches: bool,
     performance: dict | None = None, phase: str = "screening",
+    history_calendar=None, history_days: dict | None = None,
 ):
     """Compute exact-date factor panels while bounding raw-data memory."""
     import numpy as np
     import pandas as pd
     from factors.engine import FactorComputationError, FactorEngine
+
+    if history_days and any(history_days.get(name, 0) for name in factor_names):
+        # Only declared long-history factors receive extra past data. The
+        # inference dates and the joint hypothesis family remain unchanged.
+        groups = {}
+        for name in factor_names:
+            groups.setdefault(int(history_days.get(name, 0)), []).append(name)
+        matrices, failures = {}, set()
+        history_calendar = pd.DatetimeIndex(history_calendar)
+        for days, names in groups.items():
+            chunks = date_chunks
+            if days:
+                chunks = []
+                for target, request in date_chunks:
+                    start = max(0, history_calendar.searchsorted(target[0]) - days)
+                    start = min(start, history_calendar.searchsorted(request[0]))
+                    stop = history_calendar.searchsorted(request[-1], side="right")
+                    chunks.append((target, history_calendar[start:stop]))
+            computed, invalid = _compute_factor_date_chunks(
+                data_mgr, names, chunks, universe, chunk_size,
+                tolerate_failures=tolerate_failures,
+                clear_intraday_caches=clear_intraday_caches,
+                performance=performance, phase=phase,
+            )
+            matrices.update(computed)
+            failures.update(invalid)
+        return {name: matrices[name] for name in factor_names}, sorted(failures)
 
     parts = {name: [] for name in factor_names}
     hard_failures: set[str] = set()
@@ -800,7 +828,7 @@ def _load_adaptivity_data(csv_path: str | None = None) -> dict:
 
     适配性研究提供:
     - best_sector: 最佳板块
-    - best_period: 最佳持有期 (适配性研究推荐)
+    - best_period: 最佳预测期 (适配性研究推荐)
     - valid_sectors: 有效板块列表 (|分隔)
     - n_valid_sectors: 有效板块数 (0 表示该因子在所有板块都无效)
     - decay_type: 衰减类型 (increasing/stable/decaying)
@@ -846,11 +874,11 @@ def _run_single_research(runner, factor_names, config_path):
 
 
 def _run_screening(runner, all_factors, config_path, t_threshold, output_dir):
-    """批量筛选所有已注册因子 (单持有期), 按 |t| 排序输出."""
+    """批量筛选所有已注册因子 (单预测期), 按 |t| 排序输出."""
     import pandas as pd
 
     print("=" * 60)
-    print(f"因子批量筛选 ({len(all_factors)} 个, 单持有期)")
+    print(f"因子批量筛选 ({len(all_factors)} 个, 单预测期)")
     print("=" * 60)
     print(f"  配置文件: {config_path}")
     print(f"  t 值阈值: |t| ≥ {t_threshold}")
@@ -974,15 +1002,15 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                                  output_dir=None, adaptivity_file=None,
                                  research_role="unspecified",
                                  common_horizon=None):
-    """按冻结契约执行多持有期筛选.
+    """按冻结契约执行多预测期筛选.
 
-    持有期为"周期数"语义 (非天数); 当 frequency=daily 时, 1个周期=1个交易日.
+    预测期为"周期数"语义 (非天数); 当 frequency=daily 时, 1个周期=1个交易日.
 
-    三种持有期选取模式:
+    三种预测期选取模式:
       1. 冻结契约模式 (默认, periods_override=None):
          - 每个因子使用注册时冻结的 validation_horizons；
          - 仅当治理配置显式声明该因子家族时，使用冻结的 family_horizons。
-      2. 显式持有期模式 (periods_override=[1,5,10,20,40]):
+      2. 显式预测期模式 (periods_override=[1,5,10,20,40]):
          - 仅允许因子注册契约与显式集合完全一致的同质批次
          - 不允许用该参数扩大或缩小冻结的因子内假设家族
       3. 共同周期对照模式 (common_horizon=1/5/...):
@@ -994,7 +1022,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     使用 Newey-West HAC 调整 t 统计量.
 
     Args:
-        periods_override: 显式持有期列表 (周期数). None 表示使用冻结注册契约.
+        periods_override: 显式预测期列表 (周期数). None 表示使用冻结注册契约.
         frequency: 周期单位 ("daily"/"1min"/"5min"/"15min"/"30min"/"hourly").
                    非日度研究通过 FrequencyDataProvider 使用真实 bar 索引。
     """
@@ -1104,8 +1132,14 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     factor_training_bars: dict[str, int] = {}
     factor_training_days: dict[str, int] = {}
     factor_requires_training_contract: dict[str, bool] = {}
+    factor_history_days: dict[str, int] = {}
     for factor_name in all_factors:
         factor = registry_get("factor", factor_name)()
+        history_days = int(getattr(factor, "warmup_trading_days", 0) or 0)
+        if history_days < 0 or (history_days and not period_ctx.is_daily):
+            raise ValueError("warmup_trading_days requires non-negative daily history")
+        if history_days:
+            factor_history_days[factor_name] = history_days
         declared = validate_factor_contract(
             factor,
             provider_frequency=period_ctx.unit.value,
@@ -1139,7 +1173,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
 
     print("=" * 60)
-    print(f"因子多持有期冻结契约筛选 ({len(all_factors)} 个)")
+    print(f"因子多预测期冻结契约筛选 ({len(all_factors)} 个)")
     print("=" * 60)
     print(f"  配置文件: {config_path}")
     print(f"  因子计算区间: {factor_start.date()} ~ {ic_end.date()} (含预热)")
@@ -1151,19 +1185,19 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     print(f"  周期单位: {period_ctx.unit.value} (1个周期 = "
           f"{period_ctx.bars_per_day}个bar/交易日)")
 
-    # 持有期选取模式
+    # 预测期选取模式
     if common_horizon is not None:
         print(
-            f"  持有期模式: 共同周期对照 H={common_horizon}，"
+            f"  预测期模式: 共同周期对照 H={common_horizon}，"
             "不改变因子注册契约"
         )
     elif periods_override is not None:
         print(
-            f"  持有期模式: 冻结显式列表 {periods_override} "
+            f"  预测期模式: 冻结显式列表 {periods_override} "
             "(必须与每个因子契约完全一致)"
         )
     else:
-        print("  持有期模式: 因子/家族冻结 validation_horizons")
+        print("  预测期模式: 因子/家族冻结 validation_horizons")
 
     # 适配性输出只作为部署元数据，不能预先缩小发现阶段的假设家族。
     adaptivity_data = _load_adaptivity_data(adaptivity_file)
@@ -1178,7 +1212,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         print("  适配性研究: 未指定有效输入文件，使用冻结因子/家族契约")
         print()
 
-    # 按窗口分组 (仍需要窗口信息用于结果展示, 即使持有期被覆盖)
+    # 按窗口分组 (仍需要窗口信息用于结果展示, 即使预测期被覆盖)
     window_groups: dict[str, list[str]] = {}
     for f in all_factors:
         w = _infer_window(f)
@@ -1235,16 +1269,26 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             )
     print(f"交易日历: {len(calendar)} 天, universe: {len(universe)} 品种")
 
-    # 预计算各持有期的 forward returns
+    history_calendar = calendar
+    if factor_history_days:
+        history_days = max(factor_history_days.values())
+        extended = pd.DatetimeIndex(data_mgr.get_calendar(
+            factor_start - pd.Timedelta(days=history_days * 2 + 366), ic_end
+        )).sort_values().unique()
+        start = max(0, extended.searchsorted(calendar[0]) - history_days)
+        history_calendar = extended[start:]
+        print(f"  声明计算历史: 最早 {history_calendar[0].date()}；仅扩展长历史因子")
+
+    # 预计算各预测期的 forward returns
     print("\n预计算 forward returns...")
     processing_context = build_processing_context(
         data_mgr,
-        calendar,
+        history_calendar,
         universe,
         runner.config.universe_selection,
     )
     fwd_returns_by_period: dict[int, pd.DataFrame] = {}
-    # 持有期集合: 显式模式 → periods_override; 默认模式 → 各冻结契约并集
+    # 预测期集合: 显式模式 → periods_override; 默认模式 → 各冻结契约并集
     all_periods = sorted({
         period
         for factor_name in all_factors
@@ -1259,7 +1303,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 processing_context.eligibility
             )
         fwd_returns_by_period[p] = forward_returns
-    print(f"  持有期 (周期数): {all_periods}")
+    print(f"  预测期 (周期数): {all_periods}")
 
     # Stream each factor batch through inference, then release its matrices.
     # This keeps census peak memory bounded by the batch size.
@@ -1273,7 +1317,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "version": 1,
         "config_sha256": canonical_config_hash(runner.config),
         "code_sha256": source_tree_hash(Path(_PROJECT_ROOT)),
-        "data_sha256": _research_data_fingerprint(source, factor_start, ic_end),
+        "data_sha256": _research_data_fingerprint(
+            source, history_calendar[0] if factor_history_days else factor_start, ic_end
+        ),
         "factors": list(all_factors),
         "factor_start": factor_start.isoformat(),
         "ic_start": ic_start.isoformat(),
@@ -1294,6 +1340,9 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         "research_role": research_role,
         **factor_kernel_contract(),
     }
+    if factor_history_days:
+        checkpoint_contract["factor_history_trading_days"] = factor_history_days
+        checkpoint_contract["data_history_start"] = history_calendar[0].isoformat()
     research_contract = {
         key: value for key, value in checkpoint_contract.items()
         if key != "factors"
@@ -1354,6 +1403,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             clear_intraday_caches=intraday_daily_scan,
             performance=batch_profile,
             phase="discovery_compute",
+            history_calendar=history_calendar, history_days=factor_history_days,
         )
         compute_seconds = time.perf_counter() - compute_started
         processing_started = time.perf_counter()
@@ -1580,7 +1630,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     # 筛选显著因子 (业界标准筛选流程)
     # 正式门槛由层级 FDR、|IC|/|t|、预声明方向和后置交易属性共同治理。
 
-    # 第一阶段: 对每个预声明因子×持有期×预处理版本的原始单因子
+    # 第一阶段: 对每个预声明因子×预测期×预处理版本的原始单因子
     # 逐日截面 IC 序列的 HAC p 值执行层级 FDR。OLS/HAC 只保留为诊断；
     # Ridge 尚未参与，也不产生筛选 p 值。
     discovery_audit = _apply_hierarchical_discovery(results, policy)
@@ -1654,12 +1704,12 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     if rejected_by_quality:
         print(f"  经济质量门槛淘汰: {len(rejected_by_quality)} 个 (t显著但IC/命中率不达标)")
     print("=" * 80)
-    print(f"\n按最优持有期分组:")
+    print(f"\n按最佳预测期证据分组（不等于调仓或持有期）:")
     for p in sorted(by_period.keys()):
         print(f"  {p}日: {len(by_period[p])} 个")
 
     print(f"\n显著因子清单 (按 |t| 降序, 含适配性信息):")
-    print(f"{'#':>3} {'因子名':<35} {'窗口':>5} {'持有期':>5} {'t值':>7} {'阈值':>7} {'IC':>8} {'IR':>6} {'命中率':>6} {'最佳板块':>8} {'有效板块数':>8}")
+    print(f"{'#':>3} {'因子名':<35} {'窗口':>5} {'预测期':>5} {'t值':>7} {'FWER参考t':>7} {'IC':>8} {'IR':>6} {'命中率':>6} {'最佳板块':>8} {'有效板块数':>8}")
     print("-" * 115)
     for i, r in enumerate(significant, 1):
         best_sec = r.get("adaptivity_best_sector", "") or "-"
@@ -1700,6 +1750,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             clear_intraday_caches=intraday_daily_scan,
             performance=post_profile,
             phase="post_gate_compute",
+            history_calendar=history_calendar, history_days=factor_history_days,
         )
         post_compute_seconds = time.perf_counter() - post_started
         post_processing_started = time.perf_counter()
@@ -1983,7 +2034,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             r for r in economically_eligible if r.get("observation_channel", False)
         ]
         print(
-            f"\n进入WF候选: {len(final_factors)} 个 "
+            f"\n通过后置门槛（尚未登记或组合验证）: {len(final_factors)} 个 "
             f"(样本不足观察 {len(sample_observations)} 个，全部观察标记 "
             f"{len(observations)} 个，硬门槛淘汰 "
             f"{len(rejected_final)} 个)"
@@ -2136,11 +2187,11 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
     os.unlink(checkpoint_path)
     print(f"\n结果已保存: {out_path}")
 
-    # 输出 YAML 配置片段 (优先用 final_factors, 若后置检验未运行则回退 significant)
+    # 展示预测期证据分组；不生成策略配置、不指定持仓期。
     yaml_source = final_factors if significant and final_factors else significant
-    print("\n=== config/default.yaml 子组合配置片段 ===")
+    print("\n=== best_period 证据分组（仅展示，不写入策略配置） ===")
     print(f"# (基于 {'final_factors' if final_factors else 'significant_factors'})")
-    print("# 含适配性研究标注 (best_sector / valid_sectors)")
+    print("# 含适配性研究标注 (best_sector / valid_sectors)；不是有效库入库回执")
     short_factors = [r for r in yaml_source if r["best_period"] in (3, 5)]
     mid_factors = [r for r in yaml_source if r["best_period"] in (10,)]
     long_factors = [r for r in yaml_source if r["best_period"] in (20, 40)]
@@ -2154,13 +2205,13 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             return f"  - {name}  # best_sector={best_sec}, valid={valid_secs}"
         return f"  - {name}"
 
-    print(f"\n# 短期子组合 ({len(short_factors)}个, 3-5日持有期):")
+    print(f"\n# H3/H5 证据组 ({len(short_factors)}个, 3-5个信号周期):")
     for r in short_factors:
         print(_format_factor_line(r))
-    print(f"\n# 中期子组合 ({len(mid_factors)}个, 10日持有期):")
+    print(f"\n# H10 证据组 ({len(mid_factors)}个, 10个信号周期):")
     for r in mid_factors:
         print(_format_factor_line(r))
-    print(f"\n# 长期子组合 ({len(long_factors)}个, 20-40日持有期):")
+    print(f"\n# H20/H40 证据组 ({len(long_factors)}个, 20-40个信号周期):")
     for r in long_factors:
         print(_format_factor_line(r))
 
@@ -2346,10 +2397,10 @@ def main():
         help="可选注册类模块前缀；例如 factors.library.intraday")
     parser.add_argument(
         "--multi-period", action="store_true",
-        help="按每个因子的冻结validation_horizons执行多持有期筛选（周期数语义）")
+        help="按每个因子的冻结validation_horizons执行多预测期筛选（周期数语义）")
     parser.add_argument(
         "--periods", default=None,
-        help="显式指定持有期列表 (逗号分隔, 周期数语义), 如 '1,5,10,20,40'. "
+        help="显式指定预测期列表 (逗号分隔, 周期数语义), 如 '1,5,10,20,40'. "
              "仅用于注册 horizon 契约完全相同的冻结因子批次；与任一因子契约不一致即拒绝. "
              "需配合 --multi-period 使用")
     parser.add_argument(
@@ -2562,7 +2613,7 @@ def main():
             except ValueError as exc:
                 parser.error(str(exc))
         if args.multi_period:
-            # 解析 --periods (显式持有期列表, 可选)
+            # 解析 --periods (显式预测期列表, 可选)
             periods_override = parse_holding_periods(args.periods)
             _run_multi_period_screening(
                 runner, selected_factors, config_path, args.t_threshold,
@@ -2574,7 +2625,7 @@ def main():
                 research_role=args.research_role,
             )
         else:
-            # 单持有期模式: 同步配置日期
+            # 单预测期模式: 同步配置日期
             runner.config.date_range.start = str(ic_start.date())
             runner.config.date_range.end = str(ic_end.date())
             _run_screening(

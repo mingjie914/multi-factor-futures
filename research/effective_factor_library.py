@@ -130,12 +130,10 @@ def admit_validation_run(
         raise ValueError("validation summary has an invalid admission scope")
     if str(contract.get("scope", "")) != scope:
         raise ValueError("validation contract and summary admission scopes disagree")
-    if scope == "all_registered_intraday":
-        # The library command is intentionally lightweight and does not load the
-        # factor module through the research runner.  Load it here so raw-bar
-        # metadata comes from the same registered implementations that were
-        # validated, rather than from a hard-coded library default.
-        importlib.import_module("factors.library.intraday")
+    # Both full-pool and explicit-batch commands may start in a fresh process.
+    # Load ordinary factors so a daily/5min input cannot silently become 1min.
+    # This does not start or import the GP/SPEC mining entrypoints.
+    importlib.import_module("factors.library.intraday")
     contract_files = contract.get("files", {})
     required_files = {
         "factor_validation_full.csv",

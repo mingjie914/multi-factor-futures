@@ -5,6 +5,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from research.effective_factor_library import (
     admit_validation_run,
     effective_factor_names,
@@ -21,7 +23,23 @@ def test_shipped_library_contains_native_migrations_and_period_annotation():
 
     root = Path(__file__).resolve().parents[1]
     records = load_library(root / "factor_library/library.json")["factors"]
-    assert len(records) == 167
+    assert len(records) == 188
+    gap_batch = [r for r in records if r["source_run"] == "20260914_gap12_admission"]
+    assert len(gap_batch) == 1
+    assert gap_batch[0]["factor"] == "intraday_sector_upside_oi_confirmation_20d"
+    assert gap_batch[0]["best_period"] == 20
+    assert gap_batch[0]["direction"] == 1
+    assert gap_batch[0]["input_bar_frequency"] == "daily"
+    assert gap_batch[0]["signal_frequency"] == "daily"
+    assert gap_batch[0]["status"] == "effective"
+    appended = [r for r in records if r["source_run"] == "20260914_intraday98_admission"]
+    assert len(appended) == 20
+    assert sum(r["input_bar_frequency"] == "1min" for r in appended) == 18
+    assert sum(r["input_bar_frequency"] == "daily" for r in appended) == 2
+    for row in appended:
+        assert get("factor", row["factor"]).input_bar_frequency == row["input_bar_frequency"]
+        assert row["signal_frequency"] == "daily"
+        assert row["status"] == "effective"
     migrated = [r for r in records if r["source_run"] == "20260910_intraday_structure_migration"]
     assert len(migrated) == 13
     assert all(r["factor"].startswith("intraday_") for r in migrated)
@@ -46,11 +64,20 @@ def test_shipped_library_contains_native_migrations_and_period_annotation():
         assert all(str(by_name[row["factor"]].get(key, "")) == value for key, value in row.items())
 
 
-def test_validation_run_admission_creates_structured_library(tmp_path):
+@pytest.mark.parametrize("factor_name,input_frequency", [
+    ("intraday_probe", "1min"),
+    ("intraday_sector_upside_oi_confirmation_20d", "daily"),
+    ("intraday_multiperiod_trend_vote_20d", "5min"),
+])
+def test_validation_run_admission_creates_structured_library(tmp_path, factor_name, input_frequency):
+    import subprocess
+    import sys
+    from pathlib import Path
+
     run = tmp_path / "run-1"
     run.mkdir()
     row = {
-        "factor": "intraday_probe",
+        "factor": factor_name,
         "family": "microstructure",
         "registered_horizons": "5|10|20",
         "best_period": "10",
@@ -101,7 +128,7 @@ def test_validation_run_admission_creates_structured_library(tmp_path):
             "workflow": "factor-admission-validation",
             "admission_eligible": True,
             "scope": "explicit_batch",
-            "factors": ["intraday_probe"],
+            "factors": [factor_name],
             "validation_summary_sha256": digest(summary),
             "passed_results_sha256": digest(passed),
             "files": {
@@ -115,22 +142,30 @@ def test_validation_run_admission_creates_structured_library(tmp_path):
     )
     library = tmp_path / "factor_library" / "library.json"
 
-    payload = admit_validation_run(
-        run, library, admitted_at="2026-05-15"
+    # A standalone batch admission must not depend on a previous research import.
+    subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; from research.effective_factor_library import admit_validation_run; "
+         "assert 'factors.library.intraday' not in sys.modules; "
+         "admit_validation_run(sys.argv[1], sys.argv[2], admitted_at='2026-05-15')",
+         str(run), str(library)],
+        cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True,
     )
+    payload = load_library(library)
 
-    assert payload["factors"][0]["factor"] == "intraday_probe"
+    assert payload["factors"][0]["factor"] == factor_name
+    assert payload["factors"][0]["input_bar_frequency"] == input_frequency
     assert payload["factors"][0]["best_period"] == 10
     assert "selected_period" not in payload["factors"][0]
     assert "approved_periods" not in payload["factors"][0]
     assert payload["factors"][0]["family"] == "microstructure"
     assert payload["factors"][0]["direction"] == 1
     assert payload["factors"][0]["research_cutoff"] == "2026-05-15"
-    assert effective_factor_names(library) == ["intraday_probe"]
+    assert effective_factor_names(library) == [factor_name]
     assert load_library(library)["source_run"] == "run-1"
     assert library.with_name("current.csv").is_file()
 
-    validate_effective_factor_membership(library, {10: ["intraday_probe"]})
+    validate_effective_factor_membership(library, {10: [factor_name]})
 
 
 def test_membership_validation_does_not_treat_best_period_as_holding_period(tmp_path):
