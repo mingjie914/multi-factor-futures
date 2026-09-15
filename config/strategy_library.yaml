@@ -97,7 +97,7 @@ factor_sets:
       role: historical_audit
 
   - id: multi_source_balanced
-    status: active
+    status: archived
     description: 多源稳衡；冻结成员的生产方法观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -125,7 +125,7 @@ factor_sets:
       production_approved: false
 
   - id: curve_resonance
-    status: active
+    status: archived
     description: 期限共振；冻结成员的生产方法观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -153,7 +153,7 @@ factor_sets:
       production_approved: false
 
   - id: shock_enhanced
-    status: active
+    status: archived
     description: 冲击增强；冻结成员的生产方法观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -182,7 +182,7 @@ factor_sets:
       production_approved: false
 
   - id: position_trend
-    status: active
+    status: archived
     description: 持仓趋势；冻结成员的生产方法观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -206,7 +206,7 @@ factor_sets:
       production_approved: false
 
   - id: compact_diversified
-    status: active
+    status: archived
     description: 精简多源；冻结成员的生产方法观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -227,7 +227,7 @@ factor_sets:
       production_approved: false
 
   - id: sector_volume_position
-    status: active
+    status: archived
     description: 板块量持；修复后固定观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -253,7 +253,7 @@ factor_sets:
       production_approved: false
 
   - id: seat_price_structure
-    status: active
+    status: archived
     description: 席位价形；修复后固定观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -293,6 +293,11 @@ factor_sets:
       - intraday_vol_burst_peak_cnt_20d
       - intraday_wick_symmetry_20d
     selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: compact_sector__B0
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
       source_candidate: 研究候选3（10因子）
       comparison_run: 20260912_flow_residual_repair
       research_cutoff: '2026-05-15'
@@ -300,7 +305,7 @@ factor_sets:
       production_approved: false
 
   - id: volatility_follow
-    status: active
+    status: archived
     description: 波动跟随；修复后固定观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -327,7 +332,7 @@ factor_sets:
       production_approved: false
 
   - id: structure_fusion
-    status: active
+    status: archived
     description: 结构融合；修复后固定观察候选，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
@@ -355,6 +360,252 @@ factor_sets:
       comparison_run: 20260912_flow_residual_repair
       research_cutoff: '2026-05-15'
       directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_path_bandwidth_20d":1,"intraday_permutation_entropy_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_volume_oi_price_confirm_20d":1,"intraday_vwap_band_retention_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: multi_source_resilient
+    status: active
+    description: 多源韧衡(18)；多源低回撤型；接替旧多源稳衡的主要研究席位；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_liquidity_crash_surprise_20d
+      - intraday_open_state_trend_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: A4
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_liquidity_crash_surprise_20d":-1,"intraday_open_state_trend_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: price_volume_balanced
+    status: active
+    description: 量价稳衡(16)；量价、趋势与期限结构均衡；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_liquidity_crash_surprise_20d
+      - intraday_open_state_trend_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: B3
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_liquidity_crash_surprise_20d":-1,"intraday_open_state_trend_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1}
+      production_approved: false
+
+  - id: curve_essence
+    status: active
+    description: 曲线精萃(9)；期限核心，收益效率与成本韧性；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_slope_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_wick_symmetry_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: B5
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_intensity_20d":1,"intraday_wick_symmetry_20d":1}
+      production_approved: false
+
+  - id: curve_volume_balanced
+    status: active
+    description: 曲线量衡(8)；期限与量价并重，精简风险对照；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_amt_ratio_entropy_60m_20d
+      - intraday_basis_momentum_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_wick_symmetry_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: B4
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_amt_ratio_entropy_60m_20d":1,"intraday_basis_momentum_20d":1,"intraday_flow_ret_resid_vol_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_intensity_20d":1,"intraday_wick_symmetry_20d":1}
+      production_approved: false
+
+  - id: curve_position
+    status: active
+    description: 曲线持仓(11)；期限叠加持仓信息，历史最差段较强；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_oi_quantile_range_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_wick_symmetry_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_effective188_repeat_methods
+      source_job: B1
+      source_contract_sha256: 8c88e0ddcd143eff7566d298fe899e5adb1feac2dbe338a8a0933bfc14e61c67
+      source_results_sha256: 385bdbe93af3dacffe5839b1cb28a3bd52701b7b6ea2323628527242aa2a6073
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_flow_ret_resid_vol_20d":1,"intraday_oi_quantile_range_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_wick_symmetry_20d":1}
+      production_approved: false
+
+  - id: sector_quality_balanced
+    status: active
+    description: 板块质衡(16)；板块量持增加有界成交量质量；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_volume_oi_price_confirm_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+      - intraday_volume_distribution_bounded_quality_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_incremental21_trade_buffers
+      source_job: sector_volume_position__c4abc5f92431becd
+      source_contract_sha256: e71b5e82c8b525e1832adff3c7813cfc39154610ef86862a9b861c159d280d2b
+      source_results_sha256: b7a655a4ba4123920dc62639d94288f2a4d8baa86ce09a026f15797b0863d65b
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_volume_oi_price_confirm_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1,"intraday_volume_distribution_bounded_quality_20d":1}
+      production_approved: false
+
+  - id: structure_quality_balanced
+    status: active
+    description: 结构质衡(21)；结构融合增加成交量方向质量；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_body_consistency_20d
+      - intraday_extreme_conc_20d
+      - intraday_flow_ret_resid_vol_20d
+      - intraday_path_bandwidth_20d
+      - intraday_permutation_entropy_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_sector_breadth_trend_20d
+      - intraday_sector_breadth_z_20d
+      - intraday_smart_money_v4_vol_20d
+      - intraday_term_dtws_20d
+      - intraday_term_slope_20d
+      - intraday_term_spread_vol_20d
+      - intraday_term_vol_spread_20d
+      - intraday_vol_burst_peak_cnt_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_volume_oi_price_confirm_20d
+      - intraday_vwap_band_retention_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+      - intraday_volume_distribution_direction_quality_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_incremental21_trade_buffers
+      source_job: structure_fusion__9e9c19186a3d1d6d
+      source_contract_sha256: e71b5e82c8b525e1832adff3c7813cfc39154610ef86862a9b861c159d280d2b
+      source_results_sha256: b7a655a4ba4123920dc62639d94288f2a4d8baa86ce09a026f15797b0863d65b
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_body_consistency_20d":1,"intraday_extreme_conc_20d":-1,"intraday_flow_ret_resid_vol_20d":1,"intraday_path_bandwidth_20d":1,"intraday_permutation_entropy_20d":-1,"intraday_roll_yield_dualscore_20d":-1,"intraday_sector_breadth_trend_20d":-1,"intraday_sector_breadth_z_20d":1,"intraday_smart_money_v4_vol_20d":1,"intraday_term_dtws_20d":-1,"intraday_term_slope_20d":1,"intraday_term_spread_vol_20d":1,"intraday_term_vol_spread_20d":-1,"intraday_vol_burst_peak_cnt_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_volume_oi_price_confirm_20d":1,"intraday_vwap_band_retention_20d":1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1,"intraday_volume_distribution_direction_quality_20d":1}
+      production_approved: false
+
+  - id: compact_quality_balanced
+    status: active
+    description: 精简质衡(11)；精简多源的方向质量增量，偏收益改进；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_term_dtws_20d
+      - intraday_term_spread_vol_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+      - intraday_volume_distribution_direction_quality_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_incremental21_trade_buffers
+      source_job: compact_diversified__9e9c19186a3d1d6d
+      source_contract_sha256: e71b5e82c8b525e1832adff3c7813cfc39154610ef86862a9b861c159d280d2b
+      source_results_sha256: b7a655a4ba4123920dc62639d94288f2a4d8baa86ce09a026f15797b0863d65b
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_term_dtws_20d":-1,"intraday_term_spread_vol_20d":1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1,"intraday_volume_distribution_direction_quality_20d":1}
+      production_approved: false
+
+  - id: compact_liquidity_stable
+    status: active
+    description: 精简流稳(10)；以流动性脆弱异常增量替代价差波动率，偏回撤改善；冻结观察候选，非实盘批准。
+    factors:
+      - intraday_basis_momentum_20d
+      - intraday_downside_path_concentration_20d
+      - intraday_path_bandwidth_20d
+      - intraday_roll_yield_dualscore_20d
+      - intraday_term_dtws_20d
+      - intraday_vol_burst_intensity_20d
+      - intraday_vol_oi_corr_20d
+      - intraday_wick_symmetry_20d
+      - vp_corr_intraday_eod
+      - intraday_liquidity_crash_surprise_20d
+    selection_context:
+      source_run: runs/portfolio_factor_search/20260914_incremental21_trade_buffers
+      source_job: compact_diversified__46f36de7c8b4984a
+      source_contract_sha256: e71b5e82c8b525e1832adff3c7813cfc39154610ef86862a9b861c159d280d2b
+      source_results_sha256: b7a655a4ba4123920dc62639d94288f2a4d8baa86ce09a026f15797b0863d65b
+      retained_at: '2026-09-15'
+      research_cutoff: '2026-05-15'
+      directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_term_dtws_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1,"intraday_liquidity_crash_surprise_20d":-1}
       production_approved: false
 
 strategies:
@@ -421,7 +672,7 @@ strategies:
 
   - id: multi_source_balanced
     name: 多源稳衡(17)
-    status: preferred
+    status: archived
     source: effective_library
     factor_set_id: multi_source_balanced
     config_path: config/default.yaml
@@ -430,7 +681,7 @@ strategies:
 
   - id: curve_resonance
     name: 期限共振(17)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: curve_resonance
     config_path: config/default.yaml
@@ -439,7 +690,7 @@ strategies:
 
   - id: shock_enhanced
     name: 冲击增强(18)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: shock_enhanced
     config_path: config/default.yaml
@@ -448,7 +699,7 @@ strategies:
 
   - id: position_trend
     name: 持仓趋势(13)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: position_trend
     config_path: config/default.yaml
@@ -457,7 +708,7 @@ strategies:
 
   - id: compact_diversified
     name: 精简多源(10)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: compact_diversified
     config_path: config/default.yaml
@@ -466,7 +717,7 @@ strategies:
 
   - id: sector_volume_position
     name: 板块量持(15)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: sector_volume_position
     config_path: config/default.yaml
@@ -475,7 +726,7 @@ strategies:
 
   - id: seat_price_structure
     name: 席位价形(15)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: seat_price_structure
     config_path: config/default.yaml
@@ -493,7 +744,7 @@ strategies:
 
   - id: volatility_follow
     name: 波动跟随(16)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: volatility_follow
     config_path: config/default.yaml
@@ -502,9 +753,90 @@ strategies:
 
   - id: structure_fusion
     name: 结构融合(20)
-    status: observing
+    status: archived
     source: effective_library
     factor_set_id: structure_fusion
     config_path: config/default.yaml
     mode: single
     description: 结构融合；20因子，共享默认生产方法参数；仅观察，不替换默认。
+
+  - id: multi_source_resilient
+    name: 多源韧衡(18)
+    status: preferred
+    source: effective_library
+    factor_set_id: multi_source_resilient
+    config_path: config/default.yaml
+    mode: single
+    description: 多源低回撤型；接替旧多源稳衡的主要研究席位；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: price_volume_balanced
+    name: 量价稳衡(16)
+    status: observing
+    source: effective_library
+    factor_set_id: price_volume_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 量价、趋势与期限结构均衡；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: curve_essence
+    name: 曲线精萃(9)
+    status: observing
+    source: effective_library
+    factor_set_id: curve_essence
+    config_path: config/default.yaml
+    mode: single
+    description: 期限核心，收益效率与成本韧性；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: curve_volume_balanced
+    name: 曲线量衡(8)
+    status: observing
+    source: effective_library
+    factor_set_id: curve_volume_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 期限与量价并重，精简风险对照；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: curve_position
+    name: 曲线持仓(11)
+    status: observing
+    source: effective_library
+    factor_set_id: curve_position
+    config_path: config/default.yaml
+    mode: single
+    description: 期限叠加持仓信息，历史最差段较强；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: sector_quality_balanced
+    name: 板块质衡(16)
+    status: observing
+    source: effective_library
+    factor_set_id: sector_quality_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 板块量持增加有界成交量质量；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: structure_quality_balanced
+    name: 结构质衡(21)
+    status: observing
+    source: effective_library
+    factor_set_id: structure_quality_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 结构融合增加成交量方向质量；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: compact_quality_balanced
+    name: 精简质衡(11)
+    status: observing
+    source: effective_library
+    factor_set_id: compact_quality_balanced
+    config_path: config/default.yaml
+    mode: single
+    description: 精简多源的方向质量增量，偏收益改进；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+
+  - id: compact_liquidity_stable
+    name: 精简流稳(10)
+    status: observing
+    source: effective_library
+    factor_set_id: compact_liquidity_stable
+    config_path: config/default.yaml
+    mode: single
+    description: 以流动性脆弱异常增量替代价差波动率，偏回撤改善；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。

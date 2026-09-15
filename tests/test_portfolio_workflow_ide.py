@@ -42,7 +42,40 @@ def test_shipped_legacy_definitions_are_portable():
         if entry.id in historical:
             assert entry.status == "archived"
             assert entry.name.endswith("*")
-    assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_balanced"]
+    assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_resilient"]
+
+
+def test_retained_catalog_has_frozen_members_and_default_off_buffer():
+    catalog = load_strategy_library("config/strategy_library.yaml")
+    sets = {s.id: s for s in catalog.factor_sets}
+    expected = {
+        "compact_sector": 10, "multi_source_resilient": 18,
+        "price_volume_balanced": 16, "curve_essence": 9,
+        "curve_volume_balanced": 8, "curve_position": 11,
+        "sector_quality_balanced": 16, "structure_quality_balanced": 21,
+        "compact_quality_balanced": 11, "compact_liquidity_stable": 10,
+    }
+    active = [s for s in catalog.strategies if s.status != "archived"]
+    assert {s.id for s in active} == set(expected)
+    library = json.loads(Path(catalog.effective_factor_library).read_text(encoding="utf-8"))
+    effective = {r["factor"]: r for r in library["factors"] if r["status"] == "effective"}
+    union = set()
+    for strategy in active:
+        subset = sets[strategy.factor_set_id]
+        context = subset.selection_context
+        assert subset.status == "active"
+        assert strategy.name.endswith(f"({expected[strategy.id]})")
+        assert len(subset.factors) == expected[strategy.id]
+        assert context["directions"] == {n: effective[n]["direction"] for n in subset.factors}
+        assert context["research_cutoff"] == "2026-05-15"
+        assert context["production_approved"] is False
+        assert len(context["source_results_sha256"]) == 64
+        assert getattr(strategy, "rank_exit_buffer", None) in (None, 0)
+        union.update(subset.factors)
+    assert len(union) == 29
+    assert load_config("config/default.yaml").production_portfolio.rank_exit_buffer == 0
+    assert sets["multi_source_balanced"].status == "archived"
+    assert len(sets["multi_source_balanced"].factors) == 17
 
 
 @pytest.mark.parametrize("count", [9, 20])
@@ -197,9 +230,9 @@ def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
     _, catalog, selected = ide._validated_specs()
     assert len(selected) == 1
-    assert selected[0][0].id == "multi_source_balanced"
-    assert selected[0][0].name == "多源稳衡(17)"
-    assert len(selected[0][2].factors) == 17
+    assert selected[0][0].id == "multi_source_resilient"
+    assert selected[0][0].name == "多源韧衡(18)"
+    assert len(selected[0][2].factors) == 18
     assert selected[0][2].factor_library.enforce_effective_membership
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
     _, _, peers = ide._validated_specs()
