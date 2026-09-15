@@ -16,7 +16,7 @@ import re
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, StrictBool, conint
 
 from core.sectors import require_framework_universe
 
@@ -494,6 +494,9 @@ class StrategyLibraryEntry(StrictConfigModel):
     id: str
     name: str = ""
     status: Literal["preferred", "observing", "archived"] = "observing"
+    # User-designated formal strategy, not target-publication/order approval.
+    # Independent of the single preferred/default choice; multiple may be formal.
+    formal: StrictBool = False
     source: Literal["effective_library", "legacy_observation"] = "effective_library"
     factor_set_id: str = ""
     # Optional frozen definition for a historical observation strategy.
@@ -680,6 +683,8 @@ def load_strategy_library(path: str) -> StrategyLibraryConfig:
     if len(preferred) > 1:
         raise ValueError(f"strategy library has multiple preferred strategies: {preferred}")
     for entry in catalog.strategies:
+        if entry.formal and (entry.status == "archived" or entry.source != "effective_library"):
+            raise ValueError(f"formal strategy {entry.id!r} must be active and effective-library backed")
         if entry.source == "effective_library":
             if entry.factor_set_id not in factor_sets:
                 raise ValueError(

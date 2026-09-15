@@ -2,9 +2,10 @@
 
 The readable strategy library names parallel factor subsets and strategies;
 each strategy points to a method YAML; shared-default subsets live in the catalog.
-``RUN_PREFERRED`` runs the unique preferred observation strategy by default.
-``RUN_AND_COMPARE`` compares active peers: only the factor set varies and every
-selected strategy uses the single configured production recipe. The explicit
+``RUN_PREFERRED`` runs the unique preferred strategy for backtest/observation.
+The catalog's formal designation does not authorize target publication or orders.
+``RUN_AND_COMPARE`` compares active peers using the shared production recipe
+plus the catalog's explicit per-strategy rank buffer. The explicit
 ``RUN_AND_COMPARE_CONFIGURED`` branch is reserved for deliberate
 model/optimizer comparisons from each strategy YAML.
 """
@@ -37,8 +38,7 @@ from research.effective_factor_library import (
 class PortfolioWorkflow(Enum):
     VALIDATE_CONFIGURATIONS = "validate_configurations"
     RUN_PREFERRED = "run_preferred"
-    # Default comparison route: only the factor subset varies; every selected
-    # strategy uses config/default.yaml::production_portfolio.
+    # Shared base recipe; members and explicit catalog rank buffers may differ.
     RUN_AND_COMPARE = "run_and_compare"
     # Explicit challenger route: honor each strategy YAML's configured model,
     # risk and optimizer instead of the production recipe.
@@ -46,7 +46,7 @@ class PortfolioWorkflow(Enum):
     # Explicitly rerun archived 6f/8f/13f definitions through the current
     # production ledger without adding them to ordinary peer comparisons.
     RUN_AND_COMPARE_SNAPSHOT_AUDIT = "run_and_compare_snapshot_audit"
-    # Compare non-archived catalog peers under the same production recipe.
+    # Compare non-archived catalog peers under the shared base recipe.
     RUN_AND_COMPARE_ALL = "run_and_compare_all"
     # Explicit research-pool comparison: common-H5 passed factors are routed
     # through the same default production recipe as the ordinary peers.  This
@@ -305,17 +305,20 @@ def _validated_specs():
         ):
             raise ValueError(
                 f"strategy {strategy.id!r} overrides production_portfolio; "
-                "default comparison changes factor sets only"
+                "default comparison permits only catalog members and rank buffer overrides"
             )
         if strategy.rank_exit_buffer is not None:
             config.production_portfolio.rank_exit_buffer = strategy.rank_exit_buffer
         validate_rank_buffer_route(config, actual_holdings_supported=(
             WORKFLOW is not PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED
         ))
-        if (default_production is not None
-                and WORKFLOW not in {PortfolioWorkflow.RUN_PREFERRED, PortfolioWorkflow.VALIDATE_CONFIGURATIONS}
-                and _config_dict(config.production_portfolio) != _config_dict(default_production)):
-            raise ValueError("rank_exit_buffer differs across the default same-production_portfolio comparison; use an explicit native study")
+        # The base recipe was checked above, before this single catalog override.
+        # Native peer comparisons may use adopted buffers; other recipe changes
+        # and routes without actual holdings remain rejected.
+        if default_production is not None:
+            STRATEGY_LABELS[strategy.id] = (
+                f"{strategy.name or strategy.id} [B{config.production_portfolio.rank_exit_buffer}]"
+            )
         assignments = _assignments(config, strategy.mode)
         configured_factors = set().union(*map(set, assignments.values()))
         if strategy.source == "effective_library":
@@ -648,10 +651,11 @@ def _run_production_portfolio(
 ):
     """Run a factor set through the shared configured production ledger.
 
-    ``config/default.yaml`` remains the single source for the recipe, while
+    ``config/default.yaml`` owns the base recipe; the catalog owns its narrow
+    rank-buffer override, while
     the generic model/risk PipelineRunner remains available for the explicit
     configured-candidate route.  The default IDE comparison calls this helper
-    for every selected peer, so only the factor subset changes.
+    for every selected peer without changing construction or execution engines.
     """
     from backtest.engine import BacktestResult
     from backtest.metrics import compute_all_metrics
@@ -676,7 +680,7 @@ def _run_production_portfolio(
     panel_start = start - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS)
     factors = list(config.factors)
     # Catalog validation resolves the narrow per-strategy buffer override and
-    # enforces equal recipes for default comparisons. Never reload and erase it.
+    # enforces equal base recipes. Never reload and erase the resolved override.
     validate_rank_buffer_route(config, actual_holdings_supported=True)
     production_config = config
     recipe = _legacy_recipe(production_config)
@@ -862,7 +866,8 @@ def _write_segment_report(
             (
                 "- 本次默认生产方法比较中，所有选定策略均采用 "
                 "config/default.yaml::production_portfolio 的同一默认方法："
-                "因子加权、选池、板块上限、品种分配及敞口参数以运行合同为准；只改变因子集合。"
+                "因子加权、选池、板块上限、品种分配及敞口参数保持一致；"
+                "成员与策略目录显式排名缓冲可不同，不是纯因子集消融；参数以运行合同为准。"
             )
             if production_method_compare and int(ic_horizon) == 1
             else (
@@ -876,6 +881,10 @@ def _write_segment_report(
             )
         ),
         "- `research_through_cutoff`：用于查看研究截止日前的历史表现。",
+        "- 已解析排名缓冲：" + "；".join(
+            f"{getattr(strategy, 'name', None) or strategy.id}=B{config.production_portfolio.rank_exit_buffer}"
+            for strategy, _, config in strategy_results
+        ),
         f"- `forward_observation_after_cutoff`：{cutoff.date().isoformat()} 之后的数据，仅作为确定组合的真实环境观察。",
         "- 信号时序：T 日收盘形成目标，下一交易日生效；收益按前一日有效权重乘 T 日收盘到收盘收益。",
         "- 价格口径：因子与连续收益使用因果的点时主连比例后复权价格；交易转换单独使用具体合约计划计量换手和换月成本。",

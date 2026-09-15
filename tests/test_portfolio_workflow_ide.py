@@ -17,6 +17,14 @@ from core.config import (
 )
 from core.sectors import FRAMEWORK_UNIVERSE
 
+RETAINED_BUFFERS = {
+    "compact_sector": 1, "multi_source_resilient": 1,
+    "price_volume_balanced": 0, "curve_essence": 1,
+    "curve_volume_balanced": 2, "curve_position": 0,
+    "sector_quality_balanced": 0, "structure_quality_balanced": 0,
+    "compact_quality_balanced": 0, "compact_liquidity_stable": 1,
+}
+
 
 def test_frozen_json_definition_loads_without_executing_python(tmp_path):
     definition = tmp_path / "members.json"
@@ -45,7 +53,7 @@ def test_shipped_legacy_definitions_are_portable():
     assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_resilient"]
 
 
-def test_retained_catalog_has_frozen_members_and_default_off_buffer():
+def test_retained_catalog_has_frozen_members_and_adopted_buffers():
     catalog = load_strategy_library("config/strategy_library.yaml")
     sets = {s.id: s for s in catalog.factor_sets}
     expected = {
@@ -57,6 +65,7 @@ def test_retained_catalog_has_frozen_members_and_default_off_buffer():
     }
     active = [s for s in catalog.strategies if s.status != "archived"]
     assert {s.id for s in active} == set(expected)
+    assert [s.id for s in active if s.formal] == ["multi_source_resilient"]
     library = json.loads(Path(catalog.effective_factor_library).read_text(encoding="utf-8"))
     effective = {r["factor"]: r for r in library["factors"] if r["status"] == "effective"}
     union = set()
@@ -70,7 +79,7 @@ def test_retained_catalog_has_frozen_members_and_default_off_buffer():
         assert context["research_cutoff"] == "2026-05-15"
         assert context["production_approved"] is False
         assert len(context["source_results_sha256"]) == 64
-        assert getattr(strategy, "rank_exit_buffer", None) in (None, 0)
+        assert strategy.rank_exit_buffer == RETAINED_BUFFERS[strategy.id]
         union.update(subset.factors)
     assert len(union) == 29
     assert load_config("config/default.yaml").production_portfolio.rank_exit_buffer == 0
@@ -208,13 +217,16 @@ def test_segment_report_does_not_hardcode_recipe_parameters(tmp_path):
     dates = pd.bdate_range("2026-05-14", periods=5)
     strategy = SimpleNamespace(id="probe", status="observing", factor_set_id="probe")
     combined = SimpleNamespace(nav=pd.Series([1., 1.01, 1.02, 1.01, 1.03], index=dates))
+    config = load_config("config/default.yaml")
+    config.production_portfolio.rank_exit_buffer = 1
     for production, horizon in ((True, 1), (True, 5), (False, 1)):
         ide._write_segment_report(
-            tmp_path, [(strategy, combined, None)], pd.Timestamp("2026-05-15"),
+            tmp_path, [(strategy, combined, config)], pd.Timestamp("2026-05-15"),
             production_method_compare=production, ic_horizon=horizon,
         )
         report = (tmp_path / "portfolio_report.md").read_text(encoding="utf-8")
         assert "参数以运行合同为准" in report
+        assert "probe=B1" in report
         assert "ICIR + Top10" not in report
         assert "总敞口2" not in report
 
@@ -245,6 +257,8 @@ def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     assert selected[0][0].id == "multi_source_resilient"
     assert selected[0][0].name == "多源韧衡(18)"
     assert len(selected[0][2].factors) == 18
+    assert selected[0][0].formal is True
+    assert selected[0][2].production_portfolio.rank_exit_buffer == 1
     assert selected[0][2].factor_library.enforce_effective_membership
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
     _, _, peers = ide._validated_specs()
@@ -255,6 +269,15 @@ def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     assert "snapshot_6f_icir" not in {s.id for s, _, _ in peers}
     subsets = {s.id: s for s in catalog.factor_sets}
     for strategy, _, config in peers:
+        assert config.production_portfolio.rank_exit_buffer == RETAINED_BUFFERS[strategy.id]
+        recipe = ide._legacy_recipe(config).to_dict()
+        assert recipe.pop("rank_exit_buffer") == RETAINED_BUFFERS[strategy.id]
+        base = ide._legacy_recipe(load_config("config/default.yaml")).to_dict()
+        base.pop("rank_exit_buffer")
+        recipe.pop("name")
+        base.pop("name")
+        assert recipe == base
+        assert ide._strategy_label(strategy.id).endswith(f"[B{RETAINED_BUFFERS[strategy.id]}]")
         if strategy.source == "effective_library":
             subset = subsets[strategy.factor_set_id]
             assert strategy.name.endswith(f"({len(subset.factors)})")
@@ -327,15 +350,48 @@ def test_strategy_rank_buffer_resolves_once_without_rewriting_config(tmp_path, m
     assert cfg.production_portfolio.rank_exit_buffer == global_value
 
 
-@pytest.mark.parametrize("mode", [ide.PortfolioWorkflow.RUN_AND_COMPARE, ide.PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED])
-def test_comparison_rejects_implicit_rank_buffer_route_change(tmp_path, monkeypatch, mode):
+def test_configured_comparison_rejects_rank_buffer_route_change(tmp_path, monkeypatch):
     path = _write_config(tmp_path)
     catalog_path = _write_catalog(tmp_path, path)
     catalog = load_strategy_library(catalog_path)
     catalog.strategies[0].rank_exit_buffer = 1
     monkeypatch.setattr(ide, "load_strategy_library", lambda _: catalog)
-    monkeypatch.setattr(ide, "WORKFLOW", mode)
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED)
     with pytest.raises(ValueError, match="rank_exit_buffer|production_portfolio"):
+        ide._validated_specs()
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", "false", None])
+def test_formal_designation_requires_explicit_boolean(value):
+    with pytest.raises(ValueError):
+        StrategyLibraryEntry(id="probe", config_path="strategy.yaml", formal=value)
+
+
+def test_formal_designation_is_not_publication_approval(tmp_path):
+    import yaml
+    assert StrategyLibraryEntry(id="probe", config_path="strategy.yaml").formal is False
+    assert yaml.safe_load(Path("config/target_publication.yaml").read_text(encoding="utf-8"))["enabled"] is False
+    config = _write_config(tmp_path)
+    path = _write_catalog(tmp_path, config)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "status: preferred", "status: archived\n    formal: true"), encoding="utf-8")
+    with pytest.raises(ValueError, match="formal strategy"):
+        load_strategy_library(path)
+
+
+def test_native_comparison_still_rejects_other_recipe_changes(monkeypatch):
+    original = ide.load_config
+    def changed(path):
+        config = original(path)
+        config.production_portfolio.top_n_per_side = 5
+        return config
+    # Freeze the true common recipe before simulating a differing strategy YAML.
+    default = original("config/default.yaml")
+    monkeypatch.setattr(ide, "_default_production_config", lambda: default)
+    monkeypatch.setattr(ide, "load_config", changed)
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
+    monkeypatch.setattr(ide, "STRATEGY_IDS", ())
+    with pytest.raises(ValueError, match="overrides production_portfolio"):
         ide._validated_specs()
 
 
@@ -353,7 +409,7 @@ def test_rank_buffer_rejects_other_buffer_layers_and_generic_pipeline():
         getattr(cfg, field).enabled = False
 
 
-@pytest.mark.parametrize("buffer", [0, 1])
+@pytest.mark.parametrize("buffer", [0, 1, 2])
 def test_native_portfolio_exports_actual_ledger_and_diagnoses_costs_once(tmp_path, monkeypatch, buffer):
     import numpy as np
     import optimization.costs as costs

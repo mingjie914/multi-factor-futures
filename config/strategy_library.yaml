@@ -364,7 +364,7 @@ factor_sets:
 
   - id: multi_source_resilient
     status: active
-    description: 多源韧衡(18)；多源低回撤型；接替旧多源稳衡的主要研究席位；冻结观察候选，非实盘批准。
+    description: 多源韧衡(18)的冻结成员；多源低回撤型；所属策略已获用户指定为正式主策略，非实盘批准。
     factors:
       - intraday_basis_momentum_20d
       - intraday_body_consistency_20d
@@ -739,6 +739,7 @@ strategies:
     source: effective_library
     factor_set_id: compact_sector
     config_path: config/default.yaml
+    rank_exit_buffer: 1
     mode: single
     description: 精简板块；10因子，共享默认生产方法参数；仅观察，不替换默认。
 
@@ -763,11 +764,13 @@ strategies:
   - id: multi_source_resilient
     name: 多源韧衡(18)
     status: preferred
+    formal: true
     source: effective_library
     factor_set_id: multi_source_resilient
     config_path: config/default.yaml
+    rank_exit_buffer: 1
     mode: single
-    description: 多源低回撤型；接替旧多源稳衡的主要研究席位；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+    description: 用户指定的正式主策略；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲1；默认回测与观察，交易发布及下单另行授权。
 
   - id: price_volume_balanced
     name: 量价稳衡(16)
@@ -775,6 +778,7 @@ strategies:
     source: effective_library
     factor_set_id: price_volume_balanced
     config_path: config/default.yaml
+    rank_exit_buffer: 0
     mode: single
     description: 量价、趋势与期限结构均衡；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
 
@@ -784,8 +788,9 @@ strategies:
     source: effective_library
     factor_set_id: curve_essence
     config_path: config/default.yaml
+    rank_exit_buffer: 1
     mode: single
-    description: 期限核心，收益效率与成本韧性；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+    description: 期限核心，收益效率与成本韧性；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲1；仅观察。
 
   - id: curve_volume_balanced
     name: 曲线量衡(8)
@@ -793,8 +798,9 @@ strategies:
     source: effective_library
     factor_set_id: curve_volume_balanced
     config_path: config/default.yaml
+    rank_exit_buffer: 2
     mode: single
-    description: 期限与量价并重，精简风险对照；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+    description: 期限与量价并重，精简风险对照；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲2；仅观察。
 
   - id: curve_position
     name: 曲线持仓(11)
@@ -802,6 +808,7 @@ strategies:
     source: effective_library
     factor_set_id: curve_position
     config_path: config/default.yaml
+    rank_exit_buffer: 0
     mode: single
     description: 期限叠加持仓信息，历史最差段较强；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
 
@@ -811,6 +818,7 @@ strategies:
     source: effective_library
     factor_set_id: sector_quality_balanced
     config_path: config/default.yaml
+    rank_exit_buffer: 0
     mode: single
     description: 板块量持增加有界成交量质量；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
 
@@ -820,6 +828,7 @@ strategies:
     source: effective_library
     factor_set_id: structure_quality_balanced
     config_path: config/default.yaml
+    rank_exit_buffer: 0
     mode: single
     description: 结构融合增加成交量方向质量；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
 
@@ -829,6 +838,7 @@ strategies:
     source: effective_library
     factor_set_id: compact_quality_balanced
     config_path: config/default.yaml
+    rank_exit_buffer: 0
     mode: single
     description: 精简多源的方向质量增量，偏收益改进；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
 
@@ -838,5 +848,6 @@ strategies:
     source: effective_library
     factor_set_id: compact_liquidity_stable
     config_path: config/default.yaml
+    rank_exit_buffer: 1
     mode: single
-    description: 以流动性脆弱异常增量替代价差波动率，偏回撤改善；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲默认0；仅观察。
+    description: 以流动性脆弱异常增量替代价差波动率，偏回撤改善；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲1；仅观察。
