@@ -360,6 +360,209 @@ def report(output, *, source_dir=None, catalog_path=None, factor_types=None):
     plot_sector_contributions(output, baseline, peers)
 
 
+def report_registered_trade_study(output, *, factor_types=None):
+    """Render frozen registered portfolios and trade diagnostics, without selection."""
+    from core.registry import get as registry_get
+    from research.governance import factor_family
+    from research.artifacts import sha256_file
+    from run_portfolio_workflow import _write_comparison_plot
+    from workflows.experiments.historical_portfolio_search import _plot_incremental_trade_diagnostics
+    import factors.library  # noqa: F401
+    output = Path(output)
+    contract = read_json(output / "contract.json")
+    if contract["role"] != "registered_portfolio_trade_validation":
+        raise ValueError("registered report needs a fixed-catalog trade contract")
+    peers, source = contract["peers"], contract["source"]
+    with duckdb.connect(str(output / "results.duckdb"), read_only=True) as db:
+        rows = [json.loads(r[0]) for r in db.execute("SELECT payload FROM results ORDER BY rowid").fetchall()]
+        if len(rows) != len(contract["jobs"]) or any(r["status"] != "completed" for r in rows):
+            raise ValueError("report requires every frozen trade job to complete")
+        daily = db.execute("SELECT * FROM daily ORDER BY date,job").df()
+    lookup = {(r["seed"], r["buffer"]): r for r in rows}
+    if any(not lookup[(p["id"], 0)].get("baseline_exact") for p in peers):
+        raise ValueError("all registered B0 ledgers must be exact before reporting")
+    for path, digest in {**contract["input_sha256"], **contract["code_sha256"]}.items():
+        if sha256_file(Path(path)) != digest:
+            raise ValueError(f"frozen computation input changed: {path}")
+    if _search_source_snapshot(source["panel_start"], source["end"]) != {
+            "end": source["end"], "source_fingerprint": source["source_fingerprint"]}:
+        raise ValueError("market source changed during registered trade validation")
+    names = sorted({n for p in peers for n in p["directions"]})
+    saved = output / "report_contract.json"
+    previous = read_json(saved) if saved.is_file() else {}
+    mapping = factor_types if factor_types is not None else previous.get("factor_types", {})
+    types = {n: factor_family(n, mapping) for n in names}
+    library = {r["factor"]: r for r in read_json("factor_library/library.json")["factors"]}
+    cluster_data = read_json(output / "clusters.json")
+    clusters = cluster_data["clusters"]
+    factor_corr = pd.DataFrame(cluster_data["correlation"], index=cluster_data["names"], columns=cluster_data["names"])
+    cutoff = pd.Timestamp(source["selection_end"])
+    nav, base_nav, plot_rows, stage_costs, audits = {}, {}, [], {}, []
+    baseline = {p["id"]: lookup[(p["id"], 0)] for p in peers}
+    for row in rows:
+        frame = daily.loc[daily.job == row["id"]].set_index("date").drop(columns="job")
+        np.testing.assert_allclose(frame.gross_return-frame.trade_cost-frame.holding_cost, frame.net_return, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(frame.executed_traded_notional * contract["runtime"]["costs"]["trade_cost_rate"], frame.trade_cost, rtol=0, atol=1e-12)
+        expected_nav = np.cumprod(1 + frame.net_return.to_numpy())
+        np.testing.assert_allclose(expected_nav, frame.nav_after.to_numpy()/frame.nav_before.iloc[0], rtol=0, atol=1e-11)
+        label = row["name"] + f"·B{row['buffer']}"
+        nav[label] = frame.nav_after / frame.nav_after.iloc[0]
+        if row["buffer"] == 0:
+            base_nav[row["name"]] = nav[label]
+            m = row["metrics"]["full"]
+            plot_rows.append({"strategy": row["name"], **m, "volatility": m["annual_volatility"]})
+        stage_costs[row["id"]] = []
+        for left, right in source["selection_segments"]:
+            part = frame.loc[left:right]
+            if left == source["performance_start"]:
+                part = part.iloc[1:]
+            stage_costs[row["id"]].append({"start": left, "end": right, **evaluate_cost_sensitivity(part)})
+        audits.append({"job": row["id"], "accounting": "passed", "baseline_exact": row.get("baseline_exact"),
+                       "asset_exact": row.get("asset_exact"), "risk_count_backend": row.get("risk_count_backend")})
+    _write_comparison_plot(output, pd.DataFrame(base_nav), plot_rows, cutoff=cutoff,
+        title=f"{len(peers)}组已登记备选：排名缓冲=0（{source['performance_start']}至{source['end']}）\n表内为全期指标；虚线后为模拟实盘观察，不据此重新选择")
+    _plot_incremental_trade_diagnostics(output, contract, rows, nav)
+    lines = [f"# {len(peers)}组备选策略：因子结构、成本承受力与缓冲对照", "",
+        f"固定成员回测{source['performance_start']}至{source['end']}，面板预热始于{source['panel_start']}。"
+        f"研究截止{source['selection_end']}（含），之后为已查看的模拟实盘观察，不是未见锁箱。", "",
+        "登记池已更新；本轮不再改变成员、方向、默认缓冲0、方法、费用和因子准入，不批准实盘。",
+        "lw_abs＋Top10/Bottom10＋cap3＋ERC，总敞口2倍。B0/B1/B2是实际持仓退出排名缓冲0/1/2名，不是搜索方法A/B，不是信号平滑或权重免交易区间。"
+        "B1/B2允许符合资格的原持仓在第11/12名边界内优先保留，但不是持有11/12个；每侧目标仍10个，cap及真实不可交易约束优先。",
+        "全部B0逐日账本精确复现登记来源；新缓冲通过同一原生执行模块重算。净收益已经扣费，固定路径压力采用替换费率而非重复扣费。", "",
+        "## B0表现", "", "| 策略 | 截止前年化 | 夏普 | 回撤 | 五段最差夏普 | 年换手 | 观察段累计 | 全期年化 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for p in peers:
+        m = baseline[p["id"]]["metrics"]; a = m["selection"]
+        lines.append(f"| {p['name']} | {a['annual_return']:.2%} | {a['sharpe']:.3f} | {a['max_drawdown']:.2%} | {m['robustness']['worst_sharpe']:.3f} | {a['annualized_turnover']:.2f} | {m['observation']['total_return']:.2%} | {m['full']['annual_return']:.2%} |")
+    lines += ["", "五段边界：" + "；".join(f"{a}—{b}" for a,b in source["selection_segments"]) + "。不是旧六段口径，也不是独立Walk-forward准入。", "",
+        "![零缓冲净值](nav_comparison.png)", "", "## 因子类型与总体分布", "",
+        "类型是人为经济解释标签；簇沿用188池截止前排名相关性诊断，编号不重新计算。类型/簇/品种板块互不混称。"
+        + previous.get("type_note", ""), "",
+        "| 类型 | 不重复因子数 | 不重复占比 | 成员席位数 | 席位占比 | 覆盖策略数 |", "|---|---:|---:|---:|---:|---:|"]
+    unique = Counter(types.values())
+    slots = Counter(types[n] for p in peers for n in p["directions"])
+    total = sum(slots.values())
+    for t in sorted(unique):
+        coverage = sum(any(types[n] == t for n in p["directions"]) for p in peers)
+        lines.append(f"| {t} | {unique[t]} | {unique[t]/len(names):.1%} | {slots[t]} | {slots[t]/total:.1%} | {coverage}/{len(peers)} |")
+    lines += ["", f"联合{len(names)}个不同因子，累计{total}个成员席位。同一因子进入多组只在不同因子数中记一次，在席位数中重复计数。"
+              "出现频次不是收益贡献，也不能证明未覆盖类型无效。缺失方向应先研究，再走原准入流程。", "",
+        "| 策略 | 正/负方向 | 覆盖簇数 | 近似有效维数 | 类型构成 |", "|---|---:|---:|---:|---|"]
+    for p in peers:
+        members = p["directions"]; counts = Counter(types[n] for n in members)
+        eigen = np.maximum(np.linalg.eigvalsh(factor_corr.loc[list(members), list(members)]), 0)
+        dim = float(eigen.sum()**2 / np.square(eigen).sum())
+        positive = sum(d > 0 for d in members.values())
+        lines.append(f"| {p['name']} | {positive}/{len(members)-positive} | {len({clusters[n] for n in members})} | {dim:.2f} | " + "、".join(f"{k}×{v}" for k,v in sorted(counts.items())) + " |")
+    lines += ["", "近似有效维数为相关矩阵特征值参与率，负特征值截零，不是独立因子数，亦非越高越好。", "",
+        "![类型分布](factor_distribution.png)", "", "## 逐因子使用分布", "",
+        "| 因子 | 说明 | 类型 | 簇 | 输入bar | 证据期 | 方向 | 使用组合 |", "|---|---|---|---:|---|---:|---:|---|"]
+    for n in names:
+        record = library[n]; cls = registry_get("factor", n)
+        lines.append(f"| `{n}` | {cls.description} | {types[n]} | C{clusters[n]} | {record['input_bar_frequency']} | H{record['best_period']} | {int(record['direction']):+d} | " +
+                     "、".join(p["name"] for p in peers if n in p["directions"]) + " |")
+    common = sorted(set.intersection(*(set(p["directions"]) for p in peers)))
+    lines += ["", "全部组合共同包含：" + "、".join(f"`{n}`" for n in common) + "。"
+              "因此十组不是十个相互独立的收益源；共享成员的模型风险仍需关注，不能以策略数量替代分散度。",
+              "", "best_period仅作准入证据标签；不改变日度更新、持有或缓冲规则。以下分组再次列明成员以便按策略阅读。", ""]
+    for p in peers:
+        lines += [f"### {p['name']}", ""]
+        for t in sorted({types[n] for n in p["directions"]}):
+            lines.append(f"- {t}：" + "、".join(f"`{n}`（C{clusters[n]}，{d:+d}）" for n,d in p["directions"].items() if types[n] == t))
+        lines.append("")
+    lines += ["## 缓冲与成本承受力", "",
+        "1/2/3/4/6/8bp完整交易费率在每条已执行路径上替换，持有费用不变；这是固定路径敏感性，"
+        "没有在每个费率下再优化仓位，不代表报价价差、冲击、参与率、容量或保证金账户验证。",
+        "判断整体净表现、风险阶段和成本余量，不以降低换手为唯一目的；允许小幅可解释退步，不自动采纳。", "",
+        "| 策略 | 缓冲 | 净年化 | 相对B0变化(pp) | 夏普 | 回撤 | 最差段夏普 | 年换手 | 4bp年化 | 8bp年化 | 平衡费率bp | 观察段累计 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for p in peers:
+        b = baseline[p["id"]]["metrics"]["selection"]
+        for buffer in (0, 1, 2):
+            row = lookup[p["id"], buffer]; m = row["metrics"]; a=m["selection"]
+            sensitivity = a["cost_sensitivity"]
+            costs = {round(s["trade_cost_rate"]*10000): s["metrics"]["annual_return"] for s in sensitivity["scenarios"]}
+            be = sensitivity["breakeven_trade_cost_rate"]
+            be_label = "不可定义" if be is None else f"{be*10000:.2f}"
+            lines.append(f"| {p['name']} | {buffer} | {a['annual_return']:.2%} | {100*(a['annual_return']-b['annual_return']):+.2f} | {a['sharpe']:.3f} | {a['max_drawdown']:.2%} | {m['robustness']['worst_sharpe']:.3f} | {a['annualized_turnover']:.2f} | {costs[4]:.2%} | {costs[8]:.2%} | {be_label} | {m['observation']['total_return']:.2%} |")
+    lines += ["", "### 缓冲改善的算术对账", "",
+        "以下为252×日均收益变化（百分点/年），不是复利年化之差。"
+        "净变化＝毛收益变化＋交易费节省＋持有费节省；不把已扣成本再扣一次。", "",
+        "| 策略 | 缓冲 | 毛收益变化 | 交易费节省 | 持有费节省 | 净变化 |", "|---|---:|---:|---:|---:|---:|"]
+    for p in peers:
+        control = daily.loc[(daily.job == p["id"]+"__B0") & (daily.date <= cutoff)].iloc[1:]
+        columns = ["gross_return", "trade_cost", "holding_cost", "net_return"]
+        for buffer in (1, 2):
+            actual = daily.loc[(daily.job == p["id"]+f"__B{buffer}") & (daily.date <= cutoff)].iloc[1:]
+            np.testing.assert_array_equal(control.date.to_numpy(), actual.date.to_numpy())
+            gross, trade, hold, net = (actual[columns].mean()-control[columns].mean()).to_numpy()*252
+            np.testing.assert_allclose(gross-trade-hold, net, rtol=0, atol=1e-12)
+            lines.append(f"| {p['name']} | {buffer} | {gross*100:+.3f} | {-trade*100:+.3f} | {-hold*100:+.3f} | {net*100:+.3f} |")
+    lines += ["", "![缓冲效果](buffer_effects.png)", "", "![逐组缓冲净值](buffer_nav.png)", "",
+        "![成本压力](cost_curves.png)", "", "## 分段风险与换手来源", "",
+        "各段各费率的完整夏普、回撤及收益见cost_diagnostics.json；所有区间的日账本与权重见results.duckdb。", "",
+        "| 策略 | 缓冲 | 五段夏普（顺序同上） | 五段年化收益 |", "|---|---:|---|---|"]
+    for p in peers:
+        for buffer in (0,1,2):
+            row=lookup[p["id"],buffer]
+            lines.append(f"| {p['name']} | {buffer} | " + " / ".join(f"{s['sharpe']:.3f}" for s in row["metrics"]["segments"]) + " | " + " / ".join(f"{s['annual_return']:.2%}" for s in row["metrics"]["segments"]) + " |")
+    lines += ["", "年換手为完整成交名义量相对净值基准的倍数，已含开平、换月和实际杠杆，不除以2或再乘杠杆。", "",
+        "| 策略 | 缓冲 | 换手来源（倍/年） |", "|---|---:|---|"]
+    for row in rows:
+        parts=row["metrics"]["selection"]["turnover_components"]
+        lines.append(f"| {row['name']} | {row['buffer']} | " + "；".join(f"{k}={v:.2f}" for k,v in parts.items()) + " |")
+    performance = read_json(output / "performance.json")
+    lines += ["", "## 性能与验收", "",
+        f"复用{performance['reused_panels']}个冻结日度面板，新增分钟因子计算0次。执行墙钟{performance['wall_seconds']:.1f}秒、CPU {performance['cpu_seconds']:.1f}秒。",
+        "共享框架既有Polars/Rust路径；不新增策略特例内核。首项包含cProfile开销，任务峰值内存是进程历史峰值，不能将其当各策略独占内存。"
+        "本轮执行期间并行运行了回归测试，因此耗时是实际任务记录，不作为独占机器的标准性能基准。", "",
+        "| 类型 | 项数 | 累计秒 | 中位秒 | P95秒 |", "|---|---:|---:|---:|---:|"]
+    for kind in ("baseline","buffer"):
+        times=[r["wall_seconds"] for r in rows if r["kind"]==kind]
+        lines.append(f"| {kind} | {len(times)} | {sum(times):.1f} | {np.median(times):.1f} | {np.quantile(times,.95):.1f} |")
+    lines += ["", "热点累计时间含子调用，不能相加：", ""]
+    for row in rows:
+        for h in row.get("hotspots",[])[:6]:
+            lines.append(f"- {row['id']}：`{h['function']}`，{h['seconds']:.2f}秒。")
+    lines += ["", "10项B0日账本精确复现；有历史资产明细的来源另作精确资产对账，没有明细者不虚构通过。"
+              "全部任务收益/费用/净值恒等式复核；执行期间源合同、源数据、成员、默认配置及计算代码哈希不变。"
+              "这不是独立组合级准入或真实成交容量通过证明。", ""]
+    from monitoring.weekly_report import _mk_png
+    plt = _mk_png()
+    kinds=sorted(unique)
+    fig, axes=plt.subplots(1,2,figsize=(17,6),gridspec_kw={"width_ratios":[1,2]})
+    y=np.arange(len(kinds))
+    axes[0].barh(y-.18,[unique[t] for t in kinds],height=.34,label="不同因子数",color="#76899A")
+    axes[0].barh(y+.18,[slots[t] for t in kinds],height=.34,label="成员席位数",color="#B88372")
+    axes[0].set_yticks(y,kinds);axes[0].legend();axes[0].set_title("总体类型分布（计数，不是收益贡献）")
+    bottom=np.zeros(len(peers))
+    colors=["#7D9BA4","#B99B76","#8E91AC","#B78080","#88A08C","#A49A91"]
+    for i,t in enumerate(kinds):
+        v=np.array([sum(types[n]==t for n in p["directions"]) for p in peers])
+        axes[1].bar(range(len(peers)),v,bottom=bottom,label=t,color=colors[i%len(colors)]);bottom+=v
+    axes[1].set_xticks(range(len(peers)),[p["name"] for p in peers],rotation=30,ha="right")
+    axes[1].set_ylabel("因子成员数");axes[1].set_title("逐组类型构成");axes[1].legend(ncol=3,fontsize=9)
+    fig.tight_layout();fig.savefig(output/"factor_distribution.png",dpi=160);plt.close(fig)
+    fig,axes=plt.subplots((len(peers)+1)//2,2,figsize=(16,2.7*((len(peers)+1)//2)),squeeze=False)
+    for ax,p in zip(axes.ravel(),peers):
+        for b,color in enumerate(("#737D87","#6575A2","#B37758")):
+            s=lookup[p["id"],b]["metrics"]["selection"]["cost_sensitivity"]["scenarios"]
+            ax.plot([x["trade_cost_rate"]*10000 for x in s],[x["metrics"]["annual_return"]*100 for x in s],label=f"B{b}",color=color)
+        ax.axhline(0,color="#999",lw=.6);ax.set_title(p["name"]);ax.set_xlabel("完整交易费率(bp)");ax.set_ylabel("净年化(%)");ax.legend(ncol=3)
+    for ax in axes.ravel()[len(peers):]:ax.set_visible(False)
+    fig.suptitle(f"固定路径成本压力：{source['performance_start']}至{source['selection_end']}\n交易费率替换，持有费用不变；不是容量验证", fontsize=14)
+    fig.tight_layout(rect=(0,0,1,.96));fig.savefig(output/"cost_curves.png",dpi=160);plt.close(fig)
+    dump_json(output/"cost_diagnostics.json", {"selection_segments":stage_costs,
+        "all_intervals":{r["id"]:{k:r["metrics"][k]["cost_sensitivity"] for k in ("selection","observation","full")} for r in rows}})
+    dump_json(saved, {**previous,"factor_types":types,"source_contract_sha256":sha256_file(output/"contract.json"),
+        "results_sha256":sha256_file(output/"results.duckdb"),"renderer_sha256":sha256_file(Path(__file__))})
+    dump_json(output/"accounting_review.json",{"jobs":audits,"all_passed":True})
+    if previous.get("review_notes"):
+        lines[4:4] = ["## 结果审阅", "", *previous["review_notes"], ""]
+    (output/"report.md").write_text("\n".join(lines),encoding="utf-8")
+    return {"completed":len(rows),"baseline_exact":len(peers),"unique_factors":len(names),"factor_slots":total}
+
+
 def plot_sector_contributions(output, baseline, peers):
     """Render saved contributions only, without rewriting the reviewed report."""
     from monitoring.weekly_report import _mk_png

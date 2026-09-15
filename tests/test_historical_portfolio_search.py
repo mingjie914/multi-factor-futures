@@ -1439,6 +1439,95 @@ def test_trade_replay_inherits_parent_reporting_segments(monkeypatch, tmp_path):
         assert "selection_segments" not in source
 
 
+def test_trade_baselines_use_each_frozen_reference(monkeypatch, tmp_path):
+    import duckdb
+    import json
+    from types import SimpleNamespace
+    import workflows.experiments.historical_portfolio_search as workflow
+
+    output, parent, other = (tmp_path / n for n in ("output", "parent", "other"))
+    for path in (output, parent, other):
+        path.mkdir()
+    dates = pd.date_range("2020-01-01", periods=2)
+    frames = {}
+    for path, value in ((parent, .02), (other, .01)):
+        frame = pd.DataFrame({"net_return": value, "gross_exposure": 2.}, index=dates)
+        frames[str(path)] = frame
+        with duckdb.connect(str(path / "results.duckdb")) as db:
+            db.register("frozen", frame.reset_index(names="date").assign(job="source"))
+            db.execute("CREATE TABLE daily AS SELECT * FROM frozen")
+    jobs = [{"id": str(i), "seed": str(i), "name": str(i), "kind": "baseline",
+             "buffer": 0, "directions": {"factor": 1}, "reference_job": "source",
+             **({"reference_dir": str(other)} if i == 0 else {})} for i in range(2)]
+    def run(evaluator, job, recipe):
+        daily = frames[str(other if job["id"] == "0" else parent)]
+        asset = pd.DataFrame(1., index=dates, columns=["A"])
+        return SimpleNamespace(daily=daily, metadata={}, effective_weights=asset,
+            asset_returns=asset, contributions=asset, target_weights=asset), {}
+    monkeypatch.setattr(workflow, "_incremental_trade_result", run)
+    monkeypatch.setattr(workflow, "_incremental_trade_metrics", lambda *a, **k: {})
+    evaluator = SimpleNamespace(runner=SimpleNamespace(u=["A"]), _score_cache={},
+                               _ledger_cache={}, _asset_weight_cache={})
+    status = workflow._run_incremental_jobs(output, parent, evaluator, None, jobs,
+        {"selection_end": "2020-01-02", "performance_start": "2020-01-01"})
+    assert status["finished"] and status["completed"] == 2
+    with duckdb.connect(str(output / "results.duckdb")) as db:
+        rows = [json.loads(r[0]) for r in db.execute("SELECT payload FROM results").fetchall()]
+    assert all(r["baseline_exact"] for r in rows)
+
+
+def test_registered_report_rejects_incomplete_results(tmp_path):
+    import duckdb
+    import json
+    from workflows.experiments.portfolio_attribution import report_registered_trade_study
+    (tmp_path / "contract.json").write_text(json.dumps({
+        "role": "registered_portfolio_trade_validation", "peers": [], "source": {}, "jobs": [1],
+    }), encoding="utf-8")
+    with duckdb.connect(str(tmp_path / "results.duckdb")) as db:
+        db.execute("CREATE TABLE results (payload VARCHAR)")
+    with np.testing.assert_raises_regex(ValueError, "every frozen trade job"):
+        report_registered_trade_study(tmp_path)
+    assert not (tmp_path / "report.md").exists()
+
+
+def test_registered_report_accepts_arbitrary_initial_nav(monkeypatch, tmp_path):
+    import duckdb
+    import json
+    from pathlib import Path
+    import run_portfolio_workflow as ide
+    import workflows.experiments.portfolio_attribution as report
+    source = {"panel_start": "2020-01-01", "performance_start": "2020-01-01",
+              "end": "2020-01-02", "selection_end": "2020-01-02",
+              "source_fingerprint": "fixed", "selection_segments": []}
+    documents = {"contract.json": {"role": "registered_portfolio_trade_validation",
+        "peers": [], "source": source, "jobs": [1], "input_sha256": {}, "code_sha256": {},
+        "runtime": {"costs": {"trade_cost_rate": .0002}}},
+        "library.json": {"factors": []},
+        "clusters.json": {"clusters": {}, "names": [], "correlation": []}}
+    monkeypatch.setattr(report, "read_json", lambda p: documents[Path(p).name])
+    monkeypatch.setattr(report, "_search_source_snapshot", lambda *a: {
+        "end": source["end"], "source_fingerprint": "fixed"})
+    class ReachedPlot(Exception):
+        pass
+    def plot(*args, **kwargs):
+        raise ReachedPlot
+    monkeypatch.setattr(ide, "_write_comparison_plot", plot)
+    for initial in (1., 1000.):
+        output = tmp_path / str(initial)
+        output.mkdir()
+        frame = pd.DataFrame({"date": pd.date_range("2020-01-01", periods=2),
+            "job": "test", "net_return": [0., .01], "gross_return": [0., .01],
+            "trade_cost": 0., "holding_cost": 0., "executed_traded_notional": 0.,
+            "nav_before": initial, "nav_after": [initial, initial*1.01]})
+        payload = {"id": "test", "seed": "test", "name": "test", "buffer": 1, "status": "completed"}
+        with duckdb.connect(str(output / "results.duckdb")) as db:
+            db.execute("CREATE TABLE results AS SELECT ? AS payload", [json.dumps(payload)])
+            db.register("frame", frame)
+            db.execute("CREATE TABLE daily AS SELECT * FROM frame")
+        with np.testing.assert_raises(ReachedPlot):
+            report.report_registered_trade_study(output)
+
+
 def test_repair_audit_rejects_unverified_provenance_before_loading_data(monkeypatch, tmp_path):
     import workflows.experiments.portfolio_attribution as audit
     reference, output, baseline = tmp_path / "search", tmp_path / "repair", tmp_path / "old"

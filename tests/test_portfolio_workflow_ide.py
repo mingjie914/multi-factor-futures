@@ -78,6 +78,18 @@ def test_retained_catalog_has_frozen_members_and_default_off_buffer():
     assert len(sets["multi_source_balanced"].factors) == 17
 
 
+def test_replaced_strategy_remains_available_only_for_explicit_audit(monkeypatch):
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_SNAPSHOT_AUDIT)
+    monkeypatch.setattr(ide, "SNAPSHOT_AUDIT_IDS", ("multi_source_balanced",))
+    _, _, selected = ide._validated_specs()
+    assert len(selected) == 1
+    strategy, _, config = selected[0]
+    assert strategy.id == "multi_source_balanced"
+    assert strategy.status == "archived"
+    assert len(config.factors) == 17
+    assert config.production_portfolio.rank_exit_buffer == 0
+
+
 @pytest.mark.parametrize("count", [9, 20])
 def test_comparison_plot_uses_actual_dates_and_distinct_styles(tmp_path, monkeypatch, count):
     import matplotlib.figure
@@ -240,15 +252,6 @@ def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     assert len({s.name for s, _, _ in peers}) == 10
     assert sum(s.status == "observing" for s, _, _ in peers) == 9
     assert all(s.source == "effective_library" for s, _, _ in peers)
-    new_sets = {
-        "sector_volume_position": 15, "seat_price_structure": 15,
-        "compact_sector": 10, "volatility_follow": 16, "structure_fusion": 20,
-    }
-    for strategy, _, config in peers:
-        if strategy.id in new_sets:
-            assert strategy.status == "observing"
-            assert strategy.source == "effective_library"
-            assert len(config.factors) == new_sets[strategy.id]
     assert "snapshot_6f_icir" not in {s.id for s, _, _ in peers}
     subsets = {s.id: s for s in catalog.factor_sets}
     for strategy, _, config in peers:

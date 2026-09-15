@@ -2035,12 +2035,14 @@ def _run_incremental_jobs(output, reference, evaluator, recipe, jobs, source, *,
     import duckdb
     import cProfile
     import pstats
+    from contextlib import ExitStack
     from run_portfolio_workflow import _peak_working_set_mib
     runner = evaluator.runner
     cutoff = pd.Timestamp(source["selection_end"])
     wall, cpu = started or (time.perf_counter(), time.process_time())
     executed = 0
-    with duckdb.connect(str(output / "results.duckdb")) as db, duckdb.connect(str(reference / "results.duckdb"), read_only=True) as old_db:
+    with duckdb.connect(str(output / "results.duckdb")) as db, ExitStack() as references:
+        reference_dbs = {}
         db.execute("CREATE TABLE IF NOT EXISTS results (id VARCHAR PRIMARY KEY, payload VARCHAR)")
         done = {row[0] for row in db.execute("SELECT id FROM results").fetchall()}
         for job in jobs:
@@ -2055,6 +2057,11 @@ def _run_incremental_jobs(output, reference, evaluator, recipe, jobs, source, *,
                 result, diagnostics = _incremental_trade_result(evaluator, job, recipe)
                 if profiler: profiler.disable()
                 if job["kind"] == "baseline":
+                    reference_dir = str(Path(job.get("reference_dir", reference)).resolve())
+                    if reference_dir not in reference_dbs:
+                        reference_dbs[reference_dir] = references.enter_context(
+                            duckdb.connect(str(Path(reference_dir) / "results.duckdb"), read_only=True))
+                    old_db = reference_dbs[reference_dir]
                     key, value = ("job", job["reference_job"]) if "reference_job" in job else ("strategy", job["name"])
                     expected = old_db.execute(f"SELECT * FROM daily WHERE {key}=? ORDER BY date", [value]).df().set_index("date")
                     np.testing.assert_array_equal(result.daily.index, expected.index)
@@ -2216,6 +2223,140 @@ def replay_completed_trade_study(output: Path, parent: Path, *, baselines_only=F
     return result
 
 
+def run_registered_trade_study(output: Path, reference: Path, *, max_jobs=None) -> dict:
+    """Explicit fixed-catalog B0/B1/B2 validation on hashed historical inputs."""
+    import duckdb
+    from core.config import load_strategy_library
+    from factors.numerics import factor_kernel_contract
+    from research.artifacts import sha256_file
+    from research.effective_factor_library import load_library
+    from workflows.factor_selection import _production_recipe, _configured_cost_model
+    catalog_path = ROOT / "config/strategy_library.yaml"
+    catalog = load_strategy_library(catalog_path)
+    library = {r["factor"]: r for r in load_library(ROOT / catalog.effective_factor_library)["factors"]
+               if r["status"] == "effective"}
+    subsets = {r.id: r for r in catalog.factor_sets}
+    reference, output = reference.resolve(), output.resolve()
+    previous = json.loads((reference / "contract.json").read_text(encoding="utf-8"))
+    accepted = json.loads((reference / "acceptance.json").read_text(encoding="utf-8"))
+    if (not accepted["review_complete"]
+            or sha256_file(reference / "contract.json") != accepted["computation_contract_sha256"]
+            or sha256_file(reference / "results.duckdb") != accepted["results_sha256"]):
+        raise ValueError("reference evidence is not sealed")
+    source = {**previous["source"], "selection_segments": previous["selection_segments"]}
+    if _search_source_snapshot(source["panel_start"], source["end"]) != {
+            "end": source["end"], "source_fingerprint": source["source_fingerprint"]}:
+        raise ValueError("registered trade controls cannot mix market releases")
+    config = load_config("config/default.yaml")
+    recipe = _production_recipe(config)
+    old_recipe = {**source["recipe"], "rank_exit_buffer": source["recipe"].get("rank_exit_buffer", 0)}
+    if (recipe.rank_exit_buffer != 0 or json.loads(json.dumps(recipe.to_dict())) != old_recipe
+            or _configured_cost_model(config).ledger_parameters() != previous["runtime"]["costs"]
+            or config.production_portfolio.ic_window != previous["runtime"]["ic_window"]
+            or config.production_portfolio.risk_lookback_calendar_days != previous["runtime"]["risk_lookback_calendar_days"]):
+        raise ValueError("registered trade recipe/runtime differs from its B0 evidence")
+    peers, protected, directions = [], [catalog_path, ROOT / catalog.effective_factor_library,
+        reference / "contract.json", reference / "acceptance.json", reference / "clusters.json",
+        ROOT / "config/default.yaml", ROOT / "config/local.yaml"], {}
+    for entry in catalog.strategies:
+        if entry.status == "archived":
+            continue
+        subset = subsets[entry.factor_set_id]
+        context = subset.selection_context
+        members = context["directions"]
+        if (entry.source != "effective_library" or subset.status != "active"
+                or entry.rank_exit_buffer not in (None, 0)
+                or set(subset.factors) != set(members)
+                or any(library.get(n, {}).get("direction") != d for n, d in members.items())):
+            raise ValueError(f"registered members or B0 policy invalid: {entry.id}")
+        parent = (ROOT / context["source_run"]).resolve()
+        if output == parent or parent in output.parents:
+            raise ValueError("use a separate output; do not overwrite source evidence")
+        for file, key in (("contract.json", "source_contract_sha256"), ("results.duckdb", "source_results_sha256")):
+            if sha256_file(parent / file) != context[key]:
+                raise ValueError(f"registered source evidence changed: {entry.id}/{file}")
+            protected.append(parent / file)
+        parent_contract = json.loads((parent / "contract.json").read_text(encoding="utf-8"))
+        if (any(parent_contract["source"][k] != source[k] for k in (
+                "panel_start", "performance_start", "selection_end", "end", "source_fingerprint"))
+                or parent_contract["runtime"] != previous["runtime"]):
+            raise ValueError(f"registered controls use different dates/data/runtime: {entry.id}")
+        with duckdb.connect(str(parent / "results.duckdb"), read_only=True) as db:
+            row = db.execute("SELECT payload FROM results WHERE id=?", [context["source_job"]]).fetchone()
+        saved = json.loads(row[0]) if row else {}
+        if saved.get("status") != "completed" or saved.get("buffer") != 0 or saved.get("directions") != members:
+            raise ValueError(f"registered B0 source membership mismatch: {entry.id}")
+        peer = {"id": entry.id, "name": entry.name, "directions": members,
+                "reference_dir": str(parent), "reference_job": context["source_job"]}
+        peers.append(peer); directions.update(members)
+    if not peers:
+        raise ValueError("registered trade study requires active effective portfolios")
+    panels = {}
+    for filename, digest in previous["code_sha256"].items():
+        if Path(filename).parts[:2] == ("factors", "library") and sha256_file(Path(filename)) != digest:
+            raise ValueError(f"factor implementation changed since panel calculation: {filename}")
+    for filename, digest in previous["input_sha256"].items():
+        path = Path(filename)
+        if path.name != "manifest.json" or path.parent.name != "factor_panel_checkpoint":
+            continue
+        if sha256_file(path) != digest:
+            raise ValueError(f"frozen panel manifest changed: {path}")
+        protected.append(path)
+        for name, file in json.loads(path.read_text(encoding="utf-8"))["completed"].items():
+            if name in directions:
+                panel = path.parent / file
+                if sha256_file(panel) != previous["input_sha256"].get(str(panel)):
+                    raise ValueError(f"unverified input panel: {panel}")
+                panels[name] = panel
+    # The search also computed new panels. Freeze those output hashes now;
+    # every B0 ledger must still exactly reproduce the sealed source result.
+    own_manifest = reference / "factor_panel_checkpoint/manifest.json"
+    if own_manifest.is_file():
+        protected.append(own_manifest)
+        for name, file in json.loads(own_manifest.read_text(encoding="utf-8"))["completed"].items():
+            if name in directions and name not in panels:
+                panels[name] = own_manifest.parent / file
+    if set(panels) != set(directions):
+        raise ValueError("reference panels do not cover registered members; prepare a fresh panel study")
+    jobs = [{**p, "id": p["id"] + f"__B{b}", "seed": p["id"], "kind": "baseline" if b == 0 else "buffer",
+             "buffer": b, "added": "", "removed": ""} for b in (0, 1, 2) for p in peers]
+    code = {str(Path(p).resolve()): sha256_file(Path(p)) for p in previous["code_sha256"]}
+    contract = {"role": "registered_portfolio_trade_validation", "source": source,
+        "runtime": previous["runtime"], "peers": peers, "jobs": jobs, "backend": factor_kernel_contract(),
+        "input_sha256": {str(p): sha256_file(p) for p in sorted(set(protected + list(panels.values())))},
+        "code_sha256": code, "trade_cost_rates_bp": [1, 2, 3, 4, 6, 8],
+        "holding_cost": "unchanged; trade-rate replacement on each fixed executed path",
+        "decision": "review net performance, material phase risks and costs jointly; no auto-promotion",
+        "observation_used_for_selection": False, "initial_holdings": "flat"}
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / "contract.json"
+    if path.exists() and json.loads(path.read_text(encoding="utf-8")) != contract:
+        raise ValueError("registered trade contract changed; cannot mix resumed results")
+    _json_dump(path, contract); _json_dump(output / "jobs.json", jobs)
+    _json_dump(output / "clusters.json", json.loads((reference / "clusters.json").read_text(encoding="utf-8")))
+    if max_jobs == 0:
+        return {"status": "frozen", "planned": len(jobs), "factors": len(directions)}
+    began = time.perf_counter(), time.process_time()
+    runner = Runner([], start=source["panel_start"], end=source["end"], ic_horizon=previous["runtime"]["ic_horizon"])
+    for name, path in panels.items():
+        frame = pd.read_parquet(path)
+        if not frame.index.equals(runner.cal) or list(frame.columns) != runner.u:
+            raise ValueError(f"registered control panel axes differ: {name}")
+        runner.raw_ranks[name] = frame.rank(axis=1, pct=True)
+    runner = runner.for_factors(sorted(directions), factor_directions=directions)
+    runner.get_contract_schedule()
+    runner.env = CausalEligibilityEnvironment(runner.cal, runner.daily_ret, runner.env.sector_of)
+    evaluator = PortfolioEvaluator(runner, start=source["performance_start"], end=source["end"],
+        cost_model=_configured_cost_model(config), ic_window=previous["runtime"]["ic_window"],
+        risk_lookback_calendar_days=previous["runtime"]["risk_lookback_calendar_days"])
+    result = _run_incremental_jobs(output, reference, evaluator, recipe, jobs, source,
+                                   max_jobs=max_jobs, started=began)
+    result.update(wall_seconds=time.perf_counter()-began[0], cpu_seconds=time.process_time()-began[1],
+                  reused_panels=len(panels), computed_factors=0)
+    _json_dump(output / "performance.json", result)
+    return result
+
+
 def run_trade_interactions(output: Path, parent: Path, *, max_jobs=None) -> dict:
     """Freeze the existing shortlist, replay its B0 ledgers, then isolate B1/B2."""
     from research.artifacts import sha256_file
@@ -2357,7 +2498,7 @@ def _plot_incremental_trade_diagnostics(output, contract, successful, nav):
     fig.suptitle(f"{len(peers)}组固定成员：B0 / B1 / B2逐组净值\n虚线为2026-05-15；其后仅模拟实盘观察", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, .95)); fig.savefig(output / "buffer_nav.png", dpi=160); plt.close(fig)
 
-    if contract.get("interaction_parent"):
+    if contract.get("interaction_parent") or contract.get("role") == "registered_portfolio_trade_validation":
         return  # No membership additions are searched again in an interaction study.
     names = sorted(contract["candidates"])
     added = {(r["seed"], r["added"]): r for r in successful if r["kind"] == "add"}
@@ -2839,6 +2980,9 @@ def main() -> None:
         description="Expanding-window native production method and factor search"
     )
     parser.add_argument("--output", required=True)
+    parser.add_argument("--registered-trade-study", action="store_true",
+                        help="explicit registered B0/B1/B2 and fixed-path costs; no member search")
+    parser.add_argument("--registered-trade-report", action="store_true")
     parser.add_argument("--incremental-trade-study", action="store_true",
                         help="explicit admitted-factor additions/replacements and isolated B0/B1/B2")
     parser.add_argument("--incremental-trade-report", action="store_true")
@@ -2886,6 +3030,21 @@ def main() -> None:
     )
     args = parser.parse_args()
     output = Path(args.output)
+    if args.registered_trade_study or args.registered_trade_report:
+        allowed = {"output", "registered_trade_study", "registered_trade_report", "reference_run", "max_jobs"}
+        if (args.registered_trade_study == args.registered_trade_report
+                or any(v not in (None, False) for k, v in vars(args).items() if k not in allowed)
+                or (args.max_jobs is not None and args.max_jobs < 0)
+                or (args.registered_trade_report and (args.reference_run or args.max_jobs is not None))
+                or (args.registered_trade_study and not args.reference_run)):
+            parser.error("registered trade study/report is exclusive; study requires reference-run")
+        if args.registered_trade_report:
+            from workflows.experiments.portfolio_attribution import report_registered_trade_study
+            result = report_registered_trade_study(output)
+        else:
+            result = run_registered_trade_study(output, args.reference_run, max_jobs=args.max_jobs)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return
     if args.repeat_selection_parent or args.repeat_selection_report:
         if (bool(args.repeat_selection_parent) == args.repeat_selection_report or any((
                 args.incremental_trade_study, args.incremental_trade_report, args.trade_interaction_parent,
