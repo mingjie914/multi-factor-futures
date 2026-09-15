@@ -91,6 +91,10 @@ class CombinedStrategy:
             raise ValueError("top_n must be positive")
         self.top_n = int(top_n)
         self.cfg = load_config(config_path)
+        # This route is the only production selector that accepts an
+        # explicitly supplied post-close actual holding state.
+        from core.config import validate_rank_buffer_route
+        validate_rank_buffer_route(self.cfg, actual_holdings_supported=True)
         self.data_manager = DataManager.from_config(self.cfg)
         self.engine = FactorEngine(self.data_manager)
         configured = set(map(str, self.cfg.universe))
@@ -247,13 +251,62 @@ class CombinedStrategy:
         close_returns, _ = self.data_manager.prepare_close_data(close)
         return causal_risk_window(close_returns, date, lookback).dropna(how="all")
 
-    def signal(self, date: str) -> pd.Series:
+    def signal(
+        self,
+        date: str,
+        *,
+        actual_holdings: pd.Series | None = None,
+        holdings_date: str | pd.Timestamp | None = None,
+    ) -> pd.Series:
         """给定交易日, 返回净持仓权重 Series (索引=品种, 值=多空抵消后净权重).
 
         - 调仓日: 使用当日可得的滞后因子打分生成次日持仓信号
+        - 启用排名缓冲时: 必须显式传入 ``T`` 日收盘后的实际持仓及其日期，
+          该状态只用于同向实际持仓保留，不从策略或数据源隐式读取
         - 异常处理: 风险历史不足的品种不进入候选；入选后数据或约束异常则报错
         """
         end = pd.Timestamp(date)
+        portfolio_cfg = getattr(self, "portfolio_cfg", None)
+        rank_exit_buffer = getattr(portfolio_cfg, "rank_exit_buffer", 0)
+        selection_state: dict[str, object] = {}
+        if rank_exit_buffer:
+            if actual_holdings is None or holdings_date is None:
+                raise ValueError(
+                    "rank_exit_buffer requires explicit actual_holdings and holdings_date"
+                )
+            if not isinstance(actual_holdings, pd.Series):
+                raise ValueError("actual_holdings must be a pandas Series")
+            try:
+                state_date = pd.Timestamp(holdings_date)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("holdings_date must be a valid date") from exc
+            if pd.isna(state_date) or state_date.date() != end.date():
+                raise ValueError("holdings_date must match the decision date")
+
+            state_index = pd.Index([str(symbol) for symbol in actual_holdings.index])
+            if state_index.has_duplicates:
+                raise ValueError("actual_holdings index must be unique")
+            universe = {str(symbol) for symbol in self._universe}
+            unknown = [symbol for symbol in state_index if symbol not in universe]
+            if unknown:
+                raise ValueError(
+                    "actual_holdings contains unknown instruments: "
+                    + ", ".join(unknown[:5])
+                )
+            try:
+                state_values = actual_holdings.to_numpy(dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "actual_holdings must contain only finite values"
+                ) from exc
+            if not np.isfinite(state_values).all():
+                raise ValueError("actual_holdings must contain only finite values")
+            state = pd.Series(state_values, index=state_index, dtype=float)
+            selection_state = {
+                "previous_long": state[state > 1e-12].index,
+                "previous_short": state[state < -1e-12].index,
+                "exit_buffer": rank_exit_buffer,
+            }
         # IC_IR 需要 60 日历史算 IC, 放大窗口保证预热充足
         start = end - pd.Timedelta(days=160)
         score = self.factor_scores(start.strftime("%Y-%m-%d"), date)
@@ -286,6 +339,7 @@ class CombinedStrategy:
             eligible=eligible,
             sector_of=SECTOR_OF,
             constraints=constraints,
+            **selection_state,
         )
 
         w_long = self._pool_weights(long_pool, end, recent_returns)

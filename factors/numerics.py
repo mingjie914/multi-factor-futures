@@ -143,6 +143,56 @@ def native_array_kernel(name: str, *args) -> np.ndarray:
     return np.asarray(kernel(*args), dtype=float)
 
 
+def finite_window_counts(values, starts, stops) -> np.ndarray:
+    """Count finite values per column for each half-open row window."""
+    array = np.asarray(values, dtype=np.float64, order="C")
+    if array.ndim != 2:
+        raise ValueError("values must be a two-dimensional array")
+    starts_array = np.asarray(starts, dtype=np.int64, order="C")
+    stops_array = np.asarray(stops, dtype=np.int64, order="C")
+    if starts_array.ndim != 1 or stops_array.ndim != 1:
+        raise ValueError("starts and stops must be one-dimensional arrays")
+    if starts_array.shape != stops_array.shape:
+        raise ValueError("starts and stops must have the same length")
+    nrows = array.shape[0]
+    if (
+        np.any(starts_array < 0)
+        or np.any(stops_array < starts_array)
+        or np.any(stops_array > nrows)
+    ):
+        raise ValueError("windows must satisfy 0 <= start <= stop <= nrows")
+
+    mode = factor_kernel_mode()
+    reference = None
+    if mode != "native":
+        if array.shape[1] == 0:
+            reference = np.empty((len(starts_array), 0), dtype=np.int64)
+        else:
+            import polars as pl
+
+            cumulative = pl.DataFrame(array).select(
+                pl.all().is_finite().cast(pl.Int64).cum_sum()
+            ).to_numpy()
+            prefix = np.concatenate(
+                (np.zeros((1, array.shape[1]), dtype=np.int64), cumulative), axis=0
+            )
+            reference = prefix[stops_array] - prefix[starts_array]
+
+    if mode in {"shadow", "native"}:
+        native = native_array_kernel(
+            "finite_window_counts", array, starts_array, stops_array
+        )
+        if mode == "shadow":
+            if not np.array_equal(reference, native):
+                raise RuntimeError("native finite_window_counts differs from reference")
+            output = reference
+        else:
+            output = np.asarray(native, dtype=np.int64)
+    else:
+        output = reference
+    return np.asarray(output, dtype=np.int64)
+
+
 def assert_native_equal(reference, candidate, name: str) -> None:
     if not (
         np.array_equal(np.isnan(reference), np.isnan(candidate))

@@ -24,7 +24,7 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from core.config import load_config
+from core.config import load_config, validate_rank_buffer_route
 from core.date_policy import factor_admission_start, research_cutoff
 from core.period import iter_overlapping_chunks
 from core.registry import list_registered
@@ -197,18 +197,8 @@ def _portfolio_shortlist(rows: list[dict], limit: int = 5) -> list[dict]:
 
 
 def _production_recipe(config) -> PortfolioRecipe:
-    policy = config.production_portfolio
-    return PortfolioRecipe(
-        factor_weight=str(policy.factor_weight_method),
-        top_n=int(policy.top_n_per_side),
-        sector_cap=int(policy.sector_count_cap),
-        asset_weight=str(policy.asset_weight_method),
-        asset_min_fraction=float(policy.asset_min_fraction),
-        asset_max_fraction=float(policy.asset_max_fraction),
-        gross_exposure=float(policy.gross_exposure),
-        asset_max_overrides=tuple(sorted(policy.asset_max_overrides.items())),
-        sector_weight_caps=tuple(sorted(policy.sector_weight_caps.items())),
-    )
+    validate_rank_buffer_route(config, actual_holdings_supported=True)
+    return PortfolioRecipe.from_config(config.production_portfolio)
 
 
 def _configured_cost_model(config) -> SimpleFuturesCost:
@@ -229,6 +219,7 @@ def _run_portfolio_search(
     exact_width: int = PORTFOLIO_SEARCH_EXACT_WIDTH,
     beam_width: int = PORTFOLIO_SEARCH_BEAM_WIDTH,
     output: Path | None = None,
+    cache_db=None,
 ) -> tuple[list[dict], list[dict], str]:
     """Multi-path forward proposals; exact net portfolios judge every size.
 
@@ -238,6 +229,12 @@ def _run_portfolio_search(
     pool = sorted(set(representatives))
     if len(pool) < 2 or min(exact_width, beam_width) < 1 or max_factors < 2:
         raise ValueError("portfolio search requires at least two factors and positive widths")
+    cached = {}
+    if cache_db is not None:
+        cache_db.execute("""CREATE TABLE IF NOT EXISTS forward_results (
+            signature VARCHAR PRIMARY KEY, result VARCHAR, net_returns DOUBLE[])""")
+        cached = {key: json.loads(value) for key, value in cache_db.execute(
+            "SELECT signature,result FROM forward_results").fetchall()}
     panel = portfolio_ic[pool]
     arrays = [panel.loc[left:right].to_numpy(dtype=float) for left, right in segments]
     positions = {name: i for i, name in enumerate(pool)}
@@ -286,6 +283,15 @@ def _run_portfolio_search(
             if any(len(set(members) & set(other["factors"])) /
                    len(set(members) | set(other["factors"])) >= 0.85 for other in exact_rows):
                 continue
+            key = json.dumps(members)
+            if key in cached:
+                row = cached[key]
+                evaluations.append(row)
+                if row["status"] == "evaluated":
+                    exact_rows.append(row)
+                if len(exact_rows) >= exact_width:
+                    break
+                continue
             started = time.perf_counter()
             row = dict(step=size, factor_count=size, added_factor="", factors=list(members),
                        status="rejected_runtime", error="", seconds=0.0,
@@ -294,6 +300,7 @@ def _run_portfolio_search(
                        annual_turnover=float("nan"), full_annual_return=float("nan"),
                        full_sharpe=float("nan"), full_max_drawdown=float("nan"),
                        full_total_return=float("nan"))
+            returns = []
             try:
                 ledger = evaluator.ledger(members, recipe)
                 if any(len(ledger.loc[left:right]) < 20 for left, right in segments):
@@ -304,9 +311,14 @@ def _run_portfolio_search(
                            full_annual_return=metrics["annual_return"], full_sharpe=metrics["sharpe"],
                            full_max_drawdown=metrics["max_drawdown"], full_total_return=metrics["total_return"])
                 exact_rows.append(row)
-            except RuntimeError as exc:
+                returns = ledger["net_return"].tolist()
+            except (RuntimeError, ValueError) as exc:
                 row["error"] = str(exc)
             row["seconds"] = time.perf_counter() - started
+            if cache_db is not None:
+                cache_db.execute("INSERT INTO forward_results VALUES (?,?,?)",
+                                 [key, json.dumps(row), returns])
+                cached[key] = row
             evaluations.append(row)
             if output is not None:
                 _write_json(output / "portfolio_search_progress.json", evaluations)
@@ -406,7 +418,9 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
             "attempted": len(evaluations), "budget": budget,
             "cached_total": len(cached), "phase": phase, "round": iteration,
             "evaluated": sum(r["status"] == "evaluated" for r in evaluations),
-            "covered_factors": len({n for r in evaluations for n in r["factors"]})})
+            "covered_factors": len({n for r in evaluations for n in r["factors"]}),
+            "successful_covered_factors": len({n for r in evaluations if r["status"] == "evaluated"
+                                               for n in r["factors"]})})
         print(f"pool {len(evaluations)}/{budget} {phase} {len(members)}f {row['status']}", flush=True)
         return row
     def choose(rows, count, existing=()):

@@ -125,6 +125,110 @@ def test_signal_reuses_one_return_history_without_changing_pool_weights():
     pd.testing.assert_series_equal(reused, direct)
 
 
+def _buffered_signal_probe(buffer=1):
+    symbols = ["A", "B", "C", "D"]
+    strategy = CombinedStrategy.__new__(CombinedStrategy)
+    strategy.top_n = 1
+    strategy._universe = symbols
+    strategy.portfolio_cfg = SimpleNamespace(rank_exit_buffer=buffer)
+    strategy.constraints = PortfolioConstraints(
+        top_n_per_side=1,
+        sector_count_cap=0,
+        asset_min_fraction=0.0,
+        asset_max_fraction=1.0,
+    )
+    strategy.factor_scores = lambda start, end: pd.DataFrame(
+        [[4.0, 3.0, 2.0, 1.0]],
+        index=[pd.Timestamp(end)],
+        columns=symbols,
+    )
+    strategy._recent_returns = lambda date, requested: pd.DataFrame(
+        0.01,
+        index=pd.bdate_range(pd.Timestamp(date) - pd.Timedelta(days=20), periods=12),
+        columns=requested,
+    )
+    strategy._pool_weights = lambda pool, date, recent_returns=None: pd.Series(
+        1.0 / len(pool), index=pool, dtype=float
+    )
+    return strategy, symbols
+
+
+def test_positive_rank_buffer_uses_explicit_t_close_actual_holdings():
+    strategy, _ = _buffered_signal_probe()
+
+    buffered = strategy.signal(
+        "2026-02-20",
+        actual_holdings=pd.Series({"B": 0.5, "C": -0.5}),
+        holdings_date="2026-02-20",
+    )
+
+    assert buffered.to_dict() == {"B": 1.0, "C": -1.0}
+
+
+def test_positive_rank_buffer_explicit_all_zero_holdings_use_original_pools():
+    strategy, symbols = _buffered_signal_probe()
+
+    empty = strategy.signal(
+        "2026-02-20",
+        actual_holdings=pd.Series(0.0, index=symbols),
+        holdings_date=pd.Timestamp("2026-02-20"),
+    )
+
+    assert empty.to_dict() == {"A": 1.0, "D": -1.0}
+
+
+def test_positive_rank_buffer_does_not_retain_reverse_side_positions():
+    strategy, _ = _buffered_signal_probe()
+
+    reversed_holdings = strategy.signal(
+        "2026-02-20",
+        actual_holdings=pd.Series({"A": -0.5, "D": 0.5}),
+        holdings_date="2026-02-20",
+    )
+
+    assert reversed_holdings.to_dict() == {"A": 1.0, "D": -1.0}
+
+
+@pytest.mark.parametrize(
+    ("actual_holdings", "holdings_date", "message"),
+    [
+        (None, "2026-02-20", "actual_holdings"),
+        (pd.Series({"A": 0.5}), None, "holdings_date"),
+        (pd.Series({"A": 0.5}), "2026-02-19", "decision date"),
+        (pd.Series({"UNKNOWN": 0.5}), "2026-02-20", "unknown"),
+        (pd.Series({"A": np.inf}), "2026-02-20", "finite"),
+        (pd.Series([0.5, 0.5], index=["A", "A"]), "2026-02-20", "unique"),
+    ],
+)
+def test_positive_rank_buffer_rejects_invalid_explicit_holdings_before_factor_compute(
+    actual_holdings, holdings_date, message
+):
+    strategy, _ = _buffered_signal_probe()
+    strategy.factor_scores = lambda *_: pytest.fail(
+        "invalid holdings must be rejected before factor computation"
+    )
+
+    with pytest.raises(ValueError, match=message):
+        strategy.signal(
+            "2026-02-20",
+            actual_holdings=actual_holdings,
+            holdings_date=holdings_date,
+        )
+
+
+def test_zero_rank_buffer_keeps_old_signal_path_without_reading_holdings_state():
+    strategy, _ = _buffered_signal_probe(buffer=0)
+
+    expected = strategy.signal("2026-02-20")
+    actual = strategy.signal(
+        "2026-02-20",
+        actual_holdings=pd.Series({"UNKNOWN": np.nan}),
+        holdings_date="not-a-date",
+    )
+
+    pd.testing.assert_series_equal(actual, expected)
+
+
 def test_signal_rejects_a_stale_previous_trading_day():
     strategy = CombinedStrategy.__new__(CombinedStrategy)
     strategy.factor_scores = lambda start, end: pd.DataFrame(

@@ -104,24 +104,105 @@ def test_shortlist_does_not_prefer_smallest_and_keeps_tradeoffs():
     assert {r["factor_count"] for r in _portfolio_shortlist(rows)} == {6, 8}
 
 
-def test_multipath_search_explores_beyond_three_flat_sizes():
+@pytest.fixture
+def forward_search_case():
     import numpy as np
-    from workflows.factor_selection import _run_portfolio_search
     dates = pd.bdate_range("2020-01-01", periods=160)
     rng = np.random.default_rng(2)
     ic = pd.DataFrame(rng.normal(.02, .1, (160, 8)), index=dates, columns=list("abcdefgh"))
     class Evaluator:
+        def __init__(self, interrupt_on=None):
+            self.calls = []
+            self.interrupt_on = interrupt_on
         def ledger(self, factors, recipe):
+            self.calls.append(tuple(factors))
+            if len(self.calls) == self.interrupt_on:
+                raise KeyboardInterrupt("interrupted exact evaluation")
             values = .0002 + .001 * np.sin(np.arange(160))
             values[0] = 0.0
             return pd.DataFrame({"net_return": values, "executed_traded_notional": .1}, index=dates)
-    path, rows, reason = _run_portfolio_search(
-        evaluator=Evaluator(), portfolio_ic=ic, representatives=list(ic), recipe=None,
+    return SimpleNamespace(evaluator=Evaluator, kwargs=dict(
+        portfolio_ic=ic, representatives=list(ic), recipe=None,
         segments=[(dates[i], dates[i+39]) for i in range(0,160,40)],
-        max_factors=8, exact_width=2, beam_width=4)
+        max_factors=8, exact_width=2, beam_width=4))
+
+
+def test_multipath_search_explores_beyond_three_flat_sizes(forward_search_case):
+    from workflows.factor_selection import _run_portfolio_search
+    case = forward_search_case
+    path, rows, reason = _run_portfolio_search(
+        evaluator=case.evaluator(), **case.kwargs)
     assert [r["factor_count"] for r in path] == list(range(2,9))
     assert reason == "candidate_pool_exhausted"
     assert len([r for r in rows if r["factor_count"] == 2]) == 2
+
+
+def _forward_result_without_timing(result):
+    from workflows.factor_selection import _portfolio_shortlist
+    path, rows, reason = result
+    def clean(items):
+        return [{key: value for key, value in row.items()
+                 if key not in {"seconds", "cpu_seconds"}} for row in items]
+    return clean(path), clean(rows), reason, clean(_portfolio_shortlist(rows))
+
+
+def test_forward_cache_preserves_path_metrics_and_shortlist(tmp_path, forward_search_case):
+    import duckdb
+    from workflows.factor_selection import _run_portfolio_search
+    case = forward_search_case
+    plain = case.evaluator()
+    expected = _run_portfolio_search(evaluator=plain, **case.kwargs)
+    database = tmp_path / "forward.duckdb"
+    with duckdb.connect(str(database)) as db:
+        measured = case.evaluator()
+        actual = _run_portfolio_search(evaluator=measured, cache_db=db, **case.kwargs)
+        assert measured.calls == plain.calls
+        assert _forward_result_without_timing(actual) == _forward_result_without_timing(expected)
+        assert db.execute("SELECT count(*) FROM forward_results").fetchone()[0] == len(actual[1])
+        assert db.execute("SELECT count(*) FROM forward_results WHERE net_returns IS NULL").fetchone()[0] == 0
+    with duckdb.connect(str(database)) as db:
+        resumed = case.evaluator()
+        replay = _run_portfolio_search(evaluator=resumed, cache_db=db, **case.kwargs)
+    assert resumed.calls == []
+    assert _forward_result_without_timing(replay) == _forward_result_without_timing(expected)
+
+
+def test_forward_invalid_candidate_is_recorded_then_search_continues(forward_search_case):
+    from workflows.factor_selection import _run_portfolio_search
+    case = forward_search_case
+    evaluator = case.evaluator()
+    native = evaluator.ledger
+    def ledger(members, recipe):
+        if not evaluator.calls:
+            evaluator.calls.append(tuple(members))
+            raise ValueError("no positive weight")
+        return native(members, recipe)
+    evaluator.ledger = ledger
+    path, rows, _ = _run_portfolio_search(evaluator=evaluator, **case.kwargs)
+    assert rows[0]["status"] == "rejected_runtime"
+    assert rows[0]["error"] == "no positive weight"
+    assert len([r for r in rows if r["factor_count"] == 2 and r["status"] == "evaluated"]) == 2
+    assert path[-1]["factor_count"] == 8
+
+
+def test_forward_cache_resumes_after_interrupted_second_ledger(tmp_path, forward_search_case):
+    import duckdb
+    from workflows.factor_selection import _run_portfolio_search
+    case = forward_search_case
+    plain = case.evaluator()
+    expected = _run_portfolio_search(evaluator=plain, **case.kwargs)
+    database = tmp_path / "forward.duckdb"
+    with duckdb.connect(str(database)) as db:
+        interrupted = case.evaluator(interrupt_on=2)
+        with pytest.raises(KeyboardInterrupt, match="interrupted exact evaluation"):
+            _run_portfolio_search(evaluator=interrupted, cache_db=db, **case.kwargs)
+        assert interrupted.calls == plain.calls[:2]
+        assert db.execute("SELECT count(*) FROM forward_results").fetchone()[0] == 1
+    with duckdb.connect(str(database)) as db:
+        resumed = case.evaluator()
+        replay = _run_portfolio_search(evaluator=resumed, cache_db=db, **case.kwargs)
+    assert resumed.calls == plain.calls[1:]
+    assert _forward_result_without_timing(replay) == _forward_result_without_timing(expected)
 
 
 def test_exact_winner_has_a_reserved_expansion():
@@ -183,6 +264,9 @@ def test_budgeted_pool_covers_all_factors_resumes_and_ignores_future(tmp_path):
     assert {n for r in rows if r["phase"] == "seed_coverage" for n in r["factors"]} == set(ic)
     assert rows[0]["status"] == "rejected_runtime"
     assert max(r["factor_count"] for r in rows) >= 4
+    progress = json.loads((tmp_path / "original" / "pool_progress.json").read_text(encoding="utf-8"))
+    assert progress["successful_covered_factors"] == len({
+        n for r in rows if r["status"] == "evaluated" for n in r["factors"]})
     resumed = Evaluator()
     _, replay, _ = run(tmp_path / "original", resumed, ic)
     assert resumed.calls == []

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 import numpy as np
 import pandas as pd
@@ -228,6 +228,7 @@ def build_close_marked_ledger(
     contract_schedule: pd.DataFrame | None = None,
     decision_tradable: pd.DataFrame | None = None,
     initial_nav: float = 1000.0,
+    decision_target: Callable[[pd.Timestamp, pd.Series, pd.Series], pd.Series] | None = None,
 ) -> "ResearchReturnLedger":
     """Build a causal daily ledger from close-indexed portfolio decisions.
 
@@ -237,6 +238,12 @@ def build_close_marked_ledger(
     the old concrete contract and opens the new one even when root weight is
     unchanged.
     ``cost_multiplier`` scales transaction fees only, not holding allowances.
+    Optional ``decision_target(date, desired_target, actual_end_weights)`` runs
+    after the current close mark and before the unchanged tradability/roll
+    transition.  It receives copies, uses only information available at that
+    close, and must return finite target weights for the known instruments.
+    The final close also records its decision target, but has no following
+    holding bar and therefore never executes or charges that target.
     """
     rate = float(trade_cost_rate)
     fee = float(annual_fee)
@@ -351,10 +358,22 @@ def build_close_marked_ledger(
         next_pending_notional = 0.0
         next_current = step.end_weights.reindex(universe).fillna(0.0)
 
-        # A final-close target is observable but not an executed trade because
-        # there is no following holding bar in this evaluation interval.
+        desired_target = targets.loc[date]
+        if decision_target is not None:
+            adjusted = decision_target(date, desired_target.copy(), next_current.copy())
+            if not isinstance(adjusted, pd.Series):
+                raise ResearchLedgerError("decision_target must return a weight Series")
+            desired_target = adjusted.astype(float)
+            if (desired_target.index.has_duplicates
+                    or len(desired_target.index.difference(universe))
+                    or not np.isfinite(desired_target.to_numpy(dtype=float)).all()):
+                raise ResearchLedgerError(
+                    "decision_target must return finite unique weights for known instruments"
+                )
+            desired_target = desired_target.reindex(universe, fill_value=0.0)
+            targets.loc[date] = desired_target
+        # Record the final target without pretending that it was traded.
         if position < len(dates) - 1:
-            desired_target = targets.loc[date]
             target = desired_target
             next_date = dates[position + 1]
             if tradable is not None:
@@ -441,6 +460,7 @@ def build_close_marked_ledger(
         contributions=pd.DataFrame(
             contribution_rows, index=dates, columns=universe
         ),
+        target_weights=targets,
         metadata={
             **default_research_ledger_metadata(),
             "schema_version": LEDGER_SCHEMA_VERSION,
@@ -480,6 +500,7 @@ class ResearchReturnLedger:
     effective_weights: pd.DataFrame
     contributions: pd.DataFrame
     metadata: Mapping[str, object]
+    target_weights: pd.DataFrame | None = None
 
     @classmethod
     def empty(cls) -> "ResearchReturnLedger":
@@ -587,6 +608,12 @@ class ResearchReturnLedger:
             raise ResearchLedgerError("asset return and effective-weight columns differ")
         if not self.contributions.columns.equals(self.effective_weights.columns):
             raise ResearchLedgerError("contribution and effective-weight columns differ")
+        if self.target_weights is not None and (
+            not self.target_weights.index.equals(self.daily.index)
+            or not self.target_weights.columns.equals(self.effective_weights.columns)
+            or not np.isfinite(self.target_weights.to_numpy(dtype=float)).all()
+        ):
+            raise ResearchLedgerError("decision targets must be finite and aligned with the ledger")
 
         expected_gross = self.effective_weights.abs().sum(axis=1)
         expected_net_exposure = self.effective_weights.sum(axis=1)
@@ -657,6 +684,8 @@ class ResearchReturnLedger:
         self.asset_returns.to_csv(root / "research_asset_returns.csv")
         self.effective_weights.to_csv(root / "research_effective_weights.csv")
         self.contributions.to_csv(root / "research_return_contributions.csv")
+        if self.target_weights is not None:
+            self.target_weights.to_csv(root / "research_target_weights.csv")
         payload = dict(self.metadata)
         payload.setdefault("schema_version", LEDGER_SCHEMA_VERSION)
         (root / "research_return_ledger_metadata.json").write_text(

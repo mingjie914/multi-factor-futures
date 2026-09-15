@@ -7,6 +7,115 @@ import pytest
 import factors.numerics as numerics
 
 
+def _pandas_finite_window_counts(values, starts, stops):
+    frame = pd.DataFrame(values)
+    rows = [
+        np.isfinite(frame.iloc[start:stop].to_numpy()).sum(axis=0)
+        for start, stop in zip(starts, stops)
+    ]
+    return (
+        np.asarray(rows, dtype=np.int64).reshape(len(starts), values.shape[1])
+        if rows
+        else np.empty((0, values.shape[1]), dtype=np.int64)
+    )
+
+
+def test_finite_window_counts_reference_handles_noncontiguous_and_empty_windows(monkeypatch):
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "reference")
+    source = np.array([
+        [1.0, np.nan, np.inf, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [np.nan, -np.inf, 9.0, 10.0],
+        [11.0, 12.0, 13.0, 14.0],
+        [15.0, 16.0, np.nan, 18.0],
+        [19.0, 20.0, 21.0, np.inf],
+        [23.0, 24.0, 25.0, 26.0],
+        [27.0, 28.0, 29.0, 30.0],
+    ])
+    values = source[::2, ::2]
+    starts = np.array([0, 1, 2, 4], dtype=np.int64)
+    stops = np.array([0, 3, 4, 4], dtype=np.int64)
+
+    from factors.numerics import finite_window_counts
+
+    actual = finite_window_counts(values, starts, stops)
+    expected = _pandas_finite_window_counts(values, starts, stops)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == np.int64
+    assert not values.flags.c_contiguous
+
+    empty = np.empty((0, 3), dtype=np.float64)
+    no_windows = finite_window_counts(
+        empty, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    )
+    np.testing.assert_array_equal(no_windows, np.empty((0, 3), dtype=np.int64))
+    one_empty = finite_window_counts(
+        empty, np.array([0], dtype=np.int64), np.array([0], dtype=np.int64)
+    )
+    np.testing.assert_array_equal(one_empty, np.zeros((1, 3), dtype=np.int64))
+    zero_columns = finite_window_counts(
+        np.empty((3, 0), dtype=np.float64),
+        np.array([0, 1], dtype=np.int64),
+        np.array([0, 3], dtype=np.int64),
+    )
+    assert zero_columns.shape == (2, 0)
+    assert zero_columns.dtype == np.int64
+
+
+@pytest.mark.parametrize("case", [
+    (np.ones(3), np.array([0]), np.array([0])),
+    (np.ones((3, 2)), np.array([[0]]), np.array([0])),
+    (np.ones((3, 2)), np.array([0, 1]), np.array([1])),
+    (np.ones((3, 2)), np.array([-1]), np.array([1])),
+    (np.ones((3, 2)), np.array([2]), np.array([1])),
+    (np.ones((3, 2)), np.array([0]), np.array([4])),
+])
+def test_finite_window_counts_rejects_invalid_shapes_and_bounds(monkeypatch, case):
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "reference")
+    from factors.numerics import finite_window_counts
+
+    with pytest.raises(ValueError):
+        finite_window_counts(*case)
+
+
+@pytest.mark.parametrize("mode", ["reference", "shadow", "native"])
+def test_finite_window_counts_mode_parity(monkeypatch, mode):
+    if mode != "reference":
+        pytest.importorskip("_mf_factor_kernels")
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", mode)
+    rng = np.random.default_rng(20260915)
+    values = rng.normal(size=(53, 5))
+    values[::7, 1] = np.nan
+    values[::11, 2] = np.inf
+    values[::13, 3] = -np.inf
+    starts = np.array([0, 1, 5, 17, 53], dtype=np.int64)
+    stops = np.array([0, 5, 17, 53, 53], dtype=np.int64)
+
+    from factors.numerics import finite_window_counts
+
+    actual = finite_window_counts(values, starts, stops)
+    expected = _pandas_finite_window_counts(values, starts, stops)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == np.int64
+
+
+def test_finite_window_counts_shadow_requires_exact_integer_equality(monkeypatch):
+    monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", "shadow")
+    from factors.numerics import finite_window_counts
+
+    def fake_native(name, *args):
+        assert name == "finite_window_counts"
+        return np.array([[1.0 + 1e-13, 1.0]], dtype=float)
+
+    monkeypatch.setattr(numerics, "native_array_kernel", fake_native)
+    with pytest.raises(RuntimeError, match="finite_window_counts"):
+        finite_window_counts(
+            np.ones((1, 2), dtype=np.float64),
+            np.array([0], dtype=np.int64),
+            np.array([1], dtype=np.int64),
+        )
+
+
 @pytest.mark.parametrize("kind", ["surprise", "asymmetry", "lead", "partial"])
 @pytest.mark.parametrize("case", ["ordinary", "missing", "constant", "empty"])
 def test_daily_volume_corr_extensions_match_reference_and_prefix(kind, case):

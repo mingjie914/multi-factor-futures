@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 
 from core.types import DateIndex, Universe
-from core.config import load_config, FrameworkConfig
+from core.config import load_config, FrameworkConfig, validate_rank_buffer_route
 from core.period import PeriodContext
 from core.registry import create, list_registered
 from core.sectors import require_framework_universe
@@ -615,6 +615,7 @@ class PipelineRunner:
     def run_full_pipeline(self, dates: DateIndex = None,
                           universe: Universe = None):
         """端到端全流程."""
+        validate_rank_buffer_route(self.config, actual_holdings_supported=False)
         self._validate_effective_factor_membership({
             int(self.config.backtest.holding_period): list(self.config.factors)
         })
@@ -692,6 +693,7 @@ class PipelineRunner:
         Returns:
             MultiPortfolioResult: 包含各子组合结果和叠加后的组合结果.
         """
+        validate_rank_buffer_route(self.config, actual_holdings_supported=False)
         from backtest.engine import MultiPortfolioResult
 
         sub_configs = self.config.sub_portfolios

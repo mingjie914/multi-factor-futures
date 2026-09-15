@@ -16,7 +16,7 @@ import re
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
 
 from core.sectors import require_framework_universe
 
@@ -26,6 +26,7 @@ except ImportError:  # Pydantic 1.x compatibility
     ConfigDict = None
 
 _PYDANTIC_V2 = hasattr(BaseModel, "model_validate")
+_StrictNonNegativeInt = conint(strict=True, ge=0)
 
 
 class StrictConfigModel(BaseModel):
@@ -231,6 +232,7 @@ class ProductionPortfolioConfig(StrictConfigModel):
     factor_weight_method: str = "lw_abs"
     ic_window: int = 60
     top_n_per_side: int = 10
+    rank_exit_buffer: _StrictNonNegativeInt = 0
     sector_count_cap: int = 3
     asset_weight_method: str = "erc"
     asset_min_fraction: float = 0.005
@@ -500,6 +502,7 @@ class StrategyLibraryEntry(StrictConfigModel):
     config_path: str
     mode: Literal["single", "multi"] = "single"
     description: str = ""
+    rank_exit_buffer: Optional[_StrictNonNegativeInt] = None
 
 
 class StrategyLibraryConfig(StrictConfigModel):
@@ -555,6 +558,16 @@ class FrameworkConfig(StrictConfigModel):
 # ---------------------------------------------------------------------------
 # Environment variable override (research → production path)
 # ---------------------------------------------------------------------------
+
+def validate_rank_buffer_route(config, *, actual_holdings_supported: bool) -> None:
+    """Reject unsupported execution routes and implicit stacking of selection layers."""
+    if not config.production_portfolio.rank_exit_buffer:
+        return
+    if not actual_holdings_supported:
+        raise ValueError("rank_exit_buffer requires a route with actual holdings")
+    if config.asset_selection.enabled or config.universe_selection.enabled:
+        raise ValueError("rank_exit_buffer cannot combine with asset_selection/universe_selection")
+
 
 _ENV_MAP = {
     # env_var: (config_path_tuple, converter)

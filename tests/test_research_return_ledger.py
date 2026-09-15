@@ -21,6 +21,122 @@ from backtest.research_ledger import (
 from data.market_quality import CloseDataQualityError, prepare_close_data
 
 
+def test_decision_target_identity_preserves_complete_ledger_exactly():
+    dates = pd.bdate_range("2025-01-01", periods=7)
+    targets = pd.DataFrame({"A": [.6, .2, -.4, -.4, .3, .1, .9], "B": -.4}, index=dates)
+    returns = pd.DataFrame({"A": [0., .1, 0., 0., -.03, .02, .01], "B": .01}, index=dates)
+    tradable = pd.DataFrame({"A": [True, True, False, True, True, True, True], "B": True}, index=dates)
+    schedule = pd.DataFrame({"A": ["A1"] * 3 + ["A2"] * 4, "B": "B1"}, index=dates)
+    kwargs = dict(trade_cost_rate=.0002, annual_fee=.005, annual_roll_cost=.002,
+                  contract_schedule=schedule, decision_tradable=tradable)
+    baseline = build_close_marked_ledger(targets, returns, **kwargs)
+    actual = build_close_marked_ledger(targets, returns,
+        decision_target=lambda date, target, current: target, **kwargs)
+    for field in ("daily", "effective_weights", "asset_returns", "contributions"):
+        pd.testing.assert_frame_equal(getattr(actual, field), getattr(baseline, field), check_exact=True)
+    assert actual.metadata == baseline.metadata
+
+
+def test_decision_target_receives_actual_drift_and_freeze_without_aliasing():
+    dates = pd.bdate_range("2025-01-01", periods=6)
+    targets = pd.DataFrame({"A": [.5, 0., 0., 0., 0., 0.], "B": [.5, 1., 1., 1., 1., 1.]}, index=dates)
+    returns = pd.DataFrame({"A": [0., .1, 0., 0., -.2, .03], "B": [0., -.1, 0., 0., .05, .01]}, index=dates)
+    tradable = pd.DataFrame({"A": [True, True, False, True, True, True], "B": True}, index=dates)
+    seen = {}
+    def callback(date, target, current):
+        seen[date] = current.copy()
+        current[:] = 999.  # A consumer must not mutate the ledger's state.
+        return target
+    ledger = build_close_marked_ledger(targets, returns, decision_tradable=tradable,
+        decision_target=callback)
+    assert seen[dates[1]].to_dict() == pytest.approx({"A": .55, "B": .45})
+    assert seen[dates[2]]["A"] == pytest.approx(.55)  # Prior target wanted zero, actual could not exit.
+    assert ledger.effective_weights.loc[dates[2], "A"] == pytest.approx(.55)
+    assert dates[-1] in seen  # Final target is observable, never executed.
+    pd.testing.assert_frame_equal(ledger.target_weights, targets, check_exact=True)
+    assert ledger.daily.iloc[-1]["decision_turnover"] == 0.
+    ledger.validate()
+
+
+def test_decision_target_stateful_prefix_is_causal_and_next_bar_effective():
+    dates = pd.bdate_range("2025-01-01", periods=8)
+    targets = pd.DataFrame(0., index=dates, columns=["A", "B"])
+    returns = pd.DataFrame({"A": np.arange(8) / 100., "B": -.01}, index=dates)
+    def callback(date, target, current):
+        # Only current actual state is available; no future return input.
+        return pd.Series({"A": .4 if current["A"] < .45 else .2, "B": -.4})
+    full = build_close_marked_ledger(targets, returns, decision_target=callback)
+    prefix = build_close_marked_ledger(targets.iloc[:5], returns.iloc[:5], decision_target=callback)
+    pd.testing.assert_frame_equal(full.effective_weights.iloc[:5], prefix.effective_weights, check_exact=True)
+    pd.testing.assert_frame_equal(full.daily.iloc[:4], prefix.daily.iloc[:4], check_exact=True)
+    assert prefix.daily.iloc[-1]["nav_after"] == full.daily.iloc[4]["nav_after"]
+    assert full.effective_weights.iloc[0].abs().sum() == 0.
+    assert full.effective_weights.iloc[1].to_dict() == {"A": .4, "B": -.4}
+
+
+@pytest.mark.parametrize("invalid", [
+    pd.Series({"A": np.nan}), pd.Series({"A": np.inf}),
+    pd.Series({"UNKNOWN": 1.}), pd.Series([.5, .5], index=["A", "A"]),
+])
+def test_decision_target_rejects_invalid_callback_weights(invalid):
+    dates = pd.bdate_range("2025-01-01", periods=2)
+    values = pd.DataFrame({"A": 0.}, index=dates)
+    with pytest.raises(ResearchLedgerError, match="finite unique weights"):
+        build_close_marked_ledger(values, values, decision_target=lambda *_: invalid)
+
+
+def test_decision_target_missing_return_cannot_silently_liquidate():
+    dates = pd.bdate_range("2025-01-01", periods=2)
+    values = pd.DataFrame({"A": 0.}, index=dates)
+    with pytest.raises(ResearchLedgerError, match="weight Series"):
+        build_close_marked_ledger(values, values, decision_target=lambda *_: None)
+
+
+def test_buffered_selection_prefix_and_future_perturbation_preserve_actual_holdings():
+    from optimization.portfolio_construction import PortfolioConstraints, select_long_short_pools
+    dates = pd.bdate_range("2025-01-01", periods=9)
+    symbols = list("ABCDEFGH")
+    scores = pd.DataFrame([np.arange(8., 0., -1)] * len(dates), index=dates, columns=symbols)
+    scores.loc[dates[2]:, "C"] = 10.
+    scores.loc[dates[2]:, "D"] = 9.
+    returns = pd.DataFrame(0., index=dates, columns=symbols)
+    targets = returns.copy()
+    tradable = pd.DataFrame(True, index=dates, columns=symbols)
+    tradable.loc[dates[3:5], "B"] = False
+    constraints = PortfolioConstraints(top_n_per_side=2, sector_count_cap=0)
+
+    def run(score_frame, target_frame, return_frame):
+        seen = {}
+        def select(date, desired, actual):
+            seen[date] = actual.copy()
+            long, short = select_long_short_pools(score_frame.loc[date], eligible=symbols,
+                sector_of={}, constraints=constraints,
+                previous_long=actual[actual > 1e-12].index,
+                previous_short=actual[actual < -1e-12].index, exit_buffer=1)
+            chosen = pd.Series(0., index=symbols)
+            chosen.loc[long], chosen.loc[short] = .5, -.5
+            return chosen
+        return build_close_marked_ledger(target_frame, return_frame,
+            decision_tradable=tradable, decision_target=select), seen
+
+    full, seen = run(scores, targets, returns)
+    prefix, _ = run(scores.iloc[:5], targets.iloc[:5], returns.iloc[:5])
+    pd.testing.assert_frame_equal(full.effective_weights.iloc[:5], prefix.effective_weights, check_exact=True)
+    pd.testing.assert_frame_equal(full.daily.iloc[:4], prefix.daily.iloc[:4], check_exact=True)
+    assert prefix.daily.iloc[-1]["nav_after"] == full.daily.iloc[4]["nav_after"]
+    # The desired replacement on day 2 cannot clear the real B holding when
+    # the following bar is untradable.  Subsequent selectors see the held B.
+    assert seen[dates[3]]["B"] == .5
+    assert seen[dates[4]]["B"] == .5
+    future_scores, future_targets, future_returns = scores.copy(), targets.copy(), returns.copy()
+    future_scores.iloc[5:] *= -1
+    future_targets.iloc[5:] = 999.
+    future_returns.iloc[5:] = .02
+    perturbed, _ = run(future_scores, future_targets, future_returns)
+    pd.testing.assert_frame_equal(full.daily.iloc[:5], perturbed.daily.iloc[:5], check_exact=True)
+    pd.testing.assert_frame_equal(full.effective_weights.iloc[:5], perturbed.effective_weights.iloc[:5], check_exact=True)
+
+
 def test_contract_transitions_match_ordered_reference_with_collisions_and_exits():
     rng = np.random.default_rng(914)
     for size in (1, 5, 10, 38):

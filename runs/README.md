@@ -19,6 +19,10 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 
 | 阶段 | 本地run | 当前意义 |
 |---|---|---|
+| 新增21因子与交易缓冲 | portfolio_factor_search/20260914_incremental21_trade_buffers | 292项完成、0失败，10项B0精确复现；17项增量诊断合格、5项短名单；中文报告、总净值/逐组缓冲图及2张热力图；188库、10策略和默认不变，不自动采纳 |
+| 冻结5项增量的缓冲交互 | portfolio_factor_search/20260914_shortlist5_trade_interactions | 15项完成、0失败，5项B0逐日精确复现；中文报告、净值、缓冲热力图、原10组换手来源/成本曲线；不自动采纳 |
+| 188有效库复用两条旧选集方法 | portfolio_factor_search/20260914_effective188_repeat_methods | 已验收；A57/B512成功，各5组候选，20项完整原生对照；原10基准精确一致，不改变库或策略目录 |
+| 排名缓冲共享接入验收 | portfolio_factor_search/20260915_rank_buffer_integration | 已完成；默认0，25项日账本/资产及10组目标精确一致，1079项回归；通用Polars/Rust权重计算受控计时；分段摘要修正见acceptance |
 | 新增98因子准入 | factor_validation/20260914_intraday98_admission | 98/294统一假设族；20个正式通过并追加入库167→187；library_admission.json记录登记回执 |
 | 12项正式准入 | factor_validation/20260914_gap12_admission | 12/36假设；1项通过并按授权入库187→188；library_admission.json为回执，report.md保留检验及编号方案 |
 | 编号统一与登记收口 | factor_research/20260914_numbering_closeout | 早期34项原地补#700–733；baseline.json/acceptance.json记录三种内核实值一致性，report.md记录清理与下一阶段建议 |

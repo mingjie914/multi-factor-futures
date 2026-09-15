@@ -52,6 +52,24 @@ class PortfolioRecipe:
     gross_exposure: float = 2.0
     asset_max_overrides: tuple[tuple[str, float], ...] = ()
     sector_weight_caps: tuple[tuple[str, float], ...] = ()
+    rank_exit_buffer: int = 0
+
+    def __post_init__(self):
+        if type(self.rank_exit_buffer) is not int or self.rank_exit_buffer < 0:
+            raise ValueError("rank_exit_buffer must be a nonnegative integer")
+
+    @classmethod
+    def from_config(cls, policy) -> "PortfolioRecipe":
+        """Resolve the one production recipe; factor evidence has no execution switches."""
+        return cls(
+            factor_weight=str(policy.factor_weight_method), top_n=int(policy.top_n_per_side),
+            sector_cap=int(policy.sector_count_cap), asset_weight=str(policy.asset_weight_method),
+            asset_min_fraction=float(policy.asset_min_fraction),
+            asset_max_fraction=float(policy.asset_max_fraction), gross_exposure=float(policy.gross_exposure),
+            asset_max_overrides=tuple(sorted(policy.asset_max_overrides.items())),
+            sector_weight_caps=tuple(sorted(policy.sector_weight_caps.items())),
+            rank_exit_buffer=policy.rank_exit_buffer,
+        )
 
     @property
     def name(self) -> str:
@@ -62,6 +80,8 @@ class PortfolioRecipe:
         )
         if self.asset_min_fraction == 0.0 and self.asset_max_fraction == 1.0:
             name += "__assetcapnone"
+        if self.rank_exit_buffer:
+            name += f"__rankbuffer{self.rank_exit_buffer}"
         return name
 
     @property
@@ -635,6 +655,9 @@ class PortfolioEvaluator:
             tuple[pd.Timestamp, tuple[str, ...], PortfolioRecipe], pd.Series
         ] = {}
         self._ledger_cache: dict[tuple[tuple[str, ...], PortfolioRecipe], pd.DataFrame] = {}
+        self._risk_counts = None
+        self._last_risk_window = None
+        self.risk_count_backend = "not_called"
 
     def bounded(
         self,
@@ -695,11 +718,12 @@ class PortfolioEvaluator:
         return score
 
     def _risk_history(self, date: pd.Timestamp, pool: Sequence[str]) -> pd.DataFrame:
-        history = causal_risk_window(
-            self.runner.daily_ret,
-            date,
-            self.risk_lookback_calendar_days,
-        )
+        # Both sleeves share the immutable full-universe window for this date.
+        if self._last_risk_window is None or self._last_risk_window[0] != date:
+            self._last_risk_window = (date, causal_risk_window(
+                self.runner.daily_ret, date, self.risk_lookback_calendar_days,
+            ))
+        history = self._last_risk_window[1]
         return history.reindex(columns=list(pool))
 
     def _risk_eligible(
@@ -708,12 +732,20 @@ class PortfolioEvaluator:
         candidates: Sequence[str],
         minimum_observations: int,
     ) -> list[str]:
-        history = self._risk_history(date, candidates).replace(
-            [np.inf, -np.inf], np.nan
-        )
-        return history.columns[
-            history.notna().sum(axis=0).ge(int(minimum_observations))
-        ].tolist()
+        if self._risk_counts is None:
+            from factors.numerics import factor_kernel_mode, finite_window_counts
+            history = self.runner.daily_ret
+            index = pd.DatetimeIndex(history.index)
+            if index.has_duplicates or not index.is_monotonic_increasing:
+                raise ValueError("risk history dates must be unique and sorted")
+            starts = index.searchsorted(self.dates - pd.Timedelta(days=self.risk_lookback_calendar_days))
+            stops = index.searchsorted(self.dates)
+            counts = finite_window_counts(history.to_numpy(dtype=float), starts, stops)
+            self._risk_counts = pd.DataFrame(counts, index=self.dates, columns=history.columns)
+            mode = factor_kernel_mode()
+            self.risk_count_backend = "polars" if mode == "reference" else mode
+        counts = self._risk_counts.loc[date].reindex(candidates, fill_value=0)
+        return counts.index[counts.ge(int(minimum_observations))].tolist()
 
     def _asset_weights(
         self,
@@ -741,6 +773,8 @@ class PortfolioEvaluator:
         return result
 
     def weights(self, factors: Sequence[str], recipe: PortfolioRecipe) -> pd.DataFrame:
+        if recipe.rank_exit_buffer:
+            raise ValueError("rank_exit_buffer requires actual holdings; use PortfolioEvaluator.run")
         score = self._score_matrix(factors, recipe.factor_weight)
         weights = pd.DataFrame(0.0, index=self.dates, columns=self.runner.u, dtype=float)
         sector_of = self.runner.env.sector_of
@@ -796,11 +830,17 @@ class PortfolioEvaluator:
         *,
         cost_multiplier: float = 1.0,
     ) -> pd.DataFrame:
+        result = self._run_weights(weights, cost_multiplier=cost_multiplier)
+        ledger = result.daily.copy()
+        ledger["nav"] = ledger["nav_after"]
+        return ledger
+
+    def _run_weights(self, weights, *, cost_multiplier=1.0, decision_target=None):
         schedule = getattr(self.runner, "contract_schedule", None)
         schedule_getter = getattr(self.runner, "get_contract_schedule", None)
         if callable(schedule_getter):
             schedule = schedule_getter()
-        result = build_close_marked_ledger(
+        return build_close_marked_ledger(
             weights.reindex(index=self.dates, columns=self.runner.u),
             self.runner.daily_ret.reindex(
                 index=self.dates, columns=self.runner.u
@@ -810,17 +850,63 @@ class PortfolioEvaluator:
             contract_schedule=schedule,
             decision_tradable=getattr(self.runner, "close_tradable", None),
             initial_nav=1000.0,
+            decision_target=decision_target,
         )
-        ledger = result.daily.copy()
-        ledger["nav"] = ledger["nav_after"]
-        return ledger
+
+    def run(self, factors: Sequence[str], recipe: PortfolioRecipe, *, cost_multiplier=1.0):
+        """One native execution path, starting flat; targets and actual holdings stay distinct.
+
+        Stateful decisions run in chronological ledger order. Only selection
+        depends on the buffer; scores and per-pool ERC inputs can be reused.
+        The last close produces an observable target, never a fictitious fill.
+        """
+        unbuffered = replace(recipe, rank_exit_buffer=0) if recipe.rank_exit_buffer else recipe
+        weights = self.weights(factors, unbuffered)
+        diagnostics = {"decisions": 0, "constraint_fallbacks": 0,
+                       "retained_long": 0, "retained_short": 0}
+        callback = None
+        if recipe.rank_exit_buffer:
+            score = self._score_matrix(factors, recipe.factor_weight)
+            constraints = recipe.constraints
+
+            def callback(date, desired, actual):
+                if not desired.abs().gt(1e-12).any():
+                    return desired
+                eligible = self._risk_eligible(date, self.runner.u, constraints.minimum_risk_observations)
+                previous_long = actual[actual > 1e-12].index
+                previous_short = actual[actual < -1e-12].index
+                detail = {}
+                long, short = select_long_short_pools(
+                    score.loc[date], eligible=eligible, sector_of=self.runner.env.sector_of,
+                    constraints=constraints, previous_long=previous_long, previous_short=previous_short,
+                    exit_buffer=recipe.rank_exit_buffer, diagnostics=detail,
+                )
+                # Keep execution diagnostics comparable to historical studies;
+                # the final unexecuted target is exported but not counted here.
+                if date != self.dates[-1]:
+                    diagnostics["decisions"] += 1
+                    diagnostics["constraint_fallbacks"] += int(detail.get("constraint_fallback", False))
+                    diagnostics["retained_long"] += len(set(long) & set(previous_long))
+                    diagnostics["retained_short"] += len(set(short) & set(previous_short))
+                return combine_sleeves(
+                    self._asset_weights(date, long, unbuffered), self._asset_weights(date, short, unbuffered),
+                    universe=self.runner.u, long_pool=long, short_pool=short,
+                    constraints=constraints, sector_of=self.runner.env.sector_of,
+                )
+
+        result = self._run_weights(weights, cost_multiplier=cost_multiplier, decision_target=callback)
+        result.metadata = {**result.metadata, "rank_exit_buffer": recipe.rank_exit_buffer,
+                           "rank_buffer_diagnostics": diagnostics, "initial_holdings": "flat",
+                           "risk_count_backend": self.risk_count_backend}
+        return result
 
     def ledger(self, factors: Sequence[str], recipe: PortfolioRecipe) -> pd.DataFrame:
         key = (tuple(factors), recipe)
         if key not in self._ledger_cache:
-            self._ledger_cache[key] = self.ledger_from_weights(
-                self.weights(factors, recipe)
-            )
+            result = self.run(factors, recipe)
+            ledger = result.daily.copy()
+            ledger["nav"] = ledger["nav_after"]
+            self._ledger_cache[key] = ledger
         return self._ledger_cache[key]
 
     def clear_transient_caches(self) -> None:

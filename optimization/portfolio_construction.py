@@ -148,8 +148,28 @@ def select_long_short_pools(
     eligible: Sequence[str],
     sector_of: Mapping[str, str],
     constraints: PortfolioConstraints,
+    previous_long: Sequence[str] = (),
+    previous_short: Sequence[str] = (),
+    exit_buffer: int = 0,
+    diagnostics: dict | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Select disjoint Top/Bottom pools using the same rules everywhere."""
+    """Select exact-size pools, optionally retaining actual same-side holdings.
+
+    The retention band extends the existing sector-cap-filtered selection by
+    ``exit_buffer`` names, not the raw rank or the final holding count.  Fill
+    vacancies in score order and keep that order for allocation.  The zero
+    default is the original stateless selector.  A buffered long side that
+    makes the short side infeasible falls back to the original feasible pair.
+    """
+    if (
+        isinstance(exit_buffer, bool)
+        or not isinstance(exit_buffer, (int, np.integer))
+        or exit_buffer < 0
+    ):
+        raise PortfolioConstructionError("exit_buffer must be a nonnegative integer")
+    if diagnostics is not None:
+        diagnostics.update(exit_buffer=int(exit_buffer), constraint_fallback=False,
+                           fallback_reason="")
     long_pool = select_pool(
         score,
         eligible=eligible,
@@ -167,7 +187,40 @@ def select_long_short_pools(
         ascending=True,
         excluded=long_pool,
     )
-    return long_pool, short_pool
+    if exit_buffer == 0 or (not len(previous_long) and not len(previous_short)):
+        return long_pool, short_pool
+
+    def buffered_side(previous, *, ascending, excluded=()):
+        eligible_set = {str(symbol) for symbol in eligible} - set(excluded)
+        clean = pd.Series(score.to_numpy(dtype=float), index=score.index.astype(str))
+        clean = clean.replace([np.inf, -np.inf], np.nan).dropna()
+        available = [symbol for symbol in clean.index if symbol in eligible_set]
+        capacity = len(available)
+        if constraints.sector_count_cap > 0:
+            sectors = pd.Series([str(sector_of.get(symbol, "其他")) for symbol in available])
+            capacity = int(sectors.value_counts().clip(upper=constraints.sector_count_cap).sum())
+        extension = select_pool(
+            score, eligible=eligible, sector_of=sector_of,
+            top_n=min(constraints.top_n_per_side + int(exit_buffer), capacity),
+            sector_count_cap=constraints.sector_count_cap,
+            ascending=ascending, excluded=excluded,
+        )
+        if len(extension) < constraints.top_n_per_side:
+            raise PortfolioConstructionError("buffered side has insufficient sector capacity")
+        incumbents = {str(symbol) for symbol in previous}
+        retained = [symbol for symbol in extension if symbol in incumbents]
+        entrants = [symbol for symbol in extension if symbol not in incumbents]
+        chosen = set((retained + entrants)[:constraints.top_n_per_side])
+        return [symbol for symbol in extension if symbol in chosen]
+
+    try:
+        buffered_long = buffered_side(previous_long, ascending=False)
+        buffered_short = buffered_side(previous_short, ascending=True, excluded=buffered_long)
+    except PortfolioConstructionError as exc:
+        if diagnostics is not None:
+            diagnostics.update(constraint_fallback=True, fallback_reason=str(exc))
+        return long_pool, short_pool
+    return buffered_long, buffered_short
 
 
 def prepare_risk_history(

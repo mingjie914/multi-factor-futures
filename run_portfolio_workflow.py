@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from backtest.metrics import TRADING_DAYS_PER_YEAR, compute_all_metrics, compute_turnover_metrics
-from core.config import ProcessingStepConfig, load_config, load_strategy_library
+from core.config import ProcessingStepConfig, load_config, load_strategy_library, validate_rank_buffer_route
 from core.date_policy import research_cutoff
 from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
@@ -307,6 +307,15 @@ def _validated_specs():
                 f"strategy {strategy.id!r} overrides production_portfolio; "
                 "default comparison changes factor sets only"
             )
+        if strategy.rank_exit_buffer is not None:
+            config.production_portfolio.rank_exit_buffer = strategy.rank_exit_buffer
+        validate_rank_buffer_route(config, actual_holdings_supported=(
+            WORKFLOW is not PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED
+        ))
+        if (default_production is not None
+                and WORKFLOW not in {PortfolioWorkflow.RUN_PREFERRED, PortfolioWorkflow.VALIDATE_CONFIGURATIONS}
+                and _config_dict(config.production_portfolio) != _config_dict(default_production)):
+            raise ValueError("rank_exit_buffer differs across the default same-production_portfolio comparison; use an explicit native study")
         assignments = _assignments(config, strategy.mode)
         configured_factors = set().union(*map(set, assignments.values()))
         if strategy.source == "effective_library":
@@ -404,6 +413,7 @@ def _write_comparison_plot(
             series.values,
             label=_strategy_label(name),
             color=colors[idx % len(colors)],
+            linestyle=("-", "--", "-.", ":")[(idx // len(colors)) % 4],
             linewidth=1.6,
         )
     # Keep failed strategies visible in the same comparison figure without
@@ -561,25 +571,7 @@ def _legacy_recipe(config):
     """Build the shared production recipe from a fully loaded config."""
     from research.historical_portfolio_search import PortfolioRecipe
 
-    portfolio = config.production_portfolio
-
-    def _pairs(value) -> tuple[tuple[str, float], ...]:
-        return tuple(sorted(
-            (str(key), float(item))
-            for key, item in dict(value or {}).items()
-        ))
-
-    return PortfolioRecipe(
-        factor_weight=str(portfolio.factor_weight_method),
-        top_n=int(portfolio.top_n_per_side),
-        sector_cap=int(portfolio.sector_count_cap),
-        asset_weight=str(portfolio.asset_weight_method),
-        asset_min_fraction=float(portfolio.asset_min_fraction),
-        asset_max_fraction=float(portfolio.asset_max_fraction),
-        gross_exposure=float(portfolio.gross_exposure),
-        asset_max_overrides=_pairs(portfolio.asset_max_overrides),
-        sector_weight_caps=_pairs(portfolio.sector_weight_caps),
-    )
+    return PortfolioRecipe.from_config(config.production_portfolio)
 
 
 def _default_production_config():
@@ -683,10 +675,10 @@ def _run_production_portfolio(
     )
     panel_start = start - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS)
     factors = list(config.factors)
-    # The default route deliberately ignores any production-method override in
-    # a candidate YAML.  This keeps the comparison variable at the factor set
-    # and makes config/default.yaml the single method source of truth.
-    production_config = _default_production_config()
+    # Catalog validation resolves the narrow per-strategy buffer override and
+    # enforces equal recipes for default comparisons. Never reload and erase it.
+    validate_rank_buffer_route(config, actual_holdings_supported=True)
+    production_config = config
     recipe = _legacy_recipe(production_config)
     direction_source = factor_direction_source
     if factor_directions is None:
@@ -745,8 +737,10 @@ def _run_production_portfolio(
             production_config.production_portfolio.risk_lookback_calendar_days
         ),
     )
-    weights = evaluator.weights(factors, recipe)
-    ledger = evaluator.ledger_from_weights(weights)
+    native_result = evaluator.run(factors, recipe)
+    weights = native_result.target_weights
+    ledger = native_result.daily.copy()
+    ledger["nav"] = ledger["nav_after"]
     nav = pd.Series(ledger["nav"], dtype=float).sort_index()
     returns = pd.Series(ledger["net_return"], dtype=float).reindex(nav.index)
     # Both turnover and executed_traded_notional are normalized weight ratios,
@@ -756,6 +750,7 @@ def _run_production_portfolio(
     result = BacktestResult(
         nav=nav,
         weights_history=weights,
+        research_ledger=native_result,
         metrics=metrics,
         turnover=turnover,
         costs=pd.Series(
@@ -780,6 +775,7 @@ def _run_production_portfolio(
         "comparison_start": start.date().isoformat(),
         "observation_end": end.date().isoformat(),
         "recipe": recipe.to_dict(),
+        "rank_buffer_diagnostics": native_result.metadata["rank_buffer_diagnostics"],
         "ic_horizon": ic_horizon,
         "factor_panel": shared_panel_meta,
         "production_config_path": str(_resolve("config/default.yaml")),
@@ -788,10 +784,6 @@ def _run_production_portfolio(
         ).hexdigest(),
     })
     ledger.to_csv(strategy_dir / "production_ledger.csv", encoding="utf-8-sig")
-    from optimization.costs import evaluate_cost_sensitivity
-    (strategy_dir / "cost_diagnostics.json").write_text(
-        json.dumps(evaluate_cost_sensitivity(ledger, initial_anchor=True),
-                   ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (strategy_dir / "production_recipe.json").write_text(
         json.dumps({
             "route": route,
@@ -801,6 +793,7 @@ def _run_production_portfolio(
             "factors": factors,
             "factor_direction_source": direction_source,
             "recipe": recipe.to_dict(),
+            "rank_buffer_diagnostics": native_result.metadata["rank_buffer_diagnostics"],
             "ic_horizon": ic_horizon,
             "factor_panel": shared_panel_meta,
             "production_config_path": str(_resolve("config/default.yaml")),

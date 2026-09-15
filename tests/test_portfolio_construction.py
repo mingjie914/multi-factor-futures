@@ -11,8 +11,94 @@ from optimization.portfolio_construction import (
     allocate_sleeve,
     combine_sleeves,
     causal_risk_window,
+    select_long_short_pools,
 )
 from optimization.risk_budgeting import RiskBudgetingOptimizer
+
+
+def test_zero_buffer_and_empty_holdings_preserve_original_pools_exactly():
+    from optimization.portfolio_construction import select_pool
+    rng = np.random.default_rng(915)
+    symbols = [f"S{i:02d}" for i in range(38)]
+    sectors = {symbol: str(i % 8) for i, symbol in enumerate(symbols)}
+    constraints = PortfolioConstraints()
+    for _ in range(20):
+        score = pd.Series(rng.integers(0, 20, len(symbols)), index=symbols)
+        long = select_pool(score, eligible=symbols, sector_of=sectors,
+                           top_n=10, sector_count_cap=3, ascending=False)
+        short = select_pool(score, eligible=symbols, sector_of=sectors,
+                            top_n=10, sector_count_cap=3, ascending=True, excluded=long)
+        for kwargs in (dict(exit_buffer=0, previous_long=short, previous_short=long),
+                       dict(exit_buffer=2)):
+            actual = select_long_short_pools(score, eligible=symbols,
+                sector_of=sectors, constraints=constraints, **kwargs)
+            assert actual == (long, short)
+
+
+@pytest.mark.parametrize("buffer,previous,expected", [
+    (1, ["A", "C"], ["A", "C"]),
+    (1, ["A", "D"], ["A", "B"]),
+    (2, ["A", "D"], ["A", "D"]),
+])
+def test_buffer_retains_only_same_side_names_in_declared_band(buffer, previous, expected):
+    score = pd.Series(range(10, 0, -1), index=list("ABCDEFGHIJ"), dtype=float)
+    long, short = select_long_short_pools(score, eligible=score.index, sector_of={},
+        constraints=PortfolioConstraints(top_n_per_side=2, sector_count_cap=0),
+        previous_long=previous, previous_short=["J", "H"], exit_buffer=buffer)
+    assert long == expected
+    assert short == ["J", "H"]
+    assert not set(long) & set(short)
+
+
+def test_buffer_band_counts_sector_admissible_names_not_raw_ranks():
+    score = pd.Series(range(10, 0, -1), index=list("ABCDEFGHIJ"), dtype=float)
+    sectors = {symbol: ("first" if symbol in "ABCD" else symbol) for symbol in score.index}
+    long, _ = select_long_short_pools(score, eligible=score.index, sector_of=sectors,
+        constraints=PortfolioConstraints(top_n_per_side=2, sector_count_cap=1),
+        previous_long=["A", "F"], exit_buffer=1)
+    # Legal entrants are A,E and the one-name retention extension is F.
+    assert long == ["A", "F"]
+
+
+def test_buffer_falls_back_when_retention_makes_opposite_side_infeasible():
+    score = pd.Series([6., 5., 4., 3., 2., 1.], index=["A1", "A2", "B", "C", "A3", "A4"])
+    sectors = {symbol: symbol[0] for symbol in score.index}
+    constraints = PortfolioConstraints(top_n_per_side=3, sector_count_cap=2)
+    baseline = select_long_short_pools(score, eligible=score.index, sector_of=sectors,
+                                     constraints=constraints)
+    diagnostics = {}
+    actual = select_long_short_pools(score, eligible=score.index, sector_of=sectors,
+        constraints=constraints, previous_long=["A1", "B", "C"], exit_buffer=1,
+        diagnostics=diagnostics)
+    assert actual == baseline
+    assert diagnostics["constraint_fallback"] is True
+    assert diagnostics["fallback_reason"]
+
+
+def test_buffer_handles_missing_scores_exit_reentry_and_stable_ties():
+    score = pd.Series([10., 9., 8., 8., 6., 5., 4., 3., 2., 1.], index=list("ABCDEFGHIJ"))
+    kwargs = dict(eligible=score.index, sector_of={},
+                  constraints=PortfolioConstraints(top_n_per_side=2, sector_count_cap=0),
+                  exit_buffer=1)
+    assert select_long_short_pools(score, previous_long=["A", "C"], **kwargs)[0] == ["A", "C"]
+    unavailable = score.copy()
+    unavailable["C"] = np.nan
+    exited = select_long_short_pools(unavailable, previous_long=["A", "C"], **kwargs)[0]
+    assert exited == ["A", "B"]
+    # Merely returning inside the retention band does not restore an exited name.
+    assert select_long_short_pools(score, previous_long=exited, **kwargs)[0] == exited
+    score["C"] = 11.
+    assert select_long_short_pools(score, previous_long=[], **kwargs)[0] == ["C", "A"]
+    unavailable["C"] = np.inf
+    assert "C" not in select_long_short_pools(unavailable, previous_long=["C"], **kwargs)[0]
+
+
+@pytest.mark.parametrize("value", [-1, 0.5, True])
+def test_buffer_rejects_invalid_width(value):
+    score = pd.Series(range(8), index=list("ABCDEFGH"), dtype=float)
+    with pytest.raises(PortfolioConstructionError, match="nonnegative integer"):
+        select_long_short_pools(score, eligible=score.index, sector_of={},
+            constraints=PortfolioConstraints(top_n_per_side=2), exit_buffer=value)
 
 
 def test_causal_ic_history_uses_exactly_sixty_rows_before_decision():

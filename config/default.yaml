@@ -239,6 +239,7 @@ production_portfolio:
   factor_weight_method: lw_abs
   ic_window: 60
   top_n_per_side: 10
+  rank_exit_buffer: 0
   sector_count_cap: 3
   asset_weight_method: erc
   asset_min_fraction: 0.005

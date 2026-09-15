@@ -19,6 +19,7 @@ import pandas as pd
 
 from core.config import load_config
 from core.period import iter_overlapping_chunks
+from core.registry import get as registry_get
 from data.manager import DataManager
 from factors.engine import FactorComputationError, FactorEngine
 from optimization.costs import SimpleFuturesCost
@@ -243,15 +244,22 @@ class FactorPanelRunner:
     """Build rank and IC panels for an explicitly supplied factor universe."""
 
     FACTOR_CHUNK_SIZE = 400
-    # 当前日内库最长跨日依赖为 120 个交易日；留 128 日预热保证边界一致。
+    # 普通因子保留既有128日重叠；显式长历史因子独立补齐计算历史。
     FACTOR_CHUNK_OVERLAP = 128
     CHECKPOINT_SCHEMA_VERSION = 1
 
     @classmethod
-    def _iter_factor_chunks(cls, calendar):
-        return iter_overlapping_chunks(
+    def _iter_factor_chunks(cls, calendar, *, history_calendar=None, history_days=0):
+        for target, request in iter_overlapping_chunks(
             calendar, cls.FACTOR_CHUNK_SIZE, cls.FACTOR_CHUNK_OVERLAP
-        )
+        ):
+            if history_days:
+                history = pd.DatetimeIndex(history_calendar)
+                left = max(0, history.searchsorted(target[0]) - int(history_days))
+                left = min(left, history.searchsorted(request[0]))
+                right = history.searchsorted(request[-1], side="right")
+                request = history[left:right]
+            yield target, request
 
     @staticmethod
     def _compute_part(engine, names, dates, universe, already_valid):
@@ -295,7 +303,10 @@ class FactorPanelRunner:
         source_fingerprint = getattr(
             source, "checkpoint_source_fingerprint", None
         )
-        return {
+        history_days = {name: days for name, days in getattr(self, "_factor_history_days", {}).items()
+                        if name in factor_names and days}
+        history_start = self._history_calendar.min() if history_days else self.cal.min()
+        contract = {
             "schema_version": self.CHECKPOINT_SCHEMA_VERSION,
             "factors": factor_names,
             "universe": list(self.u),
@@ -303,7 +314,7 @@ class FactorPanelRunner:
             "calendar_start": pd.Timestamp(self.cal.min()).isoformat(),
             "calendar_end": pd.Timestamp(self.cal.max()).isoformat(),
             "source_fingerprint": (
-                str(source_fingerprint(self.cal.min(), self.cal.max()))
+                str(source_fingerprint(history_start, self.cal.max()))
                 if callable(source_fingerprint)
                 else str(getattr(
                     source, "cache_namespace", source.__class__.__name__
@@ -311,6 +322,10 @@ class FactorPanelRunner:
             ),
             "source_tree_sha256": self._source_tree_fingerprint(),
         }
+        if history_days:
+            contract.update(factor_history_trading_days=history_days,
+                            data_history_start=pd.Timestamp(history_start).isoformat())
+        return contract
 
     @staticmethod
     def _checkpoint_factor_file(directory: Path, factor: str) -> Path:
@@ -410,21 +425,42 @@ class FactorPanelRunner:
         checkpoint_path = (
             Path(checkpoint_dir).resolve() if checkpoint_dir is not None else None
         )
+        self._factor_history_days = {}
+        for name in all_factors:
+            try:
+                days = int(getattr(registry_get("factor", name), "warmup_trading_days", 0) or 0)
+            except KeyError:
+                days = 0  # The computation engine still rejects unregistered factors.
+            if days < 0:
+                raise ValueError("factor warmup_trading_days cannot be negative")
+            if days:
+                self._factor_history_days[name] = days
+        self._history_calendar = self.cal
+        if self._factor_history_days:
+            earliest = self.cal.min() - pd.Timedelta(days=2 * max(self._factor_history_days.values()))
+            self._history_calendar = pd.DatetimeIndex(
+                self.env.data_manager.get_calendar(earliest, self.cal.max())
+            )
         comp, checkpoint_manifest = self._load_factor_checkpoint(
             checkpoint_path, all_factors
         )
         from factors.library.intraday import clear_transient_data_caches
 
         self.checkpoint_loaded_factor_count = len(comp)
+        batches = []
         for offset in range(0, len(all_factors), 10):
-            batch_names = [
-                name for name in all_factors[offset:offset + 10]
-                if name not in comp
-            ]
+            groups = {}
+            for name in all_factors[offset:offset + 10]:
+                if name not in comp:
+                    groups.setdefault(self._factor_history_days.get(name, 0), []).append(name)
+            batches.extend(groups.items())
+        for history_days, batch_names in batches:
             if not batch_names:
                 continue
             batch: dict[str, pd.DataFrame] = {}
-            for target_dates, request_dates in self._iter_factor_chunks(self.cal):
+            for target_dates, request_dates in self._iter_factor_chunks(
+                self.cal, history_calendar=self._history_calendar, history_days=history_days
+            ):
                 chunk_started = time.perf_counter()
                 engine_timings = getattr(
                     self.env.engine, "computation_timings", ()

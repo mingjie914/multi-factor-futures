@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 from external_strategies.guosen_trend_index.production_compare import (
     _run_production_weights,
 )
@@ -480,6 +481,321 @@ def test_factor_panel_runner_resumes_after_completed_batch(tmp_path, monkeypatch
         "shared_overhead_seconds": resumed.factor_chunk_timings[0]["seconds"],
         "chunks": resumed.factor_chunk_timings,
     }
+
+
+def test_factor_panel_declared_history_does_not_change_ordinary_chunk_boundaries():
+    history = pd.bdate_range("2012-01-02", periods=1600)
+    calendar = history[600:]
+    ordinary = list(FactorPanelRunner._iter_factor_chunks(calendar))
+    extended = list(FactorPanelRunner._iter_factor_chunks(
+        calendar, history_calendar=history, history_days=253,
+    ))
+    from core.period import iter_overlapping_chunks
+    old = list(iter_overlapping_chunks(calendar, 400, 128))
+    for (target, request), (old_target, old_request), (long_target, long_request) in zip(ordinary, old, extended):
+        assert target.equals(old_target) and request.equals(old_request)
+        assert long_target.equals(target)
+        assert long_request[0] == history[history.searchsorted(target[0]) - 253]
+        assert long_request[-1] == request[-1]
+
+
+def test_incremental_trade_jobs_keep_axes_separate_and_do_not_mutate_seeds():
+    peers = [{"id": "s1", "name": "策略一", "directions": {"a": 1, "b": -1}},
+             {"id": "s2", "name": "策略二", "directions": {"b": -1, "d": 1}}]
+    before = json.dumps(peers, sort_keys=True)
+    candidates = {"c": {"direction": -1}, "e": {"direction": 1}}
+    jobs = workflow.incremental_trade_jobs(peers, candidates, {"a": 1, "b": 2, "c": 1, "d": 1, "e": 3})
+    assert [j["kind"] for j in jobs[:2]] == ["baseline", "baseline"]
+    assert len(jobs) == 12  # 2 baselines + 4 buffers + 4 additions + 2 replacements.
+    assert len({j["id"] for j in jobs}) == len(jobs)
+    assert sum(j["kind"] == "replace" for j in jobs) == 2
+    assert all(not j["buffer"] for j in jobs if j["added"])
+    assert json.dumps(peers, sort_keys=True) == before
+
+
+def test_trade_turnover_partition_includes_contract_roll_once():
+    from backtest.research_ledger import build_close_marked_ledger
+    dates = pd.bdate_range("2025-01-02", periods=5)
+    weights = pd.DataFrame({"A": [1., 1., -1., 0., 0.], "B": [-1., -1., 1., 0., 0.]}, index=dates)
+    returns = pd.DataFrame(0., index=dates, columns=weights.columns)
+    contracts = pd.DataFrame({"A": ["A1", "A1", "A2", "A2", "A2"], "B": ["B1"] * 5}, index=dates)
+    result = build_close_marked_ledger(weights, returns, contract_schedule=contracts, trade_cost_rate=0.)
+    components = workflow._trade_turnover_components(result)
+    np.testing.assert_allclose(components.sum(axis=1), result.daily.executed_traded_notional, atol=1e-12)
+    assert components.roll_extra.sum() == 2.
+    assert components.entry_exit.sum() == 4.
+    assert components.reversal.sum() == 4.
+
+
+def test_incremental_trade_integration_preserves_baseline_and_cutoff():
+    rng = np.random.default_rng(915)
+    dates = pd.bdate_range("2025-01-02", periods=100)
+    symbols = [f"S{i:02}" for i in range(38)]
+    names = ["f1", "f2"]
+    returns = pd.DataFrame(rng.normal(0, .01, (100, 38)), index=dates, columns=symbols)
+    ranks = {name: pd.DataFrame(rng.random((100, 38)), index=dates, columns=symbols) for name in names}
+    runner = SimpleNamespace(cal=dates, u=symbols, daily_ret=returns, ranks=ranks,
+        ic=pd.DataFrame(rng.normal(.01, .02, (100, 2)), index=dates, columns=names),
+        close_tradable=returns.notna(), get_contract_schedule=lambda: None,
+        env=SimpleNamespace(sector_of={s: str(i % 6) for i, s in enumerate(symbols)}))
+    recipe = PortfolioRecipe("lw_abs", 10, 3, "erc")
+    evaluator = PortfolioEvaluator(runner, start=dates[60], end=dates[-1])
+    job = {"directions": {n: 1 for n in names}, "buffer": 0}
+    actual, _ = workflow._incremental_trade_result(evaluator, job, recipe)
+    expected = evaluator.ledger_from_weights(evaluator.weights(names, recipe))
+    pd.testing.assert_frame_equal(actual.daily, expected[actual.daily.columns], check_exact=True)
+    buffered, diag = workflow._incremental_trade_result(evaluator, {**job, "buffer": 1}, recipe)
+    assert diag["decisions"] == len(buffered.daily) - 1
+    assert (buffered.effective_weights.iloc[1:].gt(0).sum(axis=1) == 10).all()
+    assert (buffered.effective_weights.iloc[1:].lt(0).sum(axis=1) == 10).all()
+    cutoff = dates[85]
+    first = workflow._incremental_trade_metrics(buffered, cutoff, dates[60])
+    changed_runner = SimpleNamespace(**vars(runner))
+    changed_runner.daily_ret = returns.copy()
+    changed_runner.daily_ret.loc[dates > cutoff] += .01
+    changed_evaluator = PortfolioEvaluator(changed_runner, start=dates[60], end=dates[-1])
+    changed, _ = workflow._incremental_trade_result(changed_evaluator, {**job, "buffer": 1}, recipe)
+    second = workflow._incremental_trade_metrics(changed, cutoff, dates[60])
+    assert first["selection"] == second["selection"]
+    assert first["robustness"] == second["robustness"]
+    assert first["observation"] != second["observation"]
+    assert first["full"]["annualized_turnover"] > 0
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.0, "1"])
+def test_recipe_rejects_non_integer_rank_buffer(value):
+    with pytest.raises(ValueError, match="rank_exit_buffer"):
+        PortfolioRecipe(rank_exit_buffer=value)
+
+
+def test_risk_eligibility_batch_matches_causal_window_for_all_subsets(monkeypatch):
+    from optimization.portfolio_construction import causal_risk_window
+    dates = pd.bdate_range("2024-01-01", periods=130)
+    rng = np.random.default_rng(917)
+    values = rng.normal(size=(130, 9))
+    values[rng.random(values.shape) < .2] = np.nan
+    values[50:65, 2] = np.inf
+    returns = pd.DataFrame(values, index=dates, columns=list("ABCDEFGHI"))
+    runner = SimpleNamespace(cal=dates, u=list(returns), daily_ret=returns)
+    for mode in ("reference", "native", "shadow"):
+        monkeypatch.setenv("MF_FACTOR_KERNEL_MODE", mode)
+        evaluator = PortfolioEvaluator(runner, start=dates[0], end=dates[-1])
+        for date in dates[::7]:
+            for columns in (list(returns), ["C", "A", "UNKNOWN", "F"]):
+                expected = causal_risk_window(returns, date, 90).reindex(columns=columns)
+                counts = np.isfinite(expected.to_numpy()).sum(axis=0)
+                assert evaluator._risk_eligible(date, columns, 10) == [c for c, n in zip(columns, counts) if n >= 10]
+        assert evaluator.risk_count_backend == ("polars" if mode == "reference" else mode)
+
+
+def test_shared_buffer_run_exports_real_targets_and_separates_cache(monkeypatch):
+    from dataclasses import replace
+    dates = pd.bdate_range("2025-01-01", periods=30)
+    symbols = list("ABCDEF")
+    returns = pd.DataFrame(0., index=dates, columns=symbols)
+    scores = pd.DataFrame([list(range(6, 0, -1))] * 30, index=dates, columns=symbols, dtype=float)
+    scores.loc[dates[21]:, "C"] = 7.
+    runner = SimpleNamespace(cal=dates, u=symbols, daily_ret=returns, ranks={"f": scores},
+                             env=SimpleNamespace(sector_of={}))
+    evaluator = PortfolioEvaluator(runner, start=dates[20], end=dates[-1])
+    recipe = PortfolioRecipe("equal", 2, 0, "equal", asset_max_fraction=1.)
+    buffered = replace(recipe, rank_exit_buffer=1)
+    assert recipe.name != buffered.name
+    assert recipe.to_dict()["rank_exit_buffer"] == 0
+    with pytest.raises(ValueError, match="actual holdings"):
+        evaluator.weights(["f"], buffered)
+    old_targets = evaluator.weights(["f"], recipe)
+    old = evaluator.ledger_from_weights(old_targets)
+    plain = evaluator.run(["f"], recipe)
+    pd.testing.assert_frame_equal(plain.target_weights, old_targets, check_exact=True)
+    pd.testing.assert_frame_equal(plain.daily, old[plain.daily.columns], check_exact=True)
+    result = evaluator.run(["f"], buffered)
+    # New rank leader C must not replace actual A/B while both stay in N+B.
+    assert result.target_weights.loc[dates[-1], "C"] == 0.
+    assert old_targets.loc[dates[-1], "C"] > 0.
+    assert result.target_weights.notna().all().all()
+    pd.testing.assert_frame_equal(result.effective_weights.iloc[1:].reset_index(drop=True),
+                                  result.target_weights.iloc[:-1].reset_index(drop=True), check_exact=True)
+    assert result.daily.iloc[-1].decision_turnover == 0.
+    for policy in (recipe, buffered):
+        direct = evaluator.run(["f"], policy)
+        pd.testing.assert_frame_equal(evaluator.ledger(["f"], policy)[direct.daily.columns],
+                                      direct.daily, check_exact=True)
+    assert len(evaluator._ledger_cache) == 2
+    with pytest.raises(ValueError, match="conflicting"):
+        workflow._incremental_trade_result(evaluator, {"directions": {"f": 1}, "buffer": 2}, buffered)
+
+
+def test_factor_profile_cache_resume_preserves_measured_work(tmp_path):
+    measured = SimpleNamespace(computed_factor_count=2, checkpoint_loaded_factor_count=0,
+                               performance_profile=lambda: {"factor_totals": [{"seconds": 12.}], "chunks": [1]})
+    cached = SimpleNamespace(computed_factor_count=0, checkpoint_loaded_factor_count=2,
+                             performance_profile=lambda: {"factor_totals": [], "chunks": []})
+    path = tmp_path / "profile.json"
+    workflow._write_factor_profile(path, measured, preparation_seconds=13.)
+    original = path.read_bytes()
+    workflow._write_factor_profile(path, cached, preparation_seconds=.01)
+    assert path.read_bytes() == original
+    fresh = tmp_path / "cached.json"
+    workflow._write_factor_profile(fresh, cached, preparation_seconds=.01)
+    assert json.loads(fresh.read_text())["computed"] == 0
+    assert json.loads(fresh.read_text())["checkpoint_loaded"] == 2
+
+
+def test_trade_interaction_native_controls_resume_and_report(tmp_path, monkeypatch):
+    import duckdb
+    rng = np.random.default_rng(916)
+    dates = pd.bdate_range("2025-01-02", periods=80)
+    symbols = [f"S{i:02}" for i in range(12)]
+    returns = pd.DataFrame(rng.normal(0, .01, (80, 12)), index=dates, columns=symbols)
+    ranks = {n: pd.DataFrame(rng.random((80, 12)), index=dates, columns=symbols) for n in ("f1", "f2")}
+    runner = SimpleNamespace(cal=dates, u=symbols, daily_ret=returns, ranks=ranks,
+        ic=pd.DataFrame(rng.normal(.01, .02, (80, 2)), index=dates, columns=list(ranks)),
+        close_tradable=returns.notna(), get_contract_schedule=lambda: None,
+        env=SimpleNamespace(sector_of={s: str(i % 3) for i, s in enumerate(symbols)}))
+    recipe = PortfolioRecipe("lw_abs", 2, 2, "erc", asset_max_fraction=1.)
+    evaluator = PortfolioEvaluator(runner, start=dates[60], end=dates[-1])
+    jobs = [{"id": f"seed__B{b}", "seed": "seed", "name": "测试策略(2)", "buffer": b,
+             "kind": "baseline" if b == 0 else "buffer", "directions": {"f1": 1, "f2": 1},
+             "added": "", "removed": "", "reference_job": "prior_add"} for b in (0, 1, 2)]
+    reference, output = tmp_path / "reference", tmp_path / "study"
+    reference.mkdir(); output.mkdir()
+    control, _ = workflow._incremental_trade_result(evaluator, jobs[0], recipe)
+    with duckdb.connect(str(reference / "results.duckdb")) as db:
+        frame = control.daily.reset_index(names="date").assign(job="prior_add")
+        db.register("control", frame)
+        db.execute("CREATE TABLE daily AS SELECT * FROM control")
+    source = {"performance_start": str(dates[60].date()), "selection_end": str(dates[70].date())}
+    first = workflow._run_incremental_jobs(output, reference, evaluator, recipe, jobs, source, max_jobs=1)
+    assert first == {"completed": 1, "planned": 3, "finished": False}
+    final = workflow._run_incremental_jobs(output, reference, evaluator, recipe, jobs, source)
+    assert final == {"completed": 3, "planned": 3, "finished": True}
+    assert workflow._run_incremental_jobs(output, reference, evaluator, recipe, jobs, source) == final
+    with duckdb.connect(str(output / "results.duckdb"), read_only=True) as db:
+        results = [json.loads(row[0]) for row in db.execute("SELECT payload FROM results").fetchall()]
+        assert db.execute("SELECT count(*) FROM daily").fetchone()[0] == 3*20
+        assert db.execute("SELECT count(*) FROM asset_daily").fetchone()[0] == 3*20*12
+    assert all(r["status"] == "completed" for r in results)
+    assert next(r for r in results if r["kind"] == "baseline")["baseline_exact"]
+    peers = [{"id": "seed", "name": "测试策略(2)"}]
+    workflow._json_dump(output / "contract.json", {"peers": peers})
+    lines = workflow._trade_interaction_report_lines(output, {"interaction_parent": str(output), "peers": peers}, results)
+    assert any("交互差" in line for line in lines)
+    assert (output / "original_turnover_sources.png").stat().st_size > 1000
+    assert (output / "original_cost_curves.png").stat().st_size > 1000
+    # The same native ledgers feed the repeated-selection report; reporting
+    # must not rerank membership when observation returns are available.
+    from core import registry
+    monkeypatch.setattr(registry, "get", lambda *a: SimpleNamespace(description="测试因子"))
+    declared = [(dates[60], dates[65]), (dates[66], dates[70])]
+    metrics = workflow._incremental_trade_metrics(control, dates[70], dates[60], segments=declared)
+    assert [(r["start"], r["end"]) for r in metrics["segments"]] == [
+        (str(a.date()), str(b.date())) for a,b in declared]
+    contract = {"peers": [{**peers[0], "directions": {"f1": 1, "f2": 1}}],
+        "effective_library_count": 2,
+        "source": {**source, "panel_start": str(dates[0].date()), "end": str(dates[-1].date())},
+        "selection_segments": [(r["start"],r["end"]) for r in results[0]["metrics"]["segments"]],
+        "candidates": {n: {"input_bar_frequency": "1min", "best_period": 5} for n in ranks}}
+    workflow._json_dump(output / "contract.json", contract)
+    workflow._json_dump(output / "jobs.json", jobs)
+    workflow._json_dump(output / "clusters.json", {"clusters": {"f1": 1, "f2": 2}})
+    workflow._json_dump(output / "selection_manifest.json", {"selected": ["frozen"], "coverage": {
+        "A": {"attempts": 1, "successful": 1, "attempted_factors": 2, "successful_factors": 2}}})
+    workflow._json_dump(output / "performance.json", {"wall_seconds": 1., "cpu_seconds": 1.})
+    with duckdb.connect(str(output / "results.duckdb")) as db:
+        row = next(r for r in results if r["buffer"] == 1)
+        row.update(kind="candidate", methods=["A"])
+        db.execute("UPDATE results SET payload=? WHERE id=?", [json.dumps(row), row["id"]])
+    assert workflow.report_repeated_library_search(output)["promoted"] is False
+    assert (output / "nav_comparison.png").stat().st_size > 1000
+    assert (output / "selection_segments.png").stat().st_size > 1000
+    assert "测试因子" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_repeated_selection_rejects_mixed_modes_before_execution(monkeypatch, tmp_path):
+    import sys
+    import pytest
+    for extra in (["--incremental-trade-study"], ["--max-jobs", "1"],
+                  ["--repeat-selection-report"], ["--reference-run", str(tmp_path)]):
+        monkeypatch.setattr(sys, "argv", ["study", "--output", str(tmp_path),
+            "--repeat-selection-parent", str(tmp_path), *extra])
+        with pytest.raises(SystemExit) as exc:
+            workflow.main()
+        assert exc.value.code == 2
+
+
+def test_incremental_diagnostic_plots_allow_uncomputed_cells(tmp_path, monkeypatch):
+    from core import registry
+    monkeypatch.setattr(registry, "get", lambda *args: SimpleNamespace(description="测试因子"))
+    contract = {"peers": [{"id": "seed", "name": "测试策略(1)"}], "candidates": {"f": {}},
+                "source": {"selection_end": "2026-05-15", "end": "2026-09-11"}}
+    workflow._plot_incremental_trade_diagnostics(tmp_path, contract, [], {})
+    for name in ("buffer_nav.png", "buffer_effects.png", "factor_increment_effects.png"):
+        assert (tmp_path / name).stat().st_size > 1000
+
+
+def test_incremental_report_shortlist_ignores_observation_and_waits_for_all_jobs(tmp_path, monkeypatch):
+    import duckdb
+    import run_portfolio_workflow
+    from core import registry
+    monkeypatch.setattr(registry, "get", lambda *args: SimpleNamespace(description="测试因子"))
+    monkeypatch.setattr(run_portfolio_workflow, "_write_comparison_plot", lambda *a, **k: None)
+    monkeypatch.setattr(workflow, "_plot_incremental_trade_diagnostics", lambda *a: None)
+    contract = {"source": {"selection_end": "2026-05-15", "panel_start": "2015-04-01",
+                           "performance_start": "2016-03-31", "end": "2026-09-11"},
+                "peers": [], "candidates": {"f": {"input_bar_frequency": "1min", "best_period": 5, "direction": 1}},
+                "shortlist_rule": "frozen"}
+    workflow._json_dump(tmp_path / "contract.json", contract)
+    workflow._json_dump(tmp_path / "clusters.json", {"clusters": {"f": 1}})
+    workflow._json_dump(tmp_path / "jobs.json", ["base", "add", "pending"])
+    period = {"annual_return": .1, "sharpe": 1., "max_drawdown": -.1,
+              "annualized_turnover": 200., "gross_annual_return": .15,
+              "total_return": 1., "annual_volatility": .1,
+              "cost_sensitivity": {"breakeven_trade_cost_rate": .0006,
+                  "scenarios": [{"trade_cost_rate": bp/10000, "metrics": {"annual_return": .01}} for bp in (4, 8)]}}
+    robust = {"positive_segment_ratio": 1., "worst_sharpe": .5, "median_sharpe": 1.,
+              "median_annual_return": .1, "worst_drawdown": -.1}
+    base = {"id": "base", "seed": "seed", "name": "测试策略(1)", "kind": "baseline", "buffer": 0,
+            "status": "completed", "directions": {"old": 1}, "added": "", "removed": "",
+            "first_holding_date": "2016-04-01", "wall_seconds": 1.,
+            "metrics": {"selection": period, "observation": period, "full": period, "robustness": robust}}
+    add = json.loads(json.dumps(base))
+    add.update(id="add", kind="add", added="f", directions={"old": 1, "f": 1})
+    add["metrics"]["selection"]["annual_return"] = .11
+    with duckdb.connect(str(tmp_path / "results.duckdb")) as db:
+        db.execute("CREATE TABLE results(id VARCHAR, payload VARCHAR)")
+        db.executemany("INSERT INTO results VALUES (?, ?)", [(r["id"], json.dumps(r)) for r in (base, add)])
+        db.execute("CREATE TABLE daily(job VARCHAR, date DATE, nav_after DOUBLE)")
+        db.executemany("INSERT INTO daily VALUES (?, ?, ?)", [(r, d, n) for r in ("base", "add")
+            for d, n in (("2016-03-31", 1.), ("2026-09-11", 2.))])
+    assert workflow.report_incremental_trade_study(tmp_path)["shortlist"] == 0
+    workflow._json_dump(tmp_path / "jobs.json", ["base", "add"])
+    assert workflow.report_incremental_trade_study(tmp_path)["shortlist"] == 1
+    add["metrics"]["observation"].update(annual_return=-.9, sharpe=-10., total_return=-.9)
+    add["metrics"]["full"].update(annual_return=-.9, sharpe=-10., total_return=-.9)
+    with duckdb.connect(str(tmp_path / "results.duckdb")) as db:
+        db.execute("UPDATE results SET payload=? WHERE id='add'", [json.dumps(add)])
+    assert workflow.report_incremental_trade_study(tmp_path)["shortlist"] == 1
+    assert json.loads((tmp_path / "shortlist.json").read_text())["promoted"] is False
+
+
+def test_factor_checkpoint_fingerprints_declared_history(monkeypatch):
+    calls = []
+    runner = FactorPanelRunner.__new__(FactorPanelRunner)
+    runner.cal = pd.bdate_range("2020-01-02", periods=10)
+    runner.u = ["A"]
+    runner._factor_history_days = {"long_factor": 253}
+    runner._history_calendar = pd.bdate_range("2018-01-02", runner.cal[-1])
+    runner.env = SimpleNamespace(data_manager=SimpleNamespace(source=SimpleNamespace(
+        checkpoint_source_fingerprint=lambda left, right: calls.append((left, right)) or "slice",
+    )))
+    monkeypatch.setattr(runner, "_source_tree_fingerprint", lambda: "code")
+    ordinary = runner._checkpoint_contract(["ordinary"])
+    assert "data_history_start" not in ordinary
+    assert calls[-1][0] == runner.cal[0]
+    long = runner._checkpoint_contract(["long_factor"])
+    assert long["factor_history_trading_days"] == {"long_factor": 253}
+    assert calls[-1][0] == runner._history_calendar[0]
 
 
 def test_return_metrics_include_drawdown_from_initial_capital():
@@ -1082,6 +1398,45 @@ def test_history_optimization_preserves_recipe_grid_targets(monkeypatch):
             patch.setattr(hp, "causal_risk_window", old_risk)
             expected = PortfolioEvaluator(runner, start=dates[-3], end=dates[-1]).weights(names[:count], recipe)
         pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+
+
+def test_trade_replay_inherits_parent_reporting_segments(monkeypatch, tmp_path):
+    import duckdb
+    import json
+    import research.artifacts as artifacts
+    import workflows.experiments.historical_portfolio_search as workflow
+    from workflows.factor_selection import _production_recipe, _configured_cost_model
+
+    config = workflow.load_config("config/default.yaml")
+    source = {"panel_start": "2016-01-01", "end": "2026-09-11",
+              "source_fingerprint": "fixed", "recipe": _production_recipe(config).to_dict()}
+    runtime = {"costs": _configured_cost_model(config).ledger_parameters(),
+               "ic_window": config.production_portfolio.ic_window,
+               "risk_lookback_calendar_days": config.production_portfolio.risk_lookback_calendar_days}
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    row = dict(id="control", seed="control", name="control", buffer=0, directions={},
+               added=[], removed=[], kind="baseline", status="completed")
+    with duckdb.connect(str(parent / "results.duckdb")) as db:
+        db.execute("CREATE TABLE results AS SELECT ? AS payload", [json.dumps(row)])
+    (parent / "acceptance.json").write_text(json.dumps({"review_complete": True,
+        "computation_contract_sha256": "sealed", "results_sha256": "sealed"}), encoding="utf-8")
+    monkeypatch.setattr(artifacts, "sha256_file", lambda _: "sealed")
+    monkeypatch.setattr(workflow, "_search_source_snapshot", lambda *args: {
+        "end": source["end"], "source_fingerprint": source["source_fingerprint"]})
+    for explicit in (False, True):
+        previous = dict(source=source, runtime=runtime, input_sha256={}, code_sha256={})
+        if explicit:
+            previous["selection_segments"] = [[f"{year}-01-01", f"{year+1}-12-31"]
+                                               for year in range(2016, 2026, 2)]
+        encoded = json.dumps(previous)
+        (parent / "contract.json").write_text(encoded, encoding="utf-8")
+        output = tmp_path / str(explicit)
+        assert workflow.replay_completed_trade_study(output, parent, max_jobs=0)["status"] == "frozen"
+        frozen = json.loads((output / "contract.json").read_text(encoding="utf-8"))
+        assert frozen["source"].get("selection_segments") == previous.get("selection_segments")
+        assert (parent / "contract.json").read_text(encoding="utf-8") == encoded
+        assert "selection_segments" not in source
 
 
 def test_repair_audit_rejects_unverified_provenance_before_loading_data(monkeypatch, tmp_path):

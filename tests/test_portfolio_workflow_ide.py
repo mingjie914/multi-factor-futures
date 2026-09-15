@@ -5,10 +5,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import run_portfolio_workflow as ide
 from backtest.engine import BacktestResult
-from core.config import load_config, load_strategy_library
+from core.config import (
+    ProductionPortfolioConfig,
+    StrategyLibraryEntry,
+    load_config,
+    load_strategy_library,
+)
 from core.sectors import FRAMEWORK_UNIVERSE
 
 
@@ -39,15 +45,17 @@ def test_shipped_legacy_definitions_are_portable():
     assert [s.id for s in catalog.strategies if s.status == "preferred"] == ["multi_source_balanced"]
 
 
-def test_comparison_plot_uses_actual_dates_and_nine_distinct_colors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("count", [9, 20])
+def test_comparison_plot_uses_actual_dates_and_distinct_styles(tmp_path, monkeypatch, count):
     import matplotlib.figure
     dates = pd.date_range("2016-03-31", periods=3)
-    nav = pd.DataFrame({f"候选{i}": [1., 1.01, 1.02+i*.001] for i in range(9)}, index=dates)
+    nav = pd.DataFrame({f"候选{i}": [1., 1.01, 1.02+i*.001] for i in range(count)}, index=dates)
     captured = {}
     original = matplotlib.figure.Figure.savefig
     def save(fig, *args, **kwargs):
         captured["title"] = fig.axes[0].get_title()
         captured["colors"] = [line.get_color() for line in fig.axes[0].lines]
+        captured["styles"] = [(line.get_color(), line.get_linestyle()) for line in fig.axes[0].lines]
         captured["table_text"] = [cell.get_text().get_text() for ax in fig.axes
                                   for table in ax.tables for cell in table.get_celld().values()]
         return original(fig, *args, **kwargs)
@@ -55,7 +63,9 @@ def test_comparison_plot_uses_actual_dates_and_nine_distinct_colors(tmp_path, mo
     ide._write_comparison_plot(tmp_path, nav, [{"strategy": n} for n in nav])
     assert "2016-03-31至2016-04-02" in captured["title"]
     assert "最新" not in captured["title"]
-    assert len(set(captured["colors"])) == 9
+    assert len(set(captured["colors"])) == min(count, 13)
+    assert len(set(captured["styles"])) == count
+    assert all(style == "-" for _, style in captured["styles"][:13])
     assert "年化换手(倍/年)" in captured["table_text"]
     assert (tmp_path / "nav_comparison.png").stat().st_size > 10000
 
@@ -103,6 +113,33 @@ def test_comparison_plot_marks_forward_observation(tmp_path, monkeypatch):
 
 def test_comparison_default_start_inherits_framework():
     assert ide.COMPARISON_START == load_config("config/default.yaml").date_range.start
+
+
+def test_rank_exit_buffer_defaults_are_distinct_by_config_scope():
+    config = load_config("config/default.yaml")
+    assert config.production_portfolio.rank_exit_buffer == 0
+
+    entry = StrategyLibraryEntry(id="probe", config_path="strategy.yaml")
+    assert entry.rank_exit_buffer is None
+
+
+@pytest.mark.parametrize("value", [0, 3])
+def test_rank_exit_buffer_accepts_nonnegative_integers(value):
+    assert ProductionPortfolioConfig(rank_exit_buffer=value).rank_exit_buffer == value
+    entry = StrategyLibraryEntry(
+        id="probe", config_path="strategy.yaml", rank_exit_buffer=value
+    )
+    assert entry.rank_exit_buffer == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0.0, 1.0, -1, "0", "1"])
+def test_rank_exit_buffer_rejects_non_strict_values(value):
+    with pytest.raises(ValueError):
+        ProductionPortfolioConfig(rank_exit_buffer=value)
+    with pytest.raises(ValueError):
+        StrategyLibraryEntry(
+            id="probe", config_path="strategy.yaml", rank_exit_buffer=value
+        )
 
 
 def test_segment_metrics_include_first_post_cutoff_return_and_trade():
@@ -234,6 +271,101 @@ def test_ide_strategy_best_period_does_not_constrain_portfolio_holding(tmp_path,
 
     specs = ide._validated_specs()
     assert len(specs[2]) == 1
+
+
+@pytest.mark.parametrize("global_value,override,expected", [(0, None, 0), (2, None, 2), (2, 0, 0), (0, 1, 1)])
+def test_strategy_rank_buffer_resolves_once_without_rewriting_config(tmp_path, monkeypatch, global_value, override, expected):
+    path = _write_config(tmp_path)
+    catalog_path = _write_catalog(tmp_path, path)
+    catalog = load_strategy_library(catalog_path)
+    catalog.strategies[0].rank_exit_buffer = override
+    cfg = load_config(path)
+    cfg.production_portfolio.rank_exit_buffer = global_value
+    monkeypatch.setattr(ide, "load_strategy_library", lambda _: catalog)
+    monkeypatch.setattr(ide, "load_config", lambda _: cfg.model_copy(deep=True))
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
+    _, _, specs = ide._validated_specs()
+    resolved = specs[0][2]
+    assert resolved.production_portfolio.rank_exit_buffer == expected
+    assert ide._legacy_recipe(resolved).rank_exit_buffer == expected
+    assert cfg.production_portfolio.rank_exit_buffer == global_value
+
+
+@pytest.mark.parametrize("mode", [ide.PortfolioWorkflow.RUN_AND_COMPARE, ide.PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED])
+def test_comparison_rejects_implicit_rank_buffer_route_change(tmp_path, monkeypatch, mode):
+    path = _write_config(tmp_path)
+    catalog_path = _write_catalog(tmp_path, path)
+    catalog = load_strategy_library(catalog_path)
+    catalog.strategies[0].rank_exit_buffer = 1
+    monkeypatch.setattr(ide, "load_strategy_library", lambda _: catalog)
+    monkeypatch.setattr(ide, "WORKFLOW", mode)
+    with pytest.raises(ValueError, match="rank_exit_buffer|production_portfolio"):
+        ide._validated_specs()
+
+
+def test_rank_buffer_rejects_other_buffer_layers_and_generic_pipeline():
+    from core.config import validate_rank_buffer_route
+    cfg = load_config("config/default.yaml")
+    cfg.production_portfolio.rank_exit_buffer = 1
+    validate_rank_buffer_route(cfg, actual_holdings_supported=True)
+    with pytest.raises(ValueError, match="actual holdings"):
+        validate_rank_buffer_route(cfg, actual_holdings_supported=False)
+    for field in ("asset_selection", "universe_selection"):
+        getattr(cfg, field).enabled = True
+        with pytest.raises(ValueError, match="cannot combine"):
+            validate_rank_buffer_route(cfg, actual_holdings_supported=True)
+        getattr(cfg, field).enabled = False
+
+
+@pytest.mark.parametrize("buffer", [0, 1])
+def test_native_portfolio_exports_actual_ledger_and_diagnoses_costs_once(tmp_path, monkeypatch, buffer):
+    import numpy as np
+    import optimization.costs as costs
+    import research.historical_portfolio_search as research
+    import research.portfolio_experiment_support as support
+    from backtest.research_ledger import build_close_marked_ledger
+    dates = pd.bdate_range(ide.COMPARISON_START, periods=3)
+    targets = pd.DataFrame({"AU": [1., .8, .6], "CU": [-1., -.8, -.6]}, index=dates)
+    returns = pd.DataFrame({"AU": [0., .01, -.02], "CU": [0., -.01, .01]}, index=dates)
+    native = build_close_marked_ledger(targets, returns, trade_cost_rate=.0002,
+        decision_target=(lambda date, desired, actual: desired * .5) if buffer else None)
+    native.metadata = {**native.metadata, "rank_buffer_diagnostics": {"decisions": 2 if buffer else 0}}
+    cfg = load_config("config/default.yaml")
+    cfg.factors = ["probe"]
+    cfg.production_portfolio.rank_exit_buffer = buffer
+    panel = SimpleNamespace(cal=dates, daily_ret=returns, u=list(returns),
+                            env=SimpleNamespace(sector_of={}), get_contract_schedule=lambda: None)
+    panel.for_factors = lambda *args, **kwargs: panel
+    class Evaluator:
+        def __init__(self, *args, **kwargs):
+            pass
+        def run(self, factors, recipe):
+            assert factors == ["probe"] and recipe.rank_exit_buffer == buffer
+            return native
+    monkeypatch.setattr(research, "PortfolioEvaluator", Evaluator)
+    monkeypatch.setattr(research, "CausalEligibilityEnvironment", lambda *args: SimpleNamespace(sector_of={}))
+    monkeypatch.setattr(support, "latest_local_date", lambda: dates[-1])
+    calls = []
+    original = costs.evaluate_cost_sensitivity
+    def diagnose(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(costs, "evaluate_cost_sensitivity", diagnose)
+    result, _ = ide._run_production_portfolio(cfg, tmp_path, factor_directions={"probe": 1},
+        factor_direction_source={"fixture": True}, panel_runner_override=panel)
+    assert result.research_ledger is native
+    assert result.weights_history is native.target_weights
+    assert len(calls) == 1
+    for filename, frame in {
+        "weights.csv": native.target_weights,
+        "research_target_weights.csv": native.target_weights,
+        "research_effective_weights.csv": native.effective_weights,
+        "research_asset_returns.csv": native.asset_returns,
+        "research_return_contributions.csv": native.contributions,
+        "research_return_ledger.csv": native.daily,
+    }.items():
+        saved = pd.read_csv(tmp_path / filename, index_col=0, float_precision="round_trip")
+        np.testing.assert_array_equal(saved.to_numpy(), frame.to_numpy())
 
 
 def test_catalog_rejects_unknown_factor_even_before_strategy_use(tmp_path, monkeypatch):

@@ -9,6 +9,51 @@ const N_PAIR_STATS: usize = 10;
 const N_LAGGED_PAIR_STATS: usize = 4;
 
 #[pyfunction]
+fn finite_window_counts<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    stops: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let values = values.as_array();
+    let starts = starts.as_array();
+    let stops = stops.as_array();
+    if starts.len() != stops.len() {
+        return Err(PyValueError::new_err(
+            "starts and stops must have the same length",
+        ));
+    }
+    let nrows = i64::try_from(values.nrows())
+        .map_err(|_| PyValueError::new_err("values has too many rows"))?;
+    for index in 0..starts.len() {
+        let start = starts[index];
+        let stop = stops[index];
+        if start < 0 || start > stop || stop > nrows {
+            return Err(PyValueError::new_err(
+                "windows must satisfy 0 <= start <= stop <= nrows",
+            ));
+        }
+    }
+
+    let mut prefix = Array2::<i64>::zeros((values.nrows() + 1, values.ncols()));
+    for row in 0..values.nrows() {
+        for column in 0..values.ncols() {
+            prefix[[row + 1, column]] =
+                prefix[[row, column]] + i64::from(values[[row, column]].is_finite());
+        }
+    }
+    let mut output = Array2::<i64>::zeros((starts.len(), values.ncols()));
+    for window in 0..starts.len() {
+        let start = starts[window] as usize;
+        let stop = stops[window] as usize;
+        for column in 0..values.ncols() {
+            output[[window, column]] = prefix[[stop, column]] - prefix[[start, column]];
+        }
+    }
+    Ok(output.into_pyarray(py))
+}
+
+#[pyfunction]
 fn daily_downside_concentration<'py>(
     py: Python<'py>,
     close: PyReadonlyArray2<'py, f64>,
@@ -2198,6 +2243,7 @@ fn daily_liquidity_event_features<'py>(
 
 #[pymodule]
 fn _mf_factor_kernels(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(finite_window_counts, module)?)?;
     module.add_function(wrap_pyfunction!(daily_return_stats, module)?)?;
     module.add_function(wrap_pyfunction!(daily_downside_concentration, module)?)?;
     module.add_function(wrap_pyfunction!(daily_unary_stats, module)?)?;
