@@ -72,3 +72,10 @@ def test_lot_conversion_keeps_concrete_contract_in_handoff():
 
     assert rows[0]["contract"] == "RB2610"
     assert rows[0]["lots"] == 15
+
+
+def test_egg_lot_uses_quote_units_not_physical_tonnes():
+    # 5 tonnes / 500 kg = 10 quoted units per lot.
+    rows = lots_for({"JD": 1.0}, 38_290, {"JD": {"contract": "JD2611", "price": 3829}})
+    assert rows[0]["lots"] == 1
+    assert rows[0]["actual_notional"] == 38_290

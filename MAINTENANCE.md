@@ -18,7 +18,7 @@ $PY = 'E:\Python\Pythonvenv\Scripts\python.exe'
 & $PY -m pip check
 & $PY -B -m compileall -q alpha backtest core data external_strategies factor_mining factors `
   monitoring optimization pipeline processing research risk scripts strategies testing `
-  workflows tests main.py
+  workflows trading tests main.py run_trading_workflow.py
 & $PY -B -m pytest -q -p no:cacheprovider
 & $PY -X utf8 -B main.py mining dev-smoke `
   --periods 5000 --symbols 20 --population 32 --generations 2 --jobs 1

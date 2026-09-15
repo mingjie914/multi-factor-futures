@@ -32,9 +32,11 @@ Top10/Bottom10＋五大分组cap3＋分侧ERC；不与另一选项`diag_icir`混
 | 因子检验、入库、库内搜索 | run_factor_workflow.py | config/default.yaml、factor_library/library.json |
 | 默认组合、备选比较、配置校验 | run_portfolio_workflow.py | config/strategy_library.yaml |
 | 目标权重发布检查 | main.py close | config/target_publication.yaml |
+| 独立权重、资金折算与交易计划 | run_trading_workflow.py（显式分步） | config/trading.yaml；发布和执行默认关闭 |
 
 因子入口默认要求明确填写新增批次，不会意外启动全量检验。
 组合入口无参数运行默认首选策略；修改IDE SETTINGS显式分支即可比较10组。
+交易模块不随研究或回测自动启动，接口及已验证边界见[交易模块文档](docs/交易模块设计与验收.md)。
 
 ## 流程
 

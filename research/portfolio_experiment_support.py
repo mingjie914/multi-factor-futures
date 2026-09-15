@@ -249,10 +249,14 @@ class FactorPanelRunner:
     CHECKPOINT_SCHEMA_VERSION = 1
 
     @classmethod
-    def _iter_factor_chunks(cls, calendar, *, history_calendar=None, history_days=0):
+    def _iter_factor_chunks(cls, calendar, *, history_calendar=None, history_days=0,
+                            compute_start=None):
         for target, request in iter_overlapping_chunks(
             calendar, cls.FACTOR_CHUNK_SIZE, cls.FACTOR_CHUNK_OVERLAP
         ):
+            # Skip whole old blocks without moving the original block grid.
+            if compute_start is not None and target[-1] < pd.Timestamp(compute_start):
+                continue
             if history_days:
                 history = pd.DatetimeIndex(history_calendar)
                 left = max(0, history.searchsorted(target[0]) - int(history_days))
@@ -325,6 +329,8 @@ class FactorPanelRunner:
         if history_days:
             contract.update(factor_history_trading_days=history_days,
                             data_history_start=pd.Timestamp(history_start).isoformat())
+        if getattr(self, "compute_start", None) is not None:
+            contract["compute_start"] = pd.Timestamp(self.compute_start).isoformat()
         return contract
 
     @staticmethod
@@ -403,7 +409,9 @@ class FactorPanelRunner:
         factor_directions: Mapping[str, int] | None = None,
         ic_horizon: int = 1,
         checkpoint_dir: str | Path | None = None,
+        compute_start: str | pd.Timestamp | None = None,
     ):
+        self.compute_start = pd.Timestamp(compute_start) if compute_start is not None else None
         self.ic_horizon = int(ic_horizon)
         if self.ic_horizon < 1:
             raise ValueError("ic_horizon must be a positive daily-bar horizon")
@@ -459,7 +467,8 @@ class FactorPanelRunner:
                 continue
             batch: dict[str, pd.DataFrame] = {}
             for target_dates, request_dates in self._iter_factor_chunks(
-                self.cal, history_calendar=self._history_calendar, history_days=history_days
+                self.cal, history_calendar=self._history_calendar, history_days=history_days,
+                compute_start=self.compute_start,
             ):
                 chunk_started = time.perf_counter()
                 engine_timings = getattr(

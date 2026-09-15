@@ -1,0 +1,39 @@
+# Independently invoked only; no daemon, schedule, or automatic order submission.
+schema_version: 1
+mode: simulation
+catalog: config/strategy_library.yaml
+strategy_ids: {formal_main: '@formal'}
+output_root: runs/trading
+rounding: half_up
+accounts:
+  paper_500w:
+    equity: 5000000
+    available: 5000000
+    margin_used: 0
+    frozen_margin: 0
+    reserve: 100000
+    max_margin_ratio: 0.70
+    max_gross_exposure: 2.10
+    max_abs_net_exposure: 0.10
+    require_one_lot: true
+routes:
+  - strategy_id: formal_main
+    account_id: paper_500w
+    capital_basis: equity
+    amount: 5000000
+execution:
+  paper_500w:
+    channel: manual
+    expected_identity: paper_500w
+    execute_enabled: false
+    cold_start: require_flat
+    managed_roots: [A, AG, AL, AU, CU, FU, HC, I, IC, IF, IH, J, JM, M, MA, NI, P, RB, RM, RU, SA, SN, SR, T, TA, TL, TS, Y, ZN, IM, TF, CF, OI, LH, JD, SC, V, UR]
+    max_snapshot_age_seconds: 60
+    plan_ttl_seconds: 120
+    max_order_lots: 100
+    order_type: market
+    max_price_deviation: 0.05
+    limit_prices: {}
+    # For next-day/night trading, set the expected preceding completed close
+    # explicitly; never assume a weekend/holiday calendar from business weekdays.
+    # expected_signal_date: '2026-09-15'

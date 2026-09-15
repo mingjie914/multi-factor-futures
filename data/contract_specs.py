@@ -3,6 +3,7 @@
 乘数来源: 股指/国债用 S_INFO_CEMULTIPLIER (元/点), 商品用 S_INFO_PUNIT (吨/手等).
 保证金: S_INFO_FTMARGINS 解析 (合约价值比例).
 TS(2年债)乘数 20000 是 T/TF/TL(10000) 的 2 倍; IF/IH=300, IC/IM=200, 手数换算务必注意.
+JD每手5吨、每500千克报价，计价乘数为10，不能把实物吨数5直接用作金额乘数。
 """
 
 CONTRACT_SPECS = {
@@ -40,7 +41,7 @@ CONTRACT_SPECS = {
     "CF": {"name": "一号棉花", "unit": "吨", "multiplier": 5.0, "quote": "人民币元/吨", "margin": 0.05},
     "OI": {"name": "菜籽油", "unit": "吨", "multiplier": 10.0, "quote": "人民币元/吨", "margin": 0.05},
     "LH": {"name": "生猪", "unit": "吨", "multiplier": 16.0, "quote": "人民币元/吨", "margin": 0.05},
-    "JD": {"name": "鲜鸡蛋", "unit": "吨", "multiplier": 5.0, "quote": "人民币元/500千克", "margin": 0.05},
+    "JD": {"name": "鲜鸡蛋", "unit": "吨", "multiplier": 10.0, "quote": "人民币元/500千克", "margin": 0.05},
     "SC": {"name": "中质含硫原油", "unit": "桶", "multiplier": 1000.0, "quote": "人民币元/桶", "margin": 0.05},
     "V": {"name": "聚氯乙烯", "unit": "吨", "multiplier": 5.0, "quote": "人民币元/吨", "margin": 0.05},
     "UR": {"name": "尿素", "unit": "吨", "multiplier": 20.0, "quote": "人民币元/吨", "margin": 0.05},

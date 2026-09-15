@@ -3,7 +3,8 @@
 The close workflow is deliberately separate from research and backtesting.
 It never promotes a research candidate or an old report implicitly. Until a
 reviewed deployment package is explicitly enabled, it publishes no targets.
-Order creation, routing, fills, and position reconciliation are out of scope.
+It delegates approved weight generation to the independent trading module.
+Order creation and execution remain separate explicit steps.
 """
 from __future__ import annotations
 
@@ -60,9 +61,26 @@ def build_close_target_publication(
     elif enabled and not deployment_path.exists():
         reason_code = "DEPLOYMENT_PACKAGE_NOT_FOUND"
     elif enabled:
-        # Refuse to infer current targets from historical candidates or a
-        # backtest configuration until a reviewed generator is released.
-        reason_code = "TARGET_GENERATOR_NOT_RELEASED"
+        from trading.artifacts import read_csv
+        from trading.weights import generate_weights
+        try:
+            package = json.loads(deployment_path.read_text(encoding="utf-8"))
+            strategy_ids = {row["strategy_id"]: row["catalog_strategy_id"] for row in package["strategies"]}
+            state_file = gate.get("holding_state_file")
+            holdings = json.loads(_resolve_project_path(state_file).read_text(encoding="utf-8")) if state_file else None
+            artifact = generate_weights(strategy_ids, as_of=decision_date, mode="production",
+                                        gate=gate, holdings=holdings)
+            targets = {}
+            for row in read_csv(artifact, "weights.csv"):
+                targets.setdefault(row["strategy_id"], {})[row["root"]] = float(row["weight"])
+            return {"schema_version": 1, "as_of": decision_date, "status": "TARGETS",
+                    "reason_code": "APPROVED_TARGETS_GENERATED", "approval_status": approval_status,
+                    "target_weights": targets, "weight_artifact": str(artifact), "config": str(config_file)}
+        except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
+            reason_code = "TARGET_GENERATION_BLOCKED"
+            return {"schema_version": 1, "as_of": decision_date, "status": "NO_TARGETS",
+                    "reason_code": reason_code, "detail": str(exc), "target_weights": {},
+                    "approval_status": approval_status, "config": str(config_file)}
 
     return {
         "schema_version": 1,

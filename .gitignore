@@ -30,6 +30,7 @@ build/
 # Local credentials
 config/local.yaml
 config/secret.yaml
+config/trading.local.yaml
 .env
 
 # Editors and operating systems

@@ -853,6 +853,26 @@ class PortfolioEvaluator:
             decision_target=decision_target,
         )
 
+    def target_for_holdings(self, factors, recipe, date, actual, *, diagnostics=None):
+        """Shared one-close buffered target using explicit actual holding signs."""
+        date = pd.Timestamp(date)
+        score = self._score_matrix(factors, recipe.factor_weight)
+        eligible = self._risk_eligible(date, self.runner.u, recipe.constraints.minimum_risk_observations)
+        actual = pd.Series(actual, dtype=float).reindex(self.runner.u, fill_value=0.0)
+        if not np.isfinite(actual.to_numpy()).all():
+            raise ValueError("actual holdings must be finite")
+        long, short = select_long_short_pools(
+            score.loc[date], eligible=eligible, sector_of=self.runner.env.sector_of,
+            constraints=recipe.constraints, previous_long=actual[actual > 1e-12].index,
+            previous_short=actual[actual < -1e-12].index,
+            exit_buffer=recipe.rank_exit_buffer, diagnostics=diagnostics,
+        )
+        return combine_sleeves(
+            self._asset_weights(date, long, recipe), self._asset_weights(date, short, recipe),
+            universe=self.runner.u, long_pool=long, short_pool=short,
+            constraints=recipe.constraints, sector_of=self.runner.env.sector_of,
+        )
+
     def run(self, factors: Sequence[str], recipe: PortfolioRecipe, *, cost_multiplier=1.0):
         """One native execution path, starting flat; targets and actual holdings stay distinct.
 
@@ -872,27 +892,18 @@ class PortfolioEvaluator:
             def callback(date, desired, actual):
                 if not desired.abs().gt(1e-12).any():
                     return desired
-                eligible = self._risk_eligible(date, self.runner.u, constraints.minimum_risk_observations)
                 previous_long = actual[actual > 1e-12].index
                 previous_short = actual[actual < -1e-12].index
                 detail = {}
-                long, short = select_long_short_pools(
-                    score.loc[date], eligible=eligible, sector_of=self.runner.env.sector_of,
-                    constraints=constraints, previous_long=previous_long, previous_short=previous_short,
-                    exit_buffer=recipe.rank_exit_buffer, diagnostics=detail,
-                )
+                result = self.target_for_holdings(factors, recipe, date, actual, diagnostics=detail)
                 # Keep execution diagnostics comparable to historical studies;
                 # the final unexecuted target is exported but not counted here.
                 if date != self.dates[-1]:
                     diagnostics["decisions"] += 1
                     diagnostics["constraint_fallbacks"] += int(detail.get("constraint_fallback", False))
-                    diagnostics["retained_long"] += len(set(long) & set(previous_long))
-                    diagnostics["retained_short"] += len(set(short) & set(previous_short))
-                return combine_sleeves(
-                    self._asset_weights(date, long, unbuffered), self._asset_weights(date, short, unbuffered),
-                    universe=self.runner.u, long_pool=long, short_pool=short,
-                    constraints=constraints, sector_of=self.runner.env.sector_of,
-                )
+                    diagnostics["retained_long"] += len(set(result[result > 1e-12].index) & set(previous_long))
+                    diagnostics["retained_short"] += len(set(result[result < -1e-12].index) & set(previous_short))
+                return result
 
         result = self._run_weights(weights, cost_multiplier=cost_multiplier, decision_target=callback)
         result.metadata = {**result.metadata, "rank_exit_buffer": recipe.rank_exit_buffer,

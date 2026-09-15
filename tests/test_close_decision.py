@@ -67,3 +67,14 @@ def test_close_publication_requires_iso_date(tmp_path):
         pass
     else:
         raise AssertionError("invalid decision dates must fail closed")
+
+
+def test_approved_gate_still_rejects_an_invalid_deployment_package(tmp_path):
+    package = tmp_path / "invalid.json"
+    package.write_text('{}', encoding="utf-8")
+    config = tmp_path / "gate.yaml"
+    config.write_text(yaml.safe_dump({"enabled": True,
+        "approval_status": "approved_for_target_publication", "deployment_package": str(package)}), encoding="utf-8")
+    result = build_close_target_publication(config, "2026-09-11")
+    assert result["status"] == "NO_TARGETS"
+    assert result["reason_code"] == "TARGET_GENERATION_BLOCKED"
