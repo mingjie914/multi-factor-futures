@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from math import isfinite
 import re
@@ -17,15 +17,55 @@ def timestamp(value):
     return parsed
 
 
+def validate_execution_window(policy, *, now=None):
+    """Validate an explicitly dated send window; absence preserves manual use.
+
+    Completion is a target, not a promise by the broker. Orders must stop being
+    submitted earlier, with room for the channel's queue and reconciliation.
+    Calendar selection belongs to the caller; never infer T-1 from weekdays.
+    """
+    if "execution_window" not in policy:
+        return None
+    window = policy["execution_window"]
+    try:
+        start, stop, completion = (
+            timestamp(window[key]) for key in ("start_at", "submit_until", "completion_by")
+        )
+        shanghai = timezone(timedelta(hours=8))
+        execution_date = start.astimezone(shanghai).date()
+        if (not start < stop <= completion
+                or any(t.astimezone(shanghai).date() != execution_date for t in (stop, completion))
+                or date.fromisoformat(policy["expected_signal_date"]) >= execution_date):
+            raise ValueError("invalid dated window or signal date")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None or not start <= current < stop:
+            raise ValueError("outside execution window")
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"execution window: {exc}") from exc
+    return stop
+
+
 def snapshot_hash(snapshot):
     # Fresh read timestamps differ even when the complete account state does not.
     return digest({k: v for k, v in snapshot.items() if k != "as_of"})
+
+
+def snapshot_positions_hash(snapshot):
+    return digest({**{key: snapshot[key] for key in ("identity", "trade_date", "open_orders")},
+                   "positions": sorted(snapshot["positions"], key=lambda p: (p["contract"], p["side"]))})
 
 
 def integer(value, field):
     if isinstance(value, bool) or not isfinite(float(value)) or int(value) != float(value) or int(value) < 0:
         raise ValueError(f"{field} must be a nonnegative integer")
     return int(value)
+
+
+def signed_integer(value, field):
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    quantity = integer(abs(value), field)
+    return -quantity if value < 0 else quantity
 
 
 def number(value, field, *, positive=False):
@@ -80,6 +120,16 @@ def build_plan(sized, snapshot, *, account_id, policy, signal_id, signal_date,
         blockers.append("ACCOUNT_IDENTITY_MISMATCH")
     max_age = number(policy["max_snapshot_age_seconds"], "snapshot age", positive=True)
     ttl = number(policy["plan_ttl_seconds"], "plan ttl", positive=True)
+    expires = now + timedelta(seconds=ttl)
+    try:
+        window_stop = validate_execution_window(policy, now=now)
+        if window_stop is not None:
+            expires = min(expires, window_stop)
+            execution_date = window_stop.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+            if snapshot["trade_date"] != execution_date:
+                blockers.append("EXECUTION_TRADE_DATE_MISMATCH")
+    except ValueError:
+        blockers.append("OUTSIDE_EXECUTION_WINDOW")
     if not 0 <= (now - timestamp(snapshot["as_of"])).total_seconds() <= max_age:
         blockers.append("STALE_SNAPSHOT")
     # Exchange trading date alone is insufficient: the explicit previous close
@@ -108,6 +158,8 @@ def build_plan(sized, snapshot, *, account_id, policy, signal_id, signal_date,
     targets = {row["contract"]: row for row in sized["targets"]}
     if len(targets) != len(sized["targets"]):
         raise ValueError("duplicate target contract")
+    for row in targets.values():
+        signed_integer(row["target_lots"], "target_lots")
     if any(r["contract"] in targets and r["exchange"] != targets[r["contract"]]["exchange"]
            for r in snapshot["positions"]):
         blockers.append("POSITION_EXCHANGE_MISMATCH")
@@ -131,10 +183,19 @@ def build_plan(sized, snapshot, *, account_id, policy, signal_id, signal_date,
         spec = targets.get(contract)
         # Old contracts must supply their own specs; never borrow the new month's price.
         spec = spec or policy.get("old_contract_specs", {}).get(contract)
+        if spec is None:
+            blockers.append("OLD_CONTRACT_SPEC_REQUIRED")
+        if spec is not None and spec.get("metadata_verified") is False:
+            blockers.append(f"METADATA_UNVERIFIED: {contract}")
         price = None
         order_limit = min(max_lots, int(spec["max_order_lots"])) if spec and spec.get("max_order_lots") else max_lots
         if volume > order_limit:
-            blockers.append("ORDER_LOT_LIMIT")
+            if policy.get("slice_orders") is True:
+                # One allowed slice now; subsequent quantities are based on
+                # confirmed fills, not pre-sent as an unchecked batch.
+                volume = order_limit
+            else:
+                blockers.append("ORDER_LOT_LIMIT")
         if typ == "limit":
             value = policy.get("limit_prices", {}).get(contract)
             if value is None:
@@ -215,8 +276,9 @@ def build_plan(sized, snapshot, *, account_id, policy, signal_id, signal_date,
             "risk": {"current_margin_ratio": margin_ratio,
                      "margin_reduction_to_cap": max(0, float(snapshot["margin_used"])
                          - equity * float(sized["account"]["max_margin_ratio"]))},
-            "created_at": now.isoformat(), "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
-            "snapshot_hash": snapshot_hash(snapshot), "policy": policy, "sizing": sized,
+            "created_at": now.isoformat(), "expires_at": expires.isoformat(),
+            "snapshot_hash": snapshot_hash(snapshot), "snapshot_positions_hash": snapshot_positions_hash(snapshot),
+            "policy": policy, "sizing": sized,
             "orders": raw_orders, "blockers": sorted(set(blockers)), "ready": not blockers}
     return {**body, "plan_id": digest(body)}
 
@@ -226,12 +288,31 @@ def validate_plan(plan, snapshot=None, *, now=None):
     if digest(body) != plan["plan_id"]:
         raise ValueError("plan hash mismatch")
     now = now or datetime.now(timezone.utc)
+    validate_execution_window(plan["policy"], now=now)
     if not timestamp(plan["created_at"]) <= now <= timestamp(plan["expires_at"]):
         raise ValueError("plan expired or not yet valid")
     if not plan["ready"] or plan["blockers"]:
         raise ValueError("plan is blocked")
+    for order in plan["orders"]:
+        if not integer(order["volume"], "order volume"):
+            raise ValueError("order volume must be positive")
     if snapshot is not None and snapshot_hash(snapshot) != plan["snapshot_hash"]:
-        raise ValueError("account snapshot changed; reconcile again")
+        if (plan["policy"].get("allow_mark_to_market") is not True
+                or snapshot_positions_hash(snapshot) != plan.get("snapshot_positions_hash")):
+            raise ValueError("account snapshot changed; reconcile again")
+        # Prices continuously change cash marks in a nonempty futures account.
+        # Keep quantities immutable and recheck current risk, rather than making
+        # a penny of PnL require an endless new factor/target calculation.
+        from trading.automation import refresh_fixed_targets
+        fresh = build_plan(refresh_fixed_targets(plan["sizing"], snapshot), snapshot,
+            account_id=plan["account_id"], policy=plan["policy"], signal_id=plan["signal_id"],
+            signal_date=plan["signal_date"], previous_plan=plan, now=now)
+        if not fresh["ready"] or (fresh["risk_mode"] == "reduce_only"
+                                  and any(o["offset"] == "open" for o in plan["orders"])):
+            raise ValueError("account marked funds no longer pass execution risk")
+    if snapshot is not None and not 0 <= (now - timestamp(snapshot["as_of"])).total_seconds() <= float(
+            plan["policy"]["max_snapshot_age_seconds"]):
+        raise ValueError("account snapshot expired or not yet valid")
 
 
 def paper_execute(plan, snapshot, *, now=None):

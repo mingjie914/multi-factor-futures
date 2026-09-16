@@ -545,3 +545,85 @@ def test_zero_equity_is_invalid_even_when_the_other_account_fields_are_finite():
             account=_account(equity=0.0),
             amount=1.0,
         )
+
+
+def test_specs_as_of_allows_t_minus_one_weights_with_t_specs_and_preserves_signal_date():
+    row = _weight("RB", "RB2610", 1.0)
+    row["data_date"] = "2026-09-14"
+    original = deepcopy(row)
+    result = size_targets(
+        {"S": [row]},
+        [_spec("RB2610", as_of="2026-09-15")],
+        {"A": _account()},
+        [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+        specs_as_of="2026-09-15",
+    )
+
+    account = result["accounts"]["A"]
+    assert account["tradable"] is True
+    assert not any("METADATA_UNVERIFIED" in blocker for blocker in account["blockers"])
+    assert row == original
+    assert account["attribution"][0]["data_date"] == "2026-09-14"
+
+
+def test_specs_as_of_blocks_stale_spec_for_the_requested_execution_date():
+    row = _weight("RB", "RB2610", 1.0)
+    row["data_date"] = "2026-09-14"
+    result = size_targets(
+        {"S": [row]},
+        [_spec("RB2610", as_of="2026-09-14")],
+        {"A": _account()},
+        [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+        specs_as_of="2026-09-15",
+    )
+
+    assert result["accounts"]["A"]["tradable"] is False
+    assert any("METADATA_UNVERIFIED" in blocker for blocker in result["accounts"]["A"]["blockers"])
+
+
+def test_specs_as_of_blocks_future_spec_for_the_requested_execution_date():
+    result = size_targets(
+        {"S": [_weight("RB", "RB2610", 1.0)]},
+        [_spec("RB2610", as_of="2026-09-16")],
+        {"A": _account()},
+        [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+        specs_as_of="2026-09-15",
+    )
+
+    assert result["accounts"]["A"]["tradable"] is False
+    assert any("METADATA_UNVERIFIED" in blocker for blocker in result["accounts"]["A"]["blockers"])
+
+
+def test_specs_as_of_none_keeps_the_original_weight_date_metadata_rule():
+    row = _weight("RB", "RB2610", 1.0)
+    row["data_date"] = "2026-09-14"
+    result = size_targets(
+        {"S": [row]},
+        [_spec("RB2610", as_of="2026-09-15")],
+        {"A": _account()},
+        [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+    )
+
+    assert result["accounts"]["A"]["tradable"] is False
+    assert any("METADATA_UNVERIFIED" in blocker for blocker in result["accounts"]["A"]["blockers"])
+
+
+def test_specs_as_of_must_be_valid_and_not_earlier_than_weight_data_date():
+    row = _weight("RB", "RB2610", 1.0)
+    with pytest.raises(ValueError, match="specs_as_of"):
+        size_targets(
+            {"S": [row]},
+            [_spec("RB2610")],
+            {"A": _account()},
+            [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+            specs_as_of="2026-02-30",
+        )
+
+    with pytest.raises(ValueError, match="earlier than weight data_date"):
+        size_targets(
+            {"S": [row]},
+            [_spec("RB2610")],
+            {"A": _account()},
+            [{"strategy_id": "S", "account_id": "A", "capital_basis": "equity", "amount": 100.0}],
+            specs_as_of="2026-09-14",
+        )

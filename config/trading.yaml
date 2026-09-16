@@ -1,4 +1,4 @@
-# Independently invoked only; no daemon, schedule, or automatic order submission.
+# No-argument entrypoint remains weights only. The dated auto command is opt-in.
 schema_version: 1
 mode: simulation
 catalog: config/strategy_library.yaml
@@ -15,12 +15,15 @@ accounts:
     max_margin_ratio: 0.70
     max_gross_exposure: 2.10
     max_abs_net_exposure: 0.10
-    require_one_lot: true
+    require_one_lot: true  # Each strategy's selected legs need >= 1 lot BEFORE rounding.
 routes:
   - strategy_id: formal_main
     account_id: paper_500w
-    capital_basis: equity
-    amount: 5000000
+    # Initial/minimum sizing: normalize all selected legs together, then round.
+    # For a fixed daily scale, use capital_basis: reference and amount from
+    # route_sizing.csv's reference_capital; remove units. Never alter account equity.
+    capital_basis: complete_unit
+    units: 1
 execution:
   paper_500w:
     channel: manual
@@ -37,3 +40,21 @@ execution:
     # For next-day/night trading, set the expected preceding completed close
     # explicitly; never assume a weekend/holiday calendar from business weekdays.
     # expected_signal_date: '2026-09-15'
+automation:
+  enabled: false
+  preview_only_dates: []  # Explicit dated rehearsals cannot start an execution session.
+  contest_execution_verified: false
+  calendar_path: config/trading_calendar_2026.json
+  sdk_python: ''  # Dedicated Panda SDK interpreter, configured locally.
+  specs_path: config/trading_specs.local.json
+  prepare_at: '09:00:00'
+  retry_prepare_at: ['13:00:00', '14:00:00']
+  freeze_at: '14:30:00'
+  preflight_at: '14:45:00'
+  start_at: '14:55:00'
+  submit_until: '14:56:00'
+  completion_by: '14:58:00'
+  preparation_timeout_seconds: 3600
+  query_timeout_seconds: 60
+  poll_interval_seconds: 2
+  max_attempts_per_leg: 3

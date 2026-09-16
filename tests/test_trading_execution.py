@@ -44,8 +44,41 @@ def test_new_positions_then_reconcile_makes_no_duplicate_orders():
     assert plan(sized, filled["snapshot"], policy)["orders"] == []
 
 
+@pytest.mark.parametrize("quantity", [1.9, -1.9, True])
+def test_noninteger_target_is_rejected_instead_of_truncated(quantity):
+    sized, snapshot, policy = inputs()
+    sized["targets"][0]["target_lots"] = quantity
+    with pytest.raises(ValueError, match="target_lots"):
+        plan(sized, snapshot, policy)
+
+
+def test_market_rollover_requires_the_old_contracts_own_verified_specs():
+    sized, snapshot, policy = inputs()
+    snapshot["positions"] = [{"root": "RB", "contract": "RB2610", "exchange": "SHFE",
+        "side": "long", "volume": 1, "today": 0, "yesterday": 1,
+        "available_today": 0, "available_yesterday": 1}]
+    blocked = plan(sized, snapshot, policy)
+    assert not blocked["ready"] and "OLD_CONTRACT_SPEC_REQUIRED" in blocked["blockers"]
+    policy["old_contract_specs"] = {"RB2610": {"tick": 1, "close": 3500, "metadata_verified": True}}
+    assert plan(sized, snapshot, policy)["ready"]
+
+
+@pytest.mark.parametrize("has_position", [False, True])
+def test_unverified_zero_target_only_blocks_when_a_real_close_is_needed(has_position):
+    sized, snap, policy = inputs()
+    sized["targets"][0].update(target_lots=0, metadata_verified=False)
+    if has_position:
+        snap["positions"] = [{"root": "RB", "contract": "RB2701", "exchange": "SHFE",
+            "side": "long", "volume": 1, "today": 1, "yesterday": 0,
+            "available_today": 1, "available_yesterday": 0}]
+    result = plan(sized, snap, policy)
+    assert result["ready"] is (not has_position)
+    assert ("METADATA_UNVERIFIED: RB2701" in result["blockers"]) is has_position
+
+
 def test_rollover_closes_exact_old_today_and_yesterday_before_open():
     sized, snap, policy = inputs()
+    policy["old_contract_specs"] = {"RB2610": {"tick": 1, "close": 3500, "metadata_verified": True}}
     snap["positions"] = [{"root": "RB", "contract": "RB2610", "exchange": "SHFE",
                           "side": "long", "volume": 3, "today": 1, "yesterday": 2,
                           "available_today": 1, "available_yesterday": 2}]
@@ -126,6 +159,7 @@ def test_version_change_keeps_existing_target_and_old_roots_close_only_differenc
 
 def test_margin_over_one_hundred_percent_allows_reductions_and_suppresses_opens():
     sized, snap, policy = inputs()
+    policy["old_contract_specs"] = {"RB2610": {"tick": 1, "close": 3500, "metadata_verified": True}}
     snap.update(equity=10000, available=0, margin_used=11000)
     snap["positions"] = [{"root": "RB", "contract": "RB2610", "exchange": "SHFE",
                           "side": "short", "volume": 2, "today": 0, "yesterday": 2,
@@ -149,6 +183,7 @@ def test_cold_start_requires_explicit_adoption_if_account_is_not_flat():
 
 def test_nonpositive_equity_negative_available_do_not_prohibit_risk_reduction():
     sized, snap, policy = inputs()
+    policy["old_contract_specs"] = {"RB2610": {"tick": 1, "close": 3500, "metadata_verified": True}}
     snap.update(equity=-1, available=-11000, margin_used=11000)
     snap["positions"] = [{"root": "RB", "contract": "RB2610", "exchange": "SHFE",
                           "side": "long", "volume": 2, "today": 0, "yesterday": 2,

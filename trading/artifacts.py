@@ -10,6 +10,12 @@ from pathlib import Path
 import tempfile
 
 
+def resolve(value) -> Path:
+    """Resolve a trading path without importing the research runtime."""
+    path = Path(value)
+    return (path if path.is_absolute() else Path(__file__).resolve().parents[1] / path).resolve()
+
+
 def encoded(value) -> bytes:
     return (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
                        separators=(",", ":")) + "\n").encode("utf-8")

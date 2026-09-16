@@ -19,7 +19,13 @@ class FakePanda:
                 "positions": [], "openOrders": []}
 
     def prepare_order(self, *args, **kwargs):
-        return {"planId": "remote-one", "status": "prepared", "parameters": [list(args), kwargs]}
+        parameters = dict(zip(("contractCode", "side", "offset", "volume"), args))
+        parameters.update(clientOrderId=kwargs["client_order_id"])
+        if kwargs.get("price") is not None:
+            parameters["price"] = kwargs["price"]
+        return {"planId": "remote-one", "accountId": "test", "operation": "place_order",
+                "status": "prepared", "parameters": parameters,
+                "legs": [{**parameters, "preview": {"wouldSucceed": True}}]}
 
     def plan(self, plan_id):
         return self.prepared
@@ -63,14 +69,15 @@ def test_canonical_position_keeps_exact_broker_code_for_closing():
     client.snapshot = lambda: raw
     policy = make_plan(FakePanda())["policy"]
     policy.update(managed_roots=["SR"], cold_start="adopt_managed",
-                  position_fields={key: key for key in row}, contract_aliases={"SR701": "SR2701"})
+                  position_fields={key: key for key in row}, contract_aliases={"SR701": "SR2701"},
+                  old_contract_specs={"SR2701": {"tick": 1, "close": 5000, "metadata_verified": True}})
     snap = normalize_snapshot(raw, policy)
     sized = {"tradable": True, "blockers": [], "account": {"equity": 5e6, "reserve": 1e4,
              "max_margin_ratio": .7}, "summary": {"estimated_margin": 0}, "targets": []}
     plan = build_plan(sized, snap, account_id="test-local", policy=policy, signal_id="w", signal_date="2026-09-15")
     assert plan["orders"][0]["contract"] == "SR2701"
     prepared = prepare(plan, 0, client)
-    assert prepared["remote"]["parameters"][0][0] == "SR701"
+    assert prepared["remote"]["parameters"]["contractCode"] == "SR701"
 
 
 def test_queued_or_timeout_is_persisted_and_never_resubmitted(tmp_path):
@@ -94,6 +101,60 @@ def test_no_confirm_no_execution(tmp_path):
     remote = prepare(plan, 0, client)
     with pytest.raises(ValueError, match="confirmation"):
         execute(plan, remote, client, tmp_path, confirmation="yes")
+    assert client.calls == 0
+
+
+@pytest.mark.parametrize("changed_quantity", [False, True])
+def test_plan_lookup_epoch_expiry_preserves_exact_order_confirmation(tmp_path, changed_quantity):
+    from copy import deepcopy
+
+    class TimePanda(FakePanda):
+        def prepare_order(self, *args, **kwargs):
+            return {**super().prepare_order(*args, **kwargs), "expiresAt": "2026-09-16T11:31:37+0800"}
+
+    client = TimePanda()
+    plan = make_plan(client)
+    frozen = prepare(plan, 0, client)
+    client.prepared = deepcopy(frozen["remote"])
+    expiry = client.prepared.pop("expiresAt")
+    client.prepared.update(createdAtEpoch=1789529197.2756195,
+                           expiresAtEpoch=datetime.fromisoformat(expiry).timestamp() + .2756195)
+    if changed_quantity:
+        client.prepared["parameters"]["volume"] = 2
+        with pytest.raises(ValueError, match="frozen plan changed"):
+            execute(plan, frozen, client, tmp_path, confirmation=frozen["confirmation"])
+        assert client.calls == 0
+    else:
+        execute(plan, frozen, client, tmp_path, confirmation=frozen["confirmation"])
+        assert client.calls == 1
+
+
+@pytest.mark.parametrize("field,value", [("contractCode", "RB2705"), ("contractCode", "RB2701.DCE"),
+    ("side", "sell"), ("offset", "close"), ("volume", 2), ("volume", 1.9),
+    ("price", 3600), ("clientOrderId", "another-order")])
+def test_prepare_rejects_remote_parameters_that_disagree_with_local_order(field, value):
+    class WrongPanda(FakePanda):
+        def prepare_order(self, *args, **kwargs):
+            remote = super().prepare_order(*args, **kwargs)
+            remote["parameters"][field] = value
+            return remote
+    client = WrongPanda()
+    with pytest.raises(ValueError, match="Panda frozen order"):
+        prepare(make_plan(client), 0, client)
+    assert client.calls == 0
+
+
+def test_execute_rejects_a_consistently_wrong_remote_plan_even_with_its_confirmation(tmp_path):
+    from copy import deepcopy
+    from trading.artifacts import digest
+    client = FakePanda()
+    plan = make_plan(client)
+    frozen = prepare(plan, 0, client)
+    frozen["remote"]["legs"][0]["volume"] = 2
+    frozen["confirmation"] = digest({k: v for k, v in frozen.items() if k != "confirmation"})
+    client.prepared = deepcopy(frozen["remote"])
+    with pytest.raises(ValueError, match="Panda frozen order"):
+        execute(plan, frozen, client, tmp_path, confirmation=frozen["confirmation"])
     assert client.calls == 0
 
 

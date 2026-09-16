@@ -20,15 +20,10 @@ from research.effective_factor_library import validate_effective_factor_membersh
 from research.historical_portfolio_search import PortfolioEvaluator, PortfolioRecipe
 from research.portfolio_experiment_support import FactorPanelRunner
 from scripts.contract_lots import _contract_snapshot
-from trading.artifacts import digest, file_hash, read_artifact, write_artifact
+from trading.artifacts import digest, file_hash, read_artifact, write_artifact, resolve
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def resolve(value) -> Path:
-    path = Path(value)
-    return (path if path.is_absolute() else ROOT / path).resolve()
 
 
 def require_closed_date(as_of: str, latest: str, *, now=None) -> None:
@@ -112,6 +107,13 @@ def runtime_contract() -> dict:
     return contract
 
 
+def panel_cache_key(identity, factors, compute_start):
+    """Raw factors do not depend on broker holdings or the portfolio route."""
+    return digest({**{key: identity[key] for key in (
+        "data_date", "code_sha256", "data_fingerprint", "runtime", "config")},
+        "factors": factors, "compute_start": str(compute_start)})
+
+
 def check_publication_gate(gate: dict, contracts: list[dict]) -> None:
     if gate.get("enabled") is not True or gate.get("approval_status") != "approved_for_target_publication":
         raise ValueError("production target publication is disabled or not approved")
@@ -182,8 +184,10 @@ def generate_weights(strategy_ids, *, as_of=None, output_root="runs/trading/weig
             read_artifact(destination)
             return destination
         factors = list(dict.fromkeys(f for c in contracts for f in c["factors"]))
+        tail_start = None if full_panel else compute_start
+        checkpoint = resolve(output_root).parent / "factor_checkpoints" / panel_cache_key(identity, factors, tail_start)
         runner = FactorPanelRunner(factors, start=calendar[0], end=decision,
-                                   compute_start=None if full_panel else compute_start)
+                                   compute_start=tail_start, checkpoint_dir=checkpoint)
         try:
             rows = []
             for contract in contracts:

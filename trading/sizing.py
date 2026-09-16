@@ -9,7 +9,7 @@ target remains visible in the diagnostic output.
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
 import numbers
 import re
 from typing import Any, Mapping
@@ -40,8 +40,8 @@ _ACCOUNT_FIELDS = (
     "max_abs_net_exposure",
     "require_one_lot",
 )
-_ROUTE_FIELDS = ("strategy_id", "account_id", "capital_basis", "amount")
-_BASIS = {"equity", "notional", "margin"}
+_ROUTE_FIELDS = ("strategy_id", "account_id", "capital_basis")
+_BASIS = {"equity", "notional", "margin", "reference", "complete_unit"}
 
 
 def size_targets(
@@ -50,17 +50,20 @@ def size_targets(
     accounts: dict[str, dict],
     routes: list[dict],
     rounding: str = "half_up",
+    *,
+    specs_as_of: str | None = None,
 ) -> dict:
     """Convert routed strategy weights to account level integer lot targets.
 
-    ``Decimal`` is used for every monetary and lot calculation.  The returned
+    Final monetary and lot calculations use ``Decimal``; balanced candidate
+    search uses bounded NumPy arrays.  The returned
     structure contains ordinary Python numbers to remain easy to serialize and
     inspect.  Invalid input is rejected with ``ValueError``; valid but
     non-tradable results return complete account diagnostics with blockers.
     """
 
-    if not isinstance(rounding, str) or rounding not in {"half_up", "toward_zero"}:
-        raise ValueError("rounding must be 'half_up' or 'toward_zero'")
+    if not isinstance(rounding, str) or rounding not in {"half_up", "toward_zero", "balanced"}:
+        raise ValueError("rounding must be 'half_up', 'toward_zero' or 'balanced'")
     if not isinstance(weight_sets, dict):
         raise ValueError("weight_sets must be a dict")
     if not isinstance(specs, list):
@@ -69,9 +72,17 @@ def size_targets(
         raise ValueError("accounts must be a dict")
     if not isinstance(routes, list):
         raise ValueError("routes must be a list")
+    validated_specs_as_of = None if specs_as_of is None else _date(specs_as_of, "specs_as_of")
 
     parsed_specs = _parse_specs(specs)
     parsed_weights = _parse_weight_sets(weight_sets, parsed_specs)
+    if validated_specs_as_of is not None:
+        if any(
+            validated_specs_as_of < row["data_date"]
+            for rows in parsed_weights.values()
+            for row in rows
+        ):
+            raise ValueError("specs_as_of cannot be earlier than weight data_date")
     parsed_accounts = _parse_accounts(accounts)
     parsed_routes = _parse_routes(routes, parsed_weights, parsed_accounts)
 
@@ -83,17 +94,17 @@ def size_targets(
             if any(route["strategy_id"] == strategy_id for route in parsed_routes):
                 raise ValueError(f"strategy {strategy_id!r} has no non-zero weight")
 
-    capital_requirements = _serialize_capital_requirements(
-        _capital_requirements(parsed_weights, parsed_specs, rounding)
-    )
+    requirements = _capital_requirements(parsed_weights, parsed_specs, rounding)
     account_results = _size_accounts(
         parsed_weights,
         parsed_specs,
         parsed_accounts,
         parsed_routes,
         rounding,
+        requirements,
+        validated_specs_as_of,
     )
-    return {"accounts": account_results, "capital_requirements": capital_requirements}
+    return {"accounts": account_results, "capital_requirements": _serialize_capital_requirements(requirements)}
 
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -307,12 +318,24 @@ def _parse_routes(
             raise ValueError(f"route[{index}] references missing account {account_id!r}")
         basis = row["capital_basis"]
         if not isinstance(basis, str) or basis not in _BASIS:
-            raise ValueError(f"route[{index}].capital_basis must be equity, notional, or margin")
+            raise ValueError(f"route[{index}].capital_basis must be one of {sorted(_BASIS)}")
         route_key = (strategy_id, account_id, basis)
         if route_key in seen_routes:
             raise ValueError(f"duplicate route for strategy {strategy_id} and account {account_id}")
         seen_routes.add(route_key)
-        amount = _decimal(row["amount"], f"route[{index}].amount", positive=True)
+        amount = units = None
+        if basis == "complete_unit":
+            _missing(row, ("units",), f"route[{index}]")
+            if "amount" in row:
+                raise ValueError(f"route[{index}] complete_unit uses units, not amount")
+            units = _decimal(row["units"], f"route[{index}].units", positive=True)
+            if units < 1 or units != units.to_integral_value():
+                raise ValueError(f"route[{index}].units must be an integer >= 1")
+        else:
+            _missing(row, ("amount",), f"route[{index}]")
+            if "units" in row:
+                raise ValueError(f"route[{index}].units requires complete_unit")
+            amount = _decimal(row["amount"], f"route[{index}].amount", positive=True)
         parsed.append(
             {
                 "route_index": index,
@@ -320,6 +343,7 @@ def _parse_routes(
                 "account_id": account_id,
                 "capital_basis": basis,
                 "amount": amount,
+                "units": units,
             }
         )
     if not parsed:
@@ -364,7 +388,7 @@ def _capital_requirements(
                 )
                 continue
             proportional_value = notional_per_lot / abs(row["weight"])
-            rounded_value = proportional_value * (Decimal("0.5") if rounding == "half_up" else Decimal(1))
+            rounded_value = proportional_value * (Decimal("0.5") if rounding != "toward_zero" else Decimal(1))
             proportional.append(proportional_value)
             rounded.append(rounded_value)
             output_rows.append(
@@ -414,8 +438,100 @@ def _serialize_capital_requirements(
 
 
 def _round_lots(value: Decimal, rounding: str) -> Decimal:
-    mode = ROUND_HALF_UP if rounding == "half_up" else ROUND_DOWN
+    mode = ROUND_DOWN if rounding == "toward_zero" else ROUND_HALF_UP
     return value.quantize(Decimal("1"), rounding=mode)
+
+
+def _balance_rounding(targets, account, specs):
+    """Choose adjacent integers closest to theoretical net, then to leg weights.
+
+    Search account targets once, before position reconciliation. Candidate arrays
+    are bounded in size; final lots, money and risk checks still use Decimal.
+    """
+    import numpy as np
+
+    limit = account["equity"] * account["max_abs_net_exposure"]
+    raw_net = sum((r["target_notional"] for r in targets), Decimal(0))
+    if abs(raw_net) > limit:
+        return []  # Do not optimize away a genuine strategy-level risk breach.
+    totals = [sum((r["actual_notional"] for r in targets), Decimal(0)),
+              sum((abs(r["actual_notional"]) for r in targets), Decimal(0)),
+              sum((r["estimated_margin"] for r in targets), Decimal(0)),
+              sum((abs(r["actual_notional"] - r["target_notional"]) for r in targets), Decimal(0))]
+    choices = []
+    for row in sorted(targets, key=lambda r: r["contract"]):
+        raw, lots = row["raw_lots"], row["target_lots"]
+        position_limit = specs[row["contract"]]["max_position_lots"]
+        base_allowed = position_limit is None or abs(lots) <= position_limit
+        # A complete-unit capital rounded to cents can produce 1.0000000001 lots.
+        if abs(raw) < 1 or abs(raw - raw.to_integral_value()) < Decimal("1e-8"):
+            if not base_allowed:
+                return []
+            continue
+        lower = int(raw.to_integral_value(rounding=ROUND_FLOOR))
+        other = lower + 1 if lots == lower else lower
+        if not other or (other > 0) != (lots > 0):
+            continue
+        unit = row["close"] * row["multiplier"]
+        new_value = other * unit
+        gross_delta = abs(new_value) - abs(row["actual_notional"])
+        error_delta = abs(new_value - row["target_notional"]) - abs(row["actual_notional"] - row["target_notional"])
+        choices.append((row, other, new_value - row["actual_notional"], gross_delta,
+                        gross_delta * row["margin_rate"], error_delta, base_allowed,
+                        position_limit is None or abs(other) <= position_limit))
+    # Exact search is fast for this 20-leg portfolio; never begin unbounded 2**N work.
+    if len(choices) > 24:
+        raise ValueError("BALANCED_ROUNDING_SEARCH_LIMIT: more than 24 variable contracts")
+    if not choices:
+        return []
+    raw_reference = 0.0 if abs(raw_net) < Decimal("1e-8") else float(raw_net)
+    gross_limit = float(account["equity"] * account["max_gross_exposure"])
+    margin_limit = float(account["equity"] * account["max_margin_ratio"] - account["frozen_margin"] - account["reserve"])
+    cash_limit = float(account["available"] - account["reserve"])
+    best = None
+    for start in range(0, 1 << len(choices), 65536):
+        masks = np.arange(start, min(start + 65536, 1 << len(choices)), dtype=np.uint32)
+        net, gross, margin, error = [np.full(len(masks), float(value)) for value in totals]
+        allowed = np.ones(len(masks), dtype=bool)
+        changes = np.zeros(len(masks), dtype=np.uint8)
+        for bit, (_, _, dn, dg, dm, de, base_ok, other_ok) in enumerate(choices):
+            use_other = ((masks >> bit) & 1).astype(bool)
+            net += use_other * float(dn)
+            gross += use_other * float(dg)
+            margin += use_other * float(dm)
+            error += use_other * float(de)
+            changes += use_other
+            allowed &= np.where(use_other, other_ok, base_ok)
+        allowed &= ((np.abs(net) <= float(limit)) & (gross <= gross_limit)
+                    & (margin <= margin_limit)
+                    & (np.maximum(0, margin - float(account["margin_used"])) <= cash_limit))
+        candidates = np.flatnonzero(allowed)
+        if not len(candidates):
+            continue
+        distances = np.round(np.abs(net[candidates] - raw_reference), 8)
+        distance = distances.min()
+        candidates = candidates[distances == distance]
+        errors = np.round(error[candidates], 8)
+        weight_error = errors.min()
+        candidates = candidates[errors == weight_error]
+        change_count = changes[candidates].min()
+        chosen = candidates[changes[candidates] == change_count][0]
+        key = (float(distance), float(weight_error), int(change_count), int(masks[chosen]))
+        if best is None or key < best:
+            best = key
+    if best is None:
+        return []  # Retain original diagnostics and existing risk blockers.
+    adjustments = []
+    for bit, (row, other, _, _, _, extra_error, _, _) in enumerate(choices):
+        if not (best[3] >> bit) & 1:
+            continue
+        adjustments.append({"contract": row["contract"], "from_lots": row["target_lots"], "to_lots": other,
+                            "additional_abs_notional_error": extra_error})
+        row["target_lots"] = other
+        row["actual_notional"] = other * row["close"] * row["multiplier"]
+        row["estimated_margin"] = abs(row["actual_notional"]) * row["margin_rate"]
+        row["weight_error"] = (row["actual_notional"] - row["target_notional"]) / account["equity"]
+    return adjustments
 
 
 def _number(value: Decimal | int | float | None) -> int | float | None:
@@ -436,10 +552,14 @@ def _size_accounts(
     accounts: dict[str, dict[str, Any]],
     routes: list[dict[str, Any]],
     rounding: str,
+    requirements: dict[str, dict[str, Any]],
+    specs_as_of: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     merged: dict[str, dict[str, dict[str, Any]]] = {account_id: {} for account_id in accounts}
     attributions: dict[str, list[dict[str, Any]]] = {account_id: [] for account_id in accounts}
     equity_route_amounts: dict[str, Decimal] = {account_id: Decimal(0) for account_id in accounts}
+    resolved_routes: dict[str, list[dict]] = {account_id: [] for account_id in accounts}
+    strategy_notionals: dict[str, dict[str, dict[str, Decimal]]] = {account_id: {} for account_id in accounts}
 
     for route in routes:
         strategy_rows = weight_sets[route["strategy_id"]]
@@ -457,25 +577,58 @@ def _size_accounts(
             raise ValueError(f"strategy {route['strategy_id']!r} has no usable budget denominator")
 
         account_id = route["account_id"]
+        minimum = requirements[route["strategy_id"]]["proportional_one_lot_equity"]
+        if route["capital_basis"] == "complete_unit":
+            # Round the common scaling amount UP to a cent before sizing; never
+            # independently raise an underweight leg to one lot.
+            reference_capital = minimum.quantize(Decimal("0.01"), rounding=ROUND_CEILING) * route["units"]
+        else:
+            reference_capital = route["amount"] / denominator
+        resolved_routes[account_id].append({**route, "reference_capital": reference_capital,
+            "minimum_complete_reference_capital": minimum})
+        notionals = strategy_notionals[account_id].setdefault(route["strategy_id"], {})
         if route["capital_basis"] == "equity":
             equity_route_amounts[account_id] += route["amount"]
         for row in strategy_rows:
             spec = specs[row["contract"]]
-            if route["capital_basis"] == "equity":
+            if route["capital_basis"] in {"complete_unit", "reference"}:
+                target_notional = row["weight"] * reference_capital
+            elif route["capital_basis"] == "equity":
                 target_notional = row["weight"] * route["amount"]
             else:
                 target_notional = row["weight"] * route["amount"] / denominator
+            notionals[row["contract"]] = notionals.get(row["contract"], Decimal(0)) + target_notional
+            notional_per_lot = row["close"] * spec["multiplier"]
+            raw_lots = target_notional / notional_per_lot
+            margin_rate = _margin_rate(row["weight"], spec)
+            rounded_lots = int(_round_lots(raw_lots, rounding))
             attribution = {
                 "route_index": route["route_index"],
                 "strategy_id": route["strategy_id"],
                 "account_id": account_id,
                 "capital_basis": route["capital_basis"],
                 "amount": route["amount"],
+                "units": route["units"],
+                "reference_capital": reference_capital,
                 "root": row["root"],
                 "contract": row["contract"],
                 "weight": row["weight"],
                 "target_notional": target_notional,
                 "notional": target_notional,
+                "data_date": row["data_date"],
+                "close": row["close"],
+                "multiplier": spec["multiplier"],
+                "margin_rate": margin_rate,
+                "notional_per_lot": notional_per_lot,
+                "margin_per_lot": notional_per_lot * margin_rate,
+                "raw_lots": raw_lots,
+                # Standalone route diagnostics only; executable targets are
+                # still rounded once after the account's notionals are merged.
+                "rounded_lots": rounded_lots,
+                "independent_rounded_lots": rounded_lots,
+                "estimated_margin": abs(rounded_lots) * notional_per_lot * margin_rate,
+                "rounded_weight": rounded_lots * notional_per_lot / reference_capital,
+                "weight_error": rounded_lots * notional_per_lot / reference_capital - row["weight"],
             }
             attributions[account_id].append(attribution)
             target = merged[account_id].setdefault(
@@ -496,13 +649,26 @@ def _size_accounts(
             )
             target["target_notional"] += target_notional
             target["data_dates"].add(row["data_date"])
-            if not spec["verified"] or spec["as_of"] != row["data_date"]:
+            if not spec["verified"] or spec["as_of"] != (specs_as_of or row["data_date"]):
                 target["metadata_unverified"] = True
 
     results: dict[str, dict[str, Any]] = {}
     for account_id, account in accounts.items():
         targets: list[dict[str, Any]] = []
         blockers: list[str] = []
+        completeness = {}
+        # Check each strategy before cross-strategy netting. Multiple capital
+        # routes for the same strategy are one allocation, so combine them first.
+        for strategy_id, notionals in strategy_notionals[account_id].items():
+            selected = [row for row in weight_sets[strategy_id] if row["weight"] != 0]
+            raw = {row["contract"]: abs(notionals[row["contract"]])
+                   / (row["close"] * specs[row["contract"]]["multiplier"]) for row in selected}
+            below = [contract for contract, lots in raw.items() if lots < 1]
+            completeness[strategy_id] = {"selected_count": len(selected),
+                "min_abs_raw_lots": _number(min(raw.values())),
+                "below_one_contracts": below, "complete": not below}
+            if account["require_one_lot"] and below:
+                blockers.append(f"REQUIRE_ONE_LOT: {strategy_id} pre-round lots below one: {', '.join(below)}")
         for contract, merged_target in merged[account_id].items():
             spec = specs[contract]
             desired = merged_target["target_notional"]
@@ -531,21 +697,32 @@ def _size_accounts(
                 "target_notional": desired,
                 "raw_lots": raw_lots,
                 "target_lots": target_lots,
+                "independent_rounded_lots": target_lots,
                 "actual_notional": actual_notional,
                 "estimated_margin": estimated_margin,
                 "weight_error": weight_error,
                 "max_order_lots": spec["max_order_lots"],
+                "metadata_verified": not merged_target["metadata_unverified"],
             }
             targets.append(target_row)
-            if merged_target["metadata_unverified"]:
+        adjustments = _balance_rounding(targets, account, specs) if rounding == "balanced" else []
+        for target in targets:
+            contract, target_lots = target["contract"], target["target_lots"]
+            spec = specs[contract]
+            if target_lots and not target["metadata_verified"]:
                 blockers.append(f"METADATA_UNVERIFIED: {contract}")
-            if account["require_one_lot"] and desired != 0 and target_lots == 0:
-                blockers.append(f"REQUIRE_ONE_LOT: {contract} non-zero target rounded to zero")
             max_position_lots = spec["max_position_lots"]
             if max_position_lots is not None and abs(target_lots) > max_position_lots:
                 blockers.append(
                     f"MAX_POSITION_LOTS: {contract} target {target_lots} exceeds {max_position_lots}"
                 )
+            contributions = [r for r in attributions[account_id] if r["contract"] == contract]
+            if adjustments and len(contributions) == 1:
+                row = contributions[0]
+                row["rounded_lots"] = target_lots
+                row["estimated_margin"] = target["estimated_margin"]
+                row["rounded_weight"] = target["actual_notional"] / row["reference_capital"]
+                row["weight_error"] = row["rounded_weight"] - row["weight"]
 
         gross_notional = sum((abs(row["actual_notional"]) for row in targets), Decimal(0))
         net_notional = sum((row["actual_notional"] for row in targets), Decimal(0))
@@ -595,6 +772,9 @@ def _size_accounts(
         results[account_id] = {
             "targets": [_serialize_target(row) for row in targets],
             "attribution": [_serialize_attribution(row) for row in attributions[account_id]],
+            "routes": [_serialize_attribution(row) for row in resolved_routes[account_id]],
+            "completeness": completeness,
+            "rounding_adjustments": [_serialize_target(row) for row in adjustments],
             "blockers": _dedupe(blockers),
             "tradable": not blockers,
             "summary": {key: _number(value) for key, value in summary.items()},

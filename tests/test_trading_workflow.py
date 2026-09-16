@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from run_trading_workflow import artifact_json, size_artifact
-from trading.artifacts import read_artifact, read_csv, write_artifact
+from trading.artifacts import digest, read_artifact, read_csv, write_artifact
 from trading.execution import build_plan, paper_execute
 
 
@@ -102,6 +106,37 @@ def _weights_artifact(tmp_path):
     )
 
 
+def test_size_plan_and_paper_cli_do_not_import_research_or_weights(tmp_path):
+    import yaml
+    settings = _settings(tmp_path / "output")
+    config = tmp_path / "trading.yaml"
+    config.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    specs = tmp_path / "specs.json"
+    specs.write_text(json.dumps([_spec("RB2610"), _spec("CU2610")]), encoding="utf-8")
+    source = _weights_artifact(tmp_path)
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps({**_snapshot("A1"), "as_of": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+    code = f'''
+import builtins
+original_import = builtins.__import__
+def independent_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level == 0 and (name.split('.')[0] in {{'research', 'factors', 'data', 'core'}} or name == 'trading.weights'):
+        raise AssertionError('downstream imported upstream: ' + name)
+    return original_import(name, globals, locals, fromlist, level)
+builtins.__import__ = independent_import
+from run_trading_workflow import main, artifact_json
+prefix = ['--config', {str(config)!r}]
+sizing = main(prefix + ['size', '--weights', {str(source)!r}, '--specs', {str(specs)!r}])
+plan = main(prefix + ['plan', '--sizing', str(sizing), '--account', 'A1', '--snapshot', {str(snapshot)!r}])
+assert artifact_json(plan, 'plan.json')['ready']
+result = main(prefix + ['paper', '--plan', str(plan), '--snapshot', {str(snapshot)!r}])
+assert artifact_json(result, 'snapshot.json')['positions'][0]['volume'] == 3
+'''
+    completed = subprocess.run([sys.executable, "-X", "utf8", "-c", code],
+                               cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr
+
+
 def _snapshot(account_id: str, *, positions: list[dict] | None = None) -> dict:
     return {
         "trade_date": DATA_DATE,
@@ -138,6 +173,171 @@ def _sized(tmp_path, *, verified: bool = True):
         [_spec("RB2610", verified=verified), _spec("CU2610", verified=verified)],
     )
     return settings, sized_path, artifact_json(sized_path, "sizing.json")
+
+
+def test_daily_report_preserves_source_and_money_units(tmp_path):
+    settings = _settings(tmp_path / "output")
+    source = _weights_artifact(tmp_path)
+    short_spec = {**_spec("CU2610"), "margin_short": 0.2}
+    path = size_artifact(source, settings, [_spec("RB2610"), short_spec])
+    rows = read_csv(path, "daily_positions.csv")
+    assert path.parent.name == DATA_DATE
+    assert (path / "weights.csv").read_bytes() == (source / "weights.csv").read_bytes()
+    assert len(rows) == 2
+    for row, sign in zip(rows, (1, -1)):
+        assert row["数据日期"] == DATA_DATE
+        assert row["权重快照"] == source.name
+        assert row["合约类型"] == "具体合约"
+        assert row["主力滞后交易日"] == ""
+        assert float(row["基准权重"]) == sign * 0.5
+        assert float(row["基准仓位_元"]) == sign * 500
+        assert float(row["理论手数"]) == sign * 2.5
+        assert int(row["理论手数取整"]) == sign * 3
+        assert int(row["账户合并目标手数"]) == sign * 3
+        assert float(row["参考价格"]) == 10
+        assert float(row["单手价值_元"]) == 200
+        assert float(row["单手保证金_元"]) == (20 if sign == 1 else 40)
+        assert float(row["预计占用保证金_元"]) == (60 if sign == 1 else 120)
+        assert row["账户状态"] == "READY"
+    assert rows[0]["理论合约"] == "RB2610"
+    summary = read_csv(path, "account_summary.csv")
+    assert [float(r["预计占用保证金_元"]) for r in summary] == [60, 120]
+    assert [float(r["预计保证金占用率_%"]) for r in summary] == [0.006, 0.012]
+
+
+@pytest.mark.parametrize("basis,amount,notional", [("equity", 1000, 500),
+    ("notional", 1000, 1000), ("margin", 100, 1000)])
+def test_daily_report_uses_sizing_budget_semantics(tmp_path, basis, amount, notional):
+    settings = _settings(tmp_path / "output")
+    settings["routes"][0].update(capital_basis=basis, amount=amount)
+    path = size_artifact(_weights_artifact(tmp_path), settings, [_spec("RB2610"), _spec("CU2610")])
+    row = read_csv(path, "daily_positions.csv")[0]
+    assert row["资金口径"] == basis
+    assert float(row["基准仓位_元"]) == notional
+
+
+def test_daily_report_routes_do_not_replace_account_net_rounding(tmp_path):
+    settings = _settings(tmp_path / "output")
+    settings["accounts"] = {"A1": _account()}
+    settings["routes"] = [{"strategy_id": sid, "account_id": "A1", "capital_basis": "equity",
+                           "amount": 160} for sid in ("S1", "S2")]
+    weights = [{**_weights()[0], "strategy_id": sid} for sid in ("S1", "S2")]
+    source = write_artifact(tmp_path / "weights", {"stage": "weights", "data_date": DATA_DATE,
+        "mode": "simulation"}, {"weights.csv": weights})
+    path = size_artifact(source, settings, [_spec("RB2610")])
+    rows = read_csv(path, "daily_positions.csv")
+    assert [int(r["理论手数取整"]) for r in rows] == [0, 0]
+    assert [int(r["账户合并目标手数"]) for r in rows] == [1, 1]
+    assert read_csv(path, "targets.csv")[0]["target_lots"] == "1"
+    assert [float(r["预计占用保证金_元"]) for r in rows] == [0, 0]
+    assert float(read_csv(path, "account_summary.csv")[0]["预计占用保证金_元"]) == 20
+
+
+def test_daily_margin_summary_nets_opposing_routes(tmp_path):
+    settings = _settings(tmp_path / "output")
+    settings["accounts"] = {"A1": _account()}
+    settings["routes"] = [{"strategy_id": sid, "account_id": "A1", "capital_basis": "equity",
+                           "amount": 1000} for sid in ("S1", "S2")]
+    weights = [{**_weights()[0], "strategy_id": sid, "weight": weight}
+               for sid, weight in (("S1", 0.5), ("S2", -0.5))]
+    source = write_artifact(tmp_path / "weights", {"stage": "weights", "data_date": DATA_DATE,
+        "mode": "simulation"}, {"weights.csv": weights})
+    path = size_artifact(source, settings, [{**_spec("RB2610"), "margin_short": 0.2}])
+    rows = read_csv(path, "daily_positions.csv")
+    assert [float(r["预计占用保证金_元"]) for r in rows] == [60, 120]
+    summary = read_csv(path, "account_summary.csv")
+    assert len(summary) == 1
+    assert float(summary[0]["预计占用保证金_元"]) == 0
+    assert float(summary[0]["预计保证金占用率_%"]) == 0
+
+
+def test_daily_sort_signed_weights_then_zeros_with_stable_ties(tmp_path):
+    settings = _settings(tmp_path / "output")
+    settings["accounts"] = {"A1": _account()}
+    settings["routes"] = settings["routes"][:1]
+    weights = [{**_weights()[0], "root": root, "contract": root + "2610", "weight": weight}
+               for root, weight in (("ZN", 0), ("CU", -0.4), ("AL", 0.2),
+                                    ("RB", 0.7), ("AG", 0.2), ("AU", -0.1), ("NI", 0))]
+    for revision, source_rows in enumerate((weights, list(reversed(weights)))):
+        source = write_artifact(tmp_path / "weights", {"stage": "weights", "data_date": DATA_DATE,
+            "mode": "simulation", "revision": revision}, {"weights.csv": source_rows})
+        path = size_artifact(source, settings, [_spec(r["contract"]) for r in weights])
+        rows = read_csv(path, "daily_positions.csv")
+        assert [r["品种"] for r in rows] == ["RB", "AG", "AL", "AU", "CU", "NI", "ZN"]
+        assert [float(r["预计占用保证金_元"]) for r in rows[-2:]] == [0, 0]
+        assert (path / "weights.csv").read_bytes() == (source / "weights.csv").read_bytes()
+
+
+def test_complete_unit_report_separates_reference_capital_and_account_equity(tmp_path):
+    settings = _settings(tmp_path / "output")
+    settings["routes"] = [{"strategy_id": sid, "account_id": aid, "capital_basis": "complete_unit", "units": 1}
+                          for sid, aid in (("S1", "A1"), ("S2", "A2"))]
+    for account in settings["accounts"].values():
+        account.update(equity=100, available=100, require_one_lot=True, max_gross_exposure=1)
+    source = _weights_artifact(tmp_path)
+    path = size_artifact(source, settings, [_spec("RB2610"), _spec("CU2610")])
+    rows = read_csv(path, "daily_positions.csv")
+    assert [float(r["折算基准金额_元"]) for r in rows] == [400, 400]
+    assert [int(r["组合份数"]) for r in rows] == [1, 1]
+    assert [r["组合完整"] for r in rows] == ["True", "True"]
+    assert [abs(float(r["理论手数"])) for r in rows] == [1, 1]
+    assert [float(r["取整权重偏差"]) for r in rows] == [0, 0]
+    summary = read_csv(path, "account_summary.csv")
+    assert all(float(r["基准权益_元"]) == 100 for r in summary)
+    assert all(float(r["总名义杠杆"]) == 2 for r in summary)
+    assert all(r["账户状态"] == "BLOCKED" and "GROSS_EXPOSURE" in r["拦截原因"] for r in summary)
+    routes = read_csv(path, "route_sizing.csv")
+    assert all(float(r["reference_capital"]) == 400 and r["amount"] == "" for r in routes)
+    assert (path / "weights.csv").read_bytes() == (source / "weights.csv").read_bytes()
+
+
+def test_default_trading_config_uses_complete_units_without_raising_risk_limits():
+    from run_trading_workflow import load_settings
+    settings = load_settings("config/trading.yaml")
+    assert settings["routes"] == [{"strategy_id": "formal_main", "account_id": "paper_500w",
+                                   "capital_basis": "complete_unit", "units": 1}]
+    assert settings["accounts"]["paper_500w"]["equity"] == 5000000
+    assert settings["accounts"]["paper_500w"]["max_gross_exposure"] == 2.1
+    assert settings["execution"]["paper_500w"]["execute_enabled"] is False
+
+
+def test_daily_report_keeps_revisions_dates_and_causal_main_contract(tmp_path):
+    settings = _settings(tmp_path / "output")
+    paths = []
+    for revision, day in enumerate((DATA_DATE, DATA_DATE, "2026-09-16")):
+        contract = {"strategy_id": "S1", "catalog_strategy_id": "formal", "revision": revision}
+        identity = {"stage": "weights", "data_date": day, "mode": "simulation",
+                    "strategies": [contract], "config": {"data": {"source": "duckdb_futures",
+                    "parquet": {"dominant_lag_days": 1}}}}
+        source = write_artifact(tmp_path / "weights", identity,
+            {"weights.csv": [{**r, "data_date": day} for r in _weights()]})
+        path = size_artifact(source, settings, [_spec("RB2610"), _spec("CU2610")])
+        contents = (path / "daily_positions.csv").read_bytes()
+        assert size_artifact(source, settings, [_spec("RB2610"), _spec("CU2610")]) == path
+        assert (path / "daily_positions.csv").read_bytes() == contents
+        assert path.parent.name == day
+        row = read_csv(path, "daily_positions.csv")[0]
+        assert row["合约类型"] == "滞后主力合约"
+        assert row["主力滞后交易日"] == "1"
+        assert row["策略版本"] == digest(contract)
+        if day != DATA_DATE:
+            assert row["参数当日核实"] == "False"
+            assert row["账户状态"] == "BLOCKED"
+        paths.append(path)
+    assert len(set(paths)) == 3
+    assert all(read_artifact(path) for path in paths)
+
+
+def test_daily_report_rejects_date_manifest_mismatch_and_tampering(tmp_path):
+    settings = _settings(tmp_path / "output")
+    source = write_artifact(tmp_path / "weights", {"stage": "weights", "data_date": "2026-09-16",
+        "mode": "simulation"}, {"weights.csv": _weights()})
+    with pytest.raises(ValueError, match="data_date"):
+        size_artifact(source, settings, [_spec("RB2610"), _spec("CU2610")])
+    _, path, _ = _sized(tmp_path)
+    (path / "daily_positions.csv").write_text("modified", encoding="utf-8")
+    with pytest.raises(ValueError, match="file hash mismatch"):
+        read_artifact(path)
 
 
 def test_size_artifact_manifest_float_csv_and_capital_requirements_round_trip(tmp_path):

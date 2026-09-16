@@ -31,6 +31,7 @@ build/
 config/local.yaml
 config/secret.yaml
 config/trading.local.yaml
+config/trading_specs.local.json
 .env
 
 # Editors and operating systems
