@@ -608,7 +608,138 @@ factor_sets:
       directions: {"intraday_basis_momentum_20d":1,"intraday_downside_path_concentration_20d":-1,"intraday_path_bandwidth_20d":1,"intraday_roll_yield_dualscore_20d":-1,"intraday_term_dtws_20d":-1,"intraday_vol_burst_intensity_20d":1,"intraday_vol_oi_corr_20d":-1,"intraday_wick_symmetry_20d":1,"vp_corr_intraday_eod":-1,"intraday_liquidity_crash_surprise_20d":-1}
       production_approved: false
 
+  - id: trend_allocation_daily_probe
+    status: archived
+    description: 历史五因子工程代理；日线对数非流动性在默认10位精度下全为零，含固定篮子成分，归档保留账本。
+    factors:
+      - intraday_daily_log_illiquidity_20d
+      - intraday_oi_price_response_asymmetry_20d
+      - intraday_volume_abs_return_partial_corr_20d
+      - intraday_volume_surprise_abs_return_corr_20d
+      - volume_price_corr_20d
+    selection_context:
+      purpose: configured_long_only_rule_reproduction
+      evidence_role: engineering_probe_not_independent_oos
+      factor_identity_disclosed: false
+      archived_at: '2026-09-15'
+      archive_reason: intraday_daily_log_illiquidity_20d has no cross-sectional information after rounding to 10 decimals
+      excluded_coverage: {intraday_sector_upside_oi_confirmation_20d: "2019-2026范围内60日不足九选五"}
+
+  - id: trend_allocation_robust_pair
+    status: active
+    description: 六个日线输入有效因子的受限开发搜索候选；按最弱分段表现优先，非独立样本外证据。
+    factors: [intraday_oi_price_response_asymmetry_20d, intraday_volume_abs_return_partial_corr_20d]
+    selection_context:
+      purpose: configured_long_only_development_candidate
+      evidence_role: retrospective_development_not_independent_oos
+      source: runs/factor_selection/20260915_trend_daily6_acceptance/selection_summary.json
+      discovery_scope_count: 6
+      full_effective_pool_searched: false
+      review_source: runs/factor_selection/20260915_trend_daily6_representation_check/run_contract.json
+      representation_qualified: true
+      directions: {intraday_oi_price_response_asymmetry_20d: 1, intraday_volume_abs_return_partial_corr_20d: -1}
+  - id: trend_allocation_low_turnover_pair
+    status: archived
+    description: 历史低换手工程候选；日线对数非流动性在默认10位精度下全为零，含固定篮子成分，归档保留账本。
+    factors: [intraday_daily_log_illiquidity_20d, intraday_oi_price_response_asymmetry_20d]
+    selection_context:
+      purpose: configured_long_only_development_candidate
+      evidence_role: retrospective_development_not_independent_oos
+      source: runs/factor_selection/20260915_trend_daily6_acceptance/selection_summary.json
+      discovery_scope_count: 6
+      full_effective_pool_searched: false
+      archived_at: '2026-09-15'
+      archive_reason: intraday_daily_log_illiquidity_20d has no cross-sectional information after rounding to 10 decimals
+
+  - id: trend_allocation_obv_vol_pair
+    status: active
+    description: 固定默认权重、全有效库资格检查后预算搜索的开发期排序第一项；仅条件验证后观察。
+    factors: [intraday_obv_slope_20d, intraday_parkinson_vol_ratio_20d]
+    selection_context:
+      source_run: runs/factor_selection/20260915_trend_effective188_default_qualified
+      source_candidate: candidate_1_2f
+      source_contract_sha256: c38543fc4b7d914cdd5f897140787a1df564b3140e96eafdbd85a9c27a5ecdaf
+      locked_candidates_sha256: dabf2287aa12ed9f6df47f0103c94b37bc45226737c464a1729223ebf42572f4
+      method_config_sha256: 0ff7a76bf534ef5d885a68b38fda2b1359eca643550bdc448e8ad5c807e56b04
+      acceptance: runs/strategy_extension/20260915_factor_search_review/acceptance_full/acceptance.json
+      retained_at: '2026-09-15'
+      selection_end: '2024-12-31'
+      research_cutoff: '2026-05-15'
+      discovery_scope_count: 188
+      qualified_scope_count: 169
+      exact_search_attempts: 512
+      directions: {intraday_obv_slope_20d: 1, intraday_parkinson_vol_ratio_20d: 1}
+      independent_oos: false
+      production_approved: false
+  - id: trend_allocation_obv_vol_regime
+    status: active
+    description: 同次默认权重预算搜索的开发期排序第二项；增加量波状态因子，仅条件验证后观察。
+    factors: [intraday_obv_slope_20d, intraday_parkinson_vol_ratio_20d, intraday_vol_volume_regime_20d]
+    selection_context:
+      source_run: runs/factor_selection/20260915_trend_effective188_default_qualified
+      source_candidate: candidate_2_3f
+      source_contract_sha256: c38543fc4b7d914cdd5f897140787a1df564b3140e96eafdbd85a9c27a5ecdaf
+      locked_candidates_sha256: dabf2287aa12ed9f6df47f0103c94b37bc45226737c464a1729223ebf42572f4
+      method_config_sha256: 0ff7a76bf534ef5d885a68b38fda2b1359eca643550bdc448e8ad5c807e56b04
+      acceptance: runs/strategy_extension/20260915_factor_search_review/acceptance_full/acceptance.json
+      retained_at: '2026-09-15'
+      selection_end: '2024-12-31'
+      research_cutoff: '2026-05-15'
+      discovery_scope_count: 188
+      qualified_scope_count: 169
+      exact_search_attempts: 512
+      directions: {intraday_obv_slope_20d: 1, intraday_parkinson_vol_ratio_20d: 1, intraday_vol_volume_regime_20d: -1}
+      independent_oos: false
+      production_approved: false
+
 strategies:
+  - id: trend_allocation_obv_vol_pair
+    name: 趋势配置量能波动(2)
+    status: observing
+    formal: false
+    factor_set_id: trend_allocation_obv_vol_pair
+    config_path: config/strategy_trend_allocation.yaml
+    recipe_source: strategy_config
+    comparison_group: long_only_trend_9
+    description: 默认相关修正逆波动权重；全库资格检查及512次预算搜索，按开发期锁定顺序保留第一项，仅观察。
+  - id: trend_allocation_obv_vol_regime
+    name: 趋势配置量能状态(3)
+    status: observing
+    formal: false
+    factor_set_id: trend_allocation_obv_vol_regime
+    config_path: config/strategy_trend_allocation.yaml
+    recipe_source: strategy_config
+    comparison_group: long_only_trend_9
+    description: 同一默认方法；按开发期锁定顺序保留第二项，含量波状态增量，仅观察。
+  - id: trend_allocation_robust_pair
+    name: 趋势配置稳健候选(2)
+    status: observing
+    formal: false
+    factor_set_id: trend_allocation_robust_pair
+    config_path: config/strategy_trend_allocation.yaml
+    recipe_source: strategy_config
+    comparison_group: long_only_trend_9
+    description: 复用规则代理默认方法；六因子受限开发搜索结果，仅观察。
+  - id: trend_allocation_low_turnover_pair
+    name: 趋势配置低换手候选(2)
+    status: archived
+    formal: false
+    factor_set_id: trend_allocation_low_turnover_pair
+    config_path: config/strategy_trend_allocation.yaml
+    recipe_source: strategy_config
+    comparison_group: long_only_trend_9
+    description: 含默认精度下恒定的日线对数非流动性因子；工程结果归档，不再列入当前观察组。
+  - id: trend_allocation_daily_probe
+    name: 趋势配置规则代理(5)
+    status: archived
+    formal: false
+    source: effective_library
+    factor_set_id: trend_allocation_daily_probe
+    config_path: config/strategy_trend_allocation.yaml
+    recipe_source: strategy_config
+    comparison_group: long_only_trend_9
+    mode: single
+    description: 含默认精度下恒定的日线对数非流动性因子；工程结果归档，非原指数精确复制。
   # The two effective-library IDs and YAML filenames retain their historical
   # ``_ridge`` suffix for run/artifact compatibility; display names and
   # portfolio semantics are factor-set based, not Ridge-owned.
@@ -772,6 +903,22 @@ strategies:
     mode: single
     description: 用户指定的正式主策略；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲1；默认回测与观察，交易发布及下单另行授权。
 
+  - id: multi_source_resilient_p12
+    name: 多源精择12品种(18)
+    status: observing
+    formal: false
+    source: effective_library
+    factor_set_id: multi_source_resilient
+    config_path: config/default.yaml
+    comparison_group: neutral_position_count_research
+    top_n_per_side: 6
+    rank_exit_buffer: 1
+    mode: single
+    description: >-
+      多源韧衡的12持仓品种研究版本，复用原18因子和冻结方向；共享lw_abs＋Top6/Bottom6＋cap3＋ERC、总敞口2、B1。
+      独立登记，不进入默认中性10组，不是正式或实盘批准。
+      冻结证据为runs/portfolio_backtest/20260915_position_count_scale/contract.json的P12及同目录report.md，不代表新行情发布认证。
+
   - id: price_volume_balanced
     name: 量价稳衡(16)
     status: observing
@@ -791,6 +938,46 @@ strategies:
     rank_exit_buffer: 1
     mode: single
     description: 期限核心，收益效率与成本韧性；共享lw_abs＋Top10/Bottom10＋cap3＋ERC，排名缓冲1；仅观察。
+
+  - id: curve_essence_sleeve_equal
+    name: 曲线精萃子组合等权(9)
+    status: observing
+    formal: false
+    source: effective_library
+    factor_set_id: curve_essence
+    config_path: config/default.yaml
+    rank_exit_buffer: 1
+    factor_sleeves:
+      method: equal
+      lookback: 126
+      minimum_observations: 60
+      covariance_shrinkage: 0.30
+      min_weight: 0.01
+      max_weight: 0.15
+      final_asset_max_fraction: 0.20
+      final_sector_max_fraction: 0.60
+    mode: single
+    description: 九个单因子分别Top10/Bottom10、cap3、ERC、B1；外层日度等权，60个共同实际毛收益日起步，净额后投影恢复多1空1，不再裁成20品种。证据为comparison_research/20260918_full_library/contract.json的curve_essence__pf_equal_gross2；仅备选，不是实盘批准。
+
+  - id: curve_essence_sleeve_erc
+    name: 曲线精萃子组合日度ERC(9)
+    status: observing
+    formal: false
+    source: effective_library
+    factor_set_id: curve_essence
+    config_path: config/default.yaml
+    rank_exit_buffer: 1
+    factor_sleeves:
+      method: erc
+      lookback: 126
+      minimum_observations: 60
+      covariance_shrinkage: 0.30
+      min_weight: 0.01
+      max_weight: 0.15
+      final_asset_max_fraction: 0.20
+      final_sector_max_fraction: 0.60
+    mode: single
+    description: 共用曲线精萃九个原生单因子子组合；外层日度ERC使用严格滞后126日毛收益、至少60共同日、30%对角收缩与1%—15%预算，净额后投影恢复多1空1。证据为comparison_research/20260918_full_library/contract.json的curve_essence__pf_erc_gross2；仅备选，不是实盘批准。
 
   - id: curve_volume_balanced
     name: 曲线量衡(8)

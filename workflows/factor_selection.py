@@ -11,9 +11,11 @@ library path, so a future library version needs no workflow change.
 from __future__ import annotations
 
 import csv
+import importlib.util
 from itertools import combinations
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +39,7 @@ from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
 from research.effective_factor_library import load_library
 from research.governance import factor_family
-from research.portfolio_experiment_support import FactorPanelRunner
+from research.portfolio_experiment_support import FactorPanelRunner, configured_futures_cost_model
 from research.historical_portfolio_search import (
     PortfolioEvaluator,
     PortfolioRecipe,
@@ -70,7 +72,7 @@ def _write_json(path: Path, value: object) -> None:
 def _write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         raise ValueError(f"refusing to write empty selection table: {path}")
-    fields = list(rows[0])
+    fields = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -85,13 +87,14 @@ def _daily_spearman_ic(
     factor: pd.DataFrame,
     returns: pd.DataFrame,
     dates: pd.DatetimeIndex,
+    *, minimum_cross_section: int = MIN_CROSS_SECTION,
 ) -> pd.Series:
     values: dict[pd.Timestamp, float] = {}
     for date in dates:
         x = pd.to_numeric(factor.loc[date], errors="coerce")
         y = pd.to_numeric(returns.loc[date], errors="coerce")
         mask = x.notna() & y.notna() & np.isfinite(x) & np.isfinite(y)
-        if int(mask.sum()) < MIN_CROSS_SECTION:
+        if int(mask.sum()) < minimum_cross_section:
             continue
         xr = x.loc[mask].rank(method="average")
         yr = y.loc[mask].rank(method="average")
@@ -202,14 +205,7 @@ def _production_recipe(config) -> PortfolioRecipe:
 
 
 def _configured_cost_model(config) -> SimpleFuturesCost:
-    policy = config.costs
-    return SimpleFuturesCost(
-        turnover_cost_rate=float(policy.turnover_cost_rate),
-        annual_fee=float(policy.annual_fee),
-        annual_roll_cost=float(policy.annual_roll_cost),
-        periods_per_year=float(policy.periods_per_year),
-        cost_stage=str(policy.cost_stage),
-    )
+    return configured_futures_cost_model(config)
 
 
 def _run_portfolio_search(
@@ -339,14 +335,31 @@ def _run_portfolio_search(
 
 def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments,
                               clusters, db, output, budget=512, beam_width=6,
-                              round_width=16):
+                              round_width=16, cache_namespace=None, search_sizes=(),
+                              initial_candidates=(), search_seed=20260915):
     """Explicit research-only multi-start search; never changes default selection.
 
-    Every factor gets an exact seed-pair attempt. IC only orders proposals;
+    Portfolio-first recipes start with exact single-factor eligibility and net
+    returns; other recipes use IC seed pairs. Proxies only order proposals;
     exact net backtests choose the moving beam and the final Pareto archive.
     Growth lanes survive temporary deterioration. Size is not a stop rule.
     """
     names = sorted(set(pool))
+    custom = bool(getattr(recipe, "investment_universe", ()))
+    periods = recipe.periods_per_year if custom else 252
+    portfolio_proposals = custom and recipe.combination_order == "portfolio_first"
+    if (search_sizes or initial_candidates) and not portfolio_proposals:
+        raise ValueError("size-stratified search requires a portfolio-first configured recipe")
+    if initial_candidates and not search_sizes:
+        raise ValueError("initial_candidates require size-stratified search")
+    if any(type(n) is not int or n < 2 for n in search_sizes) or len(set(search_sizes)) != len(search_sizes):
+        raise ValueError("search_sizes must contain unique integers of at least two")
+    if any(len(m) < 2 or len(set(m)) != len(m) or set(m) - set(names) for m in initial_candidates):
+        raise ValueError("initial_candidates must contain unique admitted members")
+    if custom and not cache_namespace:
+        raise ValueError("configured search requires a frozen data/code cache namespace")
+    if custom and recipe.factor_groups:
+        raise ValueError("subset search cannot split parameter groups; evaluate complete declared groups explicitly")
     if len(names) < 2 or budget < len(names) or not 1 <= beam_width <= round_width:
         raise ValueError("budget must cover the full pool and widths must be positive")
     # IC at T contains T+1 returns. Drop the last selection-day label even if
@@ -368,7 +381,7 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
                     break
                 mean, std = y.mean(), y.std(ddof=1)
                 means.append(mean)
-                sharpes.append(mean / std * np.sqrt(252) if std > 0 else -10.0)
+                sharpes.append(mean / std * np.sqrt(periods) if std > 0 else -10.0)
             else:
                 proxies[members] = (float(np.mean(np.asarray(means) > 0)),
                                     float(min(sharpes)), float(np.median(sharpes)))
@@ -378,12 +391,18 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
         nav DOUBLE[], net_returns DOUBLE[])""")
     cached = {key: json.loads(value) for key, value in db.execute(
         "SELECT signature,result FROM pool_results").fetchall()}
-    evaluations, visited, path = [], set(), []
-    def evaluate(members, phase, iteration):
+    evaluations, visited, path, single_returns = [], set(), [], {}
+    def evaluate(members, phase, iteration, size_target=None):
         members = tuple(sorted(members))
         if members in visited or len(evaluations) >= budget:
             return None
-        key = json.dumps(members)
+        key = json.dumps({"algorithm": "portfolio-rounded-singleton-seeds-v3", "scope": cache_namespace, "recipe": recipe.to_dict(),
+                          "start": str(evaluator.start), "end": str(evaluator.end),
+                          "cost": evaluator.cost_model.ledger_parameters(),
+                          "ic_window": evaluator.ic_window,
+                          "risk_lookback_calendar_days": evaluator.risk_lookback_calendar_days,
+                          "segments": [(str(a), str(b)) for a, b in segments], "factors": members},
+                         sort_keys=True) if custom else json.dumps(members)
         row = cached.get(key)
         if row is None:
             started, cpu = time.perf_counter(), time.process_time()
@@ -393,16 +412,28 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
                    "worst_sharpe": -10.0, "median_sharpe": -10.0,
                    "median_annual_return": -1.0, "worst_drawdown": -1.0,
                    "annual_turnover": None, "full_annual_return": None}
+            if size_target is not None:
+                row["search_size_target"] = size_target
             dates, nav, returns = [], [], []
             try:
+                if portfolio_proposals and len(members) == 1:
+                    values = evaluator.runner.factor_values[members[0]].loc[evaluator.start:evaluator.end]
+                    counts = np.isfinite(values.to_numpy(dtype=float)).sum(axis=1)
+                    required = recipe.selection_count * (2 if recipe.position_mode == "long_short" else 1)
+                    bad = values.index[counts < required]
+                    if len(bad):
+                        raise RuntimeError(f"fixed-pool coverage below {required} on {len(bad)} days; first={bad[0].date()}")
+                    represented = values.round(recipe.score_decimals) if recipe.score_decimals is not None else values
+                    if not represented.nunique(axis=1, dropna=True).gt(1).any():
+                        raise RuntimeError("no cross-sectional information after configured rounding; tie-selected fixed basket")
                 ledger = evaluator.ledger(members, recipe)
                 if ledger.index.max() > evaluator.end:
                     raise AssertionError("selection ledger escaped the cutoff")
-                metrics = performance_metrics(ledger["net_return"], initial_anchor=True)
+                metrics = performance_metrics(ledger["net_return"], initial_anchor=True, periods_per_year=periods)
                 if any(len(ledger.loc[left:right]) < 20 for left, right in segments):
                     raise RuntimeError("insufficient history in a declared block")
-                row.update(status="evaluated", **robust_summary(ledger, segments, initial_anchor=True),
-                           annual_turnover=float(ledger["executed_traded_notional"].iloc[1:].mean()*252),
+                row.update(status="evaluated", **robust_summary(ledger, segments, initial_anchor=True, periods_per_year=periods),
+                           annual_turnover=float(ledger["executed_traded_notional"].iloc[1:].mean()*periods),
                            **{f"full_{k}": v for k, v in metrics.items()})
                 dates, nav, returns = list(ledger.index.date), ledger["nav"].tolist(), ledger["net_return"].tolist()
             except (RuntimeError, ValueError) as exc:
@@ -412,11 +443,15 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
                        [key, json.dumps(row), dates, nav, returns])
             cached[key] = row
             evaluator.clear_transient_caches()
+        if portfolio_proposals and len(members) == 1 and row["status"] == "evaluated":
+            dates, returns = db.execute("SELECT dates,net_returns FROM pool_results WHERE signature=?", [key]).fetchone()
+            single_returns[members[0]] = pd.Series(returns, index=pd.DatetimeIndex(dates))
         visited.add(members)
         evaluations.append(row)
         _write_json(output / "pool_progress.json", {
             "attempted": len(evaluations), "budget": budget,
             "cached_total": len(cached), "phase": phase, "round": iteration,
+            "search_size_target": size_target,
             "evaluated": sum(r["status"] == "evaluated" for r in evaluations),
             "covered_factors": len({n for r in evaluations for n in r["factors"]}),
             "successful_covered_factors": len({n for r in evaluations if r["status"] == "evaluated"
@@ -433,15 +468,147 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
             if len(selected) >= count:
                 break
         return selected
+    single_rows = []
+    if portfolio_proposals:
+        single_rows = [evaluate((name,), "single_factor_eligibility", 0) for name in names]
+        # Exclude data/construction failures only, never discard a valid factor
+        # for low stand-alone return. Averaged net returns are a proposal proxy:
+        # final caps, netting and drift costs still require the shared ledger.
+        names = sorted(single_returns)
+        panel = pd.DataFrame(single_returns).loc[:evaluator.end]
+        arrays = [panel.loc[left:right].to_numpy(dtype=float) for left, right in segments]
+        positions, proxies = {n: i for i, n in enumerate(panel.columns)}, {}
+        _write_json(output / "factor_eligibility.json", {
+            "qualified": names, "evaluations": single_rows,
+            "performance_filter": False, "observation_used": False})
+    if search_sizes:
+        # Reserve exact evaluations for disjoint size bands, including large
+        # starting portfolios. Singleton qualification never competes with them.
+        sizes = sorted({min(n, len(names)) for n in search_sizes if len(names) >= 2})
+        if not sizes:
+            raise ValueError("size-stratified search requires two qualified factors")
+        if any(set(m) - set(names) for m in initial_candidates):
+            raise ValueError("initial candidate failed current fixed-pool qualification")
+        target = lambda n: min(sizes, key=lambda s: (abs(n-s), s))
+        bands = {s: [n for n in range(2, len(names)+1) if target(n) == s] for s in sizes}
+        remaining = budget-len(evaluations)
+        if remaining < len(sizes):
+            raise ValueError("budget must reserve at least one evaluation per size band")
+        quotas = {s: remaining//len(sizes)+int(i < remaining % len(sizes)) for i, s in enumerate(sizes)}
+        if any(quotas[s] < len(bands[s])+sum(target(len(m)) == s for m in initial_candidates) for s in sizes):
+            raise ValueError("size-band budget must cover every cardinality and initial candidate")
+        used, rows_by_size, exploration = {s: 0 for s in sizes}, {s: [] for s in sizes}, {}
+        rng = np.random.default_rng(search_seed)
+
+        def assess(members, phase, iteration):
+            size = target(len(members))
+            if used[size] >= quotas[size]:
+                return None
+            row = evaluate(members, phase, iteration, size)
+            if row is not None:
+                used[size] += 1
+                rows_by_size[size].append(row)
+            return row
+
+        ranked = [r["factors"][0] for r in sorted(
+            (r for r in single_rows if r and r["status"] == "evaluated"),
+            key=lambda r: (*robustness_key(r), -r["annual_turnover"]), reverse=True)]
+        cluster_members = {}
+        for name in ranked:
+            cluster_members.setdefault(clusters[name], []).append(name)
+        diversified = [group[i] for i in range(max(map(len, cluster_members.values())))
+                       for group in cluster_members.values() if i < len(group)]
+        for members in initial_candidates:
+            assess(members, "prior_locked_seed", 0)
+        for size in sizes:
+            seeds = [ranked[:count] for count in bands[size]] + [diversified[:size]]
+            seeds += [list(rng.choice(names, size=size, replace=False)) for _ in range(2)]
+            for members in seeds:
+                assess(members, "size_seed", 0)
+            for members in initial_candidates:
+                if len(members) <= size:
+                    extended = list(members)+[n for n in diversified if n not in members][:size-len(members)]
+                    assess(extended, "incumbent_size_seed", 0)
+        active, iteration = set(sizes), 0
+        def write_size_progress():
+            _write_json(output / "size_search.json", {
+                "seed": search_seed, "targets": sizes, "bands": bands,
+                "quotas": quotas, "attempted_by_size": used, "round": iteration,
+                "proposal_sample_per_parent": 64, "exact_batch_per_size": 4,
+                "seed_every_cardinality": True,
+                "extend_initial_candidates": True,
+                "initial_candidates": initial_candidates})
+        write_size_progress()
+        while active and len(evaluations) < budget:
+            iteration += 1
+            round_rows = []
+            for size in sizes:
+                if size not in active:
+                    continue
+                if used[size] >= quotas[size]:
+                    active.remove(size)
+                    continue
+                parents = choose(rows_by_size[size], 2)
+                if size in exploration and exploration[size] not in parents:
+                    parents.append(exploration[size])
+                proposals = set()
+                low, high = min(bands[size]), max(bands[size])
+                for parent in parents:
+                    outside = sorted(set(names)-set(parent))
+                    operations = (["add"] if outside and len(parent) < high else [])
+                    operations += (["delete"] if len(parent) > low else [])
+                    operations += (["swap"] if outside else [])
+                    for _ in range(64):
+                        if not operations:
+                            break
+                        operation = str(rng.choice(operations))
+                        members = set(parent)
+                        if operation in ("delete", "swap"):
+                            members.remove(str(rng.choice(parent)))
+                        if operation in ("add", "swap"):
+                            members.add(str(rng.choice(outside)))
+                        proposals.add(tuple(sorted(members)))
+                # Fresh starts let a size band escape a weak local neighborhood.
+                for _ in range(4):
+                    count = int(rng.integers(low, high+1))
+                    proposals.add(tuple(sorted(rng.choice(names, size=count, replace=False))))
+                ordered = sorted(proposals-visited, key=lambda m: (proxy(m), m), reverse=True)
+                if not ordered:
+                    active.remove(size)
+                    continue
+                batch = ordered[:3]
+                if len(ordered) > 3:
+                    batch.append(ordered[int(rng.integers(3, len(ordered)))])
+                for members in batch:
+                    row = assess(members, "size_add_delete_swap", iteration)
+                    if row is not None:
+                        round_rows.append(row)
+                        if row["status"] == "evaluated":
+                            exploration[size] = tuple(row["factors"])
+            if round_rows:
+                valid = [r for r in round_rows if r["status"] == "evaluated"]
+                if valid:
+                    path.append(max(valid, key=robustness_key))
+            write_size_progress()
+        reason = "exact_backtest_budget_exhausted" if len(evaluations) >= budget else "sampled_size_neighborhoods_exhausted"
+        _write_json(output / "pool_selection.json", {
+            "stop_reason": reason, "budget": budget, "attempted": len(evaluations),
+            "scope": sorted(set(pool)), "constructible_scope": names,
+            "proxy": "mean_single_factor_net_returns", "search_sizes": sizes,
+            "shortlist": _portfolio_shortlist(evaluations), "path": path,
+            "observation_used_for_selection": False})
+        return path, evaluations, reason
     pairs = sorted(combinations(names, 2), key=lambda m: (proxy(m), m), reverse=True)
     seeds = []
-    for name in names:
+    for name in names if pairs else ():
         pair = next((m for m in pairs if name in m and clusters[m[0]] != clusters[m[1]]),
                     next(m for m in pairs if name in m))
         if pair not in seeds:
             seeds.append(pair)
     seed_rows = [evaluate(m, "seed_coverage", 0) for m in seeds]
-    beam = choose(seed_rows, beam_width)
+    if portfolio_proposals and len(names) >= 2:
+        seed_rows.append(evaluate(tuple(names), "full_qualified_pool", 0))
+    beam = choose(single_rows + seed_rows, beam_width)
     iteration = 0
     while beam and len(evaluations) < budget:
         iteration += 1
@@ -464,13 +631,16 @@ def _run_budgeted_pool_search(*, evaluator, portfolio_ic, pool, recipe, segments
         rows = [evaluate(m, "grow" if m in growth else "add_delete_swap", iteration)
                 for m in ordered[:round_width] if len(evaluations) < budget]
         grown = choose([r for r in rows if r and r["phase"] == "grow"], max(1, beam_width//2))
-        beam = choose(rows, beam_width, grown)
+        incumbents = [r for r in evaluations if tuple(r["factors"]) in beam]
+        beam = choose(rows + incumbents, beam_width, grown)
         if rows and any(r and r["status"] == "evaluated" for r in rows):
             path.append(max((r for r in rows if r and r["status"] == "evaluated"), key=robustness_key))
     reason = "exact_backtest_budget_exhausted" if len(evaluations) >= budget else "reachable_proposals_exhausted"
     _write_json(output / "pool_selection.json", {
         "stop_reason": reason, "budget": budget, "attempted": len(evaluations),
-        "scope": names, "shortlist": _portfolio_shortlist(evaluations), "path": path,
+        "scope": sorted(set(pool)), "constructible_scope": names,
+        "proxy": "mean_single_factor_net_returns" if portfolio_proposals else "H1_IC",
+        "shortlist": _portfolio_shortlist(evaluations), "path": path,
         "observation_used_for_selection": False})
     return path, evaluations, reason
 
@@ -574,6 +744,13 @@ def run_effective_factor_selection(
     common_horizon: int | None = None,
     group_by_best_period: bool = False,
     selection_start: str = "2016-03-31",
+    candidate_names: list[str] | None = None,
+    portfolio_search_budget: int = 512,
+    search_end: str | None = None,
+    resume: bool = False,
+    search_sizes: tuple[int, ...] = (),
+    initial_candidates: list[list[str]] | None = None,
+    search_seed: int = 20260915,
 ) -> Path:
     """Run governed effective-library subset selection and write one immutable run."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(run_id)):
@@ -592,25 +769,47 @@ def run_effective_factor_selection(
     project = Path(__file__).resolve().parents[1]
     output = project / "runs" / "factor_selection" / str(run_id)
     config = load_config(config_path)
+    custom = bool(config.production_portfolio.investment_universe)
+    if (search_sizes or initial_candidates) and (not custom or config.production_portfolio.combination_order != "portfolio_first"):
+        raise ValueError("size-stratified search requires a portfolio-first configured recipe")
+    if initial_candidates and not search_sizes:
+        raise ValueError("initial_candidates require size-stratified search")
+    if any(type(n) is not int or n < 2 for n in search_sizes) or len(set(search_sizes)) != len(search_sizes):
+        raise ValueError("search_sizes must contain unique integers of at least two")
+    if (search_end is not None or resume) and not custom:
+        raise ValueError("bounded/resumable search requires an explicit strategy configuration")
+    if custom and (source_run_dir is not None or group_by_best_period):
+        raise ValueError("configured portfolio selection requires the mixed daily effective pool")
+    if custom and config.production_portfolio.factor_groups:
+        raise ValueError("subset search cannot split parameter groups; evaluate complete declared groups explicitly")
     library_path, library_rows = _load_library(
         config,
         source_run_dir=source_run_dir,
         allowed_horizons=selection_horizons,
     )
+    if candidate_names is not None:
+        if not candidate_names or len(set(candidate_names)) != len(candidate_names) or set(candidate_names) - {str(r['factor']) for r in library_rows}:
+            raise ValueError("candidate_names must be a unique non-empty effective-library subset")
+        library_rows = [r for r in library_rows if r["factor"] in candidate_names]
     if selection_horizons is None:
         selection_horizons = tuple(sorted({
             int(row["best_period"]) for row in library_rows
         }))
-    output.mkdir(parents=True, exist_ok=False)
+    if (output / "run_contract.json").exists():
+        raise FileExistsError("finalized selection runs are immutable")
+    output.mkdir(parents=True, exist_ok=resume)
     runner = PipelineRunner(config=config)
     selection_start = (factor_admission_start(config) if source_run_dir is not None
                        else pd.Timestamp(selection_start))
     cutoff = research_cutoff(config)
+    selection_end = pd.Timestamp(search_end) if search_end is not None else cutoff
+    if not selection_start <= selection_end <= cutoff:
+        raise ValueError("search_end must be between selection_start and research_cutoff")
     warmup_days = int(config.validation_policy.warmup_days_by_frequency["daily"])
     factor_start = selection_start - pd.Timedelta(days=warmup_days)
     source_fingerprint = runner.data_manager.source.checkpoint_source_fingerprint(factor_start, cutoff)
     selection_dates = pd.DatetimeIndex(
-        runner.data_manager.get_calendar(selection_start, cutoff)
+        runner.data_manager.get_calendar(selection_start, selection_end)
     )
     requested_dates = pd.DatetimeIndex(
         runner.data_manager.get_calendar(factor_start, cutoff)
@@ -619,22 +818,72 @@ def run_effective_factor_selection(
         raise ValueError("factor-set selection requires at least 80 trading days")
     universe = pd.Index(config.universe)
     names = sorted(str(row["factor"]) for row in library_rows)
+    if any(len(m) < 2 or len(set(m)) != len(m) or set(m) - set(names) for m in (initial_candidates or [])):
+        raise ValueError("initial_candidates must contain unique admitted members")
+    if search_sizes and portfolio_search_budget < len(names)+len(search_sizes):
+        raise ValueError("budget must reserve at least one evaluation per size band")
+    if custom:
+        import duckdb
+        import scipy
+        from factors.numerics import factor_kernel_contract
+        native = importlib.util.find_spec("_mf_factor_kernels")
+        runtime = {"python": sys.version, "numpy": np.__version__, "pandas": pd.__version__,
+                   "scipy": scipy.__version__, "duckdb": duckdb.__version__, **factor_kernel_contract(),
+                   "native_binary_sha256": sha256_file(Path(native.origin)) if native and native.origin else None}
+        plan = {
+            "factors": library_rows, "library_sha256": sha256_file(library_path),
+            "reference_universe": list(universe), "recipe": _production_recipe(config).to_dict(),
+            "costs": _configured_cost_model(config).ledger_parameters(),
+            "selection_start": str(selection_start.date()), "selection_end": str(selection_end.date()),
+            "evaluation_end": str(cutoff.date()), "exact_budget": portfolio_search_budget,
+            "beam_width": None if search_sizes else 6, "round_width": None if search_sizes else 16,
+            "source_fingerprint": source_fingerprint,
+            "size_search": {"targets": list(search_sizes), "random_seed": search_seed,
+                            "initial_candidates": initial_candidates or [],
+                            "proposal_sample_per_parent": 64, "exact_batch_per_size": 4,
+                            "seed_every_cardinality": True,
+                            "extend_initial_candidates": True,
+                            "incumbents_per_size": 2, "exploration_paths_per_size": 1} if search_sizes else None,
+            "factor_code": FactorPanelRunner._source_tree_fingerprint(),
+            "runtime": runtime,
+            "code": {str(p.relative_to(project)): sha256_file(p) for p in (
+                Path(__file__), project / "research/historical_portfolio_search.py",
+                project / "optimization/portfolio_construction.py", project / "backtest/research_ledger.py",
+                project / "optimization/costs.py", project / "optimization/factor_weighting.py")},
+            "resolved_config": json.loads(config.model_dump_json() if hasattr(config, "model_dump_json") else config.json()),
+            "historical_role": "development_and_conditional_validation_on_current_effective_pool",
+            "method_search": False, "direction_search": False, "observation_used_for_selection": False,
+        }
+        plan = json.loads(json.dumps(plan, default=str))
+        plan_path = output / "search_plan.json"
+        if plan_path.exists() and json.loads(plan_path.read_text(encoding="utf-8")) != plan:
+            raise RuntimeError("frozen selection plan changed")
+        _write_json(plan_path, plan)
     factor_compute_started = time.perf_counter()
     from factors.library.intraday import clear_transient_data_caches
-    raw = {}
-    for target_dates, chunk_dates in iter_overlapping_chunks(requested_dates, 400, 128):
-        part = FactorPanelRunner._compute_part(
-            runner.factor_engine, names, chunk_dates, universe, raw
-        )
-        for name, frame in part.items():
-            if name not in raw:
-                raw[name] = pd.DataFrame(np.nan, index=requested_dates, columns=universe)
-            raw[name].loc[target_dates] = frame.reindex(index=target_dates, columns=universe)
-        runner.factor_engine.clear_cache()
-        clear_transient_data_caches()
-        print(f"factor panel through {target_dates[-1].date()}: {len(raw)}/{len(names)}", flush=True)
+    if custom:
+        factor_panel = FactorPanelRunner(names, start=factor_start, end=cutoff,
+            factor_directions={str(r["factor"]): int(r["direction"]) for r in library_rows},
+            checkpoint_dir=output / "factor_panel_checkpoint", config=config,
+            universe=list(universe), retain_values=True)
+        raw = factor_panel.factor_values
+        factor_timings = [row for chunk in factor_panel.factor_chunk_timings for row in chunk["factor_timings"]]
+        source_fingerprint = factor_panel._checkpoint_contract(names)["source_fingerprint"]
+    else:
+        raw = {}
+        for target_dates, chunk_dates in iter_overlapping_chunks(requested_dates, 400, 128):
+            part = FactorPanelRunner._compute_part(
+                runner.factor_engine, names, chunk_dates, universe, raw
+            )
+            for name, frame in part.items():
+                if name not in raw:
+                    raw[name] = pd.DataFrame(np.nan, index=requested_dates, columns=universe)
+                raw[name].loc[target_dates] = frame.reindex(index=target_dates, columns=universe)
+            runner.factor_engine.clear_cache()
+            clear_transient_data_caches()
+            print(f"factor panel through {target_dates[-1].date()}: {len(raw)}/{len(names)}", flush=True)
+        factor_timings = list(runner.factor_engine.computation_timings)
     factor_compute_seconds = time.perf_counter() - factor_compute_started
-    factor_timings = list(runner.factor_engine.computation_timings)
     if set(raw) != set(names):
         raise ValueError("factor engine did not return all admitted factor names")
     registry = list_registered("factor").get("factor", {})
@@ -655,6 +904,13 @@ def run_effective_factor_selection(
         row["input_bar_frequency"] = declared_input
     directions = {str(row["factor"]): int(row["direction"]) for row in library_rows}
     periods = {str(row["factor"]): int(row["best_period"]) for row in library_rows}
+    reference_universe = list(universe)
+    if custom:
+        investment = config.production_portfolio.investment_universe
+        if set(investment) - set(universe):
+            raise ValueError("investment roots require qualification in the factor reference universe")
+        universe = pd.Index(investment)
+        raw = {name: frame.reindex(columns=universe) for name, frame in raw.items()}
 
     returns = {
         horizon: runner.data_manager.get_forward_returns(
@@ -669,7 +925,8 @@ def run_effective_factor_selection(
     for row in library_rows:
         name = str(row["factor"])
         horizon = periods[name]
-        raw_rank = _rank_frame(raw[name])
+        decimals = config.production_portfolio.score_decimals if custom else None
+        raw_rank = _rank_frame(raw[name].round(decimals) if decimals is not None else raw[name])
         direction = directions[name]
         full_ranks[name] = raw_rank if direction == 1 else (1.0 - raw_rank)
         ranks[name] = full_ranks[name].loc[selection_dates]
@@ -677,7 +934,11 @@ def run_effective_factor_selection(
             ranks[name],
             returns[horizon].loc[selection_dates],
             selection_dates,
+            minimum_cross_section=min(MIN_CROSS_SECTION, len(universe)) if custom else MIN_CROSS_SECTION,
         )
+        if custom:
+            # Exclude labels whose H-day return ends after the search boundary.
+            ic = ic.reindex(selection_dates[:-horizon]).dropna()
         segment_values = []
         for segment in segments:
             mean, positive_ratio, ir = _metric(ic.reindex(segment))
@@ -825,6 +1086,7 @@ def run_effective_factor_selection(
             cal=requested_dates,
             u=list(universe),
             ranks=full_ranks,
+            factor_values=raw, factor_directions=directions, reference_universe=reference_universe,
             ic=full_portfolio_ic,
             daily_ret=daily_ret,
             close_tradable=close_tradable,
@@ -858,14 +1120,33 @@ def run_effective_factor_selection(
         # Clusters describe redundancy, but no member is permanently excluded.
         representatives = names
         history_segments = [
-            (max(selection_dates[0], pd.Timestamp(left)), min(cutoff, pd.Timestamp(right)))
+            (max(selection_dates[0], pd.Timestamp(left)), min(selection_end, pd.Timestamp(right)))
             for left, right in (("2016-03-31", "2019-12-31"), ("2020-01-01", "2021-12-31"),
                                 ("2022-01-01", "2023-12-31"), ("2024-01-01", "2024-12-31"),
                                 ("2025-01-01", str(cutoff.date())))
-            if pd.Timestamp(right) >= selection_dates[0] and pd.Timestamp(left) <= cutoff
+            if pd.Timestamp(right) >= selection_dates[0] and pd.Timestamp(left) <= selection_end
         ]
-        nested_path, candidate_evaluations, nested_stop_reason = (
-            _run_portfolio_search(
+        if custom:
+            import duckdb
+            cache_namespace = json.dumps({"data": source_fingerprint, "library": sha256_file(library_path),
+                "runtime": plan["runtime"],
+                "factor_code": FactorPanelRunner._source_tree_fingerprint(),
+                "directions": directions, "reference_universe": reference_universe,
+                "code": {str(p.relative_to(project)): sha256_file(p) for p in (
+                    project / "research/historical_portfolio_search.py", project / "optimization/portfolio_construction.py",
+                    project / "backtest/research_ledger.py", Path(__file__))}}, sort_keys=True)
+            with duckdb.connect(str(output / "search.duckdb")) as db:
+                nested_path, candidate_evaluations, nested_stop_reason = _run_budgeted_pool_search(
+                    evaluator=evaluator, portfolio_ic=portfolio_ic, pool=names, recipe=recipe,
+                    segments=history_segments, clusters=clusters, db=db, output=output,
+                    budget=portfolio_search_budget, cache_namespace=cache_namespace,
+                    search_sizes=search_sizes, initial_candidates=initial_candidates or (), search_seed=search_seed)
+            if search_sizes:
+                valid_rows = [r for r in candidate_evaluations if r["status"] == "evaluated"]
+                nested_path = [max((r for r in valid_rows if r["factor_count"] == size), key=robustness_key)
+                               for size in sorted({r["factor_count"] for r in valid_rows})]
+        else:
+            nested_path, candidate_evaluations, nested_stop_reason = _run_portfolio_search(
                 evaluator=evaluator,
                 portfolio_ic=portfolio_ic,
                 representatives=representatives,
@@ -873,8 +1154,28 @@ def run_effective_factor_selection(
                 segments=history_segments,
                 output=output,
             )
-        )
         shortlist = _portfolio_shortlist(candidate_evaluations)
+        if custom and selection_end < cutoff:
+            # Lock membership and ordering before reading validation performance.
+            _write_json(output / "locked_candidates.json", shortlist)
+            observation_evaluator = evaluator.bounded(selection_dates[0], cutoff)
+            observation_rows, observation_returns = [], {}
+            for i, row in enumerate(shortlist, 1):
+                result = {"candidate": f"candidate_{i}_{row['factor_count']}f",
+                          "factors": row["factors"], "status": "evaluated", "error": ""}
+                try:
+                    ledger = observation_evaluator.ledger(row["factors"], recipe)
+                    values = ledger.loc[ledger.index > selection_end, "net_return"]
+                    result.update(performance_metrics(values, periods_per_year=recipe.periods_per_year))
+                    observation_returns[result["candidate"]] = ledger["net_return"]
+                except (RuntimeError, ValueError) as exc:
+                    result.update(status="rejected_runtime", error=str(exc))
+                observation_rows.append(result)
+            _write_json(output / "conditional_validation.json", {
+                "after": str(selection_end.date()), "end": str(cutoff.date()),
+                "used_for_selection": False, "independent_oos": False, "candidates": observation_rows})
+            pd.DataFrame(observation_returns).to_csv(output / "locked_candidate_full_returns.csv")
+            extra_files.extend(["locked_candidates.json", "conditional_validation.json", "locked_candidate_full_returns.csv"])
         factor_sets["portfolio_candidates"] = {
             "purpose": "diverse Pareto candidates; historical development evidence only",
             "candidates": shortlist,
@@ -896,7 +1197,8 @@ def run_effective_factor_selection(
                     block_metrics.append({
                         "candidate": f"candidate_{i}_{row['factor_count']}f",
                         "start": str(left.date()), "end": str(right.date()),
-                        **performance_metrics(values, initial_anchor=values.index[0] == ledger.index[0]),
+                        **performance_metrics(values, initial_anchor=values.index[0] == ledger.index[0],
+                                              periods_per_year=recipe.periods_per_year),
                     })
             _write_csv(output / "candidate_block_metrics.csv", block_metrics)
             extra_files.append("candidate_block_metrics.csv")
@@ -905,13 +1207,13 @@ def run_effective_factor_selection(
                       for i, (name, row) in enumerate(zip(candidate_returns, shortlist), 1)}
             plot_rows = []
             for name, row in zip(candidate_returns, shortlist):
-                metrics = performance_metrics(candidate_returns[name], initial_anchor=True)
+                metrics = performance_metrics(candidate_returns[name], initial_anchor=True, periods_per_year=recipe.periods_per_year)
                 plot_rows.append({"strategy": labels[name], **metrics,
                                   "volatility": metrics["annual_volatility"],
                                   "annualized_turnover": row["annual_turnover"]})
             _write_comparison_plot(
                 output, (1 + candidate_returns).cumprod().rename(columns=labels), plot_rows,
-                title=f"候选组合净值对比（{selection_dates[0]:%Y-%m-%d}至{cutoff:%Y-%m-%d}）\n历史开发样本；统一组合配方与成本，非独立样本外",
+                title=f"候选组合净值对比（{selection_dates[0]:%Y-%m-%d}至{selection_end:%Y-%m-%d}）\n历史开发样本；统一组合配方与成本，非独立样本外",
             )
             extra_files.append("nav_comparison.png")
         recommended = shortlist[0] if shortlist else None
@@ -960,8 +1262,9 @@ def run_effective_factor_selection(
                 {**row, "factors": "|".join(row["factors"])}
                 for row in rows_to_write
             ]
-            _write_csv(output / filename, serializable)
-            extra_files.append(filename)
+            if serializable:
+                _write_csv(output / filename, serializable)
+                extra_files.append(filename)
 
     _write_csv(output / "factor_diagnostics.csv", all_diagnostics)
     _write_csv(output / "factor_clusters.csv", cluster_rows)
@@ -978,6 +1281,11 @@ def run_effective_factor_selection(
         ),
         "common_horizon": int(common_horizon) if common_horizon is not None else None,
         "library_count": len(names),
+        "candidate_scope": names,
+        "factor_reference_universe": reference_universe,
+        "investment_universe": list(universe),
+        "resolved_costs": _configured_cost_model(config).ledger_parameters() if custom else None,
+        "resolved_recipe": recipe.to_dict() if custom else None,
         "data_source": config.data.source,
         "data_sha256": source_fingerprint,
         "research_cutoff": cutoff.date().isoformat(),
@@ -987,7 +1295,7 @@ def run_effective_factor_selection(
         ],
         "selection_sample": [
             selection_start.date().isoformat(),
-            cutoff.date().isoformat(),
+            selection_end.date().isoformat(),
             len(selection_dates),
         ],
         "post_cutoff_data_used": False,
@@ -1016,8 +1324,10 @@ def run_effective_factor_selection(
             {
                 "enabled": True,
                 "recipe": recipe.to_dict(),
+                "periods_per_year": recipe.periods_per_year,
                 "cap_groups": {name: PORTFOLIO_CAP_GROUPS[name] for name in universe},
                 "ic_horizon": 1,
+                "ic_window": int(config.production_portfolio.ic_window),
                 "risk_lookback_calendar_days": int(
                     config.production_portfolio.risk_lookback_calendar_days
                 ),
@@ -1028,20 +1338,24 @@ def run_effective_factor_selection(
                     config.production_portfolio.covariance_shrinkage
                 ),
                 "segments": [[str(a.date()), str(b.date())] for a, b in history_segments],
-                "initial_factor_count": 2,
+                "initial_factor_count": 1 if custom and recipe.combination_order == "portfolio_first" else 2,
                 "final_factor_count_is_fixed": False,
-                "maximum_explored_factor_count": PORTFOLIO_SEARCH_MAX_FACTORS,
-                "exact_shortlist_width": PORTFOLIO_SEARCH_EXACT_WIDTH,
-                "beam_width": PORTFOLIO_SEARCH_BEAM_WIDTH,
+                "maximum_explored_factor_count": max((r["factor_count"] for r in candidate_evaluations), default=0),
+                "exact_budget": portfolio_search_budget if custom else None,
+                "exact_shortlist_width": 4 if search_sizes else (16 if custom else PORTFOLIO_SEARCH_EXACT_WIDTH),
+                "beam_width": 2 if search_sizes else (6 if custom else PORTFOLIO_SEARCH_BEAM_WIDTH),
+                "size_search": plan["size_search"] if custom else None,
                 "size_penalty": False,
                 "early_stop_on_nonimprovement": False,
-                "proxy_role": "H1 IC proposal only; exact net portfolios determine shortlist",
+                "proxy_role": ("mean single-factor net returns; exact net portfolios determine shortlist"
+                               if custom and recipe.combination_order == "portfolio_first" else
+                               "H1 IC proposal only; exact net portfolios determine shortlist"),
                 "stop_reason": nested_stop_reason,
                 "recommended_factor_count": int(
                     factor_sets["recommended_core"]["factor_count"]
                 ),
             }
-            if nested_path else {"enabled": False}
+            if candidate_evaluations else {"enabled": False}
         ),
         "performance": {
             "factor_compute_seconds": factor_compute_seconds,
@@ -1068,6 +1382,9 @@ def run_effective_factor_selection(
         "factor_diagnostics.csv", "factor_clusters.csv", "factor_sets.json",
         "selection_summary.json", *correlation_files.values(), *extra_files,
     ]
+    if custom:
+        files.extend(name for name in ("search_plan.json", "factor_eligibility.json", "pool_selection.json", "size_search.json")
+                     if (output / name).exists())
     contract = {
         "schema_version": SELECTION_SCHEMA_VERSION,
         "run_id": str(run_id),

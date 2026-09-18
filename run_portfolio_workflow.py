@@ -259,6 +259,8 @@ def _validated_specs():
         requested_ids = {entry.id for entry in catalog.strategies if entry.status == "preferred"}
         if len(requested_ids) != 1:
             raise ValueError("default portfolio requires exactly one preferred strategy")
+    preferred_group = next((s.comparison_group for s in catalog.strategies
+                            if s.status == "preferred"), "neutral_futures")
     STRATEGY_LABELS.update({entry.id: entry.name for entry in catalog.strategies if entry.name})
     seen_ids: set[str] = set()
     for strategy in catalog.strategies:
@@ -269,9 +271,15 @@ def _validated_specs():
             continue
         if requested_ids and strategy.id not in requested_ids:
             continue
+        if (not requested_ids and not all_strategy_compare
+                and WORKFLOW is not PortfolioWorkflow.VALIDATE_CONFIGURATIONS
+                and strategy.comparison_group != preferred_group):
+            continue
         path = _resolve(strategy.config_path)
         config = load_config(path)
-        if strategy.source == "effective_library" and path == _resolve("config/default.yaml"):
+        if strategy.source == "effective_library" and (
+            path == _resolve("config/default.yaml") or strategy.recipe_source == "strategy_config"
+        ):
             # Shared method config; the catalog owns each reusable factor subset.
             factor_set = factor_sets[strategy.factor_set_id]
             config.factors = list(factor_set.factors)
@@ -288,7 +296,8 @@ def _validated_specs():
             config.factors = list(snapshot_definition["factors"])
             config.factor_library.enforce_effective_membership = False
         # All peers share the comparison range without rewriting their YAMLs.
-        config.date_range.start = COMPARISON_START
+        if strategy.recipe_source == "shared_default":
+            config.date_range.start = COMPARISON_START
         if strategy.source == "legacy_observation" and LEGACY_COMPARISON_FILLNA_ZERO:
             if not any(step.type == "fillna" for step in config.processing):
                 config.processing.append(
@@ -299,22 +308,26 @@ def _validated_specs():
                 f"strategy {strategy.id!r} must use the framework's certified "
                 "duckdb_futures runtime source"
             )
-        if default_production is not None and (
+        if default_production is not None and strategy.recipe_source == "shared_default" and (
             _config_dict(config.production_portfolio)
             != _config_dict(default_production)
         ):
             raise ValueError(
                 f"strategy {strategy.id!r} overrides production_portfolio; "
-                "default comparison permits only catalog members and rank buffer overrides"
+                "shared-default recipes permit only declared catalog construction overrides"
             )
-        if strategy.rank_exit_buffer is not None:
-            config.production_portfolio.rank_exit_buffer = strategy.rank_exit_buffer
+        strategy.apply_portfolio_overrides(config.production_portfolio)
+        from core.config import validate_portfolio_config
+        validate_portfolio_config(config, factor_names=config.factors)
+        if strategy.recipe_source == "strategy_config" and (
+            strategy.mode != "single" or not config.production_portfolio.investment_universe
+        ):
+            raise ValueError("strategy_config requires a single configured portfolio with a fixed universe")
         validate_rank_buffer_route(config, actual_holdings_supported=(
             WORKFLOW is not PortfolioWorkflow.RUN_AND_COMPARE_CONFIGURED
         ))
-        # The base recipe was checked above, before this single catalog override.
-        # Native peer comparisons may use adopted buffers; other recipe changes
-        # and routes without actual holdings remain rejected.
+        # The base recipe was checked before the narrow catalog overrides.
+        # Peer groups control default inclusion; unsupported buffer routes remain rejected.
         if default_production is not None:
             STRATEGY_LABELS[strategy.id] = (
                 f"{strategy.name or strategy.id} [B{config.production_portfolio.rank_exit_buffer}]"
@@ -358,7 +371,7 @@ def _strategy_label(strategy_id: str) -> str:
     return STRATEGY_LABELS.get(str(strategy_id), str(strategy_id))
 
 
-def _comparison_metrics(combined) -> dict:
+def _comparison_metrics(combined, periods_per_year=TRADING_DAYS_PER_YEAR) -> dict:
     """Add NAV-day and turnover diagnostics to the framework metrics."""
     metrics = dict(combined.metrics)
     nav = pd.Series(combined.nav, dtype=float).dropna().sort_index()
@@ -370,7 +383,7 @@ def _comparison_metrics(combined) -> dict:
         getattr(combined, "turnover", pd.Series(dtype=float)), dtype=float
     ).reindex(nav.index)
     intervals = turnover.iloc[1:]
-    metrics.update(compute_turnover_metrics(intervals) if intervals.notna().all() else
+    metrics.update(compute_turnover_metrics(intervals, periods_per_year) if intervals.notna().all() else
                    dict.fromkeys(compute_turnover_metrics(pd.Series(dtype=float))))
     return metrics
 
@@ -522,6 +535,7 @@ def _segment_rows(
     nav: pd.Series,
     turnover: pd.Series,
     cutoff: pd.Timestamp,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
 ) -> list[dict]:
     """Compute full/pre-cutoff/forward metrics without changing the backtest."""
     nav = pd.Series(nav, dtype=float).dropna().sort_index()
@@ -545,7 +559,7 @@ def _segment_rows(
             continue
         normalized = anchored / float(anchored.iloc[0])
         returns = normalized.pct_change(fill_method=None).iloc[1:]
-        metrics = compute_all_metrics(normalized, returns=returns)
+        metrics = compute_all_metrics(normalized, returns=returns, periods_per_year=periods_per_year)
         # ``compute_all_metrics.win_rate`` is reserved for trade-signal
         # ledgers; this report has daily NAV returns, so expose the relevant
         # positive-day ratio explicitly instead of presenting a misleading 0.
@@ -553,7 +567,7 @@ def _segment_rows(
             float(returns.gt(0.0).mean()) if not returns.empty else 0.0
         )
         intervals = turnover.loc[returns.index]
-        metrics.update(compute_turnover_metrics(intervals) if intervals.notna().all() else
+        metrics.update(compute_turnover_metrics(intervals, periods_per_year) if intervals.notna().all() else
                        dict.fromkeys(compute_turnover_metrics(pd.Series(dtype=float))))
         rows.append({
             "strategy": strategy,
@@ -626,15 +640,28 @@ def _build_shared_production_panel(
         else min(pd.Timestamp(config.date_range.end).normalize(), latest)
         for _strategy, _config_path, config in specs
     ]
+    custom = any(config.production_portfolio.investment_universe for _, _, config in specs)
+    reference = specs[0][2]
+    if any(getattr(c, "data", None) != getattr(reference, "data", None) or c.universe != reference.universe
+           for _, _, c in specs):
+        raise ValueError("shared factor panel requires identical data and factor reference universes")
+    # Preserve the main cross-sectional reference population. Extra roots can
+    # be computed on their own route; never silently change peers' factors.
+    for _, _, config in specs:
+        if set(config.production_portfolio.investment_universe) - set(config.universe):
+            raise ValueError("investment roots outside the factor reference universe require explicit data/factor qualification")
     return FactorPanelRunner(
         factors,
         start=(
-            pd.Timestamp(COMPARISON_START)
-            - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS)
+            min(pd.Timestamp(config.date_range.start) - pd.Timedelta(days=(
+                int(config.validation_policy.warmup_days_by_frequency["daily"])
+                if config.production_portfolio.investment_universe else LEGACY_PANEL_BUFFER_DAYS
+            )) for _, _, config in specs)
         ),
         end=max(configured_ends),
         ic_horizon=int(ic_horizon),
         checkpoint_dir=checkpoint_dir,
+        **({"retain_values": True, "config": specs[0][2]} if custom else {}),
     )
 
 
@@ -648,11 +675,12 @@ def _run_production_portfolio(
     factor_direction_source: dict | None = None,
     panel_runner_override=None,
     ic_horizon: int = 1,
+    production_config_path: Path | None = None,
 ):
     """Run a factor set through the shared configured production ledger.
 
     ``config/default.yaml`` owns the base recipe; the catalog owns its narrow
-    rank-buffer override, while
+    rank-buffer, position-count and factor-sleeve overrides, while
     the generic model/risk PipelineRunner remains available for the explicit
     configured-candidate route.  The default IDE comparison calls this helper
     for every selected peer without changing construction or execution engines.
@@ -669,7 +697,8 @@ def _run_production_portfolio(
         latest_local_date,
     )
 
-    start = pd.Timestamp(COMPARISON_START)
+    custom = bool(config.production_portfolio.investment_universe)
+    start = pd.Timestamp(config.date_range.start if custom else COMPARISON_START)
     latest = pd.Timestamp(latest_local_date()).normalize()
     configured_end = str(config.date_range.end)
     end = (
@@ -677,12 +706,19 @@ def _run_production_portfolio(
         if configured_end == "latest_available"
         else min(pd.Timestamp(configured_end).normalize(), latest)
     )
-    panel_start = start - pd.Timedelta(days=LEGACY_PANEL_BUFFER_DAYS)
+    panel_start = start - pd.Timedelta(days=(
+        int(config.validation_policy.warmup_days_by_frequency["daily"])
+        if custom else LEGACY_PANEL_BUFFER_DAYS
+    ))
     factors = list(config.factors)
-    # Catalog validation resolves the narrow per-strategy buffer override and
-    # enforces equal base recipes. Never reload and erase the resolved override.
+    # Catalog validation resolves narrow per-strategy overrides and checks the
+    # base recipes. Never reload and erase the resolved overrides.
     validate_rank_buffer_route(config, actual_holdings_supported=True)
     production_config = config
+    if custom:
+        from core.config import validate_portfolio_config
+        validate_portfolio_config(config, factor_names=factors)
+    method_path = _resolve(production_config_path or "config/default.yaml")
     recipe = _legacy_recipe(production_config)
     direction_source = factor_direction_source
     if factor_directions is None:
@@ -715,7 +751,12 @@ def _run_production_portfolio(
             end=end,
             factor_directions=factor_directions,
             ic_horizon=ic_horizon,
+            **({"retain_values": True, "config": config} if custom else {}),
         )
+        if custom:
+            panel_runner.get_contract_schedule()
+            panel_runner = panel_runner.for_factors(factors, factor_directions=factor_directions,
+                universe=recipe.investment_universe, score_decimals=recipe.score_decimals)
     else:
         # Load the concrete-contract schedule once on the shared owner before
         # creating a shallow strategy view. Factor values are never recomputed;
@@ -724,6 +765,7 @@ def _run_production_portfolio(
         panel_runner = panel_runner_override.for_factors(
             factors,
             factor_directions=factor_directions,
+            **({"universe": recipe.investment_universe, "score_decimals": recipe.score_decimals} if custom else {}),
         )
     panel_runner.get_contract_schedule()
     panel_runner.env = CausalEligibilityEnvironment(
@@ -735,13 +777,16 @@ def _run_production_portfolio(
         panel_runner,
         start=start,
         end=end,
-        cost_model=configured_futures_cost_model(),
+        cost_model=configured_futures_cost_model(config) if custom else configured_futures_cost_model(),
         ic_window=int(production_config.production_portfolio.ic_window),
         risk_lookback_calendar_days=int(
             production_config.production_portfolio.risk_lookback_calendar_days
         ),
     )
     native_result = evaluator.run(factors, recipe)
+    if recipe.factor_sleeves:
+        strategy_dir.mkdir(parents=True, exist_ok=True)
+        evaluator.factor_sleeve_budgets.to_parquet(strategy_dir / "factor_sleeve_budgets.parquet")
     weights = native_result.target_weights
     ledger = native_result.daily.copy()
     ledger["nav"] = ledger["nav_after"]
@@ -750,7 +795,8 @@ def _run_production_portfolio(
     # Both turnover and executed_traded_notional are normalized weight ratios,
     # not currency amounts. Gross leverage is already included in the weights.
     turnover = pd.Series(ledger["turnover"], dtype=float).reindex(nav.index)
-    metrics = compute_all_metrics(nav, returns=returns.iloc[1:])
+    metrics = compute_all_metrics(nav, returns=returns.iloc[1:],
+                                  periods_per_year=recipe.periods_per_year)
     result = BacktestResult(
         nav=nav,
         weights_history=weights,
@@ -782,9 +828,9 @@ def _run_production_portfolio(
         "rank_buffer_diagnostics": native_result.metadata["rank_buffer_diagnostics"],
         "ic_horizon": ic_horizon,
         "factor_panel": shared_panel_meta,
-        "production_config_path": str(_resolve("config/default.yaml")),
+        "production_config_path": str(method_path),
         "production_config_sha256": hashlib.sha256(
-            _resolve("config/default.yaml").read_bytes()
+            method_path.read_bytes()
         ).hexdigest(),
     })
     ledger.to_csv(strategy_dir / "production_ledger.csv", encoding="utf-8-sig")
@@ -800,9 +846,9 @@ def _run_production_portfolio(
             "rank_buffer_diagnostics": native_result.metadata["rank_buffer_diagnostics"],
             "ic_horizon": ic_horizon,
             "factor_panel": shared_panel_meta,
-            "production_config_path": str(_resolve("config/default.yaml")),
+            "production_config_path": str(method_path),
             "production_config_sha256": hashlib.sha256(
-                _resolve("config/default.yaml").read_bytes()
+                method_path.read_bytes()
             ).hexdigest(),
         }, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -816,9 +862,9 @@ def _run_production_portfolio(
         "recipe": recipe.to_dict(),
         "ic_horizon": ic_horizon,
         "factor_panel": shared_panel_meta,
-        "production_config_path": str(_resolve("config/default.yaml")),
+        "production_config_path": str(method_path),
         "production_config_sha256": hashlib.sha256(
-            _resolve("config/default.yaml").read_bytes()
+            method_path.read_bytes()
         ).hexdigest(),
     }
 
@@ -843,6 +889,7 @@ def _write_segment_report(
                 combined.nav,
                 getattr(combined, "turnover", pd.Series(dtype=float)),
                 cutoff,
+                periods_per_year=int(getattr(_config.costs, "periods_per_year", TRADING_DAYS_PER_YEAR)),
             )
         )
     if not rows and not failures:
@@ -895,6 +942,9 @@ def _write_segment_report(
         "| strategy | segment | start | end | annual_return | sharpe | max_drawdown | volatility | total_return | positive_day_ratio | avg_turnover | annualized_turnover | total_turnover |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    if any(getattr(s, "recipe_source", "shared_default") == "strategy_config" for s, _, _ in strategy_results):
+        lines[2] = "- 回测区间与年化频率按各策略冻结配置，详见下表及运行合同。"
+        lines[4] = "- 所有策略共用因子计算、组合评估与执行账本；方法和固定品种池按策略配置。跨比较组结果仅作并列观察，不作为统一排名。"
     for row in rows:
         cells = [row["strategy"], row["segment"], row["start"], row["end"]]
         for column in metric_columns:
@@ -999,7 +1049,7 @@ def run_and_compare() -> Path:
                 if strategy.factor_definition_path
                 else None
             )
-            if strategy.source == "legacy_observation" or production_method_compare:
+            if strategy.source == "legacy_observation" or production_method_compare or strategy.recipe_source == "strategy_config":
                 # The old observation strategy is a durable production recipe, not
                 # a generic single-pipeline model experiment.  Keep this explicit
                 # so the two semantically different routes cannot be conflated.
@@ -1008,6 +1058,8 @@ def run_and_compare() -> Path:
                     strategy_dir,
                     strategy_id=name,
                     route=(
+                        "configured_production_portfolio"
+                        if strategy.recipe_source == "strategy_config" else
                         "default_production_portfolio"
                         if production_method_compare
                         else "legacy_production_portfolio"
@@ -1024,6 +1076,7 @@ def run_and_compare() -> Path:
                         if snapshot_definition is not None else None
                     ),
                     panel_runner_override=shared_panel_runner,
+                    production_config_path=config_path,
                 )
                 runner = None
                 if catalog.plot:
@@ -1115,7 +1168,7 @@ def run_and_compare() -> Path:
             continue
         strategy_results.append((strategy, combined, config))
         navs[name] = combined.nav / float(combined.nav.iloc[0])
-        metrics = _comparison_metrics(combined)
+        metrics = _comparison_metrics(combined, periods_per_year=int(getattr(config.costs, "periods_per_year", TRADING_DAYS_PER_YEAR)))
         observation_start = (
             route_meta.get("comparison_start", config.date_range.start)
         )
@@ -1126,6 +1179,7 @@ def run_and_compare() -> Path:
             "strategy": name,
             "status": strategy.status,
             "factor_set_id": strategy.factor_set_id,
+            "comparison_group": strategy.comparison_group,
             "start": observation_start,
             "end": observation_end,
             **metrics,
@@ -1160,6 +1214,8 @@ def run_and_compare() -> Path:
         "comparison_start": COMPARISON_START,
         "comparison_policy": {
             "construction_route": (
+                "shared_configured_production_portfolio"
+                if production_method_compare and any(s.recipe_source == "strategy_config" for s, _, _ in specs) else
                 "default_production_portfolio"
                 if production_method_compare
                 else "catalog_configured"

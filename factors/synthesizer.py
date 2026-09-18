@@ -352,6 +352,120 @@ class FactorSynthesizer:
         return z.where(df.notna())
 
 
+def residualize_against_factors(
+    factor_values: Dict[str, pd.DataFrame],
+    reference_factors: List[str],
+    train_dates: pd.DatetimeIndex,
+    *,
+    minimum_observations: int = 30,
+) -> Tuple[Dict[str, pd.DataFrame], dict]:
+    """Optional joint OLS residuals against a fixed reference set.
+
+    Inputs must already carry their frozen directions and desired precision.
+    Cross-sectional standardization uses only the current row. Coefficients use
+    exactly ``train_dates`` and are applied unchanged to every supplied date.
+    Outputs are already oriented (direction +1); do not flip them again or
+    standardize tiny residuals back to unit variance. Diagnostics let the caller
+    reject weak residuals without changing the global effective-factor library.
+    No existing synthesis or processing default invokes this method.
+    """
+    if not reference_factors or len(set(reference_factors)) != len(reference_factors):
+        raise ValueError("reference factors must be unique and non-empty")
+    if set(reference_factors) - factor_values.keys():
+        raise ValueError("reference factor values are missing")
+    first = factor_values[reference_factors[0]]
+    dates = pd.DatetimeIndex(train_dates)
+    if dates.empty or not dates.is_unique or not dates.isin(first.index).all():
+        raise ValueError("training dates must be unique, non-empty and available")
+    if not first.index.is_unique or not first.columns.is_unique:
+        raise ValueError("factor axes must be unique")
+    normalized = {}
+    for name, frame in factor_values.items():
+        if not frame.index.equals(first.index) or not frame.columns.equals(first.columns):
+            raise ValueError("factor axes must match exactly")
+        clean = frame.replace([np.inf, -np.inf], np.nan)
+        normalized[name] = FactorSynthesizer._cross_section_zscore(clean)
+    shape = first.shape
+    x = np.column_stack([np.ones(first.size)] +
+                        [normalized[n].to_numpy().ravel() for n in reference_factors])
+    training = np.repeat(first.index.isin(dates), shape[1])
+    finite_x = np.isfinite(x).all(axis=1)
+    residuals, diagnostics = {}, {}
+    required = max(int(minimum_observations), x.shape[1] + 1)
+    for name, values in normalized.items():
+        if name in reference_factors:
+            continue
+        y = values.to_numpy().ravel()
+        valid = finite_x & np.isfinite(y)
+        fit = valid & training
+        info = {"observations": int(fit.sum()), "references": list(reference_factors)}
+        output = np.full(y.shape, np.nan)
+        if fit.sum() < required or np.var(y[fit]) <= 1e-14:
+            info["status"] = "insufficient_or_constant"
+        else:
+            beta, _, rank, singular = np.linalg.lstsq(x[fit], y[fit], rcond=None)
+            if rank != x.shape[1] or singular[0] / singular[-1] > 1e8:
+                raise ValueError("reference design is rank deficient or ill-conditioned")
+            output[valid] = y[valid] - x[valid] @ beta
+            info.update(status="fitted", coefficients=beta.tolist(), rank=int(rank),
+                        condition_number=float(singular[0] / singular[-1]),
+                        retained_variance_ratio=float(np.var(output[fit]) / np.var(y[fit])),
+                        max_normal_equation_error=float(np.abs(x[fit].T @ output[fit]).max() / fit.sum()))
+        residuals[name] = pd.DataFrame(output.reshape(shape), index=first.index, columns=first.columns)
+        diagnostics[name] = info
+    return residuals, diagnostics
+
+
+def remove_common_components(
+    factor_values: Dict[str, pd.DataFrame],
+    train_dates: pd.DatetimeIndex,
+    *,
+    n_components: int = 1,
+) -> Tuple[Dict[str, pd.DataFrame], dict]:
+    """Optional training-frozen PCA projection removal from oriented signals.
+
+    Reuse row standardization, fit on complete training asset-date rows, and
+    preserve missing rows on application. Residuals are not whitened, rescaled,
+    or direction-flipped. This is opt-in and does not change synthesis defaults.
+    """
+    names = list(factor_values)
+    if isinstance(n_components, bool) or not isinstance(n_components, int) or not 0 < n_components < len(names):
+        raise ValueError("component count must leave at least one factor dimension")
+    first = factor_values[names[0]]
+    dates = pd.DatetimeIndex(train_dates)
+    if dates.empty or not dates.is_unique or not dates.isin(first.index).all():
+        raise ValueError("training dates must be unique, non-empty and available")
+    normalized = []
+    for frame in factor_values.values():
+        if not frame.index.equals(first.index) or not frame.columns.equals(first.columns):
+            raise ValueError("factor axes must match exactly")
+        normalized.append(FactorSynthesizer._cross_section_zscore(frame.replace([np.inf, -np.inf], np.nan)).to_numpy().ravel())
+    x = np.column_stack(normalized)
+    valid = np.isfinite(x).all(axis=1)
+    fit = valid & np.repeat(first.index.isin(dates), len(first.columns))
+    if fit.sum() < max(30, len(names)+1):
+        raise ValueError("insufficient complete training observations")
+    center = x[fit].mean(axis=0)
+    training = x[fit]-center
+    _, singular, components = np.linalg.svd(training, full_matrices=False)
+    if np.sum(singular**2) <= 1e-14:
+        raise ValueError("training signals have no variance")
+    basis = components[:n_components]
+    residual = np.full_like(x, np.nan)
+    residual[valid] = x[valid]-center-((x[valid]-center) @ basis.T) @ basis
+    variance = np.var(training, axis=0)
+    ratio = np.divide(np.var(residual[fit], axis=0), variance,
+                      out=np.zeros_like(variance), where=variance > 1e-14)
+    return {n: pd.DataFrame(residual[:, i].reshape(first.shape), index=first.index, columns=first.columns)
+            for i, n in enumerate(names)}, {
+        "names": names, "components_removed": n_components, "fit_observations": int(fit.sum()),
+        "center": center.tolist(), "components": basis.tolist(),
+        "explained_variance_ratio": (singular**2/np.sum(singular**2)).tolist(),
+        "retained_variance_ratio": dict(zip(names, ratio.tolist())),
+        "max_projection_error": float(np.abs(residual[valid] @ basis.T).max()),
+    }
+
+
 def build_cluster_map_from_json(
     corr_json_path: str,
     min_cluster_size: int = 2,

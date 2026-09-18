@@ -174,10 +174,10 @@ NEW_FACTOR_DIRECTIONS = {
 }
 
 
-def configured_futures_cost_model() -> SimpleFuturesCost:
+def configured_futures_cost_model(config=None) -> SimpleFuturesCost:
     """Load the formal, stateless futures cost policy used by comparisons."""
     config_path = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
-    costs = load_config(str(config_path)).costs
+    costs = (config if config is not None else load_config(str(config_path))).costs
     if str(costs.type) != "simple_futures":
         raise ValueError("production-style research requires simple_futures costs")
     return SimpleFuturesCost(
@@ -186,6 +186,7 @@ def configured_futures_cost_model() -> SimpleFuturesCost:
         annual_roll_cost=float(costs.annual_roll_cost),
         periods_per_year=float(costs.periods_per_year),
         cost_stage=str(costs.cost_stage),
+        accounting_method=str(getattr(costs, "accounting_method", "close_marked")),
     )
 
 
@@ -212,8 +213,10 @@ class ExperimentEnvironment:
         *,
         start: str | pd.Timestamp = "2015-12-01",
         end: str | pd.Timestamp | None = None,
+        config=None,
+        universe=None,
     ):
-        self.cfg = load_config("config/default.yaml")
+        self.cfg = config if config is not None else load_config("config/default.yaml")
         self.data_manager = DataManager.from_config(self.cfg)
         end_date = (
             pd.Timestamp(end).normalize()
@@ -226,7 +229,7 @@ class ExperimentEnvironment:
                 end_date,
             )
         )
-        self.u = list(UNIVERSE38)
+        self.u = list(UNIVERSE38 if universe is None else universe)
         self.engine = FactorEngine(self.data_manager)
         self.close = self.data_manager.get("close", self.cal, self.u)
         self.daily_ret, self.close_tradable = (
@@ -239,6 +242,9 @@ class ExperimentEnvironment:
             for symbol in members
             if symbol in self.u
         }
+        if universe is not None:
+            from core.sectors import portfolio_selection_group_for
+            self.sector_of.update({symbol: portfolio_selection_group_for(symbol) for symbol in self.u})
 
 class FactorPanelRunner:
     """Build rank and IC panels for an explicitly supplied factor universe."""
@@ -410,12 +416,20 @@ class FactorPanelRunner:
         ic_horizon: int = 1,
         checkpoint_dir: str | Path | None = None,
         compute_start: str | pd.Timestamp | None = None,
+        config=None,
+        universe=None,
+        retain_values: bool = False,
     ):
         self.compute_start = pd.Timestamp(compute_start) if compute_start is not None else None
         self.ic_horizon = int(ic_horizon)
         if self.ic_horizon < 1:
             raise ValueError("ic_horizon must be a positive daily-bar horizon")
-        self.env = ExperimentEnvironment(BASELINE_6F, start=start, end=end)
+        environment_options = {}
+        if config is not None:
+            environment_options["config"] = config
+        if universe is not None:
+            environment_options["universe"] = universe
+        self.env = ExperimentEnvironment(BASELINE_6F, start=start, end=end, **environment_options)
         self.cal = self.env.cal
         self.u = self.env.u
         self.daily_ret = self.env.daily_ret
@@ -514,6 +528,11 @@ class FactorPanelRunner:
             raise FactorComputationError(
                 f"factors never produced finite values: {missing}"
             )
+        self.factor_values = comp if retain_values else {}
+        self.factor_directions = dict(factor_directions or {})
+        # Shared only by views of this immutable panel, never by another data run.
+        self.native_sleeve_cache = {}
+        self.reference_universe = tuple(self.u)
         self.raw_ranks: dict[str, pd.DataFrame] = {
             name: comp[name].rank(axis=1, pct=True)
             for name in all_factors
@@ -622,16 +641,38 @@ class FactorPanelRunner:
         factor_names,
         *,
         factor_directions: Mapping[str, int] | None = None,
+        universe=None,
+        score_decimals: int | None = None,
     ) -> "FactorPanelRunner":
         """Create a cheap strategy view over one already-computed factor panel."""
         view = copy.copy(self)
         names = list(dict.fromkeys(str(name) for name in factor_names))
-        view.ranks = self._oriented_ranks(
-            names, factor_directions=factor_directions
+        view.factor_directions = dict(factor_directions if factor_directions is not None
+                                      else getattr(self, "factor_directions", {}))
+        if universe is not None:
+            selected = list(universe)
+            if not selected or len(set(selected)) != len(selected) or set(selected) - set(self.u):
+                raise ValueError("investment universe must be a unique subset of the computed panel")
+            values = getattr(self, "factor_values", {})
+            if set(names) - set(values):
+                raise ValueError("investment-universe views require retained raw factor values")
+            view.u = selected
+            view.factor_values = {name: values[name].reindex(columns=selected) for name in names}
+            view.raw_ranks = {
+                name: (frame if score_decimals is None else frame.round(score_decimals)).rank(axis=1, pct=True)
+                for name, frame in view.factor_values.items()
+            }
+            view.daily_ret = self.daily_ret.reindex(columns=selected)
+            view.close_tradable = self.close_tradable.reindex(columns=selected)
+            view._ic_returns = self._ic_returns.reindex(columns=selected)
+            if self._contract_schedule_loaded and self._contract_schedule is not None:
+                view._contract_schedule = self._contract_schedule.reindex(columns=selected)
+        view.ranks = view._oriented_ranks(
+            names, factor_directions=view.factor_directions if universe is not None else factor_directions
         )
         view.ic = rank_information_coefficients(
             view.ranks,
-            self._ic_returns,
+            view._ic_returns,
             minimum_cross_section=3,
         )
         return view

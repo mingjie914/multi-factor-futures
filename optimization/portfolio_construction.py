@@ -352,6 +352,33 @@ def _project_with_sector_caps(
     return np.asarray(result.x, dtype=float)
 
 
+def project_netted_weights(
+    row: pd.Series, *, sector_of: Mapping[str, str], gross_exposure: float,
+    asset_max_fraction: float, sector_max_fraction: float,
+) -> pd.Series:
+    """Restore long/short gross after netting; constrain mass, not name counts."""
+    if not np.isfinite(row.to_numpy()).all() or float(row.abs().sum()) <= 1e-10:
+        raise PortfolioConstructionError("netting leaves no usable finite exposure")
+    result = pd.Series(0.0, index=row.index)
+    caps = {s: sector_max_fraction for s in sorted(set(sector_of.values()))}
+    for sign in (1, -1):
+        subset = row[row * sign > 1e-12] * sign
+        if subset.empty:
+            raise PortfolioConstructionError("netted portfolio is missing a side")
+        projected = _project_with_sector_caps(
+            subset.to_numpy() / subset.sum(), np.zeros(len(subset)),
+            np.full(len(subset), asset_max_fraction), list(subset.index), sector_of, caps,
+        )
+        result.loc[subset.index] = sign * projected * gross_exposure / 2
+    for sign in (1, -1):
+        side = (result * sign).clip(lower=0)
+        if (abs(float(side.sum()) - gross_exposure / 2) > 1e-9
+                or float(side.max()) > asset_max_fraction * gross_exposure / 2 + 1e-9
+                or float(side.groupby(sector_of).sum().max()) > sector_max_fraction * gross_exposure / 2 + 1e-9):
+            raise PortfolioConstructionError("netted portfolio violates final weight constraints")
+    return result
+
+
 def allocate_sleeve(
     history: pd.DataFrame,
     *,
@@ -435,6 +462,72 @@ def allocate_sleeve(
                 f"projected sleeve violates sector cap: {sector}"
             )
     return pd.Series(projected, index=symbols, dtype=float)
+
+
+def allocate_ranked_portfolio(score, history, recipe) -> pd.Series:
+    """Build one configured factor/score portfolio; final NAV caps apply later.
+
+    ``history`` ends strictly before the decision date. The fixed investment
+    universe controls selection even when a broader factor panel was computed.
+    """
+    from dataclasses import replace
+    from core.sectors import portfolio_selection_group_for
+
+    universe = list(recipe.investment_universe)
+    result = pd.Series(0.0, index=universe)
+    if recipe.position_mode not in {"long_only", "short_only", "long_short"}:
+        raise PortfolioConstructionError("unknown position_mode")
+    score = pd.Series(score, dtype=float).reindex(universe).replace([np.inf, -np.inf], np.nan)
+    history = history.reindex(columns=universe).replace([np.inf, -np.inf], np.nan)
+    volatility_history = history.tail(recipe.volatility_window)
+    volatility = volatility_history.std(ddof=1) * np.sqrt(recipe.periods_per_year)
+    valid = score.notna() & volatility.gt(0) & volatility_history.count().ge(recipe.minimum_risk_observations)
+    eligible = list(score.index[valid])
+    sides = 2 if recipe.position_mode == "long_short" else 1
+    count = recipe.selection_count
+    if len(eligible) < count * sides:
+        return result
+    sector_of = {name: portfolio_selection_group_for(name) for name in universe}
+    selected = []
+    for sign in ((1, -1) if sides == 2 else ((1,) if recipe.position_mode == "long_only" else (-1,))):
+        pool = select_pool(score, eligible=eligible, sector_of=sector_of, top_n=count,
+                           sector_count_cap=recipe.sector_cap, ascending=sign < 0, excluded=selected)
+        selected.extend(pool)
+        if recipe.asset_weight == "inverse_vol_target_corr":
+            if sides != 1 or recipe.allocation_scale != "target_volatility":
+                raise PortfolioConstructionError("correlation-target allocation requires a one-sided target-volatility recipe")
+            multiplier = 1.0
+            if recipe.correlation_window is not None and len(pool) > 1:
+                corr = history[pool].tail(recipe.correlation_window).corr(
+                    min_periods=recipe.minimum_risk_observations).to_numpy()
+                pairs = corr[np.triu_indices(len(pool), k=1)]
+                if not np.isfinite(pairs).all():
+                    raise PortfolioConstructionError("insufficient paired correlation observations")
+                denominator = 1.0 + (len(pool) - 1) * float(pairs.mean())
+                if denominator < -1e-10:
+                    raise PortfolioConstructionError("inconsistent pairwise correlation matrix")
+                multiplier = min(np.sqrt(len(pool) / max(denominator, 1e-12)), recipe.correlation_multiplier_cap)
+            raw = recipe.target_volatility / len(pool) / volatility[pool] * multiplier
+        else:
+            clean = volatility_history[pool].dropna(how="any")
+            if len(clean) < recipe.minimum_risk_observations:
+                raise PortfolioConstructionError("insufficient common allocation observations")
+            constraints = replace(recipe.constraints, top_n_per_side=len(pool),
+                                  covariance_shrinkage=recipe.covariance_shrinkage,
+                                  minimum_risk_observations=recipe.minimum_risk_observations)
+            raw = allocate_sleeve(clean, method=recipe.asset_weight, constraints=constraints,
+                                  sector_of=sector_of) * recipe.gross_exposure / sides
+        result.loc[pool] = raw * sign
+    if recipe.allocation_scale == "target_volatility" and recipe.asset_weight != "inverse_vol_target_corr":
+        covariance = volatility_history[selected].cov(min_periods=recipe.minimum_risk_observations).to_numpy()
+        vector = result.loc[selected].to_numpy()
+        variance = float(vector @ covariance @ vector) * recipe.periods_per_year
+        if not np.isfinite(variance) or variance <= 0:
+            raise PortfolioConstructionError("invalid target portfolio variance")
+        result *= recipe.target_volatility / np.sqrt(variance)
+    if not np.isfinite(result.to_numpy()).all():
+        raise PortfolioConstructionError("configured allocation returned non-finite weights")
+    return result
 
 
 def validate_long_short_weights(

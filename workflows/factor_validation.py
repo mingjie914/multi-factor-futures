@@ -22,6 +22,7 @@ from core.registry import list_registered
 from factors.processor import build_processing_context
 from pipeline.runner import PipelineRunner
 from research.artifacts import sha256_file
+from research.validation import validation_policy_sha256
 from workflows.research import (
     _joint_ic_ols_statistics,
     _run_multi_period_screening,
@@ -150,6 +151,7 @@ def _validate_admission_screening_contract(
     factor_start: pd.Timestamp,
     ic_start: pd.Timestamp,
     ic_end: pd.Timestamp,
+    policy_sha256: str | None = None,
 ) -> None:
     """Fail closed before finalizing an already-computed formal screening."""
     contract = dict(screening.get("research_contract", {}))
@@ -166,6 +168,8 @@ def _validate_admission_screening_contract(
         "horizon_mode": "registered_contract",
         "research_role": "factor_admission",
     }
+    if policy_sha256 is not None:
+        expected["policy_sha256"] = policy_sha256
     mismatches = {
         key: (contract.get(key), value)
         for key, value in expected.items()
@@ -233,10 +237,11 @@ def _evaluate_oos(config, screening: dict, window, *, frequency: str) -> dict:
             else processed[name]
         )
         stats = _joint_ic_ols_statistics(
-            matrix.loc[window.oos_start:window.oos_end],
+            matrix.loc[window.oos_start:window.oos_end,
+                getattr(config.validation_policy, "admission_universe", None) or list(matrix.columns)],
             returns[period].loc[window.oos_start:window.oos_end],
             forward_period=period,
-            min_stocks=10,
+            min_stocks=getattr(config.validation_policy, "admission_min_cross_section", 10),
         )
         train_ic = float(row["best_ic"])
         oos_ic = float(stats["ic"])
@@ -587,6 +592,7 @@ def run_default_factor_validation(
             factor_start=factor_start,
             ic_start=ic_start,
             ic_end=ic_end,
+            policy_sha256=validation_policy_sha256(config.validation_policy),
         )
     else:
         screening = _run_multi_period_screening(

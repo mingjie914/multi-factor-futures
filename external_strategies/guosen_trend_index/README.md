@@ -1,5 +1,7 @@
 # 国信趋势配置指数形式适配器
 
+> **2026-09-15：本目录已退役，仅供历史审计。** 下文均为旧实现说明，不能作为当前方法、授权或绩效依据。三个旧命令入口停止运行。现行策略登记在 `config/strategy_library.yaml` 的 `trend_allocation_daily_probe`，方法在 `config/strategy_trend_allocation.yaml`，使用现有 `run_portfolio_workflow.py` 和 `workflows/factor_selection.py`。方案及限制见 `docs/只做多趋势配置策略扩展方案.md`。
+
 > **当前审计边界**：国信原始参考净值不受项目修复影响；项目固定8f/10f/13f及两种
 > 方法的旧绩效早于最终频率路由与因子实现修复，现仅作审计；目标权重发布门继续关闭。
 

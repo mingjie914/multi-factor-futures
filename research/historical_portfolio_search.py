@@ -3,11 +3,13 @@
 This module is deliberately isolated from the production strategy.  It compares
 factor aggregation, cross-sectional selection and within-pool allocation using
 the already audited factor/risk panels, then supports a narrow cluster-aware
-factor search.  Every rolling estimate excludes the current return observation.
+factor search. Rolling estimates exclude the current observation by default;
+configured close decisions may explicitly include that close's risk return.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import json
 from itertools import combinations, product
 from typing import Iterable, Mapping, Sequence
 
@@ -27,9 +29,11 @@ from optimization.factor_weighting import (
 from optimization.portfolio_construction import (
     PortfolioConstraints,
     allocate_sleeve,
+    allocate_ranked_portfolio,
     causal_risk_window,
     combine_sleeves,
     prepare_risk_history,
+    project_netted_weights,
     select_long_short_pools,
     select_pool as _shared_select_pool,
 )
@@ -53,14 +57,60 @@ class PortfolioRecipe:
     asset_max_overrides: tuple[tuple[str, float], ...] = ()
     sector_weight_caps: tuple[tuple[str, float], ...] = ()
     rank_exit_buffer: int = 0
+    investment_universe: tuple[str, ...] = ()
+    position_mode: str = "long_short"
+    combination_order: str = "score_first"
+    selection_fraction: float | None = None
+    factor_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    parameter_aggregation: str = "by_factor"
+    allocation_scale: str = "fixed_gross"
+    target_volatility: float = 0.04
+    volatility_window: int = 20
+    risk_history_timing: str = "prior_close"
+    correlation_window: int | None = 20
+    correlation_multiplier_cap: float = 2.0
+    periods_per_year: int = 252
+    score_decimals: int | None = None
+    position_limits: tuple[tuple[str, float], ...] = ()
+    minimum_risk_observations: int = 10
+    covariance_shrinkage: float = 0.30
+    factor_sleeves: tuple[tuple[str, str | int | float], ...] = ()
 
     def __post_init__(self):
+        if self.risk_history_timing not in {"prior_close", "decision_close"}:
+            raise ValueError("unknown risk_history_timing")
+        if self.risk_history_timing != "prior_close" and not self.investment_universe:
+            raise ValueError("risk_history_timing requires a fixed investment_universe")
         if type(self.rank_exit_buffer) is not int or self.rank_exit_buffer < 0:
             raise ValueError("rank_exit_buffer must be a nonnegative integer")
+        if (self.position_mode != "long_short" or self.combination_order != "score_first") and not self.investment_universe:
+            raise ValueError("custom construction requires a fixed investment_universe")
+        if self.investment_universe and self.rank_exit_buffer:
+            raise ValueError("custom recipes do not support rank_exit_buffer")
+        if self.factor_sleeves and (self.investment_universe or self.position_mode != "long_short"
+                                    or self.combination_order != "score_first"):
+            raise ValueError("factor-sleeve construction requires native long-short sleeves")
+
+    @property
+    def selection_count(self) -> int:
+        return round(len(self.investment_universe) * self.selection_fraction) if self.selection_fraction is not None else self.top_n
 
     @classmethod
     def from_config(cls, policy) -> "PortfolioRecipe":
         """Resolve the one production recipe; factor evidence has no execution switches."""
+        extras = {}
+        if getattr(policy, "factor_sleeves", None) is not None:
+            extras["factor_sleeves"] = tuple(sorted(policy.factor_sleeves.model_dump().items()))
+        if getattr(policy, "investment_universe", None):
+            extras = {name: getattr(policy, name) for name in (
+                "position_mode", "combination_order", "selection_fraction", "parameter_aggregation",
+                "allocation_scale", "target_volatility", "volatility_window", "correlation_window",
+                "correlation_multiplier_cap", "periods_per_year", "score_decimals",
+                "minimum_risk_observations", "covariance_shrinkage", "risk_history_timing",
+            )}
+            extras.update(investment_universe=tuple(policy.investment_universe),
+                          factor_groups=tuple((k, tuple(v)) for k, v in policy.factor_groups.items()),
+                          position_limits=tuple(sorted(policy.position_limits.items())))
         return cls(
             factor_weight=str(policy.factor_weight_method), top_n=int(policy.top_n_per_side),
             sector_cap=int(policy.sector_count_cap), asset_weight=str(policy.asset_weight_method),
@@ -69,10 +119,19 @@ class PortfolioRecipe:
             asset_max_overrides=tuple(sorted(policy.asset_max_overrides.items())),
             sector_weight_caps=tuple(sorted(policy.sector_weight_caps.items())),
             rank_exit_buffer=policy.rank_exit_buffer,
+            **extras,
         )
 
     @property
     def name(self) -> str:
+        if self.factor_sleeves:
+            import hashlib
+            identity = hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:12]
+            return f"factor_sleeves_{dict(self.factor_sleeves)['method']}__{identity}"
+        if self.investment_universe:
+            import hashlib
+            identity = hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:12]
+            return f"{self.position_mode}__{self.combination_order}__{self.asset_weight}__{identity}"
         cap = "none" if self.sector_cap <= 0 else str(self.sector_cap)
         name = (
             f"{self.factor_weight}__top{self.top_n}_bottom{self.top_n}"
@@ -94,16 +153,27 @@ class PortfolioRecipe:
             asset_max_overrides=dict(self.asset_max_overrides),
             sector_weight_caps=dict(self.sector_weight_caps),
             gross_exposure=float(self.gross_exposure),
-            covariance_shrinkage=0.30,
-            minimum_risk_observations=10,
+            covariance_shrinkage=self.covariance_shrinkage,
+            minimum_risk_observations=self.minimum_risk_observations,
         )
 
     def to_dict(self) -> dict:
-        return {"name": self.name, **asdict(self)}
+        values = asdict(self)
+        if not self.investment_universe:
+            # Preserve existing artifact identities and cache contracts.
+            original = {"factor_weight", "top_n", "sector_cap", "asset_weight", "asset_min_fraction",
+                        "asset_max_fraction", "gross_exposure", "asset_max_overrides",
+                        "sector_weight_caps", "rank_exit_buffer"}
+            values = {k: v for k, v in values.items() if k in original}
+        if self.factor_sleeves:
+            values["factor_sleeves"] = dict(self.factor_sleeves)
+        return {"name": self.name, **values}
 
 
 def portfolio_recipe_grid(base: PortfolioRecipe) -> tuple[PortfolioRecipe, ...]:
     """Full declared grid; preserve every non-search production constraint."""
+    if base.investment_universe or base.factor_sleeves:
+        raise ValueError("declare configured method alternatives explicitly; the neutral grid is not applicable")
     return tuple(
         replace(base, factor_weight=method, top_n=top_n,
                 sector_cap=cap, asset_weight=allocation)
@@ -262,6 +332,7 @@ def robust_summary(
     segments: Iterable[tuple[pd.Timestamp, pd.Timestamp]],
     *,
     initial_anchor: bool = False,
+    periods_per_year: int = PERIODS_PER_YEAR,
 ) -> dict[str, float | int]:
     """Summarize segment robustness without hiding the worst historical block."""
 
@@ -272,6 +343,7 @@ def robust_summary(
             continue
         rows.append(performance_metrics(
             returns,
+            periods_per_year=periods_per_year,
             initial_anchor=bool(
                 initial_anchor
                 and len(returns)
@@ -654,8 +726,11 @@ class PortfolioEvaluator:
         self._asset_weight_cache: dict[
             tuple[pd.Timestamp, tuple[str, ...], PortfolioRecipe], pd.Series
         ] = {}
-        self._ledger_cache: dict[tuple[tuple[str, ...], PortfolioRecipe], pd.DataFrame] = {}
+        self._ledger_cache: dict[tuple, pd.DataFrame] = {}
         self._risk_counts = None
+        self._factor_portfolio_cache = {}
+        self._native_sleeve_cache = getattr(runner, "native_sleeve_cache", {})
+        self.factor_sleeve_budgets = None
         self._last_risk_window = None
         self.risk_count_backend = "not_called"
 
@@ -773,8 +848,12 @@ class PortfolioEvaluator:
         return result
 
     def weights(self, factors: Sequence[str], recipe: PortfolioRecipe) -> pd.DataFrame:
+        if recipe.factor_sleeves:
+            raise ValueError("factor-sleeve construction requires native ledgers; use PortfolioEvaluator.run")
         if recipe.rank_exit_buffer:
             raise ValueError("rank_exit_buffer requires actual holdings; use PortfolioEvaluator.run")
+        if recipe.investment_universe:
+            return self._configured_weights(factors, recipe)
         score = self._score_matrix(factors, recipe.factor_weight)
         weights = pd.DataFrame(0.0, index=self.dates, columns=self.runner.u, dtype=float)
         sector_of = self.runner.env.sector_of
@@ -824,6 +903,84 @@ class PortfolioEvaluator:
             )
         return weights
 
+    def _configured_weights(self, factors, recipe):
+        """Apply a configured construction order, then final NAV-notional caps."""
+        names = list(factors)
+        if not names or len(set(names)) != len(names):
+            raise ValueError("configured portfolios require unique non-empty factors")
+        if tuple(self.runner.u) != recipe.investment_universe:
+            raise ValueError("runner must be scoped to the fixed investment universe")
+
+        def allocate(scores, label="combined_score"):
+            result = pd.DataFrame(0.0, index=self.dates, columns=self.runner.u)
+            window = max(recipe.volatility_window, recipe.correlation_window or 0)
+            started = False
+            for date in self.dates:
+                history_dates = self.runner.daily_ret.index
+                available = (history_dates <= date if recipe.risk_history_timing == "decision_close"
+                             else history_dates < date)
+                history = self.runner.daily_ret.loc[available].tail(window)
+                try:
+                    result.loc[date] = allocate_ranked_portfolio(scores.loc[date], history, recipe)
+                except (ValueError, RuntimeError) as exc:
+                    raise RuntimeError(f"{date.date()} {label}: {exc}") from exc
+                available = bool(result.loc[date].abs().gt(1e-12).any())
+                if started and not available:
+                    raise RuntimeError(f"{date.date()} configured selection became unavailable after portfolio start")
+                started |= available
+            if not started:
+                raise RuntimeError("configured factor/score has no constructible portfolio")
+            return result
+
+        if recipe.combination_order == "score_first":
+            result = allocate(self._score_matrix(names, recipe.factor_weight))
+        else:
+            values = getattr(self.runner, "factor_values", {})
+            directions = getattr(self.runner, "factor_directions", {})
+            if set(names) - set(values) or set(names) - set(directions):
+                raise ValueError("portfolio-first construction requires raw values and frozen directions")
+            groups, grouped = [], set()
+            for label, members in recipe.factor_groups:
+                selected = set(members) & set(names)
+                if selected and selected != set(members):
+                    raise ValueError(f"factor parameter group must remain complete: {label}")
+                if selected:
+                    groups.append(tuple(members))
+                    grouped.update(members)
+            groups.extend((name,) for name in names if name not in grouped)
+            if recipe.parameter_aggregation == "flat":
+                groups = [(name,) for name in names]
+            portfolios = {}
+            for name in names:
+                key = (name, recipe)
+                if key not in self._factor_portfolio_cache:
+                    score = values[name]
+                    if recipe.score_decimals is not None:
+                        score = score.round(recipe.score_decimals)
+                    self._factor_portfolio_cache[key] = allocate(score * directions[name], name)
+                portfolios[name] = self._factor_portfolio_cache[key]
+            group_ic = pd.DataFrame({i: self.runner.ic[list(group)].mean(axis=1)
+                                     for i, group in enumerate(groups)})
+            group_weights = pd.DataFrame(1.0 / len(groups), index=self.dates, columns=group_ic.columns)
+            if recipe.factor_weight != "equal":
+                group_weights.loc[:, :] = 0.0
+                for date in self.dates:
+                    history = prepare_complete_history(
+                        causal_history(group_ic, date, self.ic_window), minimum_observations=30)
+                    weights = factor_weights(history, recipe.factor_weight)
+                    group_weights.loc[date, weights.index] = weights.to_numpy()
+            result = pd.DataFrame(0.0, index=self.dates, columns=self.runner.u)
+            for i, group in enumerate(groups):
+                average = sum(portfolios[name] for name in group) / len(group)
+                result += average.mul(group_weights[i], axis=0)
+        for symbol, limit in recipe.position_limits:
+            result[symbol] = result[symbol].clip(-limit, limit)
+        if not np.isfinite(result.to_numpy()).all():
+            raise ValueError("configured portfolio contains non-finite weights")
+        if not result.abs().gt(1e-12).any().any():
+            raise RuntimeError("configured portfolio could not be constructed in the requested interval")
+        return result
+
     def ledger_from_weights(
         self,
         weights: pd.DataFrame,
@@ -855,7 +1012,11 @@ class PortfolioEvaluator:
 
     def target_for_holdings(self, factors, recipe, date, actual, *, diagnostics=None):
         """Shared one-close buffered target using explicit actual holding signs."""
+        if recipe.factor_sleeves:
+            raise ValueError("factor-sleeve target requires separate sleeve holding histories")
         date = pd.Timestamp(date)
+        if recipe.investment_universe:
+            return self.weights(factors, recipe).loc[date].copy()
         score = self._score_matrix(factors, recipe.factor_weight)
         eligible = self._risk_eligible(date, self.runner.u, recipe.constraints.minimum_risk_observations)
         actual = pd.Series(actual, dtype=float).reindex(self.runner.u, fill_value=0.0)
@@ -880,6 +1041,10 @@ class PortfolioEvaluator:
         depends on the buffer; scores and per-pool ERC inputs can be reused.
         The last close produces an observable target, never a fictitious fill.
         """
+        if recipe.factor_sleeves:
+            return self._run_factor_sleeves(factors, recipe, cost_multiplier=cost_multiplier)
+        if recipe.investment_universe and self.cost_model.periods_per_year != recipe.periods_per_year:
+            raise ValueError("cost and allocation annualization must match")
         unbuffered = replace(recipe, rank_exit_buffer=0) if recipe.rank_exit_buffer else recipe
         weights = self.weights(factors, unbuffered)
         diagnostics = {"decisions": 0, "constraint_fallbacks": 0,
@@ -909,10 +1074,80 @@ class PortfolioEvaluator:
         result.metadata = {**result.metadata, "rank_exit_buffer": recipe.rank_exit_buffer,
                            "rank_buffer_diagnostics": diagnostics, "initial_holdings": "flat",
                            "risk_count_backend": self.risk_count_backend}
+        if recipe.investment_universe:
+            result.metadata.update(recipe=recipe.to_dict(),
+                investment_universe=list(recipe.investment_universe),
+                factor_reference_universe=list(getattr(self.runner, "reference_universe", self.runner.u)))
+        return result
+
+    def _run_factor_sleeves(self, factors, recipe, *, cost_multiplier=1.):
+        """Independent actual-holdings sleeves; fees charged once after netting."""
+        from core.config import FactorSleeveConfig
+
+        names = list(factors)
+        q = FactorSleeveConfig(**dict(recipe.factor_sleeves))
+        if not names or len(names) != len(set(names)):
+            raise ValueError("factor sleeves require unique non-empty factors")
+        if q.lookback < q.minimum_observations or not q.min_weight*len(names) <= 1 <= q.max_weight*len(names):
+            raise ValueError("factor-sleeve window or bounds are infeasible")
+        child = replace(recipe, factor_weight="equal", factor_sleeves=())
+        identity = (tuple(self.dates), id(self.runner.daily_ret), tuple(self.runner.u),
+                    self.ic_window, self.risk_lookback_calendar_days,
+                    tuple(sorted(self.cost_model.ledger_parameters().items())))
+        results = {}
+        for name in names:
+            direction = getattr(self.runner, "factor_directions", {}).get(name)
+            key = (identity, name, direction, child)
+            if key not in self._native_sleeve_cache:
+                self._native_sleeve_cache[key] = self.run([name], child)
+            results[name] = self._native_sleeve_cache[key]
+        gross = pd.DataFrame({n: r.daily.gross_return for n, r in results.items()}).reindex(self.dates)
+        first = []
+        for r in results.values():
+            active = r.target_weights.abs().sum(axis=1) > 1e-12
+            if not active.any():
+                raise ValueError("factor sleeve never acquired a target")
+            first.append(r.target_weights.index[active][0])
+        history_start = int(self.dates.searchsorted(max(first), side="right"))
+        targets = np.stack([results[n].target_weights.reindex(index=self.dates, columns=self.runner.u).to_numpy() for n in names])
+        limits = PortfolioConstraints(top_n_per_side=len(names), sector_count_cap=0,
+            asset_min_fraction=q.min_weight, asset_max_fraction=q.max_weight,
+            covariance_shrinkage=q.covariance_shrinkage, minimum_risk_observations=q.minimum_observations)
+        combined = pd.DataFrame(0., index=self.dates, columns=self.runner.u)
+        budgets = pd.DataFrame(0., index=self.dates, columns=names)
+        for i, date in enumerate(self.dates):
+            history = gross.iloc[max(history_start, i-q.lookback):i]
+            if len(history) < q.minimum_observations:
+                continue
+            if not np.isfinite(history.to_numpy()).all():
+                raise ValueError(f"{date.date()} factor-sleeve gross return history is incomplete")
+            budget = allocate_sleeve(history, method=q.method, constraints=limits,
+                                    sector_of={name: "factor" for name in names}).reindex(names)
+            vector = budget.to_numpy()
+            raw = pd.Series(np.einsum("f,fa->a", vector, targets[:, i, :]), index=self.runner.u)
+            if abs(float(raw.sum())) > 1e-9:
+                raise ValueError("factor sleeves must be net neutral before final projection")
+            covariance = history.cov().to_numpy()
+            covariance = (1-q.covariance_shrinkage)*covariance + q.covariance_shrinkage*np.diag(np.diag(covariance))
+            if not float(vector @ covariance @ vector) > 0:
+                raise ValueError("factor-sleeve risk history has no positive portfolio variance")
+            combined.loc[date] = project_netted_weights(raw, sector_of=self.runner.env.sector_of,
+                gross_exposure=recipe.gross_exposure, asset_max_fraction=q.final_asset_max_fraction,
+                sector_max_fraction=q.final_sector_max_fraction)
+            budgets.loc[date] = budget
+        if not combined.abs().gt(1e-12).any().any():
+            raise ValueError("insufficient common actual returns to start factor-sleeve allocation")
+        self.factor_sleeve_budgets = budgets
+        result = self._run_weights(combined, cost_multiplier=cost_multiplier)
+        result.metadata.update(recipe=recipe.to_dict(), rank_exit_buffer=recipe.rank_exit_buffer,
+            rank_buffer_diagnostics={n: r.metadata.get("rank_buffer_diagnostics", {}) for n, r in results.items()},
+            factor_sleeves={"policy": q.model_dump(), "factors": names, "history_return": "gross_return",
+                "risk_timing": "strictly_prior_close", "rebalance": "daily", "buffer_scope": "individual_sleeves",
+                "cost_scope": "final_netted_account_only", "final_count_cap": None})
         return result
 
     def ledger(self, factors: Sequence[str], recipe: PortfolioRecipe) -> pd.DataFrame:
-        key = (tuple(factors), recipe)
+        key = (tuple(factors), recipe, tuple(sorted(self.cost_model.ledger_parameters().items())))
         if key not in self._ledger_cache:
             result = self.run(factors, recipe)
             ledger = result.daily.copy()
@@ -926,3 +1161,4 @@ class PortfolioEvaluator:
         self._score_cache.clear()
         self._ledger_cache.clear()
         self._asset_weight_cache.clear()
+        self._native_sleeve_cache.clear()

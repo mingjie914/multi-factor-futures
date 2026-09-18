@@ -279,6 +279,7 @@ def validate_alternative_method(runner, output: Path, end: pd.Timestamp) -> None
 
 
 def main() -> None:
+    raise SystemExit("旧外挂比较已退役。请通过 run_portfolio_workflow 的共享策略目录运行 trend_allocation_daily_probe。")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--end", default=None, help="Defaults to latest local daily date")
     parser.add_argument("--output", required=True)

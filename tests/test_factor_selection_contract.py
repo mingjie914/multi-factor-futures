@@ -12,6 +12,22 @@ from workflows.factor_selection import (
 )
 
 
+@pytest.mark.parametrize("path,method", [
+    ("config/default.yaml", "close_marked"),
+    ("config/strategy_trend_allocation.yaml", "index_formula"),
+])
+def test_factor_search_and_production_share_configured_cost_policy(path, method):
+    from core.config import load_config
+    from research.portfolio_experiment_support import configured_futures_cost_model
+    from workflows.factor_selection import _configured_cost_model
+
+    config = load_config(path)
+    search = _configured_cost_model(config)
+    production = configured_futures_cost_model(config)
+    assert search.accounting_method == method
+    assert search.ledger_parameters() == production.ledger_parameters()
+
+
 def test_search_cap_groups_match_production_not_fine_sector_taxonomy():
     from strategies.combined import SECTOR_OF
     from workflows.factor_selection import PORTFOLIO_CAP_GROUPS

@@ -342,7 +342,8 @@ class ParquetFuturesSource(DataSource):
             sort_keys=True,
         )
         request_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
-        stem = f"selected_v{_SELECTED_CACHE_SCHEMA_VERSION}_{frequency}_{request_hash}"
+        order_tag = "_chronological_v1" if self._frequency_routes[frequency][1] else ""
+        stem = f"selected_v{_SELECTED_CACHE_SCHEMA_VERSION}_{frequency}{order_tag}_{request_hash}"
         return (
             self.selected_cache_path / f"{stem}.parquet",
             self.selected_cache_path / f"{stem}.json",
@@ -471,7 +472,8 @@ class ParquetFuturesSource(DataSource):
             sort_keys=True,
         )
         roots_hash = hashlib.sha256(roots_text.encode("utf-8")).hexdigest()[:16]
-        stem = f"curve_v{_CURVE_CACHE_SCHEMA_VERSION}_{frequency}_{period}_{roots_hash}"
+        order_tag = "_chronological_v1" if self._frequency_routes[frequency][1] else ""
+        stem = f"curve_v{_CURVE_CACHE_SCHEMA_VERSION}_{frequency}_{period}{order_tag}_{roots_hash}"
         return (
             self.curve_cache_path / f"{stem}.parquet",
             self.curve_cache_path / f"{stem}.json",
@@ -963,9 +965,10 @@ class ParquetFuturesSource(DataSource):
         if frame.is_empty():
             return frame
         polars_rule = rule.replace("min", "m")
-        work = frame.with_columns(
+        # Preserve chronological first/last before timestamps collapse into bins.
+        work = frame.sort(["trade_datetime", "root"]).with_columns(
             pl.col("trade_datetime").dt.truncate(polars_rule)
-        ).sort(["trade_datetime", "root"])
+        )
         aggregations = []
         for field, method in _BAR_AGGREGATIONS.items():
             if field not in work.columns:
@@ -1318,9 +1321,9 @@ class ParquetFuturesSource(DataSource):
     ) -> pl.DataFrame:
         if frame.is_empty():
             return frame
-        work = frame.with_columns(
+        work = frame.sort(["trade_datetime", "root"]).with_columns(
             pl.col("trade_datetime").dt.truncate(rule.replace("min", "m"))
-        ).sort(["trade_datetime", "root"])
+        )
         return work.group_by(
             ["trade_datetime", "root"], maintain_order=True
         ).agg(
@@ -1608,7 +1611,7 @@ class ParquetFuturesSource(DataSource):
                 pl.col("trade_datetime")
                 .dt.truncate(resample_rule.replace("min", "m"))
                 .alias("_bar_time")
-            ).sort("_bar_time")
+            ).sort(["trade_datetime", "root", "symbol"])
             aggregations = []
             for field in requested:
                 method = _BAR_AGGREGATIONS[field]

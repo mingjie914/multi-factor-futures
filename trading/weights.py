@@ -70,12 +70,15 @@ def strategy_contracts(strategy_ids, catalog_path="config/strategy_library.yaml"
         frozen = {name: directions[name] for name in factors}
         if frozen != subset.selection_context.get("directions"):
             raise ValueError(f"frozen factor directions changed: {strategy_id}")
-        if entry.rank_exit_buffer is not None:
-            config.production_portfolio.rank_exit_buffer = entry.rank_exit_buffer
+        entry.apply_portfolio_overrides(config.production_portfolio)
+        if config.production_portfolio.factor_sleeves is not None:
+            raise ValueError("factor-sleeve strategies are research-only; separate sleeve execution state is not approved")
+        recipe = config.production_portfolio.model_dump()
+        recipe.pop("factor_sleeves", None)  # Preserve existing trading contracts.
         result.append({"strategy_id": instance_id, "catalog_strategy_id": strategy_id,
                        "formal": bool(entry.formal),
                        "name": entry.name, "factors": factors,
-                       "directions": frozen, "recipe": config.production_portfolio.model_dump(),
+                       "directions": frozen, "recipe": recipe,
                        "panel_start": str((pd.Timestamp(default.date_range.start)
                                            - pd.Timedelta(days=365)).date()),
                        "config_path": str(resolve(entry.config_path)),

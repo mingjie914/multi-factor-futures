@@ -21,6 +21,55 @@ from backtest.research_ledger import (
 from data.market_quality import CloseDataQualityError, prepare_close_data
 
 
+def test_index_formula_matches_literal_costs_and_charges_final_close():
+    dates = pd.bdate_range("2025-01-01", periods=4)
+    targets = pd.DataFrame({"A": [.5, .3, .3, 0.], "B": [.2, .4, .4, .1]}, index=dates)
+    returns = pd.DataFrame({"A": [0., .1, -.03, .02], "B": [0., -.02, .04, .01]}, index=dates)
+    schedule = pd.DataFrame({"A": ["A1", "A1", "A2", "A2"], "B": "B1"}, index=dates)
+    kwargs = dict(trade_cost_rate=.0002, annual_fee=.001, periods_per_year=242,
+                  accounting_method="index_formula")
+    actual = build_close_marked_ledger(targets, returns, contract_schedule=schedule, **kwargs)
+    previous = targets.shift(1).fillna(0.)
+    gross = (previous * returns).sum(axis=1)
+    turnover = (targets - previous * (1 + returns)).abs().sum(axis=1)
+    turnover.iloc[0] = 0.
+    holding = pd.Series(.001 / 242, index=dates); holding.iloc[0] = 0.
+    expected = gross - .0002 * turnover - holding
+    np.testing.assert_allclose(actual.daily.net_return, expected, rtol=0., atol=1e-15)
+    np.testing.assert_allclose(actual.daily.trade_cost, .0002 * turnover, rtol=0., atol=1e-15)
+    np.testing.assert_allclose(actual.daily.nav_after, 1000 * (1 + expected).cumprod())
+    pd.testing.assert_frame_equal(actual.effective_weights, previous)
+    assert actual.daily.iloc[-1].trade_cost > 0
+    assert actual.daily.executed_roll_turnover.eq(0).all()
+    plain = build_close_marked_ledger(targets, returns, **kwargs)
+    pd.testing.assert_frame_equal(actual.daily, plain.daily, check_exact=True)
+    prefix = build_close_marked_ledger(targets.iloc[:3], returns.iloc[:3], **kwargs)
+    pd.testing.assert_frame_equal(prefix.daily, actual.daily.iloc[:3], check_exact=True)
+    stress = build_close_marked_ledger(targets, returns, cost_multiplier=2., **kwargs)
+    np.testing.assert_allclose(stress.daily.trade_cost, 2 * actual.daily.trade_cost)
+    pd.testing.assert_series_equal(stress.daily.holding_cost, actual.daily.holding_cost)
+    actual.validate()
+
+
+def test_index_formula_rejects_unsupported_rules_and_missing_active_prices():
+    dates = pd.bdate_range("2025-01-01", periods=3)
+    weights = pd.DataFrame({"A": [.5, .3, .2]}, index=dates)
+    returns = pd.DataFrame({"A": [0., .01, .02]}, index=dates)
+    for kwargs, error in [
+        ({"accounting_method": "typo"}, "unknown accounting_method"),
+        ({"accounting_method": "index_formula", "annual_roll_cost": .001}, "annual_roll_cost=0"),
+        ({"accounting_method": "index_formula", "decision_target": lambda *_: weights.iloc[0]}, "no decision_target"),
+    ]:
+        with pytest.raises(ResearchLedgerError, match=error):
+            build_close_marked_ledger(weights, returns, **kwargs)
+    tradable = returns.notna(); tradable.iloc[1] = False
+    with pytest.raises(ResearchLedgerError, match="untradable asset"):
+        build_close_marked_ledger(weights, returns, decision_tradable=tradable, accounting_method="index_formula")
+    returns.iloc[1] = np.nan
+    with pytest.raises(MissingActiveReturnError):
+        build_close_marked_ledger(weights, returns, accounting_method="index_formula")
+
+
 def test_decision_target_identity_preserves_complete_ledger_exactly():
     dates = pd.bdate_range("2025-01-01", periods=7)
     targets = pd.DataFrame({"A": [.6, .2, -.4, -.4, .3, .1, .9], "B": -.4}, index=dates)

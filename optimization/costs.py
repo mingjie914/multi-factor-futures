@@ -146,6 +146,7 @@ class SimpleFuturesCost(CostModel):
         annual_roll_cost: float = 0.00105,
         periods_per_year: float = 252.0,
         cost_stage: str = "post_screen_backtest",
+        accounting_method: str = "close_marked",
     ):
         numeric_rates = {
             "turnover_cost_rate": turnover_cost_rate,
@@ -165,11 +166,18 @@ class SimpleFuturesCost(CostModel):
             raise ValueError("annual_roll_cost must be finite and non-negative")
         self.periods_per_year = float(periods_per_year)
         self.cost_stage = str(cost_stage)
+        if accounting_method not in {"close_marked", "index_formula"}:
+            raise ValueError("unknown accounting_method")
+        if accounting_method == "index_formula" and self.annual_roll_cost != 0.0:
+            raise ValueError("index_formula requires annual_roll_cost=0; use annual_fee for the fixed allowance")
+        self.accounting_method = accounting_method
 
     def estimate_cost(
         self, target: WeightVector, current: WeightVector, date: Date
     ) -> float:
         del date
+        if self.accounting_method != "close_marked":
+            raise ValueError("index_formula requires the configured daily research ledger")
         assets = pd.Index(target.index).union(pd.Index(current.index), sort=False)
         target_values = pd.Series(target, dtype=float)
         current_values = pd.Series(current, dtype=float)
@@ -187,6 +195,8 @@ class SimpleFuturesCost(CostModel):
         self, weights: WeightVector, date: Date
     ) -> float:
         del date
+        if self.accounting_method != "close_marked":
+            raise ValueError("index_formula requires the configured daily research ledger")
         weights = pd.Series(weights, dtype=float)
         if not np.isfinite(weights.to_numpy(dtype=float)).all():
             raise ValueError("futures weights must be finite")
@@ -194,13 +204,15 @@ class SimpleFuturesCost(CostModel):
         roll_cost = gross_exposure * self.annual_roll_cost
         return (self.annual_fee + roll_cost) / self.periods_per_year
 
-    def ledger_parameters(self) -> dict[str, float]:
+    def ledger_parameters(self) -> dict[str, float | str]:
         """Return the exact parameters consumed by the shared research ledger."""
         return {
             "trade_cost_rate": self.turnover_cost_rate,
             "annual_fee": self.annual_fee,
             "annual_roll_cost": self.annual_roll_cost,
             "periods_per_year": self.periods_per_year,
+            **({"accounting_method": self.accounting_method}
+               if self.accounting_method != "close_marked" else {}),
         }
 
 def factor_cost_coverage(

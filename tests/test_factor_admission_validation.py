@@ -4,6 +4,90 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+
+def test_explicit_nine_asset_admission_keeps_default_and_rejects_incomplete_days():
+    import numpy as np
+    from core.config import ValidationPolicyConfig
+    from workflows.research import _joint_ic_ols_statistics
+    from research.validation import validation_policy_sha256
+    default = ValidationPolicyConfig()
+    scoped = ValidationPolicyConfig(admission_min_cross_section=9)
+    assert default.admission_min_cross_section == 10
+    assert validation_policy_sha256(default) != validation_policy_sha256(scoped)
+    rng = np.random.default_rng(12)
+    dates = pd.bdate_range("2020-01-01", periods=180)
+    factor = pd.DataFrame(rng.normal(size=(180, 9)), index=dates)
+    forward = .2 * factor + pd.DataFrame(rng.normal(size=(180, 9)), index=dates)
+    factor.iloc[3, 0] = np.nan
+    assert _joint_ic_ols_statistics(factor, forward, forward_period=1)["ic_n"] == 0
+    result = _joint_ic_ols_statistics(factor, forward, forward_period=1,
+        min_stocks=scoped.admission_min_cross_section)
+    assert result["ic_n"] == result["ols_days"] == 179
+    assert result["ic"] > 0 and np.isfinite(result["ic_hac_t"])
+
+
+@pytest.mark.parametrize("value", [2, True, 9.5, "9"])
+def test_admission_cross_section_must_be_an_explicit_valid_integer(value):
+    from core.config import ValidationPolicyConfig
+    with pytest.raises(ValueError):
+        ValidationPolicyConfig(admission_min_cross_section=value)
+
+
+@pytest.mark.parametrize("kind", ["valid", "duplicate", "too_few", "unknown"])
+def test_admission_scope_preserves_reference_universe_and_checks_members(tmp_path, kind):
+    from pathlib import Path
+    from core.config import load_config
+    base = Path("config/strategy_trend_allocation.yaml").resolve()
+    original = load_config(str(base))
+    assets = list(original.production_portfolio.investment_universe)
+    scope = {"valid": assets, "duplicate": assets + assets[:1],
+        "too_few": assets[:8], "unknown": assets[:-1] + ["UNKNOWN"]}[kind]
+    path = tmp_path / "scope.json"
+    path.write_text(json.dumps({"extends": str(base), "validation_policy": {
+        "admission_min_cross_section": 9, "admission_universe": scope}}), encoding="utf-8")
+    if kind != "valid":
+        with pytest.raises(ValueError, match="admission_universe"):
+            load_config(str(path))
+    else:
+        scoped = load_config(str(path))
+        assert scoped.universe == original.universe
+        assert scoped.validation_policy.admission_universe == assets
+        assert original.validation_policy.admission_universe == []
+
+
+def test_formal_resume_checks_policy_before_reusing_screening(tmp_path, monkeypatch):
+    import hashlib
+    import workflows.factor_validation as module
+    from core.config import load_config
+    from research.validation import validation_policy_sha256
+    fake_file = tmp_path / "project" / "workflows" / "factor_validation.py"
+    fake_file.parent.mkdir(parents=True)
+    monkeypatch.setattr(module, "__file__", str(fake_file))
+    cfg = load_config("config/strategy_trend_allocation.yaml")
+    cfg.validation_policy.admission_min_cross_section = 9
+    cfg.validation_policy.admission_universe = list(cfg.production_portfolio.investment_universe)
+    monkeypatch.setattr(module, "load_config", lambda path: cfg)
+    monkeypatch.setattr(module, "_resolve_candidate_names", lambda *args, **kwargs: (["probe"], "explicit_batch"))
+    monkeypatch.setattr(module, "PipelineRunner", lambda config: SimpleNamespace(config=config))
+    artifact = fake_file.parents[1] / "runs/factor_validation/resume_probe/artifacts/ic_by_window_period.json"
+    artifact.parent.mkdir(parents=True)
+    start = pd.Timestamp(cfg.date_policy.factor_admission_start)
+    contract = {"factor_count": 1, "factor_names_sha256": hashlib.sha256(b'["probe"]').hexdigest(),
+        "factor_start": (start-pd.Timedelta(days=cfg.validation_policy.warmup_days_by_frequency["daily"])).isoformat(),
+        "ic_start": start.isoformat(), "ic_end": pd.Timestamp(cfg.date_policy.research_cutoff).isoformat(),
+        "frequency": "daily", "horizon_mode": "registered_contract", "research_role": "factor_admission",
+        "policy_sha256": "old-policy"}
+    artifact.write_text(json.dumps({"research_contract": contract}), encoding="utf-8")
+    with pytest.raises(ValueError, match="policy_sha256"):
+        module.run_default_factor_validation(run_id="resume_probe", factor_names=["probe"])
+    contract["policy_sha256"] = validation_policy_sha256(cfg.validation_policy)
+    artifact.write_text(json.dumps({"research_contract": contract}), encoding="utf-8")
+    def accepted(screening):
+        raise RuntimeError("matching policy accepted")
+    monkeypatch.setattr(module, "_admission_result_rows", accepted)
+    with pytest.raises(RuntimeError, match="matching policy accepted"):
+        module.run_default_factor_validation(run_id="resume_probe", factor_names=["probe"])
+
 from workflows.factor_validation import (
     _admission_result_rows,
     _resolve_candidate_names,
@@ -263,6 +347,7 @@ def test_resumed_screening_contract_cannot_change_batch_dates_or_semantics():
         "frequency": "daily",
         "horizon_mode": "registered_contract",
         "research_role": "factor_admission",
+        "policy_sha256": "old-policy",
     }}
 
     _validate_admission_screening_contract(
@@ -271,7 +356,14 @@ def test_resumed_screening_contract_cannot_change_batch_dates_or_semantics():
         factor_start=pd.Timestamp("2024-04-24"),
         ic_start=pd.Timestamp("2025-01-01"),
         ic_end=pd.Timestamp("2026-05-15"),
+        policy_sha256="old-policy",
     )
+    with pytest.raises(ValueError, match="policy_sha256"):
+        _validate_admission_screening_contract(
+            screening, names=names, factor_start=pd.Timestamp("2024-04-24"),
+            ic_start=pd.Timestamp("2025-01-01"), ic_end=pd.Timestamp("2026-05-15"),
+            policy_sha256="nine-asset-policy",
+        )
     with pytest.raises(ValueError, match="does not match"):
         _validate_admission_screening_contract(
             screening,

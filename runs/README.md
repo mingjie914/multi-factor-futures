@@ -13,7 +13,7 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 | factor_mining | 显式挖掘产物及不可变候选快照，不由默认入口主动加载 |
 | walkforward / historical_portfolio_search | 显式组合验证、隔离历史实验 |
 
-## 当前证据索引（2026-09-15）
+## 当前证据索引（更新至2026-09-18）
 
 以下目录及其合同递归引用的面板、报告、验证结果均保留；不是可清空的临时缓存。
 
@@ -40,8 +40,12 @@ runs/只保存证据，不是配置或代码目录。按<流程>/<run_id>/分类
 | 当前10组交付 | portfolio_backtest/20260913_active_strategy_review | 截至2026-09-11的报告、净值、热力图、类型/簇及通用成本压力；历史剔除证据另行标明 |
 | 当前10组延长重算 | portfolio_backtest/20260913_active_strategy_latest | 10组同口径回测已完成；原生账本、重叠对照、性能及费用字段审阅记录；原区间净值逐点一致 |
 
-当前交付看10组目录的report.md、report_contract.json和acceptance.json；历史试验验收查其原目录。
-详细分类/归因不是新一轮选组或实盘批准。普通比较只包含当前10组；
+表中各历史批次及数量保留当时含义；原十组交付看相应目录的report.md、report_contract.json和acceptance.json。
+新增曲线精萃两项接入证据在`portfolio_backtest/20260918_curve_sleeve_registration/`；
+其原始冻结研究在项目本地`comparison_research/20260918_full_library/`，均不入Git。
+只做多扩展及后续负面诊断在`strategy_extension/`，详见docs的趋势配置扩展与验收；
+被后续合同引用的面板、系数、脚本、账本和失败证据一并保留，不只保留胜出图表。
+详细分类/归因不是实盘批准。当前默认中性比较为12组，正式策略不变；
 归档证据及旧run内状态描述保留为当时快照，当前状态以策略目录和有效库文档为准。
 日常入口仍是根目录两个workflow；上述研究由workflows/experiments中的显式分支执行，
 不会挂入默认流程。归因模块保留是为了复现真实证据，不是待删除的一次性调试脚本。
@@ -72,6 +76,8 @@ factor_research/archived_audit_scripts_20260913.zip（保留原相对路径，�
 只清理已确认未引用、可重建的临时文件；有价值失败实验保留说明，不作为有效结果。
 不得删除数据源、有效库、holdout账本、正式证据或用户手动快照。
 操作前验证绝对路径和范围，权限受阻时保留并报告。
+2026-09-18发布审阅的临时Git暂存副本位于`release_review/20260918_staged/`，
+其清理也被本机策略阻止，仍保留且不入Git；对应测试XML独立保存，不将副本当作新的研究版本。
 
 历史九组对照使用canonical_factor_panel_checkpoint。
 该历史目录中的factor_panel_checkpoint是已否决的短预热实验，不可续跑；

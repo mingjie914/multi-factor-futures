@@ -1,0 +1,41 @@
+# Shared framework data, factor admission and execution; strategy methods only.
+extends: default.yaml
+date_range:
+  start: '2019-01-01'
+  end: '2026-05-15'
+factor_library:
+  enforce_effective_membership: true
+production_portfolio:
+  investment_universe: [IF, IC, T, TF, AU, CU, SC, RB, M]
+  position_mode: long_only
+  combination_order: portfolio_first
+  factor_weight_method: equal
+  parameter_aggregation: by_factor
+  factor_groups: {}
+  selection_fraction: 0.51
+  top_n_per_side: 5
+  score_decimals: 10
+  sector_count_cap: 0
+  asset_weight_method: inverse_vol_target_corr
+  allocation_scale: target_volatility
+  # Undisclosed by the attachments: explicit reproduction assumptions.
+  target_volatility: 0.04
+  volatility_window: 20
+  risk_history_timing: decision_close  # prior_close remains available.
+  correlation_window: 20
+  correlation_multiplier_cap: 2.0
+  minimum_risk_observations: 20
+  periods_per_year: 242
+  asset_min_fraction: 0.0
+  asset_max_fraction: 1.0
+  gross_exposure: 1.0  # Used only by fixed_gross alternative methods.
+  position_limits: {IF: 0.2, IC: 0.2, T: 1.0, TF: 1.0, AU: 0.3, CU: 0.3, SC: 0.3, RB: 0.3, M: 0.3}
+costs:
+  accounting_method: index_formula  # close_marked retains native contract accounting.
+  turnover_cost_rate: 0.0002
+  annual_fee: 0.001  # Fixed annual allowance (doc 2: estimated roll cost), charged once.
+  annual_roll_cost: 0.0
+  periods_per_year: 242
+backtest:
+  rebalance_freq: daily
+  holding_period: 1

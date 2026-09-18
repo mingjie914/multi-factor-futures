@@ -229,6 +229,7 @@ def build_close_marked_ledger(
     decision_tradable: pd.DataFrame | None = None,
     initial_nav: float = 1000.0,
     decision_target: Callable[[pd.Timestamp, pd.Series, pd.Series], pd.Series] | None = None,
+    accounting_method: str = "close_marked",
 ) -> "ResearchReturnLedger":
     """Build a causal daily ledger from close-indexed portfolio decisions.
 
@@ -244,6 +245,12 @@ def build_close_marked_ledger(
     close, and must return finite target weights for the known instruments.
     The final close also records its decision target, but has no following
     holding bar and therefore never executes or charges that target.
+
+    ``index_formula`` instead charges rate * sum(abs(w_T - w_(T-1) *
+    (1+r_T))) on close T, without NAV normalization or explicit contract-roll
+    legs. The first row is a cost-free index anchor; the final close is charged.
+    A fixed annual allowance uses ``annual_fee``; gross-based roll cost and
+    stateful decision callbacks are not part of this formula.
     """
     rate = float(trade_cost_rate)
     fee = float(annual_fee)
@@ -251,6 +258,11 @@ def build_close_marked_ledger(
     periods = float(periods_per_year)
     multiplier = float(cost_multiplier)
     initial_nav = float(initial_nav)
+    if accounting_method not in {"close_marked", "index_formula"}:
+        raise ResearchLedgerError("unknown accounting_method")
+    index_formula = accounting_method == "index_formula"
+    if index_formula and (roll_rate != 0.0 or decision_target is not None):
+        raise ResearchLedgerError("index_formula requires annual_roll_cost=0 and no decision_target")
     if (
         not np.isfinite([rate, fee, roll_rate, periods, multiplier, initial_nav]).all()
         or rate < 0.0
@@ -334,6 +346,16 @@ def build_close_marked_ledger(
     contribution_rows: list[pd.Series] = []
 
     for position, date in enumerate(dates):
+        if index_formula:
+            # Validate active returns before calculating the index's literal
+            # unnormalized drift. Targets take effect only on the next bar.
+            try:
+                marked = close_marked_step(current, returns.loc[date])
+            except MissingActiveReturnError as exc:
+                raise MissingActiveReturnError(f"{date.date()}: {exc}") from exc
+            pending_traded_notional = (0.0 if position == 0 else float(
+                (targets.loc[date] - current * (1.0 + marked.asset_returns)).abs().sum()
+            ))
         trade_cost = pending_traded_notional * rate * multiplier
         holding_cost = (
             0.0
@@ -372,8 +394,16 @@ def build_close_marked_ledger(
                 )
             desired_target = desired_target.reindex(universe, fill_value=0.0)
             targets.loc[date] = desired_target
-        # Record the final target without pretending that it was traded.
-        if position < len(dates) - 1:
+        if index_formula:
+            if tradable is not None and bool((
+                ~tradable.loc[date]
+                & desired_target.sub(current * (1.0 + marked.asset_returns)).abs().gt(ACTIVE_WEIGHT_TOLERANCE)
+            ).any()):
+                raise ResearchLedgerError(f"{date.date()}: index_formula target changes an untradable asset")
+            decision_turnover = pending_traded_notional
+            next_current = desired_target
+        # Native accounting records the final target without executing it.
+        elif position < len(dates) - 1:
             target = desired_target
             next_date = dates[position + 1]
             if tradable is not None:
@@ -489,6 +519,25 @@ def build_close_marked_ledger(
             "roll_turnover_definition": "all_legs_of_changed_contract_positions_including_resize",
         },
     )
+    if index_formula:
+        ledger.metadata = {
+            **ledger.metadata,
+            "accounting_method": "index_formula",
+            "position_model": "previous_close_target_for_each_daily_index_return",
+            "transition_basis": "previous_target_times_one_plus_return_without_nav_normalization",
+            "transaction_cost_timing": "same_close_after_initial_anchor",
+            "turnover_definition": "l1_target_minus_previous_target_times_one_plus_return",
+            "decision_turnover_timing": "decision_close",
+            "executed_turnover_timing": "decision_close_index_cost_estimate",
+            "rollover_cost_policy": "fixed_annual_allowance_no_explicit_contract_legs",
+            "untradable_rollover_policy": "not_modeled_by_root_index_formula",
+            "untradable_decision_policy": "reject_changes_when_decision_close_untradable",
+            "annual_fee_policy": "fixed_index_allowance_each_elapsed_bar_after_anchor",
+            "annual_roll_cost_policy": "disabled",
+            "roll_turnover_definition": "not_separately_charged",
+            "final_bar_target_policy": "charged_on_current_close",
+            "initial_anchor_policy": "zero_return_and_cost",
+        }
     ledger.validate()
     return ledger
 

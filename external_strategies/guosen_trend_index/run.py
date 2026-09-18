@@ -162,6 +162,7 @@ def _write_result(result: ExternalBacktestResult, output: Path, name: str) -> No
 
 
 def main() -> None:
+    raise SystemExit("旧外挂入口已退役。请用 run_portfolio_workflow，STRATEGY_IDS=('trend_allocation_daily_probe',)，方法见 config/strategy_trend_allocation.yaml。")
     parser = argparse.ArgumentParser(description="Run the isolated Guosen index-style adapter")
     parser.add_argument("--start", default="2016-03-31")
     parser.add_argument("--end", required=True)

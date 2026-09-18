@@ -317,6 +317,7 @@ def _plot(
 
 
 def main() -> None:
+    raise SystemExit("旧外挂搜索已退役。请用 workflows.factor_selection.run_effective_factor_selection(config_path='config/strategy_trend_allocation.yaml', ...)；历史结果仅供审计。")
     parser = argparse.ArgumentParser(
         description="Research factor-set search; use current_core_compare for fixed current comparisons"
     )

@@ -210,6 +210,23 @@ def test_listing_dates_come_from_first_concrete_contract_observation(tmp_path):
     assert pd.isna(result.loc["MISSING"])
 
 
+@pytest.mark.parametrize("extended", [False, True])
+def test_resampling_uses_original_bar_chronology(extended):
+    times = pd.to_datetime(["2024-01-03 09:15", "2024-01-03 09:00"])
+    frame = pl.DataFrame({"trade_datetime": times, "root": ["A", "A"],
+                          "open": [20., 10.], "close": [21., 11.],
+                          "volume": [2., 1.], "curve_total_oi": [200., 100.],
+                          "curve_top2_oi": [180., 90.], "curve_total_volume": [2., 1.],
+                          "curve_contract_count": [3, 2], "curve_oi_breadth": [.4, .2],
+                          "curve_oi_concentration": [.8, .6], "curve_oi_hhi": [.5, .3]})
+    if extended:
+        frame = pl.concat([frame, frame.with_columns(pl.col("trade_datetime") + pl.duration(days=1))])
+    bars = ParquetFuturesSource._resample_long_polars(frame, "30min").row(0, named=True)
+    assert (bars["open"], bars["close"], bars["volume"]) == (10., 21., 3.)
+    curve = ParquetFuturesSource._resample_curve_long_polars(frame, "30min").row(0, named=True)
+    assert (curve["curve_total_oi"], curve["curve_contract_count"]) == (200., 3)
+
+
 def test_intraday_route_keeps_real_bar_index_and_resamples(tmp_path):
     root = _fixture_root(tmp_path)
     source = ParquetFuturesSource({"root_path": str(root), "eager_fields": False})

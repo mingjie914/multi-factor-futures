@@ -138,7 +138,8 @@ class BacktestResult:
             if len(self.research_ledger.daily) > 1:
                 from optimization.costs import evaluate_cost_sensitivity
                 (root / "cost_diagnostics.json").write_text(
-                    json.dumps(evaluate_cost_sensitivity(self.research_ledger.daily, initial_anchor=True),
+                    json.dumps(evaluate_cost_sensitivity(self.research_ledger.daily, initial_anchor=True,
+                               periods_per_year=int(self.research_ledger.metadata.get("periods_per_year", 252))),
                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (root / "failures.json").write_text(
             json.dumps(

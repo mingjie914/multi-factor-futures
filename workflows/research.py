@@ -1489,6 +1489,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                 variants["raw"] = raw_variant_batch[fname]
             for variant, matrix in variants.items():
                 f_ic = matrix.loc[ic_start:ic_end]
+                if getattr(policy, "admission_universe", None):
+                    f_ic = f_ic.loc[:, policy.admission_universe]
                 for p in periods:
                     fwd = fwd_returns_by_period[p].loc[ic_start:ic_end]
                     estimation_failure = None
@@ -1497,7 +1499,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
                             f_ic,
                             fwd,
                             forward_period=p,
-                            min_stocks=10,
+                            min_stocks=getattr(policy, "admission_min_cross_section", 10),
                         )
                         t_stat = stats["ic_hac_t"]
                         ic_mean = stats["ic"]
@@ -1765,6 +1767,7 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
         )
         scorecard = policy.scorecard
         robustness_test = CalendarYearRobustnessTest(
+            min_cross_section=getattr(policy, "admission_min_cross_section", 10),
             min_ic_abs=policy.min_abs_ic,
             direction_ratio=policy.annual_direction_ratio,
             effect_ratio=policy.annual_effect_ratio,
@@ -1796,6 +1799,8 @@ def _run_multi_period_screening(runner, all_factors, config_path, t_threshold,
             else:
                 selected_matrix = factor_matrices[fname]
             f_mat = selected_matrix.loc[ic_start:ic_end]
+            if getattr(policy, "admission_universe", None):
+                f_mat = f_mat.loc[:, policy.admission_universe]
             fwd = fwd_returns_by_period[best_p].loc[ic_start:ic_end]
 
             # 分层单调性

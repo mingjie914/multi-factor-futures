@@ -59,3 +59,7 @@ weights/
 # monitoring runtime outputs
 /monitoring_data/
 /weeklyreport/
+
+# Frozen local method studies (inputs, code snapshots, ledgers and audit evidence)
+/comparison_research/
+/exa-results/

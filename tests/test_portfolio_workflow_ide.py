@@ -24,6 +24,7 @@ RETAINED_BUFFERS = {
     "sector_quality_balanced": 0, "structure_quality_balanced": 0,
     "compact_quality_balanced": 0, "compact_liquidity_stable": 1,
 }
+SLEEVE_CANDIDATES = {"curve_essence_sleeve_equal", "curve_essence_sleeve_erc"}
 
 
 def test_frozen_json_definition_loads_without_executing_python(tmp_path):
@@ -44,7 +45,7 @@ def test_shipped_legacy_definitions_are_portable():
             assert definition.is_relative_to(root / "config/factor_sets")
             loaded = ide._load_factor_definition(definition)
             assert set(loaded["directions"].values()) <= {-1, 1}
-    assert len([s for s in catalog.strategies if s.status != "archived"]) == 10
+    assert len([s for s in catalog.strategies if s.status != "archived" and s.comparison_group == "neutral_futures"]) == 12
     historical = {"current_single_baseline", "snapshot_8f_icir", "snapshot_13f_icir"}
     for entry in catalog.strategies:
         if entry.id in historical:
@@ -63,8 +64,9 @@ def test_retained_catalog_has_frozen_members_and_adopted_buffers():
         "sector_quality_balanced": 16, "structure_quality_balanced": 21,
         "compact_quality_balanced": 11, "compact_liquidity_stable": 10,
     }
-    active = [s for s in catalog.strategies if s.status != "archived"]
-    assert {s.id for s in active} == set(expected)
+    active = [s for s in catalog.strategies if s.status != "archived" and s.comparison_group == "neutral_futures"]
+    assert {s.id for s in active} == set(expected) | SLEEVE_CANDIDATES
+    active = [s for s in active if s.id in expected]
     assert [s.id for s in active if s.formal] == ["multi_source_resilient"]
     library = json.loads(Path(catalog.effective_factor_library).read_text(encoding="utf-8"))
     effective = {r["factor"]: r for r in library["factors"] if r["status"] == "effective"}
@@ -85,6 +87,66 @@ def test_retained_catalog_has_frozen_members_and_adopted_buffers():
     assert load_config("config/default.yaml").production_portfolio.rank_exit_buffer == 0
     assert sets["multi_source_balanced"].status == "archived"
     assert len(sets["multi_source_balanced"].factors) == 17
+
+
+def test_position_count_research_is_opt_in_and_shares_formal_members(monkeypatch):
+    from trading.weights import strategy_contracts
+
+    sid = "multi_source_resilient_p12"
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
+    monkeypatch.setattr(ide, "STRATEGY_IDS", ())
+    _, _, peers = ide._validated_specs()
+    assert {s.id for s, _, _ in peers} == set(RETAINED_BUFFERS) | SLEEVE_CANDIDATES
+    parent = next(c for s, _, c in peers if s.id == "multi_source_resilient")
+    monkeypatch.setattr(ide, "STRATEGY_IDS", (sid,))
+    _, catalog, selected = ide._validated_specs()
+    assert len(selected) == 1
+    entry, _, config = selected[0]
+    assert entry.name == "多源精择12品种(18)"
+    assert entry.status == "observing" and not entry.formal
+    assert entry.comparison_group == "neutral_position_count_research"
+    assert entry.factor_set_id == "multi_source_resilient"
+    assert sid not in {s.id for s in catalog.factor_sets}
+    assert config.factors == parent.factors and len(config.factors) == 18
+    assert ide._effective_factor_directions(config, config.factors) == ide._effective_factor_directions(parent, parent.factors)
+    assert config.production_portfolio.top_n_per_side == 6
+    assert config.production_portfolio.rank_exit_buffer == 1
+    expected = parent.production_portfolio.model_dump()
+    expected["top_n_per_side"] = 6
+    assert config.production_portfolio.model_dump() == expected
+    assert ide._legacy_recipe(config).top_n == 6
+    # Explicit contract resolution must not silently recover the parent's 20 names.
+    resolved = strategy_contracts([sid])[0]
+    expected.pop("factor_sleeves")
+    assert resolved["recipe"] == expected and not resolved["formal"]
+    assert resolved["directions"] == ide._effective_factor_directions(config, config.factors)
+    formal = strategy_contracts(["@formal"])[0]
+    assert formal["catalog_strategy_id"] == "multi_source_resilient"
+    assert formal["recipe"]["top_n_per_side"] == 10
+    assert formal["recipe"]["rank_exit_buffer"] == 1
+    monkeypatch.setattr(ide, "STRATEGY_IDS", ())
+    monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_PREFERRED)
+    assert [s.id for s, _, _ in ide._validated_specs()[2]] == ["multi_source_resilient"]
+    assert load_config("config/default.yaml").production_portfolio.top_n_per_side == 10
+
+
+@pytest.mark.parametrize("value", [0, -1, True, False, 6.0, "6"])
+def test_catalog_position_count_requires_a_positive_integer(value):
+    with pytest.raises(ValueError):
+        StrategyLibraryEntry(id="probe", config_path="config/default.yaml", top_n_per_side=value)
+
+
+@pytest.mark.parametrize("override,expected", [(None, 10), (6, 6)])
+def test_catalog_position_count_override_preserves_other_parameters(override, expected):
+    base = ProductionPortfolioConfig()
+    resolved = base.model_copy(deep=True)
+    entry = StrategyLibraryEntry(id="probe", config_path="config/default.yaml", top_n_per_side=override, rank_exit_buffer=1)
+    entry.apply_portfolio_overrides(resolved)
+    assert resolved.top_n_per_side == expected and resolved.rank_exit_buffer == 1
+    original = base.model_dump()
+    original.update(top_n_per_side=expected, rank_exit_buffer=1)
+    assert resolved.model_dump() == original
+    assert base.top_n_per_side == 10 and base.rank_exit_buffer == 0
 
 
 def test_replaced_strategy_remains_available_only_for_explicit_audit(monkeypatch):
@@ -262,13 +324,15 @@ def test_saved_ten_candidates_and_default_retain_frozen_members(monkeypatch):
     assert selected[0][2].factor_library.enforce_effective_membership
     monkeypatch.setattr(ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE)
     _, _, peers = ide._validated_specs()
-    assert len(peers) == 10
-    assert len({s.name for s, _, _ in peers}) == 10
-    assert sum(s.status == "observing" for s, _, _ in peers) == 9
+    assert len(peers) == 12
+    assert len({s.name for s, _, _ in peers}) == 12
+    assert sum(s.status == "observing" for s, _, _ in peers) == 11
     assert all(s.source == "effective_library" for s, _, _ in peers)
     assert "snapshot_6f_icir" not in {s.id for s, _, _ in peers}
     subsets = {s.id: s for s in catalog.factor_sets}
     for strategy, _, config in peers:
+        if strategy.id in SLEEVE_CANDIDATES:
+            continue  # Independently tested native factor-sleeve recipes.
         assert config.production_portfolio.rank_exit_buffer == RETAINED_BUFFERS[strategy.id]
         recipe = ide._legacy_recipe(config).to_dict()
         assert recipe.pop("rank_exit_buffer") == RETAINED_BUFFERS[strategy.id]
@@ -570,7 +634,7 @@ def test_ide_comparison_persists_results_and_contract(tmp_path, monkeypatch):
     assert "process_peak_working_set_mib" in performance
 
 
-def test_all_strategy_branch_selects_ten_active_peers_not_archives(monkeypatch):
+def test_all_strategy_branch_explicitly_includes_all_active_groups_not_archives(monkeypatch):
     monkeypatch.setattr(
         ide, "WORKFLOW", ide.PortfolioWorkflow.RUN_AND_COMPARE_ALL
     )
@@ -578,7 +642,7 @@ def test_all_strategy_branch_selects_ten_active_peers_not_archives(monkeypatch):
     assert [strategy.id for strategy, _path, _config in specs] == [
         entry.id for entry in catalog.strategies if entry.status != "archived"
     ]
-    assert len(specs) == 10
+    assert any(s.comparison_group == "long_only_trend_9" for s, _, _ in specs)
     assert all(strategy.id != "snapshot_6f_icir" for strategy, _, _ in specs)
 
 
@@ -601,11 +665,13 @@ def test_shared_production_panel_computes_union_once(monkeypatch):
     specs = [
         (object(), Path("a.yaml"), SimpleNamespace(
             factors=["factor_a", "shared"],
-            date_range=SimpleNamespace(end="latest_available"),
+            date_range=SimpleNamespace(start=ide.COMPARISON_START, end="latest_available"),
+            production_portfolio=ProductionPortfolioConfig(), universe=FRAMEWORK_UNIVERSE,
         )),
         (object(), Path("b.yaml"), SimpleNamespace(
             factors=["shared", "factor_b"],
-            date_range=SimpleNamespace(end="2026-08-20"),
+            date_range=SimpleNamespace(start=ide.COMPARISON_START, end="2026-08-20"),
+            production_portfolio=ProductionPortfolioConfig(), universe=FRAMEWORK_UNIVERSE,
         )),
     ]
 

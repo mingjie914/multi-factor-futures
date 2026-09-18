@@ -16,7 +16,7 @@ import re
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, StrictBool, conint
+from pydantic import BaseModel, Field, StrictBool, conint
 
 from core.sectors import require_framework_universe
 
@@ -226,6 +226,19 @@ class AssetSelectionConfig(StrictConfigModel):
     restrict_to_valid_sectors: bool = False
 
 
+class FactorSleeveConfig(StrictConfigModel):
+    """Daily allocation of native single-factor sleeves, before final netting."""
+
+    method: Literal["equal", "erc"] = "equal"
+    lookback: conint(strict=True, ge=2) = 126
+    minimum_observations: conint(strict=True, ge=2) = 60
+    covariance_shrinkage: float = Field(default=.30, ge=0, le=1)
+    min_weight: float = Field(default=.01, ge=0, le=1)
+    max_weight: float = Field(default=.15, gt=0, le=1)
+    final_asset_max_fraction: float = Field(default=.20, gt=0, le=1)
+    final_sector_max_fraction: float = Field(default=.60, gt=0, le=1)
+
+
 class ProductionPortfolioConfig(StrictConfigModel):
     """Frozen production-construction parameters, expressed per sleeve."""
 
@@ -243,6 +256,26 @@ class ProductionPortfolioConfig(StrictConfigModel):
     risk_lookback_calendar_days: int = 90
     minimum_risk_observations: int = 10
     covariance_shrinkage: float = 0.30
+    factor_sleeves: Optional[FactorSleeveConfig] = None
+    # Strategy-local investment scope; the framework universe remains the
+    # reference population for existing cross-sectional factor definitions.
+    investment_universe: List[str] = []
+    position_mode: Literal["long_short", "long_only", "short_only"] = "long_short"
+    combination_order: Literal["score_first", "portfolio_first"] = "score_first"
+    selection_fraction: Optional[float] = None
+    factor_groups: Dict[str, List[str]] = {}
+    parameter_aggregation: Literal["by_factor", "flat"] = "by_factor"
+    allocation_scale: Literal["fixed_gross", "target_volatility"] = "fixed_gross"
+    target_volatility: float = 0.04
+    volatility_window: int = 20
+    risk_history_timing: Literal["prior_close", "decision_close"] = "prior_close"
+    correlation_window: Optional[int] = 20
+    correlation_multiplier_cap: float = 2.0
+    periods_per_year: int = 252
+    score_decimals: Optional[int] = None
+    # Absolute NAV-notional caps applied once, after all sleeves are combined.
+    # Existing asset_max_fraction/overrides retain their within-sleeve meaning.
+    position_limits: Dict[str, float] = {}
 
 
 class UniverseSelectionConfig(StrictConfigModel):
@@ -403,6 +436,8 @@ class ValidationPolicyConfig(StrictConfigModel):
 
     version: str = "factor_admission_ic_hac_v1"
     admission_statistic: str = "daily_cross_sectional_ic_hac"
+    admission_min_cross_section: conint(strict=True, ge=3) = 10
+    admission_universe: List[str] = []  # Empty preserves the framework reference universe.
     discovery_method: str = "hierarchical_fdr"
     discovery_q: float = 0.10
     fwer_report_alpha: float = 0.05
@@ -506,6 +541,18 @@ class StrategyLibraryEntry(StrictConfigModel):
     mode: Literal["single", "multi"] = "single"
     description: str = ""
     rank_exit_buffer: Optional[_StrictNonNegativeInt] = None
+    top_n_per_side: Optional[conint(strict=True, gt=0)] = None
+    factor_sleeves: Optional[FactorSleeveConfig] = None
+    # Same catalog/lifecycle, with an explicit method source and peer group.
+    recipe_source: Literal["shared_default", "strategy_config"] = "shared_default"
+    comparison_group: str = "neutral_futures"
+
+    def apply_portfolio_overrides(self, portfolio: ProductionPortfolioConfig) -> None:
+        """Apply explicit catalog knobs after the caller's base-recipe checks."""
+        for name in ("rank_exit_buffer", "top_n_per_side", "factor_sleeves"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(portfolio, name, value)
 
 
 class StrategyLibraryConfig(StrictConfigModel):
@@ -627,14 +674,26 @@ def load_config(path: str) -> FrameworkConfig:
         Validated FrameworkConfig instance.
     """
     path = os.path.abspath(path)
-    with open(path, "r", encoding="utf-8") as fh:
-        if path.endswith((".yaml", ".yml")):
-            raw = yaml.safe_load(fh)
-        else:
-            raw = json.load(fh)
-
-    if not isinstance(raw, dict):
-        raise ValueError(f"Config file must contain a dict at top level, got {type(raw)}")
+    # A sparse strategy config can reuse one existing framework config without
+    # copying data, frequency or research policy. Resolve before runtime overrides.
+    layers, visited, current = [], set(), path
+    while current:
+        identity = os.path.normcase(os.path.realpath(current))
+        if identity in visited:
+            raise ValueError("cyclic config extends")
+        visited.add(identity)
+        with open(current, "r", encoding="utf-8") as fh:
+            layer = yaml.safe_load(fh) if current.endswith((".yaml", ".yml")) else json.load(fh)
+        if not isinstance(layer, dict):
+            raise ValueError("Config file must contain a dict at top level")
+        parent = layer.pop("extends", None)
+        layers.append(layer)
+        if parent is not None and (not isinstance(parent, str) or not parent.strip()):
+            raise ValueError("config extends must be a non-empty path")
+        current = os.path.abspath(os.path.join(os.path.dirname(current), parent)) if parent else None
+    raw = {}
+    for layer in reversed(layers):
+        raw = _deep_merge(raw, layer)
 
     # CR-012: 展开 ${VAR} 和 ${VAR:default} 环境变量引用
     raw = _expand_env_vars(raw)
@@ -658,7 +717,84 @@ def load_config(path: str) -> FrameworkConfig:
 
     research_cutoff(config)
     require_framework_universe(config.universe)
+    admission = config.validation_policy.admission_universe
+    if admission and (len(admission) != len(set(admission))
+            or set(admission) - set(config.universe)
+            or len(admission) < config.validation_policy.admission_min_cross_section):
+        raise ValueError("admission_universe must be a unique framework subset meeting admission_min_cross_section")
+    validate_portfolio_config(config)
     return config
+
+
+def validate_portfolio_config(config, *, factor_names=None) -> None:
+    """Validate explicit strategy recipes without relaxing the main universe."""
+    import math
+    from core.sectors import SECTOR_MAP
+
+    p = config.production_portfolio
+    if p.factor_sleeves is not None:
+        q = p.factor_sleeves
+        if (p.investment_universe or p.position_mode != "long_short"
+                or p.combination_order != "score_first" or p.factor_groups
+                or config.asset_selection.enabled or config.universe_selection.enabled):
+            raise ValueError("factor-sleeve construction requires the native long-short route")
+        if q.lookback < q.minimum_observations or q.min_weight > q.max_weight:
+            raise ValueError("invalid factor-sleeve window or bounds")
+        if factor_names is not None and not (
+            q.min_weight * len(factor_names) <= 1 <= q.max_weight * len(factor_names)
+        ):
+            raise ValueError("factor-sleeve bounds cannot allocate the declared factor count")
+    if not p.investment_universe and (p.asset_weight_method == "inverse_vol_target_corr"
+            or p.position_limits or p.factor_groups or p.selection_fraction is not None
+            or p.score_decimals is not None or p.allocation_scale != "fixed_gross"
+            or p.risk_history_timing != "prior_close"):
+        raise ValueError("custom construction options require investment_universe")
+    custom = bool(p.investment_universe) or p.position_mode != "long_short" or p.combination_order != "score_first"
+    if not custom:
+        return
+    universe = p.investment_universe
+    if not universe or len(universe) != len(set(universe)) or any(x not in SECTOR_MAP for x in universe):
+        raise ValueError("investment_universe must contain unique, known uppercase futures roots")
+    if config.universe_selection.enabled or config.asset_selection.enabled:
+        raise ValueError("fixed investment_universe cannot combine with dynamic selection layers")
+    if p.rank_exit_buffer:
+        raise ValueError("custom portfolio recipes do not yet support rank_exit_buffer")
+    if config.costs.type != "simple_futures" or float(getattr(config.costs, "periods_per_year", 252)) != p.periods_per_year:
+        raise ValueError("configured construction and cost annualization must match")
+    if p.asset_weight_method not in {"equal", "inverse_volatility", "erc", "inverse_vol_target_corr"}:
+        raise ValueError("unknown asset_weight_method")
+    if p.factor_weight_method not in {"equal", "diag_icir", "lw_abs", "lw_positive"}:
+        raise ValueError("unknown factor_weight_method")
+    if p.selection_fraction is not None and not 0 < p.selection_fraction <= 1:
+        raise ValueError("selection_fraction must be in (0, 1]")
+    count = round(len(universe) * p.selection_fraction) if p.selection_fraction is not None else p.top_n_per_side
+    if count < 1 or count * (2 if p.position_mode == "long_short" else 1) > len(universe):
+        raise ValueError("selection size does not fit the fixed investment_universe")
+    if p.asset_weight_method == "inverse_vol_target_corr" and (
+        p.allocation_scale != "target_volatility" or p.position_mode == "long_short"
+    ):
+        raise ValueError("inverse_vol_target_corr requires one-sided target_volatility allocation")
+    if (p.volatility_window < 2 or p.minimum_risk_observations < 2
+            or p.minimum_risk_observations > p.volatility_window
+            or (p.correlation_window is not None and p.correlation_window < p.minimum_risk_observations)
+            or p.periods_per_year <= 0):
+        raise ValueError("invalid portfolio risk windows or annualization")
+    if any(not math.isfinite(float(x)) or x <= 0 for x in (
+        p.target_volatility, p.correlation_multiplier_cap, p.gross_exposure
+    )):
+        raise ValueError("portfolio risk scales must be finite and positive")
+    if p.score_decimals is not None and (type(p.score_decimals) is not int or not 0 <= p.score_decimals <= 15):
+        raise ValueError("score_decimals must be an integer from 0 to 15")
+    if set(p.position_limits) - set(universe) or any(
+        not math.isfinite(float(v)) or v < 0 for v in p.position_limits.values()
+    ):
+        raise ValueError("position_limits must be finite nonnegative caps inside the investment universe")
+    grouped = [name for group in p.factor_groups.values() for name in group]
+    if (any(not group for group in p.factor_groups.values()) or len(grouped) != len(set(grouped))
+            or (factor_names is not None and set(grouped) - set(factor_names))):
+        raise ValueError("factor_groups must contain non-overlapping configured factor names")
+    if p.factor_groups and p.combination_order != "portfolio_first":
+        raise ValueError("factor_groups require portfolio_first combination")
 
 
 def load_strategy_library(path: str) -> StrategyLibraryConfig:
